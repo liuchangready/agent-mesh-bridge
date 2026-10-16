@@ -2,19 +2,29 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { execFile } from 'child_process';
-import { AgentId, AgentInfo } from './types';
+import { AgentId, AgentInfo, AgentStatusType } from './types';
+import { RateLimitTracker } from './rate-limit-tracker';
 
 export class AgentDetector {
   private customPaths: Partial<Record<AgentId, string>> = {};
+  private rateLimitTracker: RateLimitTracker;
+  private cache: Partial<Record<AgentId, { info: AgentInfo; timestamp: number }>> = {};
+  private readonly CACHE_TTL_MS = 5000; // 5s cache
 
-  constructor(customPaths?: Partial<Record<AgentId, string>>) {
+  constructor(customPaths?: Partial<Record<AgentId, string>>, rateLimitTracker?: RateLimitTracker) {
     if (customPaths) {
       this.customPaths = customPaths;
     }
+    this.rateLimitTracker = rateLimitTracker || RateLimitTracker.getInstance();
   }
 
   public setCustomPath(agent: AgentId, execPath: string): void {
     this.customPaths[agent] = execPath;
+    delete this.cache[agent];
+  }
+
+  public getRateLimitTracker(): RateLimitTracker {
+    return this.rateLimitTracker;
   }
 
   /**
@@ -27,7 +37,6 @@ export class AgentDetector {
     }
 
     const home = os.homedir();
-    // Default gemini bin paths
     if (process.platform === 'win32') {
       candidates.push(path.join(home, '.gemini', 'bin', 'agy.exe'));
       candidates.push(path.join(home, 'AppData', 'Local', 'Programs', 'Antigravity', 'agy.exe'));
@@ -36,7 +45,6 @@ export class AgentDetector {
       candidates.push('/usr/local/bin/agy');
     }
 
-    // Try finding in PATH
     const pathBin = this.lookupInPath(process.platform === 'win32' ? 'agy.exe' : 'agy');
     if (pathBin) candidates.push(pathBin);
 
@@ -81,14 +89,11 @@ export class AgentDetector {
 
     const home = os.homedir();
     if (process.platform === 'win32') {
-      // Look in VSCode extensions folder for openai.chatgpt-*
       const extensionsDir = path.join(home, '.vscode', 'extensions');
       if (fs.existsSync(extensionsDir)) {
         try {
           const dirs = fs.readdirSync(extensionsDir);
-          const codexDirs = dirs.filter(
-            (d) => d.startsWith('openai.chatgpt-') || d.startsWith('openai.codex-'),
-          );
+          const codexDirs = dirs.filter(d => d.startsWith('openai.chatgpt-') || d.startsWith('openai.codex-'));
           for (const d of codexDirs) {
             candidates.push(path.join(extensionsDir, d, 'bin', 'windows-x86_64', 'codex.exe'));
             candidates.push(path.join(extensionsDir, d, 'bin', 'codex.exe'));
@@ -102,9 +107,7 @@ export class AgentDetector {
       if (fs.existsSync(extensionsDir)) {
         try {
           const dirs = fs.readdirSync(extensionsDir);
-          const codexDirs = dirs.filter(
-            (d) => d.startsWith('openai.chatgpt-') || d.startsWith('openai.codex-'),
-          );
+          const codexDirs = dirs.filter(d => d.startsWith('openai.chatgpt-') || d.startsWith('openai.codex-'));
           for (const d of codexDirs) {
             candidates.push(path.join(extensionsDir, d, 'bin', 'linux-x86_64', 'codex'));
             candidates.push(path.join(extensionsDir, d, 'bin', 'darwin-arm64', 'codex'));
@@ -152,44 +155,168 @@ export class AgentDetector {
   }
 
   /**
-   * Probe agent info including version if possible.
+   * Probe agent info including version, authentication status, and rate limit exhaustion with recovery time.
    */
-  public async probeAgent(agent: AgentId): Promise<AgentInfo> {
+  public async probeAgent(agent: AgentId, forceRefresh: boolean = false): Promise<AgentInfo> {
+    const cached = this.cache[agent];
+    if (!forceRefresh && cached && (Date.now() - cached.timestamp < this.CACHE_TTL_MS)) {
+      return cached.info;
+    }
+
     const names: Record<AgentId, string> = {
       antigravity: 'Google Antigravity',
       claude_code: 'Anthropic Claude Code',
       codex: 'OpenAI Codex',
-      vscode_chat: 'VSCode Copilot/Chat',
+      vscode_chat: 'VSCode Copilot/Chat'
     };
 
     if (agent === 'vscode_chat') {
-      return {
+      const info: AgentInfo = {
         id: 'vscode_chat',
         name: names.vscode_chat,
+        status: 'online',
         available: true,
         executablePath: 'builtin',
+        authDetails: 'Builtin VSCode Session',
+        statusDetails: 'Ready',
+        lastChecked: new Date().toISOString()
       };
+      this.cache[agent] = { info, timestamp: Date.now() };
+      return info;
     }
 
     const execPath = this.resolveExecutable(agent);
+    const rateLimit = this.rateLimitTracker.getRateLimitInfo(agent);
+
+    // 1. Check if executable exists (Offline check)
     if (!execPath) {
-      return {
+      const info: AgentInfo = {
         id: agent,
         name: names[agent],
+        status: 'offline',
         available: false,
-        statusDetails: 'Executable not found in standard paths or PATH',
+        statusDetails: '未安装或无法找到可执行文件 (Offline / Missing executable)',
+        rateLimit,
+        lastChecked: new Date().toISOString()
       };
+      this.cache[agent] = { info, timestamp: Date.now() };
+      return info;
     }
 
+    // 2. Check version
     const version = await this.queryVersion(execPath);
-    return {
+
+    // 3. Check Authentication
+    const auth = this.checkAuthentication(agent);
+
+    // 4. Check Rate Limit Exhaustion
+    let status: AgentStatusType = 'online';
+    let statusDetails = '正常就绪 (Ready)';
+
+    if (rateLimit && rateLimit.isExhausted) {
+      status = 'exhausted';
+      const resets = rateLimit.resetsAtFormatted || '未知时间';
+      statusDetails = `配额耗尽 / 限流中 (恢复时间: ${resets})`;
+    } else if (!auth.authenticated) {
+      status = 'unauthenticated';
+      statusDetails = `未登录 (${auth.details})`;
+    }
+
+    const info: AgentInfo = {
       id: agent,
       name: names[agent],
+      status,
       available: true,
       executablePath: execPath,
       version: version || 'installed',
-      statusDetails: 'Ready',
+      authDetails: auth.details,
+      statusDetails,
+      rateLimit,
+      lastChecked: new Date().toISOString()
     };
+
+    this.cache[agent] = { info, timestamp: Date.now() };
+    return info;
+  }
+
+  /**
+   * Probe all agents concurrently.
+   */
+  public async probeAll(forceRefresh: boolean = false): Promise<Record<AgentId, AgentInfo>> {
+    const agents: AgentId[] = ['antigravity', 'codex', 'claude_code'];
+    const results = await Promise.all(agents.map(a => this.probeAgent(a, forceRefresh)));
+    const map: Partial<Record<AgentId, AgentInfo>> = {};
+    for (const r of results) {
+      map[r.id] = r;
+    }
+    return map as Record<AgentId, AgentInfo>;
+  }
+
+  private checkAuthentication(agent: AgentId): { authenticated: boolean; details: string } {
+    const home = os.homedir();
+
+    if (agent === 'antigravity') {
+      const pbtxt = path.join(home, '.gemini', 'antigravity', 'antigravity_state.pbtxt');
+      const cliPbtxt = path.join(home, '.gemini', 'antigravity-cli', 'jetski_state.pbtxt');
+      if (fs.existsSync(pbtxt)) {
+        try {
+          const content = fs.readFileSync(pbtxt, 'utf8');
+          if (content.includes('installation_uuid') || content.includes('AGENT_ONBOARDING_STATE_COMPLETED')) {
+            return { authenticated: true, details: '已登录 (Antigravity 会话就绪)' };
+          }
+        } catch {}
+      }
+      if (fs.existsSync(cliPbtxt) || process.env.ANTIGRAVITY_APP || process.env.GEMINI_API_KEY) {
+        return { authenticated: true, details: '已登录 (CLI / 环境变量)' };
+      }
+      return { authenticated: false, details: '缺失 Antigravity 登录会话' };
+    }
+
+    if (agent === 'codex') {
+      const authPath = path.join(home, '.codex', 'auth.json');
+      if (fs.existsSync(authPath)) {
+        try {
+          const data = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+          if (data.OPENAI_API_KEY || (data.tokens && Object.keys(data.tokens).length > 0) || data.access_token) {
+            return { authenticated: true, details: '已登录 (Codex API Key / 凭据)' };
+          }
+        } catch {}
+      }
+      if (process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY) {
+        return { authenticated: true, details: '已登录 (环境变量 API Key)' };
+      }
+      return { authenticated: false, details: '未找到 OpenAI API Key 或 Token' };
+    }
+
+    if (agent === 'claude_code') {
+      const settingsPath = path.join(home, '.claude', 'settings.json');
+      if (fs.existsSync(settingsPath)) {
+        try {
+          const data = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+          if (data.env && (data.env.ANTHROPIC_AUTH_TOKEN || data.env.ANTHROPIC_API_KEY)) {
+            return { authenticated: true, details: '已登录 (Claude Auth Token)' };
+          }
+        } catch {}
+      }
+
+      const claudeJsonPath = path.join(home, '.claude.json');
+      if (fs.existsSync(claudeJsonPath)) {
+        try {
+          const data = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
+          if (data.primaryApiKey || data.oauthAccount || data.sessionKey) {
+            return { authenticated: true, details: '已登录 (Claude OAuth/Key)' };
+          }
+        } catch {}
+      }
+
+      if (process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN) {
+        return { authenticated: true, details: '已登录 (环境变量 Token)' };
+      }
+
+      return { authenticated: false, details: '未配置 Anthropic 访问令牌' };
+    }
+
+    return { authenticated: true, details: 'Default' };
   }
 
   private queryVersion(execPath: string): Promise<string | undefined> {
@@ -211,9 +338,6 @@ export class AgentDetector {
     });
   }
 
-  /**
-   * Search PATH for command.
-   */
   private lookupInPath(command: string): string | null {
     const envPath = process.env.PATH || '';
     const delimiter = process.platform === 'win32' ? ';' : ':';

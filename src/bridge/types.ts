@@ -94,13 +94,28 @@ export interface ApproveResult {
   message: string;
 }
 
+export type AgentStatusType = 'online' | 'offline' | 'unauthenticated' | 'exhausted';
+
+export interface RateLimitInfo {
+  isExhausted: boolean;
+  resetsAt?: string;          // ISO8601 string
+  resetsAtFormatted?: string; // e.g. "18:45:00 (in 32m)"
+  remainingSeconds?: number;  // Seconds until recovery
+  reason?: string;            // e.g. "Rate limit reached (429)"
+  lastUpdated: string;
+}
+
 export interface AgentInfo {
   id: AgentId;
   name: string;
+  status: AgentStatusType;
   available: boolean;
   executablePath?: string;
   version?: string;
+  authDetails?: string;
   statusDetails?: string;
+  rateLimit?: RateLimitInfo;
+  lastChecked?: string;
 }
 
 export interface AgentMeshStatus {
@@ -109,3 +124,5 @@ export interface AgentMeshStatus {
   agents: Record<AgentId, AgentInfo>;
   totalLedgerTasks: number;
 }
+
+

@@ -43,6 +43,10 @@
     "views": {
       "agent-mesh-bridge-container": [
         {
+          "id": "agent-mesh-bridge.agent-nodes",
+          "name": "Agent Nodes / 节点状态"
+        },
+        {
           "id": "agent-mesh-bridge.active-tasks",
           "name": "Active & In-Review Tasks"
         },
@@ -53,6 +57,15 @@
       ]
     },
     "commands": [
+      {
+        "command": "agent-mesh-bridge.refreshAgentStatus",
+        "title": "Refresh Agent Nodes Status",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "agent-mesh-bridge.clearAgentExhaustion",
+        "title": "Clear Agent Rate Limit Status"
+      },
       {
         "command": "agent-mesh-bridge.refreshTasks",
         "title": "Refresh Tasks",
@@ -82,17 +95,27 @@
     "menus": {
       "view/title": [
         {
+          "command": "agent-mesh-bridge.refreshAgentStatus",
+          "when": "view == agent-mesh-bridge.agent-nodes",
+          "group": "navigation"
+        },
+        {
           "command": "agent-mesh-bridge.refreshTasks",
           "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
           "group": "navigation"
         },
         {
           "command": "agent-mesh-bridge.syncMcpConfig",
-          "when": "view == agent-mesh-bridge.active-tasks",
+          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.agent-nodes",
           "group": "navigation"
         }
       ],
       "view/item/context": [
+        {
+          "command": "agent-mesh-bridge.clearAgentExhaustion",
+          "when": "view == agent-mesh-bridge.agent-nodes",
+          "group": "1_actions"
+        },
         {
           "command": "agent-mesh-bridge.openTaskDetail",
           "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",

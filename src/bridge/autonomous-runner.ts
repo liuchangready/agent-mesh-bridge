@@ -315,10 +315,14 @@ export class AutonomousRunner {
         const durationMs = Date.now() - startTime;
         const exitCode = code ?? 0;
         const extracted = this.extractCleanOutput(stdoutData);
-
         let error: string | undefined = undefined;
         if (exitCode !== 0) {
           error = stderrData.trim() || `Process exited with non-zero code ${exitCode}`;
+        }
+
+        const combinedOutput = `${stdoutData}\n${stderrData}`;
+        if (/429|rate\s*limit|quota\s*exceeded|resource_exhausted|insufficient_quota|overloaded|try\s*again\s*in|resets\s*at|resets\s*in/i.test(combinedOutput)) {
+          this.detector.getRateLimitTracker().recordExhaustion(options.agent, combinedOutput);
         }
 
         resolve({

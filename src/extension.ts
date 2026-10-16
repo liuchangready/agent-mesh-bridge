@@ -9,6 +9,7 @@ import { ReworkController } from './bridge/rework-controller';
 import { ConfigSyncService } from './config/config-sync';
 import { StatusBarController } from './ui/status-bar';
 import { TaskTreeProvider, TaskTreeItem } from './ui/task-tree-provider';
+import { AgentNodesProvider, AgentNodeItem } from './ui/agent-nodes-provider';
 import { TaskDetailPanel } from './ui/detail-panel';
 import { AgentId } from './bridge/types';
 
@@ -42,13 +43,18 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   // 3. Status Bar Controller
-  const statusBar = new StatusBarController(resolver);
+  const statusBar = new StatusBarController(resolver, detector);
   context.subscriptions.push(statusBar.getStatusBarItem());
 
   // 4. Tree Views
+  const agentNodesProvider = new AgentNodesProvider(detector, resolver);
   const activeTreeProvider = new TaskTreeProvider(taskStore, 'active');
   const recentTreeProvider = new TaskTreeProvider(taskStore, 'all');
 
+  const agentNodesTreeView = vscode.window.createTreeView('agent-mesh-bridge.agent-nodes', {
+    treeDataProvider: agentNodesProvider,
+    showCollapseAll: false,
+  });
   const activeTreeView = vscode.window.createTreeView('agent-mesh-bridge.active-tasks', {
     treeDataProvider: activeTreeProvider,
     showCollapseAll: true,
@@ -58,7 +64,7 @@ export function activate(context: vscode.ExtensionContext) {
     showCollapseAll: true,
   });
 
-  context.subscriptions.push(activeTreeView, recentTreeView);
+  context.subscriptions.push(agentNodesTreeView, activeTreeView, recentTreeView);
 
   // 5. Notify in VSCode when tasks complete
   callbackManager.on('taskCompleted', ({ thread, round }) => {
@@ -74,12 +80,39 @@ export function activate(context: vscode.ExtensionContext) {
     });
 
     statusBar.update();
+    agentNodesProvider.refresh(false);
   });
 
   // 6. Register Commands
   context.subscriptions.push(
+    vscode.commands.registerCommand('agent-mesh-bridge.refreshAgentStatus', async () => {
+      await agentNodesProvider.refresh(true);
+      await statusBar.update();
+      vscode.window.showInformationMessage('Agent Mesh Bridge: 节点状态与限流信息已刷新。');
+    }),
+
+    vscode.commands.registerCommand('agent-mesh-bridge.clearAgentExhaustion', async (item?: AgentNodeItem) => {
+      if (item && item.info) {
+        detector.getRateLimitTracker().clearExhaustion(item.info.id);
+        await agentNodesProvider.refresh(true);
+        await statusBar.update();
+        vscode.window.showInformationMessage(`已清除 ${item.info.name} 的耗尽状态标记。`);
+      } else {
+        const pick = await vscode.window.showQuickPick(['antigravity', 'codex', 'claude_code'], {
+          placeHolder: '选择要清除耗尽状态的 Agent'
+        });
+        if (pick) {
+          detector.getRateLimitTracker().clearExhaustion(pick as AgentId);
+          await agentNodesProvider.refresh(true);
+          await statusBar.update();
+          vscode.window.showInformationMessage(`已清除 ${pick} 的耗尽状态标记。`);
+        }
+      }
+    }),
+
     vscode.commands.registerCommand('agent-mesh-bridge.refreshTasks', () => {
       taskStore.loadFromDisk();
+      agentNodesProvider.refresh(false);
       activeTreeProvider.refresh();
       recentTreeProvider.refresh();
       statusBar.update();
