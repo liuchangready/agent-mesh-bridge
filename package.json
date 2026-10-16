@@ -1,0 +1,177 @@
+{
+  "name": "agent-mesh-bridge",
+  "displayName": "Agent Mesh Bridge",
+  "description": "Peer-to-Peer Multi-Agent Bridge connecting Google Antigravity, OpenAI Codex, and Anthropic Claude Code in VSCode",
+  "version": "1.0.0",
+  "publisher": "agent-mesh",
+  "author": "Antigravity Team",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages",
+    "Tools"
+  ],
+  "keywords": [
+    "agent",
+    "mesh",
+    "antigravity",
+    "codex",
+    "claude",
+    "mcp",
+    "multi-agent"
+  ],
+  "main": "./out/extension.js",
+  "bin": {
+    "agent-bridge-mcp": "./bin/agent-bridge-mcp.cjs"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agent-mesh-bridge-container",
+          "title": "Agent Mesh Bridge",
+          "icon": "resources/bridge-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "agent-mesh-bridge-container": [
+        {
+          "id": "agent-mesh-bridge.active-tasks",
+          "name": "Active & In-Review Tasks"
+        },
+        {
+          "id": "agent-mesh-bridge.recent-tasks",
+          "name": "Recent Tasks (1,000 Ledger)"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "agent-mesh-bridge.refreshTasks",
+        "title": "Refresh Tasks",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "agent-mesh-bridge.selectActiveAgent",
+        "title": "Agent Bridge: Switch Active Agent"
+      },
+      {
+        "command": "agent-mesh-bridge.openTaskDetail",
+        "title": "Open Task Details"
+      },
+      {
+        "command": "agent-mesh-bridge.approveTask",
+        "title": "Approve Task"
+      },
+      {
+        "command": "agent-mesh-bridge.requestRework",
+        "title": "Request Rework"
+      },
+      {
+        "command": "agent-mesh-bridge.syncMcpConfig",
+        "title": "Sync MCP Configuration to Agents"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "agent-mesh-bridge.refreshTasks",
+          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "group": "navigation"
+        },
+        {
+          "command": "agent-mesh-bridge.syncMcpConfig",
+          "when": "view == agent-mesh-bridge.active-tasks",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "agent-mesh-bridge.openTaskDetail",
+          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "group": "inline"
+        },
+        {
+          "command": "agent-mesh-bridge.approveTask",
+          "when": "view == agent-mesh-bridge.active-tasks",
+          "group": "1_actions"
+        },
+        {
+          "command": "agent-mesh-bridge.requestRework",
+          "when": "view == agent-mesh-bridge.active-tasks",
+          "group": "1_actions"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Agent Mesh Bridge",
+      "properties": {
+        "agentMeshBridge.defaultAgent": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "codex",
+            "claude_code",
+            "antigravity"
+          ],
+          "default": "auto",
+          "description": "Default target agent for task delegation when not explicitly specified."
+        },
+        "agentMeshBridge.maxTasks": {
+          "type": "number",
+          "default": 1000,
+          "description": "Maximum number of tasks stored in the persistent delegation ledger."
+        },
+        "agentMeshBridge.antigravityPath": {
+          "type": "string",
+          "default": "",
+          "description": "Custom executable path for Google Antigravity (agy)."
+        },
+        "agentMeshBridge.claudeCodePath": {
+          "type": "string",
+          "default": "",
+          "description": "Custom executable path for Anthropic Claude Code (claude)."
+        },
+        "agentMeshBridge.codexPath": {
+          "type": "string",
+          "default": "",
+          "description": "Custom executable path for OpenAI Codex (codex)."
+        },
+        "agentMeshBridge.autoSyncMcp": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically sync MCP configuration to Antigravity, Claude, and Codex profiles on activation."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "node --test out/test/**/*.test.js",
+    "package": "npx @vscode/vsce package --no-dependencies",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^2.29.0",
+    "eslint": "^10.12.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.10",
+    "typescript": "^5.4.5",
+    "typescript-eslint": "^8.71.2"
+  }
+}
