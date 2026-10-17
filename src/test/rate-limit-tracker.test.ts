@@ -29,8 +29,15 @@ describe('RateLimitTracker & Agent Status Tests', () => {
 
     assert.strictEqual(recorded.isExhausted, true);
     assert.strictEqual(recorded.reason, '429 Rate Limit Exceeded');
-    assert.ok(recorded.remainingSeconds !== undefined && recorded.remainingSeconds > 0 && recorded.remainingSeconds <= 120);
-    assert.ok(recorded.resetsAtFormatted?.includes('in 2m') || recorded.resetsAtFormatted?.includes('in 1m'));
+    assert.ok(
+      recorded.remainingSeconds !== undefined &&
+        recorded.remainingSeconds > 0 &&
+        recorded.remainingSeconds <= 120,
+    );
+    assert.ok(
+      recorded.resetsAtFormatted?.includes('in 2m') ||
+        recorded.resetsAtFormatted?.includes('in 1m'),
+    );
 
     assert.strictEqual(tracker.isExhausted('claude_code'), true);
   });

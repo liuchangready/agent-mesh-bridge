@@ -6,6 +6,10 @@
   "publisher": "agent-mesh",
   "author": "Antigravity Team",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/agent-mesh/agent-mesh-bridge"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -88,6 +92,16 @@
         "title": "Request Rework"
       },
       {
+        "command": "agent-mesh-bridge.resumeTask",
+        "title": "Resume / Continue Task",
+        "icon": "$(play)"
+      },
+      {
+        "command": "agent-mesh-bridge.wakeUpCaller",
+        "title": "Wake Up Initiator / 唤醒下发者检视",
+        "icon": "$(bell)"
+      },
+      {
         "command": "agent-mesh-bridge.syncMcpConfig",
         "title": "Sync MCP Configuration to Agents"
       }
@@ -130,6 +144,16 @@
           "command": "agent-mesh-bridge.requestRework",
           "when": "view == agent-mesh-bridge.active-tasks",
           "group": "1_actions"
+        },
+        {
+          "command": "agent-mesh-bridge.resumeTask",
+          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "group": "1_actions"
+        },
+        {
+          "command": "agent-mesh-bridge.wakeUpCaller",
+          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "group": "1_actions"
         }
       ]
     },
@@ -151,6 +175,11 @@
           "type": "number",
           "default": 1000,
           "description": "Maximum number of tasks stored in the persistent delegation ledger."
+        },
+        "agentMeshBridge.taskTimeoutMinutes": {
+          "type": "number",
+          "default": 120,
+          "description": "Maximum execution timeout in minutes for a single task round before terminating (default: 120 mins / 2 hours)."
         },
         "agentMeshBridge.antigravityPath": {
           "type": "string",
@@ -180,7 +209,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "test": "node --test out/test/**/*.test.js",
-    "package": "npx @vscode/vsce package --no-dependencies",
+    "package": "npx @vscode/vsce package --no-dependencies --allow-missing-repository",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",

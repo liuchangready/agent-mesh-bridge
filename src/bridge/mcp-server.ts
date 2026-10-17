@@ -49,6 +49,12 @@ export class MCPServer {
               description:
                 'Target agent to execute the task. Defaults to "default" (auto-detected).',
             },
+            initiatorAgent: {
+              type: 'string',
+              enum: ['default', 'codex', 'claude_code', 'antigravity'],
+              description:
+                'Your agent identity (codex, claude_code, antigravity). Defaults to auto-detected caller.',
+            },
             title: {
               type: 'string',
               description: 'Brief descriptive task title (e.g. "Fix TCP stream buffer leak")',
@@ -61,7 +67,7 @@ export class MCPServer {
             callerSessionId: {
               type: 'string',
               description:
-                'Your native session ID so the bridge can proactively wake you up upon completion.',
+                'Your native session ID so the bridge can proactively wake you up upon completion. If omitted, the bridge automatically auto-detects your active session.',
             },
             workspacePath: {
               type: 'string',
@@ -196,8 +202,15 @@ export class MCPServer {
   public async handleToolCall(name: string, args: any): Promise<any> {
     switch (name) {
       case 'dispatch_task': {
+        const callerFromEnv = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
+        const initiatorAgent =
+          args.initiatorAgent && args.initiatorAgent !== 'default'
+            ? (args.initiatorAgent as AgentId)
+            : callerFromEnv;
+
         return await this.dispatcher.dispatchTask({
           targetAgent: args.targetAgent,
+          initiatorAgent,
           title: args.title,
           prompt: args.prompt,
           callerSessionId: args.callerSessionId,

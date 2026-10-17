@@ -11,10 +11,7 @@ export class StatusBarController {
   constructor(resolver: ActiveAgentResolver, detector: AgentDetector) {
     this.resolver = resolver;
     this.detector = detector;
-    this.statusBarItem = vscode.window.createStatusBarItem(
-      vscode.StatusBarAlignment.Right,
-      100
-    );
+    this.statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     this.statusBarItem.command = 'agent-mesh-bridge.selectActiveAgent';
     this.update();
   }
@@ -26,13 +23,14 @@ export class StatusBarController {
   public async update(): Promise<void> {
     const resolved = await this.resolver.resolveActiveAgent();
     const allAgents = await this.detector.probeAll(false);
-    const activeInfo = allAgents[resolved.agent] || await this.detector.probeAgent(resolved.agent);
+    const activeInfo =
+      allAgents[resolved.agent] || (await this.detector.probeAgent(resolved.agent));
 
     const agentLabels: Record<AgentId, string> = {
       antigravity: 'Antigravity',
       claude_code: 'Claude Code',
       codex: 'Codex',
-      vscode_chat: 'VSCode Chat'
+      vscode_chat: 'VSCode Chat',
     };
 
     let statusSymbol = '$(pass-filled)';
@@ -84,7 +82,8 @@ export class StatusBarController {
       const info = agents[id];
       if (!info) return '';
       if (info.status === 'online') return '🟢 在线 (Ready)';
-      if (info.status === 'exhausted') return `⏳ 耗尽 (恢复: ${info.rateLimit?.resetsAtFormatted || '待定'})`;
+      if (info.status === 'exhausted')
+        return `⏳ 耗尽 (恢复: ${info.rateLimit?.resetsAtFormatted || '待定'})`;
       if (info.status === 'unauthenticated') return '🟡 未登录';
       return '🔴 离线';
     };
@@ -93,31 +92,31 @@ export class StatusBarController {
       {
         label: `$(sync) 自动选路 / Auto-Detect (当前: ${current.agent})`,
         description: current.reason,
-        detail: '根据当前 IDE 宿主、扩展活跃度和会话文件自动选路'
+        detail: '根据当前 IDE 宿主、扩展活跃度和会话文件自动选路',
       },
       {
         label: '$(symbol-event) Google Antigravity (agy)',
         description: formatAgentStatus('antigravity'),
-        detail: `状态: ${agents.antigravity?.statusDetails || ''}`
+        detail: `状态: ${agents.antigravity?.statusDetails || ''}`,
       },
       {
         label: '$(symbol-event) OpenAI Codex (codex)',
         description: formatAgentStatus('codex'),
-        detail: `状态: ${agents.codex?.statusDetails || ''}`
+        detail: `状态: ${agents.codex?.statusDetails || ''}`,
       },
       {
         label: '$(symbol-event) Anthropic Claude Code (claude)',
         description: formatAgentStatus('claude_code'),
-        detail: `状态: ${agents.claude_code?.statusDetails || ''}`
+        detail: `状态: ${agents.claude_code?.statusDetails || ''}`,
       },
       {
         label: '$(refresh) 刷新所有 Agent 节点状态 (Refresh Status)',
-        description: '重新探测各 Agent 可执行文件、登录态与限流恢复时间'
-      }
+        description: '重新探测各 Agent 可执行文件、登录态与限流恢复时间',
+      },
     ];
 
     const pick = await vscode.window.showQuickPick(items, {
-      placeHolder: '选择目标 Agent 或刷新节点状态'
+      placeHolder: '选择目标 Agent 或刷新节点状态',
     });
 
     if (!pick) return;
@@ -140,7 +139,9 @@ export class StatusBarController {
       vscode.window.showInformationMessage('Agent Mesh Bridge: 目标已锁定为 OpenAI Codex。');
     } else if (pick.label.includes('Anthropic Claude Code')) {
       this.resolver.setManualOverride('claude_code');
-      vscode.window.showInformationMessage('Agent Mesh Bridge: 目标已锁定为 Anthropic Claude Code。');
+      vscode.window.showInformationMessage(
+        'Agent Mesh Bridge: 目标已锁定为 Anthropic Claude Code。',
+      );
     }
 
     await this.update();

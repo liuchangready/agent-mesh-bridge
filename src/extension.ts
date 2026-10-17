@@ -30,10 +30,11 @@ export function activate(context: vscode.ExtensionContext) {
   const taskStore = TaskStore.getInstance();
   const detector = new AgentDetector(customPaths);
   const resolver = new ActiveAgentResolver(detector);
-  const runner = new AutonomousRunner(detector);
+  const timeoutMinutes = config.get<number>('taskTimeoutMinutes', 120);
+  const runner = new AutonomousRunner(detector, timeoutMinutes * 60 * 1000);
   const callbackManager = new CallbackManager(detector);
-  const dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager);
-  const reworkController = new ReworkController(taskStore, runner, callbackManager);
+  const _dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector);
+  const reworkController = new ReworkController(taskStore, runner, callbackManager, detector);
   const configSync = new ConfigSyncService();
 
   // Apply defaultAgent config if manual
@@ -67,15 +68,28 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(agentNodesTreeView, activeTreeView, recentTreeView);
 
   // 5. Notify in VSCode when tasks complete
-  callbackManager.on('taskCompleted', ({ thread, round }) => {
+  callbackManager.on('taskCompleted', async ({ thread, round }) => {
     const isSuccess = round.status === 'completed';
-    const msg = isSuccess
-      ? `[Agent Bridge] ${thread.targetAgent} completed Round ${round.round} for "${thread.title}".`
-      : `[Agent Bridge] ${thread.targetAgent} failed Round ${round.round} for "${thread.title}".`;
+    const statusText = isSuccess ? '已完成' : '执行失败';
+    const msg = `[Agent Bridge] ${thread.targetAgent} ${statusText} 第 ${round.round} 轮: "${thread.title}".`;
 
-    vscode.window.showInformationMessage(msg, 'View Details').then((choice) => {
-      if (choice === 'View Details') {
+    const actions = ['查看详情 (View Details)'];
+    if (isSuccess) {
+      actions.push('验收通过 (Approve)');
+      actions.push('唤醒下发者 (Wake Up Caller)');
+    } else {
+      actions.push('恢复继续 (Resume)');
+    }
+
+    vscode.window.showInformationMessage(msg, ...actions).then(async (choice) => {
+      if (choice === '查看详情 (View Details)') {
         TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, thread.threadId);
+      } else if (choice === '验收通过 (Approve)') {
+        vscode.commands.executeCommand('agent-mesh-bridge.approveTask', { thread });
+      } else if (choice === '唤醒下发者 (Wake Up Caller)') {
+        vscode.commands.executeCommand('agent-mesh-bridge.wakeUpCaller', thread.threadId);
+      } else if (choice === '恢复继续 (Resume)') {
+        vscode.commands.executeCommand('agent-mesh-bridge.resumeTask', thread.threadId);
       }
     });
 
@@ -91,24 +105,27 @@ export function activate(context: vscode.ExtensionContext) {
       vscode.window.showInformationMessage('Agent Mesh Bridge: 节点状态与限流信息已刷新。');
     }),
 
-    vscode.commands.registerCommand('agent-mesh-bridge.clearAgentExhaustion', async (item?: AgentNodeItem) => {
-      if (item && item.info) {
-        detector.getRateLimitTracker().clearExhaustion(item.info.id);
-        await agentNodesProvider.refresh(true);
-        await statusBar.update();
-        vscode.window.showInformationMessage(`已清除 ${item.info.name} 的耗尽状态标记。`);
-      } else {
-        const pick = await vscode.window.showQuickPick(['antigravity', 'codex', 'claude_code'], {
-          placeHolder: '选择要清除耗尽状态的 Agent'
-        });
-        if (pick) {
-          detector.getRateLimitTracker().clearExhaustion(pick as AgentId);
+    vscode.commands.registerCommand(
+      'agent-mesh-bridge.clearAgentExhaustion',
+      async (item?: AgentNodeItem) => {
+        if (item && item.info) {
+          detector.getRateLimitTracker().clearExhaustion(item.info.id);
           await agentNodesProvider.refresh(true);
           await statusBar.update();
-          vscode.window.showInformationMessage(`已清除 ${pick} 的耗尽状态标记。`);
+          vscode.window.showInformationMessage(`已清除 ${item.info.name} 的耗尽状态标记。`);
+        } else {
+          const pick = await vscode.window.showQuickPick(['antigravity', 'codex', 'claude_code'], {
+            placeHolder: '选择要清除耗尽状态的 Agent',
+          });
+          if (pick) {
+            detector.getRateLimitTracker().clearExhaustion(pick as AgentId);
+            await agentNodesProvider.refresh(true);
+            await statusBar.update();
+            vscode.window.showInformationMessage(`已清除 ${pick} 的耗尽状态标记。`);
+          }
         }
-      }
-    }),
+      },
+    ),
 
     vscode.commands.registerCommand('agent-mesh-bridge.refreshTasks', () => {
       taskStore.loadFromDisk();
@@ -183,6 +200,101 @@ export function activate(context: vscode.ExtensionContext) {
           vscode.window.showInformationMessage(`Rework requested for ${threadId} in same session.`);
         } catch (e: any) {
           vscode.window.showErrorMessage(e.message);
+        }
+      },
+    ),
+
+    vscode.commands.registerCommand(
+      'agent-mesh-bridge.resumeTask',
+      async (itemOrThreadId?: TaskTreeItem | string) => {
+        let threadId =
+          typeof itemOrThreadId === 'string' ? itemOrThreadId : itemOrThreadId?.thread?.threadId;
+
+        if (!threadId) {
+          const input = await vscode.window.showInputBox({
+            prompt: '输入要恢复/继续执行的 Thread ID:',
+          });
+          if (!input) return;
+          threadId = input.trim();
+        }
+
+        const thread = taskStore.getTask(threadId);
+        if (!thread) {
+          vscode.window.showErrorMessage(`未找到任务: ${threadId}`);
+          return;
+        }
+
+        const feedback = await vscode.window.showInputBox({
+          prompt: `恢复继续任务 [${thread.title}]：`,
+          value: '检测到任务中断，请在当前原生会话中继续执行未完成的开发与交付。',
+          placeHolder: '可输入补充要求或直接回车继续...',
+        });
+        if (!feedback) return;
+
+        try {
+          await reworkController.requestRework({ threadId, feedback: feedback.trim() });
+          vscode.window.showInformationMessage(
+            `已成功恢复任务 ${threadId}，并在原生会话中继续执行。`,
+          );
+          TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`恢复任务失败: ${e.message}`);
+        }
+      },
+    ),
+
+    vscode.commands.registerCommand(
+      'agent-mesh-bridge.wakeUpCaller',
+      async (itemOrThreadId?: TaskTreeItem | string) => {
+        let threadId =
+          typeof itemOrThreadId === 'string' ? itemOrThreadId : itemOrThreadId?.thread?.threadId;
+
+        if (!threadId) {
+          const input = await vscode.window.showInputBox({
+            prompt: '输入要唤醒下发者的 Thread ID:',
+          });
+          if (!input) return;
+          threadId = input.trim();
+        }
+
+        const thread = taskStore.getTask(threadId);
+        if (!thread) {
+          vscode.window.showErrorMessage(`未找到任务: ${threadId}`);
+          return;
+        }
+
+        const lastRound = thread.rounds[thread.rounds.length - 1];
+        if (!lastRound) {
+          vscode.window.showErrorMessage(`任务无有效轮次: ${threadId}`);
+          return;
+        }
+
+        // If callerSessionId is missing, allow user to input or confirm detected
+        if (!thread.callerSessionId) {
+          const detected = detector.detectActiveSession(
+            thread.initiatorAgent,
+            thread.workspacePath,
+            [thread.receiverSessionId],
+          );
+          const input = await vscode.window.showInputBox({
+            prompt: `请输入下发者 [${thread.initiatorAgent}] 的会话 ID:`,
+            value: detected || '',
+            placeHolder: '例如 UUID 会话 ID',
+          });
+          if (!input) return;
+          thread.callerSessionId = input.trim();
+          taskStore.upsertTask(thread);
+        }
+
+        const success = await callbackManager.notifyCaller(thread, lastRound);
+        if (success) {
+          vscode.window.showInformationMessage(
+            `已成功向下发者 ${thread.initiatorAgent} (会话: ${thread.callerSessionId}) 触发检视回调通知！`,
+          );
+        } else {
+          vscode.window.showWarningMessage(
+            `唤醒下发者可能未成功，请检查 ${thread.initiatorAgent} 运行环境与会话有效性。`,
+          );
         }
       },
     ),

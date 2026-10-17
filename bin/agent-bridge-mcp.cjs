@@ -18,6 +18,12 @@ if (!fs.existsSync(outBridgeDir)) {
   process.exit(1);
 }
 
+// Check for --caller argument to identify initiating agent
+const callerIdx = process.argv.indexOf('--caller');
+if (callerIdx !== -1 && process.argv[callerIdx + 1]) {
+  process.env.MESH_CALLER_AGENT = process.argv[callerIdx + 1];
+}
+
 const { TaskStore } = require(path.join(outBridgeDir, 'task-store'));
 const { AgentDetector } = require(path.join(outBridgeDir, 'agent-detector'));
 const { ActiveAgentResolver } = require(path.join(outBridgeDir, 'active-agent-resolver'));
@@ -33,8 +39,8 @@ try {
   const resolver = new ActiveAgentResolver(detector);
   const runner = new AutonomousRunner(detector);
   const callbackManager = new CallbackManager(detector);
-  const dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager);
-  const reworkController = new ReworkController(taskStore, runner, callbackManager);
+  const dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector);
+  const reworkController = new ReworkController(taskStore, runner, callbackManager, detector);
 
   const server = new MCPServer(dispatcher, reworkController, taskStore, detector, resolver, runner);
 

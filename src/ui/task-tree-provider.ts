@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { TaskStore } from '../bridge/task-store';
-import { DelegationThread, ThreadStatus } from '../bridge/types';
+import { DelegationThread } from '../bridge/types';
 
 export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
   private _onDidChangeTreeData: vscode.EventEmitter<TaskTreeItem | undefined | void> =

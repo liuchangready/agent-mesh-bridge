@@ -64,7 +64,7 @@ export class RateLimitTracker {
       return {
         ...info,
         remainingSeconds: remainingSec,
-        resetsAtFormatted: this.formatResetTime(resetTime, remainingSec)
+        resetsAtFormatted: this.formatResetTime(resetTime, remainingSec),
       };
     }
 
@@ -92,13 +92,15 @@ export class RateLimitTracker {
   public recordExhaustion(
     agent: AgentId,
     errorText: string,
-    fallbackDurationMs: number = 60 * 60 * 1000 // 1 hour default
+    fallbackDurationMs: number = 60 * 60 * 1000, // 1 hour default
   ): RateLimitInfo {
     const now = Date.now();
     let durationMs = fallbackDurationMs;
 
     // Pattern 1: "retry after X seconds/minutes/hours"
-    const retryAfterMatch = errorText.match(/retry\s+after\s+(\d+)\s*(s|sec|seconds?|m|min|minutes?|h|hours?)?/i);
+    const retryAfterMatch = errorText.match(
+      /retry\s+after\s+(\d+)\s*(s|sec|seconds?|m|min|minutes?|h|hours?)?/i,
+    );
     if (retryAfterMatch) {
       const val = parseInt(retryAfterMatch[1], 10);
       const unit = (retryAfterMatch[2] || 's').toLowerCase();
@@ -108,7 +110,9 @@ export class RateLimitTracker {
     }
 
     // Pattern 2: "resets in X seconds/minutes/hours" or "try again in X"
-    const inMatch = errorText.match(/(?:resets\s+in|try\s+again\s+in)\s+(\d+)\s*(s|sec|seconds?|m|min|minutes?|h|hours?)?/i);
+    const inMatch = errorText.match(
+      /(?:resets\s+in|try\s+again\s+in)\s+(\d+)\s*(s|sec|seconds?|m|min|minutes?|h|hours?)?/i,
+    );
     if (inMatch) {
       const val = parseInt(inMatch[1], 10);
       const unit = (inMatch[2] || 'm').toLowerCase();
@@ -145,7 +149,7 @@ export class RateLimitTracker {
       resetsAtFormatted: this.formatResetTime(resetTimestamp, remainingSec),
       remainingSeconds: remainingSec,
       reason: this.extractReason(errorText),
-      lastUpdated: new Date().toISOString()
+      lastUpdated: new Date().toISOString(),
     };
 
     this.limits[agent] = info;
@@ -167,7 +171,7 @@ export class RateLimitTracker {
     const pad = (n: number) => String(n).padStart(2, '0');
     const timeStr = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 
-    let remainingStr = '';
+    let remainingStr: string;
     if (remainingSec >= 3600) {
       const hrs = Math.floor(remainingSec / 3600);
       const mins = Math.floor((remainingSec % 3600) / 60);

@@ -43,7 +43,7 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
 
     const items: AgentNodeItem[] = [];
     for (const agentId of agentsList) {
-      const info = this.cachedAgents[agentId] || await this.detector.probeAgent(agentId);
+      const info = this.cachedAgents[agentId] || (await this.detector.probeAgent(agentId));
       const isActive = activeResolution.agent === agentId;
       items.push(this.createAgentNodeItem(info, isActive));
     }
@@ -63,12 +63,15 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
         iconName = 'pass-filled';
         iconColor = new vscode.ThemeColor('testing.iconPassed');
         break;
-      case 'exhausted':
-        const resetInfo = info.rateLimit?.resetsAtFormatted ? ` · 恢复: ${info.rateLimit.resetsAtFormatted}` : '';
+      case 'exhausted': {
+        const resetInfo = info.rateLimit?.resetsAtFormatted
+          ? ` · 恢复: ${info.rateLimit.resetsAtFormatted}`
+          : '';
         statusText = `⏳ 耗尽${resetInfo}`;
         iconName = 'warning';
         iconColor = new vscode.ThemeColor('problemsWarningIcon.foreground');
         break;
+      }
       case 'unauthenticated':
         statusText = `🟡 未登录 (${info.authDetails || '缺失凭证'})`;
         iconName = 'key';
@@ -84,7 +87,7 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     const item = new AgentNodeItem(
       `${info.name}${activeBadge}`,
       vscode.TreeItemCollapsibleState.Expanded,
-      info
+      info,
     );
 
     item.description = statusText;
@@ -98,7 +101,7 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     // 1. Status detail
     const statusSub = new AgentNodeItem(
       `状态: ${this.translateStatus(info.status)}`,
-      vscode.TreeItemCollapsibleState.None
+      vscode.TreeItemCollapsibleState.None,
     );
     statusSub.description = info.statusDetails || '';
     statusSub.iconPath = new vscode.ThemeIcon('pulse');
@@ -108,7 +111,7 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     if (info.rateLimit && (info.status === 'exhausted' || info.rateLimit.isExhausted)) {
       const resetSub = new AgentNodeItem(
         `恢复时间: ${info.rateLimit.resetsAtFormatted || '计算中...'}`,
-        vscode.TreeItemCollapsibleState.None
+        vscode.TreeItemCollapsibleState.None,
       );
       resetSub.description = info.rateLimit.reason || '配额耗尽 / 限流中';
       resetSub.iconPath = new vscode.ThemeIcon('watch');
@@ -118,7 +121,7 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     // 3. Auth Details
     const authSub = new AgentNodeItem(
       `认证: ${info.authDetails || '未配置'}`,
-      vscode.TreeItemCollapsibleState.None
+      vscode.TreeItemCollapsibleState.None,
     );
     authSub.iconPath = new vscode.ThemeIcon('shield');
     subItems.push(authSub);
@@ -127,7 +130,7 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     if (info.executablePath) {
       const pathSub = new AgentNodeItem(
         `路径: ${info.executablePath}`,
-        vscode.TreeItemCollapsibleState.None
+        vscode.TreeItemCollapsibleState.None,
       );
       pathSub.iconPath = new vscode.ThemeIcon('file-code');
       subItems.push(pathSub);
@@ -137,7 +140,7 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     if (info.version) {
       const verSub = new AgentNodeItem(
         `版本: ${info.version}`,
-        vscode.TreeItemCollapsibleState.None
+        vscode.TreeItemCollapsibleState.None,
       );
       verSub.iconPath = new vscode.ThemeIcon('tag');
       subItems.push(verSub);
@@ -149,10 +152,14 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
 
   private translateStatus(status: AgentStatusType): string {
     switch (status) {
-      case 'online': return '在线 (Online)';
-      case 'exhausted': return '耗尽 (Rate Limit Exhausted)';
-      case 'unauthenticated': return '未登录 (Unauthenticated)';
-      case 'offline': return '离线 (Offline)';
+      case 'online':
+        return '在线 (Online)';
+      case 'exhausted':
+        return '耗尽 (Rate Limit Exhausted)';
+      case 'unauthenticated':
+        return '未登录 (Unauthenticated)';
+      case 'offline':
+        return '离线 (Offline)';
     }
   }
 }
@@ -161,11 +168,7 @@ export class AgentNodeItem extends vscode.TreeItem {
   public subItems?: AgentNodeItem[];
   public info?: AgentInfo;
 
-  constructor(
-    label: string,
-    collapsibleState: vscode.TreeItemCollapsibleState,
-    info?: AgentInfo
-  ) {
+  constructor(label: string, collapsibleState: vscode.TreeItemCollapsibleState, info?: AgentInfo) {
     super(label, collapsibleState);
     this.info = info;
   }

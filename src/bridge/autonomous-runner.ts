@@ -9,7 +9,7 @@ export interface RunOptions {
   receiverSessionId: string;
   title?: string;
   cwd?: string;
-  timeoutMs?: number; // Overall process timeout, default 15 min
+  timeoutMs?: number; // Overall process timeout, default 2 hours (120 mins)
   silenceTimeoutMs?: number; // Silence watchdog timeout, default 180s
   onStdoutChunk?: (chunk: string) => void;
   onStderrChunk?: (chunk: string) => void;
@@ -20,15 +20,22 @@ export interface RunResult {
   stdout: string;
   stderr: string;
   extractedOutput: string;
+  actualSessionId?: string;
   durationMs: number;
   error?: string;
 }
 
 export class AutonomousRunner {
   private detector: AgentDetector;
+  private defaultTimeoutMs: number;
 
-  constructor(detector: AgentDetector) {
+  constructor(detector: AgentDetector, defaultTimeoutMs: number = 2 * 60 * 60 * 1000) {
     this.detector = detector;
+    this.defaultTimeoutMs = defaultTimeoutMs;
+  }
+
+  public setDefaultTimeoutMs(ms: number): void {
+    this.defaultTimeoutMs = ms;
   }
 
   /**
@@ -145,7 +152,7 @@ export class AutonomousRunner {
     if (agent === 'antigravity') {
       const exec = resolvedPath || (isWindows ? 'agy.exe' : 'agy');
       if (isRework) {
-        // agy --conversation <receiverSessionId> -p "<feedback>" --dangerously-skip-permissions --mode accept-edits --output-format json
+        // agy --conversation <receiverSessionId> -p "<feedback>" --dangerously-skip-permissions --mode accept-edits --output-format stream-json
         return {
           command: exec,
           args: [
@@ -157,24 +164,23 @@ export class AutonomousRunner {
             '--mode',
             'accept-edits',
             '--output-format',
-            'json',
+            'stream-json',
           ],
           useShell: false,
         };
       } else {
-        // agy -p "<prompt>" --conversation <uuid> --dangerously-skip-permissions --mode accept-edits --output-format json
+        // agy -p "<prompt>" --dangerously-skip-permissions --mode accept-edits --output-format stream-json
+        // NOTE: agy does not accept --conversation for new conversations; native conversation ID is emitted in stream-json.
         return {
           command: exec,
           args: [
             '-p',
             prompt,
-            '--conversation',
-            receiverSessionId,
             '--dangerously-skip-permissions',
             '--mode',
             'accept-edits',
             '--output-format',
-            'json',
+            'stream-json',
           ],
           useShell: false,
         };
@@ -198,7 +204,7 @@ export class AutonomousRunner {
       const { command, args, useShell } = this.buildCommand(options);
 
       const cwd = options.cwd || process.cwd();
-      const timeoutMs = options.timeoutMs || 15 * 60 * 1000; // 15 mins max
+      const timeoutMs = options.timeoutMs || this.defaultTimeoutMs; // 2 hours default
       const silenceTimeoutMs = options.silenceTimeoutMs || 180 * 1000; // 180s silence watchdog
 
       const env: NodeJS.ProcessEnv = {
@@ -214,6 +220,8 @@ export class AutonomousRunner {
       let stderrData = '';
       let isSettled = false;
       let lastActivityTime = Date.now();
+      let watchdogTriggered = false;
+      let maxTimerTriggered = false;
 
       let child: child_process.ChildProcess;
       try {
@@ -252,6 +260,7 @@ export class AutonomousRunner {
         const silentDuration = Date.now() - lastActivityTime;
         if (silentDuration > silenceTimeoutMs) {
           clearInterval(silenceInterval);
+          watchdogTriggered = true;
           console.warn(
             `[AutonomousRunner] Watchdog triggered: Process ${options.agent} silent for ${Math.round(silentDuration / 1000)}s. Terminating.`,
           );
@@ -264,6 +273,7 @@ export class AutonomousRunner {
       // Overall Timeout Timer
       const maxTimer = setTimeout(() => {
         if (!isSettled) {
+          maxTimerTriggered = true;
           console.warn(
             `[AutonomousRunner] Overall timeout (${Math.round(timeoutMs / 1000)}s) reached for ${options.agent}. Terminating.`,
           );
@@ -315,13 +325,23 @@ export class AutonomousRunner {
         const durationMs = Date.now() - startTime;
         const exitCode = code ?? 0;
         const extracted = this.extractCleanOutput(stdoutData);
+        const actualSessionId = this.extractSessionId(stdoutData);
         let error: string | undefined = undefined;
-        if (exitCode !== 0) {
+
+        if (watchdogTriggered) {
+          error = `Process terminated by watchdog: silent for more than ${Math.round(silenceTimeoutMs / 1000)}s without output`;
+        } else if (maxTimerTriggered) {
+          error = `Process terminated: exceeded maximum execution timeout of ${Math.round(timeoutMs / 1000)}s`;
+        } else if (exitCode !== 0) {
           error = stderrData.trim() || `Process exited with non-zero code ${exitCode}`;
         }
 
         const combinedOutput = `${stdoutData}\n${stderrData}`;
-        if (/429|rate\s*limit|quota\s*exceeded|resource_exhausted|insufficient_quota|overloaded|try\s*again\s*in|resets\s*at|resets\s*in/i.test(combinedOutput)) {
+        if (
+          /429|rate\s*limit|quota\s*exceeded|resource_exhausted|insufficient_quota|overloaded|try\s*again\s*in|resets\s*at|resets\s*in/i.test(
+            combinedOutput,
+          )
+        ) {
           this.detector.getRateLimitTracker().recordExhaustion(options.agent, combinedOutput);
         }
 
@@ -330,6 +350,7 @@ export class AutonomousRunner {
           stdout: stdoutData,
           stderr: stderrData,
           extractedOutput: extracted || stdoutData.trim(),
+          actualSessionId,
           durationMs,
           error,
         });
@@ -351,9 +372,34 @@ export class AutonomousRunner {
   }
 
   /**
-   * Attempts to parse JSON output if applicable, extracting human-readable message/summary.
+   * Attempts to extract native conversation / session ID from agent output stream.
    */
-  private extractCleanOutput(raw: string): string {
+  public extractSessionId(raw: string): string | undefined {
+    const trimmed = raw.trim();
+    if (!trimmed) return undefined;
+
+    const lines = trimmed.split('\n');
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+      if (trimmedLine.startsWith('{') && trimmedLine.endsWith('}')) {
+        try {
+          const parsed = JSON.parse(trimmedLine);
+          if (parsed.conversation_id) return String(parsed.conversation_id);
+          if (parsed.session_id) return String(parsed.session_id);
+          if (parsed.result?.conversation_id) return String(parsed.result.conversation_id);
+          if (parsed.result?.session_id) return String(parsed.result.session_id);
+          if (parsed.step_update?.conversation_id)
+            return String(parsed.step_update.conversation_id);
+        } catch {}
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Attempts to parse JSON / stream-json output, extracting human-readable message/summary.
+   */
+  public extractCleanOutput(raw: string): string {
     const trimmed = raw.trim();
     if (!trimmed) return '';
 
@@ -364,14 +410,24 @@ export class AutonomousRunner {
       if (line.startsWith('{') && line.endsWith('}')) {
         try {
           const parsed = JSON.parse(line);
-          if (parsed.message) return parsed.message;
-          if (parsed.content) return parsed.content;
-          if (parsed.output) return parsed.output;
-          if (parsed.text) return parsed.text;
-          if (parsed.result)
+          if (parsed.event === 'result' && parsed.result) {
+            if (parsed.result.response) return String(parsed.result.response);
+            if (typeof parsed.result === 'string') return parsed.result;
+            return JSON.stringify(parsed.result, null, 2);
+          }
+          if (parsed.response) return String(parsed.response);
+          if (parsed.message) return String(parsed.message);
+          if (parsed.content) return String(parsed.content);
+          if (parsed.output) return String(parsed.output);
+          if (parsed.text) return String(parsed.text);
+          if (parsed.result) {
+            if (typeof parsed.result === 'object' && parsed.result.response) {
+              return String(parsed.result.response);
+            }
             return typeof parsed.result === 'string'
               ? parsed.result
               : JSON.stringify(parsed.result, null, 2);
+          }
         } catch {}
       }
     }
@@ -380,15 +436,39 @@ export class AutonomousRunner {
     if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
       try {
         const parsed = JSON.parse(trimmed);
-        if (parsed.message) return parsed.message;
-        if (parsed.content) return parsed.content;
-        if (parsed.output) return parsed.output;
-        if (parsed.text) return parsed.text;
-        if (parsed.result)
+        if (parsed.event === 'result' && parsed.result?.response)
+          return String(parsed.result.response);
+        if (parsed.response) return String(parsed.response);
+        if (parsed.message) return String(parsed.message);
+        if (parsed.content) return String(parsed.content);
+        if (parsed.output) return String(parsed.output);
+        if (parsed.text) return String(parsed.text);
+        if (parsed.result) {
+          if (typeof parsed.result === 'object' && parsed.result.response) {
+            return String(parsed.result.response);
+          }
           return typeof parsed.result === 'string'
             ? parsed.result
             : JSON.stringify(parsed.result, null, 2);
+        }
       } catch {}
+    }
+
+    // Fallback: check if stream-json has text_delta in agent_response steps
+    const deltas: string[] = [];
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+      if (trimmedLine.startsWith('{') && trimmedLine.endsWith('}')) {
+        try {
+          const parsed = JSON.parse(trimmedLine);
+          if (parsed.event === 'step_update' && parsed.step_update?.text_delta) {
+            deltas.push(parsed.step_update.text_delta);
+          }
+        } catch {}
+      }
+    }
+    if (deltas.length > 0) {
+      return deltas.join('');
     }
 
     return trimmed;

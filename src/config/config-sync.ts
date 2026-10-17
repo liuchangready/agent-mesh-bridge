@@ -79,7 +79,10 @@ export class ConfigSyncService {
 
       config.mcpServers['agent-mesh-bridge'] = {
         command: 'node',
-        args: [this.mcpScriptPath],
+        args: [this.mcpScriptPath, '--caller', 'claude_code'],
+        env: {
+          MESH_CALLER_AGENT: 'claude_code',
+        },
       };
 
       try {
@@ -117,7 +120,10 @@ export class ConfigSyncService {
 
     config.mcpServers['agent-mesh-bridge'] = {
       command: 'node',
-      args: [this.mcpScriptPath],
+      args: [this.mcpScriptPath, '--caller', 'codex'],
+      env: {
+        MESH_CALLER_AGENT: 'codex',
+      },
     };
 
     fs.writeFileSync(confPath, JSON.stringify(config, null, 2), 'utf8');
@@ -150,7 +156,10 @@ export class ConfigSyncService {
 
     config.mcpServers['agent-mesh-bridge'] = {
       command: 'node',
-      args: [this.mcpScriptPath],
+      args: [this.mcpScriptPath, '--caller', 'antigravity'],
+      env: {
+        MESH_CALLER_AGENT: 'antigravity',
+      },
     };
 
     fs.writeFileSync(mcpConfigPath, JSON.stringify(config, null, 2), 'utf8');

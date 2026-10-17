@@ -172,9 +172,18 @@ export class TaskStore extends EventEmitter {
     roundNumber: number,
     roundUpdate: Partial<DelegationRound>,
     newThreadStatus?: ThreadStatus,
+    receiverSessionId?: string,
+    callerSessionId?: string,
   ): DelegationThread | undefined {
     const thread = this.tasks.get(threadId);
     if (!thread) return undefined;
+
+    if (receiverSessionId) {
+      thread.receiverSessionId = receiverSessionId;
+    }
+    if (callerSessionId) {
+      thread.callerSessionId = callerSessionId;
+    }
 
     const roundIndex = thread.rounds.findIndex((r) => r.round === roundNumber);
     if (roundIndex >= 0) {

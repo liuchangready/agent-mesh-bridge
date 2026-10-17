@@ -93,7 +93,9 @@ export class AgentDetector {
       if (fs.existsSync(extensionsDir)) {
         try {
           const dirs = fs.readdirSync(extensionsDir);
-          const codexDirs = dirs.filter(d => d.startsWith('openai.chatgpt-') || d.startsWith('openai.codex-'));
+          const codexDirs = dirs.filter(
+            (d) => d.startsWith('openai.chatgpt-') || d.startsWith('openai.codex-'),
+          );
           for (const d of codexDirs) {
             candidates.push(path.join(extensionsDir, d, 'bin', 'windows-x86_64', 'codex.exe'));
             candidates.push(path.join(extensionsDir, d, 'bin', 'codex.exe'));
@@ -107,7 +109,9 @@ export class AgentDetector {
       if (fs.existsSync(extensionsDir)) {
         try {
           const dirs = fs.readdirSync(extensionsDir);
-          const codexDirs = dirs.filter(d => d.startsWith('openai.chatgpt-') || d.startsWith('openai.codex-'));
+          const codexDirs = dirs.filter(
+            (d) => d.startsWith('openai.chatgpt-') || d.startsWith('openai.codex-'),
+          );
           for (const d of codexDirs) {
             candidates.push(path.join(extensionsDir, d, 'bin', 'linux-x86_64', 'codex'));
             candidates.push(path.join(extensionsDir, d, 'bin', 'darwin-arm64', 'codex'));
@@ -159,7 +163,7 @@ export class AgentDetector {
    */
   public async probeAgent(agent: AgentId, forceRefresh: boolean = false): Promise<AgentInfo> {
     const cached = this.cache[agent];
-    if (!forceRefresh && cached && (Date.now() - cached.timestamp < this.CACHE_TTL_MS)) {
+    if (!forceRefresh && cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
       return cached.info;
     }
 
@@ -167,7 +171,7 @@ export class AgentDetector {
       antigravity: 'Google Antigravity',
       claude_code: 'Anthropic Claude Code',
       codex: 'OpenAI Codex',
-      vscode_chat: 'VSCode Copilot/Chat'
+      vscode_chat: 'VSCode Copilot/Chat',
     };
 
     if (agent === 'vscode_chat') {
@@ -179,7 +183,7 @@ export class AgentDetector {
         executablePath: 'builtin',
         authDetails: 'Builtin VSCode Session',
         statusDetails: 'Ready',
-        lastChecked: new Date().toISOString()
+        lastChecked: new Date().toISOString(),
       };
       this.cache[agent] = { info, timestamp: Date.now() };
       return info;
@@ -197,7 +201,7 @@ export class AgentDetector {
         available: false,
         statusDetails: '未安装或无法找到可执行文件 (Offline / Missing executable)',
         rateLimit,
-        lastChecked: new Date().toISOString()
+        lastChecked: new Date().toISOString(),
       };
       this.cache[agent] = { info, timestamp: Date.now() };
       return info;
@@ -232,7 +236,7 @@ export class AgentDetector {
       authDetails: auth.details,
       statusDetails,
       rateLimit,
-      lastChecked: new Date().toISOString()
+      lastChecked: new Date().toISOString(),
     };
 
     this.cache[agent] = { info, timestamp: Date.now() };
@@ -244,7 +248,7 @@ export class AgentDetector {
    */
   public async probeAll(forceRefresh: boolean = false): Promise<Record<AgentId, AgentInfo>> {
     const agents: AgentId[] = ['antigravity', 'codex', 'claude_code'];
-    const results = await Promise.all(agents.map(a => this.probeAgent(a, forceRefresh)));
+    const results = await Promise.all(agents.map((a) => this.probeAgent(a, forceRefresh)));
     const map: Partial<Record<AgentId, AgentInfo>> = {};
     for (const r of results) {
       map[r.id] = r;
@@ -261,7 +265,10 @@ export class AgentDetector {
       if (fs.existsSync(pbtxt)) {
         try {
           const content = fs.readFileSync(pbtxt, 'utf8');
-          if (content.includes('installation_uuid') || content.includes('AGENT_ONBOARDING_STATE_COMPLETED')) {
+          if (
+            content.includes('installation_uuid') ||
+            content.includes('AGENT_ONBOARDING_STATE_COMPLETED')
+          ) {
             return { authenticated: true, details: '已登录 (Antigravity 会话就绪)' };
           }
         } catch {}
@@ -277,7 +284,11 @@ export class AgentDetector {
       if (fs.existsSync(authPath)) {
         try {
           const data = JSON.parse(fs.readFileSync(authPath, 'utf8'));
-          if (data.OPENAI_API_KEY || (data.tokens && Object.keys(data.tokens).length > 0) || data.access_token) {
+          if (
+            data.OPENAI_API_KEY ||
+            (data.tokens && Object.keys(data.tokens).length > 0) ||
+            data.access_token
+          ) {
             return { authenticated: true, details: '已登录 (Codex API Key / 凭据)' };
           }
         } catch {}
@@ -352,5 +363,137 @@ export class AgentDetector {
       } catch {}
     }
     return null;
+  }
+
+  /**
+   * Automatically detect the most recent active session ID for an agent in a given workspace.
+   */
+  public detectActiveSession(
+    agent: AgentId,
+    workspacePath?: string,
+    excludeSessionIds: string[] = [],
+  ): string | undefined {
+    const home = os.homedir();
+    const excludeSet = new Set(excludeSessionIds);
+
+    try {
+      if (agent === 'claude_code') {
+        const projectsDir = path.join(home, '.claude', 'projects');
+        if (!fs.existsSync(projectsDir)) return undefined;
+
+        let targetDirs: string[] = [];
+        if (workspacePath) {
+          const resolvedWs = path.resolve(workspacePath);
+          const baseName = path.basename(resolvedWs).toLowerCase();
+          try {
+            const projectEntries = fs.readdirSync(projectsDir);
+            for (const entry of projectEntries) {
+              const lower = entry.toLowerCase();
+              if (lower.includes(baseName)) {
+                targetDirs.push(path.join(projectsDir, entry));
+              }
+            }
+          } catch {}
+        }
+
+        if (targetDirs.length === 0) {
+          try {
+            const allEntries = fs.readdirSync(projectsDir);
+            targetDirs = allEntries.map((e) => path.join(projectsDir, e));
+          } catch {}
+        }
+
+        const allFiles: { file: string; mtime: number }[] = [];
+        for (const dir of targetDirs) {
+          try {
+            if (!fs.statSync(dir).isDirectory()) continue;
+            const files = fs.readdirSync(dir);
+            for (const f of files) {
+              if (f.endsWith('.jsonl')) {
+                const fullPath = path.join(dir, f);
+                const stat = fs.statSync(fullPath);
+                allFiles.push({ file: f, mtime: stat.mtimeMs });
+              }
+            }
+          } catch {}
+        }
+
+        allFiles.sort((a, b) => b.mtime - a.mtime);
+        for (const item of allFiles) {
+          const sessionId = path.basename(item.file, '.jsonl');
+          if (!excludeSet.has(sessionId)) {
+            return sessionId;
+          }
+        }
+      }
+
+      if (agent === 'antigravity') {
+        const convDir = path.join(home, '.gemini', 'antigravity-cli', 'conversations');
+        if (fs.existsSync(convDir)) {
+          const files = fs.readdirSync(convDir);
+          const dbFiles: { file: string; mtime: number }[] = [];
+          for (const f of files) {
+            if (f.endsWith('.db') && !f.endsWith('.db-wal') && !f.endsWith('.db-shm')) {
+              try {
+                const stat = fs.statSync(path.join(convDir, f));
+                dbFiles.push({ file: f, mtime: stat.mtimeMs });
+              } catch {}
+            }
+          }
+          dbFiles.sort((a, b) => b.mtime - a.mtime);
+          for (const item of dbFiles) {
+            const sessionId = path.basename(item.file, '.db');
+            if (!excludeSet.has(sessionId)) {
+              return sessionId;
+            }
+          }
+        }
+      }
+
+      if (agent === 'codex') {
+        const sessionsDir = path.join(home, '.codex', 'sessions');
+        if (fs.existsSync(sessionsDir)) {
+          const files = this.findRecentFilesRecursive(sessionsDir, 3);
+          files.sort((a, b) => b.mtime - a.mtime);
+          for (const item of files) {
+            const base = path.basename(item.file, path.extname(item.file));
+            if (!excludeSet.has(base)) {
+              return base;
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(`[AgentDetector] Error detecting active session for ${agent}:`, e);
+    }
+
+    return undefined;
+  }
+
+  private findRecentFilesRecursive(
+    dir: string,
+    maxDepth: number,
+    currentDepth: number = 0,
+  ): { file: string; mtime: number }[] {
+    const results: { file: string; mtime: number }[] = [];
+    if (currentDepth > maxDepth || !fs.existsSync(dir)) return results;
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          results.push(...this.findRecentFilesRecursive(fullPath, maxDepth, currentDepth + 1));
+        } else if (
+          entry.isFile() &&
+          (entry.name.endsWith('.jsonl') || entry.name.endsWith('.json'))
+        ) {
+          try {
+            const stat = fs.statSync(fullPath);
+            results.push({ file: fullPath, mtime: stat.mtimeMs });
+          } catch {}
+        }
+      }
+    } catch {}
+    return results;
   }
 }

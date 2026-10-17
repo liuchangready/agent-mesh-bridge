@@ -50,6 +50,16 @@ export class TaskDetailPanel {
           case 'requestRework':
             await this.handleRequestRework(message.feedback);
             break;
+          case 'resumeTask':
+            await this.handleResumeTask(message.feedback);
+            break;
+          case 'wakeUpCaller':
+            await vscode.commands.executeCommand(
+              'agent-mesh-bridge.wakeUpCaller',
+              this.currentThreadId,
+            );
+            this.update();
+            break;
           case 'openTerminal':
             this.handleOpenTerminal();
             break;
@@ -129,6 +139,34 @@ export class TaskDetailPanel {
       this.update();
     } catch (err: any) {
       vscode.window.showErrorMessage(`Rework request failed: ${err.message}`);
+    }
+  }
+
+  private async handleResumeTask(feedback?: string) {
+    const thread = this.taskStore.getTask(this.currentThreadId);
+    if (!thread) return;
+
+    if (!feedback || !feedback.trim()) {
+      const input = await vscode.window.showInputBox({
+        prompt: `恢复继续任务 [${thread.title}]：`,
+        value: '检测到任务中断，请在当前原生会话中继续执行未完成的开发与交付。',
+        placeHolder: '可输入补充要求或直接回车继续...',
+      });
+      if (!input) return;
+      feedback = input;
+    }
+
+    try {
+      await this.reworkController.requestRework({
+        threadId: this.currentThreadId,
+        feedback: feedback.trim(),
+      });
+      vscode.window.showInformationMessage(
+        `已成功恢复任务 ${this.currentThreadId}，正在原生会话中继续执行。`,
+      );
+      this.update();
+    } catch (err: any) {
+      vscode.window.showErrorMessage(`恢复任务失败: ${err.message}`);
     }
   }
 
@@ -318,6 +356,22 @@ export class TaskDetailPanel {
     button.secondary:hover {
       background: var(--vscode-button-secondaryHoverBackground, #45494e);
     }
+    button.resume-btn {
+      background: #059669;
+      color: #ffffff;
+      font-weight: 600;
+    }
+    button.resume-btn:hover {
+      background: #10b981;
+    }
+    button.notify-btn {
+      background: #4f46e5;
+      color: #ffffff;
+      font-weight: 600;
+    }
+    button.notify-btn:hover {
+      background: #6366f1;
+    }
     .round-card {
       background: rgba(255, 255, 255, 0.02);
       border: 1px solid rgba(255, 255, 255, 0.08);
@@ -400,12 +454,20 @@ export class TaskDetailPanel {
         <div class="meta-val">${escapeHtml(thread.threadId)}</div>
       </div>
       <div class="meta-item">
+        <div class="meta-label">Initiator Agent / Session</div>
+        <div class="meta-val">${escapeHtml(thread.initiatorAgent)} / ${escapeHtml(thread.callerSessionId || '未绑定 (点击唤醒)')}</div>
+      </div>
+      <div class="meta-item">
         <div class="meta-label">Receiver Native Session</div>
         <div class="meta-val">${escapeHtml(thread.receiverSessionId)}</div>
       </div>
       <div class="meta-item">
         <div class="meta-label">Current Round</div>
         <div class="meta-val">${thread.currentRound || 1}</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">Workspace</div>
+        <div class="meta-val">${escapeHtml(thread.workspacePath)}</div>
       </div>
       <div class="meta-item">
         <div class="meta-label">Created At</div>
@@ -415,6 +477,8 @@ export class TaskDetailPanel {
   </div>
 
   <div class="action-bar">
+    ${thread.status === 'failed' || thread.status === 'waiting_review' ? `<button class="resume-btn" onclick="resumeTask()">▶ 恢复任务 / 继续执行</button>` : ''}
+    <button class="notify-btn" onclick="wakeUpCaller()">🔔 唤醒下发者检视</button>
     <button onclick="approveTask()">✓ Approve Task</button>
     <button class="secondary" onclick="openTerminal()">💻 Resume in Terminal</button>
     <button class="secondary" onclick="refresh()">⟳ Refresh</button>
@@ -434,6 +498,14 @@ export class TaskDetailPanel {
 
   <script>
     const vscode = acquireVsCodeApi();
+
+    function resumeTask() {
+      vscode.postMessage({ command: 'resumeTask' });
+    }
+
+    function wakeUpCaller() {
+      vscode.postMessage({ command: 'wakeUpCaller' });
+    }
 
     function approveTask() {
       vscode.postMessage({ command: 'approve' });

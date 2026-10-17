@@ -7,6 +7,7 @@ import {
   ApproveResult,
 } from './types';
 import { TaskStore } from './task-store';
+import { AgentDetector } from './agent-detector';
 import { AutonomousRunner } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
 
@@ -14,11 +15,18 @@ export class ReworkController {
   private taskStore: TaskStore;
   private runner: AutonomousRunner;
   private callbackManager: CallbackManager;
+  private detector?: AgentDetector;
 
-  constructor(taskStore: TaskStore, runner: AutonomousRunner, callbackManager: CallbackManager) {
+  constructor(
+    taskStore: TaskStore,
+    runner: AutonomousRunner,
+    callbackManager: CallbackManager,
+    detector?: AgentDetector,
+  ) {
     this.taskStore = taskStore;
     this.runner = runner;
     this.callbackManager = callbackManager;
+    this.detector = detector;
   }
 
   /**
@@ -54,6 +62,18 @@ export class ReworkController {
     thread.updatedAt = nowIso;
     if (params.callerSessionId) {
       thread.callerSessionId = params.callerSessionId;
+    } else if (!thread.callerSessionId && this.detector) {
+      const detected = this.detector.detectActiveSession(
+        thread.initiatorAgent,
+        thread.workspacePath,
+        [thread.receiverSessionId],
+      );
+      if (detected) {
+        thread.callerSessionId = detected;
+        console.log(
+          `[ReworkController] Auto-detected caller session for ${thread.initiatorAgent}: ${detected}`,
+        );
+      }
     }
     thread.rounds.push(reworkRound);
     thread.summary.lastPromptSnippet = (params.feedback || '').slice(0, 100);
@@ -140,6 +160,14 @@ export class ReworkController {
     const finalRoundStatus = isSuccess ? 'completed' : 'failed';
     const finalThreadStatus = isSuccess ? 'waiting_review' : 'failed';
 
+    const nativeSessionId = result.actualSessionId || thread.receiverSessionId;
+    if (result.actualSessionId && result.actualSessionId !== thread.receiverSessionId) {
+      console.log(
+        `[ReworkController] Syncing receiverSessionId from ${thread.receiverSessionId} to actual native ID: ${result.actualSessionId}`,
+      );
+      thread.receiverSessionId = result.actualSessionId;
+    }
+
     const updatedThread = this.taskStore.updateRound(
       thread.threadId,
       roundNumber,
@@ -150,6 +178,7 @@ export class ReworkController {
         status: finalRoundStatus,
       },
       finalThreadStatus,
+      nativeSessionId,
     );
 
     if (updatedThread) {

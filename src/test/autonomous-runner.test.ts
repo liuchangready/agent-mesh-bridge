@@ -91,11 +91,13 @@ describe('AutonomousRunner Tests', () => {
 
     assert.ok(initialCmd.args.includes('-p'));
     assert.ok(initialCmd.args.includes('Add benchmark script'));
-    assert.ok(initialCmd.args.includes('--conversation'));
-    assert.ok(initialCmd.args.includes(sessionId));
+    // Antigravity does not take --conversation on initial run
+    assert.ok(!initialCmd.args.includes('--conversation'));
     assert.ok(initialCmd.args.includes('--dangerously-skip-permissions'));
     assert.ok(initialCmd.args.includes('--mode'));
     assert.ok(initialCmd.args.includes('accept-edits'));
+    assert.ok(initialCmd.args.includes('--output-format'));
+    assert.ok(initialCmd.args.includes('stream-json'));
 
     const reworkCmd = runner.buildCommand({
       agent: 'antigravity',
@@ -109,5 +111,32 @@ describe('AutonomousRunner Tests', () => {
     assert.ok(reworkCmd.args.includes('-p'));
     assert.ok(reworkCmd.args.includes('Fix memory leak in benchmark'));
     assert.ok(reworkCmd.args.includes('--dangerously-skip-permissions'));
+    assert.ok(reworkCmd.args.includes('--output-format'));
+    assert.ok(reworkCmd.args.includes('stream-json'));
+  });
+
+  test('should accurately extract session ID and output from stream-json stream', () => {
+    const streamSample = [
+      '{"event":"init","conversation_id":"conv-test-999","init":{"cwd":"/repo"}}',
+      '{"event":"step_update","step_update":{"conversation_id":"conv-test-999","step_index":1,"state":"ACTIVE","text_delta":"Processing"}}',
+      '{"event":"result","result":{"conversation_id":"conv-test-999","status":"SUCCESS","response":"Done with refactor"}}',
+    ].join('\n');
+
+    const sessionId = runner.extractSessionId(streamSample);
+    assert.strictEqual(sessionId, 'conv-test-999');
+
+    const output = runner.extractCleanOutput(streamSample);
+    assert.strictEqual(output, 'Done with refactor');
+  });
+
+  test('should detect active sessions for claude_code and antigravity', () => {
+    const claudeSession = detector.detectActiveSession('claude_code', 'D:\\majiang');
+    assert.ok(claudeSession, 'Should detect active session for claude_code in D:\\majiang');
+    assert.strictEqual(claudeSession, '0d7e72a5-643a-42b9-b9c3-10bab872f11f');
+
+    const antiSession = detector.detectActiveSession('antigravity', undefined, [
+      'non-existent-excluded-session',
+    ]);
+    assert.ok(antiSession, 'Should detect active session for antigravity');
   });
 });

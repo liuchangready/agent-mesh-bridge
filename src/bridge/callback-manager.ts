@@ -15,14 +15,27 @@ export class CallbackManager extends EventEmitter {
    * Dispatches proactive notification callback to caller agent to resume original turn.
    */
   public async notifyCaller(thread: DelegationThread, round: DelegationRound): Promise<boolean> {
-    const callerSessionId = thread.callerSessionId;
+    let callerSessionId = thread.callerSessionId;
     const initiator = thread.initiatorAgent;
+
+    // Try auto-detecting callerSessionId if not already set
+    if (!callerSessionId && this.detector) {
+      callerSessionId = this.detector.detectActiveSession(initiator, thread.workspacePath, [
+        thread.receiverSessionId,
+      ]);
+      if (callerSessionId) {
+        thread.callerSessionId = callerSessionId;
+        console.log(
+          `[CallbackManager] Auto-detected caller session for ${initiator}: ${callerSessionId}`,
+        );
+      }
+    }
 
     this.emit('taskCompleted', { thread, round });
 
     if (!callerSessionId) {
       console.log(
-        `[CallbackManager] Thread ${thread.threadId} completed round ${round.round}, but no callerSessionId provided.`,
+        `[CallbackManager] Thread ${thread.threadId} completed round ${round.round}, but no callerSessionId provided or detected.`,
       );
       return false;
     }
@@ -36,6 +49,8 @@ export class CallbackManager extends EventEmitter {
     const promptMessage = `[Agent Mesh Bridge 回调通知] 任务【${thread.title}】第 ${round.round} 轮已由 ${thread.targetAgent} 执行完成。\n结果摘要: ${preview}\n请使用 get_thread_details(threadId="${thread.threadId}") 审查代码与产出，并在满意时调用 approve_task，或需要调整时调用 request_rework。`;
 
     console.log(`[CallbackManager] Waking up caller ${initiator} (session: ${callerSessionId})...`);
+
+    const cwd = thread.workspacePath || process.cwd();
 
     try {
       if (initiator === 'antigravity') {
@@ -55,6 +70,7 @@ export class CallbackManager extends EventEmitter {
             'accept-edits',
           ],
           {
+            cwd,
             detached: true,
             stdio: 'ignore',
             windowsHide: true,
@@ -75,14 +91,15 @@ export class CallbackManager extends EventEmitter {
               [
                 '/c',
                 claudePath,
-                '-p',
-                promptMessage,
                 '--resume',
                 callerSessionId,
+                '-p',
+                promptMessage,
                 '--permission-mode',
                 'bypassPermissions',
               ],
               {
+                cwd,
                 detached: true,
                 stdio: 'ignore',
                 windowsHide: true,
@@ -92,14 +109,15 @@ export class CallbackManager extends EventEmitter {
           : child_process.spawn(
               claudePath,
               [
-                '-p',
-                promptMessage,
                 '--resume',
                 callerSessionId,
+                '-p',
+                promptMessage,
                 '--permission-mode',
                 'bypassPermissions',
               ],
               {
+                cwd,
                 detached: true,
                 stdio: 'ignore',
                 env: { ...process.env, CI: '1', NON_INTERACTIVE: 'true' },
@@ -124,6 +142,7 @@ export class CallbackManager extends EventEmitter {
             '--dangerously-bypass-approvals-and-sandbox',
           ],
           {
+            cwd,
             detached: true,
             stdio: 'ignore',
             windowsHide: true,
