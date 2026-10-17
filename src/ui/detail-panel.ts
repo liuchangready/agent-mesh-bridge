@@ -488,11 +488,24 @@ export class TaskDetailPanel {
     </div>
   </div>
 
+  ${
+    thread.status === 'completed'
+      ? `
+  <div style="background: rgba(16, 185, 129, 0.15); border: 1px solid #10b981; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
+    <div style="font-size: 28px;">🎉</div>
+    <div>
+      <div style="font-weight: 700; font-size: 16px; color: #34d399;">任务已通过验收并正式归档 (Task Approved & Completed)</div>
+      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">由 <strong>${escapeHtml(thread.initiatorAgent)}</strong> 独立运行全部测试套件完成验证，既有测试与回归测试全绿通过。</div>
+    </div>
+  </div>`
+      : ''
+  }
+
   <div class="action-bar">
     ${thread.status !== 'completed' ? `<button class="resume-btn" onclick="resumeTask()">▶ 恢复任务 / 重新执行</button>` : ''}
-    <button class="notify-btn" onclick="wakeUpCaller()">🔔 唤醒下发者检视</button>
-    <button onclick="approveTask()">✓ Approve Task</button>
-    <button class="secondary" onclick="openTerminal()">💻 Resume in Terminal</button>
+    ${thread.status !== 'completed' ? `<button class="notify-btn" onclick="wakeUpCaller()">🔔 唤醒下发者检视</button>` : ''}
+    ${thread.status !== 'completed' ? `<button onclick="approveTask()">✓ Approve Task</button>` : ''}
+    <button class="secondary" onclick="openTerminal()">💻 Open Terminal in Session</button>
     <button class="secondary" onclick="refresh()">⟳ Refresh</button>
   </div>
 
@@ -501,12 +514,17 @@ export class TaskDetailPanel {
     ${roundsHtml}
   </div>
 
+  ${
+    thread.status !== 'completed'
+      ? `
   <div class="rework-box">
     <h3>Manual Rework Intervention</h3>
     <p style="font-size: 13px; opacity: 0.8;">Trigger next rework round for ${escapeHtml(thread.targetAgent)} inside the SAME native session:</p>
     <textarea id="reworkFeedback" placeholder="Enter feedback, missing coverage, or fixes required..."></textarea>
     <button onclick="submitRework()">Submit Rework Round</button>
-  </div>
+  </div>`
+      : ''
+  }
 
   <script>
     const vscode = acquireVsCodeApi();

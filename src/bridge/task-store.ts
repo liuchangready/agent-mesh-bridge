@@ -200,7 +200,7 @@ export class TaskStore extends EventEmitter {
         thread.currentRound = existing.currentRound;
       }
     }
-    thread.updatedAt = new Date().toISOString();
+    thread.updatedAt = thread.updatedAt || new Date().toISOString();
     this.tasks.set(thread.threadId, thread);
     this.saveToDisk();
   }

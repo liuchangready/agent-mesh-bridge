@@ -85,7 +85,40 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(agentNodesTreeView, activeTreeView, recentTreeView);
 
-  // 5. Notify in VSCode when tasks complete
+  // Track completed tasks to announce when a task transitions to completed
+  const knownCompletedThreadIds = new Set<string>();
+  for (const t of taskStore.getAllTasks()) {
+    if (t.status === 'completed') {
+      knownCompletedThreadIds.add(t.threadId);
+    }
+  }
+
+  // Auto-refresh all tree views and notify when tasks complete or change on disk
+  taskStore.on('changed', (allTasks: any[]) => {
+    activeTreeProvider.refresh();
+    recentTreeProvider.refresh();
+    statusBar.update();
+    agentNodesProvider.refresh(false);
+
+    const taskList = Array.isArray(allTasks) ? allTasks : taskStore.getAllTasks();
+    for (const t of taskList) {
+      if (t.status === 'completed' && !knownCompletedThreadIds.has(t.threadId)) {
+        knownCompletedThreadIds.add(t.threadId);
+        const lastRound = t.rounds && t.rounds[t.rounds.length - 1];
+        const snippet = lastRound && lastRound.prompt ? `\n验收备注: ${lastRound.prompt.slice(0, 100)}` : '';
+        vscode.window.showInformationMessage(
+          `🎉 [Agent Bridge] 任务【${t.title}】已由 ${t.initiatorAgent} 验收通过并正式归档！${snippet}`,
+          '查看详情 (View Details)',
+        ).then((choice) => {
+          if (choice === '查看详情 (View Details)') {
+            TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, t.threadId);
+          }
+        });
+      }
+    }
+  });
+
+  // 5. Notify in VSCode when tasks complete a round
   callbackManager.on('taskCompleted', async ({ thread, round }) => {
     const isSuccess = round.status === 'completed';
     const statusText = isSuccess ? '已完成' : '执行失败';
