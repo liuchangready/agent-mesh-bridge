@@ -12,6 +12,7 @@ import { TaskTreeProvider, TaskTreeItem } from './ui/task-tree-provider';
 import { AgentNodesProvider, AgentNodeItem } from './ui/agent-nodes-provider';
 import { TaskDetailPanel } from './ui/detail-panel';
 import { AgentId } from './bridge/types';
+import { TaskSupervisor } from './bridge/task-supervisor';
 
 export function activate(context: vscode.ExtensionContext) {
   console.log('[Agent Mesh Bridge] Activating extension...');
@@ -36,6 +37,23 @@ export function activate(context: vscode.ExtensionContext) {
   const _dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector);
   const reworkController = new ReworkController(taskStore, runner, callbackManager, detector);
   const configSync = new ConfigSyncService();
+  const supervisor = new TaskSupervisor(taskStore, runner, callbackManager, detector);
+  context.subscriptions.push({ dispose: () => supervisor.dispose() });
+
+  supervisor.on('taskStarted', ({ thread, round }) => {
+    statusBar.update();
+    activeTreeProvider.refresh();
+    recentTreeProvider.refresh();
+    vscode.window.showInformationMessage(
+      `[Agent Bridge] 开始执行【${thread.title}】第 ${round.round} 轮 (${thread.targetAgent})...`,
+    );
+  });
+
+  supervisor.on('taskCompleted', () => {
+    statusBar.update();
+    activeTreeProvider.refresh();
+    recentTreeProvider.refresh();
+  });
 
   // Apply defaultAgent config if manual
   const defaultAgentCfg = config.get<string>('defaultAgent', 'auto');
@@ -221,6 +239,21 @@ export function activate(context: vscode.ExtensionContext) {
         const thread = taskStore.getTask(threadId);
         if (!thread) {
           vscode.window.showErrorMessage(`未找到任务: ${threadId}`);
+          return;
+        }
+
+        const currentRoundNumber = thread.currentRound || 1;
+        const currentRound =
+          thread.rounds.find((r) => r.round === currentRoundNumber) ||
+          thread.rounds[thread.rounds.length - 1];
+
+        // If currently in running/reworking and has a round waiting to execute
+        if (currentRound && currentRound.status === 'running' && currentRound.prompt) {
+          supervisor.executeThreadRound(thread, currentRound);
+          vscode.window.showInformationMessage(
+            `已恢复执行任务 ${threadId} 第 ${currentRound.round} 轮！`,
+          );
+          TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
           return;
         }
 

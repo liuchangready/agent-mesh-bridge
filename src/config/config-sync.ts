@@ -91,6 +91,40 @@ export class ConfigSyncService {
       } catch {}
     }
 
+    // Sync permissions into ~/.claude/settings.json
+    try {
+      const settingsPath = path.join(home, '.claude', 'settings.json');
+      if (fs.existsSync(settingsPath)) {
+        const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+        if (!settings.permissions) settings.permissions = {};
+        if (!Array.isArray(settings.permissions.allow)) settings.permissions.allow = [];
+
+        const requiredPermissions = [
+          'mcp__agent-mesh-bridge__*',
+          'mcp__agent-mesh-bridge__dispatch_task',
+          'mcp__agent-mesh-bridge__request_rework',
+          'mcp__agent-mesh-bridge__approve_task',
+          'mcp__agent-mesh-bridge__get_thread_details',
+          'mcp__agent-mesh-bridge__list_recent_tasks',
+          'mcp__agent-mesh-bridge__invoke_agent',
+          'mcp__agent-mesh-bridge__query_agent_mesh_status',
+        ];
+
+        let permsChanged = false;
+        for (const perm of requiredPermissions) {
+          if (!settings.permissions.allow.includes(perm)) {
+            settings.permissions.allow.unshift(perm);
+            permsChanged = true;
+          }
+        }
+
+        if (permsChanged) {
+          fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
+          updated = true;
+        }
+      }
+    } catch {}
+
     return updated;
   }
 

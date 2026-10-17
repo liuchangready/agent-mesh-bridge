@@ -57,8 +57,7 @@ describe('AutonomousRunner Tests', () => {
     assert.ok(cmdInfo.args.includes('Refactor logger interface'));
     assert.ok(cmdInfo.args.includes('--session-id'));
     assert.ok(cmdInfo.args.includes(sessionId));
-    assert.ok(cmdInfo.args.includes('--permission-mode'));
-    assert.ok(cmdInfo.args.includes('bypassPermissions'));
+    assert.ok(cmdInfo.args.includes('--dangerously-skip-permissions'));
     assert.ok(cmdInfo.args.includes('--output-format'));
     assert.ok(cmdInfo.args.includes('json'));
   });
@@ -76,8 +75,7 @@ describe('AutonomousRunner Tests', () => {
     assert.ok(cmdInfo.args.includes('Update documentation and types'));
     assert.ok(cmdInfo.args.includes('--resume'));
     assert.ok(cmdInfo.args.includes(sessionId));
-    assert.ok(cmdInfo.args.includes('--permission-mode'));
-    assert.ok(cmdInfo.args.includes('bypassPermissions'));
+    assert.ok(cmdInfo.args.includes('--dangerously-skip-permissions'));
   });
 
   test('should generate compliant skip-danger command for Antigravity initial and rework', () => {

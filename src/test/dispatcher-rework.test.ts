@@ -27,7 +27,18 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     detector = new AgentDetector();
     resolver = new ActiveAgentResolver(detector);
     runner = new AutonomousRunner(detector);
+    runner.execute = async () => {
+      await new Promise((r) => setTimeout(r, 50));
+      return {
+        exitCode: 0,
+        stdout: 'Mock execution finished successfully',
+        stderr: '',
+        extractedOutput: 'Mock execution finished successfully',
+        durationMs: 100,
+      };
+    };
     callbackManager = new CallbackManager(detector);
+    callbackManager.notifyCaller = async () => true;
     dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager);
     reworkController = new ReworkController(taskStore, runner, callbackManager);
   });

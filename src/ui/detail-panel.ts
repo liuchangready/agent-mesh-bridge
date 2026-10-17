@@ -146,6 +146,18 @@ export class TaskDetailPanel {
     const thread = this.taskStore.getTask(this.currentThreadId);
     if (!thread) return;
 
+    const currentRoundNumber = thread.currentRound || 1;
+    const currentRound =
+      thread.rounds.find((r) => r.round === currentRoundNumber) ||
+      thread.rounds[thread.rounds.length - 1];
+
+    // If the latest round is already 'running' with a valid prompt, resume execution directly
+    if (currentRound && currentRound.status === 'running' && currentRound.prompt) {
+      await vscode.commands.executeCommand('agent-mesh-bridge.resumeTask', this.currentThreadId);
+      this.update();
+      return;
+    }
+
     if (!feedback || !feedback.trim()) {
       const input = await vscode.window.showInputBox({
         prompt: `恢复继续任务 [${thread.title}]：`,
@@ -477,7 +489,7 @@ export class TaskDetailPanel {
   </div>
 
   <div class="action-bar">
-    ${thread.status === 'failed' || thread.status === 'waiting_review' ? `<button class="resume-btn" onclick="resumeTask()">▶ 恢复任务 / 继续执行</button>` : ''}
+    ${thread.status !== 'completed' ? `<button class="resume-btn" onclick="resumeTask()">▶ 恢复任务 / 重新执行</button>` : ''}
     <button class="notify-btn" onclick="wakeUpCaller()">🔔 唤醒下发者检视</button>
     <button onclick="approveTask()">✓ Approve Task</button>
     <button class="secondary" onclick="openTerminal()">💻 Resume in Terminal</button>

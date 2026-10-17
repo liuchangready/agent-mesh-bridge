@@ -255,6 +255,13 @@ export class TaskStore extends EventEmitter {
   }
 
   /**
+   * Return all stored tasks in memory.
+   */
+  public getAllTasks(): DelegationThread[] {
+    return Array.from(this.tasks.values());
+  }
+
+  /**
    * Count of stored tasks.
    */
   public count(): number {

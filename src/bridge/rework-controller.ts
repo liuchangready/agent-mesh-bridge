@@ -10,6 +10,7 @@ import { TaskStore } from './task-store';
 import { AgentDetector } from './agent-detector';
 import { AutonomousRunner } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
+import { TaskSupervisor } from './task-supervisor';
 
 export class ReworkController {
   private taskStore: TaskStore;
@@ -82,13 +83,20 @@ export class ReworkController {
     // Persist immediately
     this.taskStore.upsertTask(thread);
 
-    // Launch background execution with isRework=true, reusing EXACT receiverSessionId
-    this.executeReworkBackground(thread, nextRound, params.feedback).catch((err) => {
-      console.error(
-        `[ReworkController] Error executing rework round ${nextRound} for ${thread.threadId}:`,
-        err,
+    // If TaskSupervisor is actively running (e.g. in VS Code extension host),
+    // let it supervise execution persistently to prevent child processes from being killed when ephemeral MCP CLI exits.
+    if (TaskSupervisor.isSupervisorActive()) {
+      console.log(
+        `[ReworkController] Active TaskSupervisor detected. Delegating Round ${nextRound} execution to supervisor.`,
       );
-    });
+    } else {
+      this.executeReworkBackground(thread, nextRound, params.feedback).catch((err) => {
+        console.error(
+          `[ReworkController] Error executing rework round ${nextRound} for ${thread.threadId}:`,
+          err,
+        );
+      });
+    }
 
     return {
       threadId: thread.threadId,

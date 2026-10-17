@@ -11,6 +11,7 @@ import { AgentDetector } from './agent-detector';
 import { ActiveAgentResolver } from './active-agent-resolver';
 import { AutonomousRunner } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
+import { TaskSupervisor } from './task-supervisor';
 
 export class AsyncDispatcher {
   private taskStore: TaskStore;
@@ -98,13 +99,20 @@ export class AsyncDispatcher {
     // Commit initial state to TaskStore
     this.taskStore.upsertTask(thread);
 
-    // Launch background execution without blocking current turn
-    this.executeBackgroundRound(thread, 1, params.prompt, false).catch((err) => {
-      console.error(
-        `[AsyncDispatcher] Unhandled error during round execution for ${threadId}:`,
-        err,
+    // If TaskSupervisor is actively running (e.g. in VS Code extension host),
+    // let it supervise execution persistently to prevent child processes from being killed when ephemeral MCP CLI exits.
+    if (TaskSupervisor.isSupervisorActive()) {
+      console.log(
+        `[AsyncDispatcher] Active TaskSupervisor detected. Delegating Thread ${threadId} execution to supervisor.`,
       );
-    });
+    } else {
+      this.executeBackgroundRound(thread, 1, params.prompt, false).catch((err) => {
+        console.error(
+          `[AsyncDispatcher] Unhandled error during round execution for ${threadId}:`,
+          err,
+        );
+      });
+    }
 
     return {
       threadId,

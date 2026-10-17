@@ -84,7 +84,7 @@ export class AutonomousRunner {
     if (agent === 'claude_code') {
       const exec = resolvedPath || (isWindows ? 'claude.cmd' : 'claude');
       if (isRework) {
-        // claude -p "<feedback>" --resume <receiverSessionId> --permission-mode bypassPermissions --output-format json
+        // claude -p "<feedback>" --resume <receiverSessionId> --dangerously-skip-permissions --output-format json
         return {
           command: isWindows ? 'cmd.exe' : exec,
           args: isWindows
@@ -95,8 +95,7 @@ export class AutonomousRunner {
                 prompt,
                 '--resume',
                 receiverSessionId,
-                '--permission-mode',
-                'bypassPermissions',
+                '--dangerously-skip-permissions',
                 '--output-format',
                 'json',
               ]
@@ -105,15 +104,14 @@ export class AutonomousRunner {
                 prompt,
                 '--resume',
                 receiverSessionId,
-                '--permission-mode',
-                'bypassPermissions',
+                '--dangerously-skip-permissions',
                 '--output-format',
                 'json',
               ],
           useShell: false,
         };
       } else {
-        // claude -p "<prompt>" --session-id <uuid> -n "<title>" --permission-mode bypassPermissions --output-format json
+        // claude -p "<prompt>" --session-id <uuid> -n "<title>" --dangerously-skip-permissions --output-format json
         const taskTitle = title || 'Task';
         return {
           command: isWindows ? 'cmd.exe' : exec,
@@ -127,8 +125,7 @@ export class AutonomousRunner {
                 receiverSessionId,
                 '-n',
                 taskTitle,
-                '--permission-mode',
-                'bypassPermissions',
+                '--dangerously-skip-permissions',
                 '--output-format',
                 'json',
               ]
@@ -139,8 +136,7 @@ export class AutonomousRunner {
                 receiverSessionId,
                 '-n',
                 taskTitle,
-                '--permission-mode',
-                'bypassPermissions',
+                '--dangerously-skip-permissions',
                 '--output-format',
                 'json',
               ],
