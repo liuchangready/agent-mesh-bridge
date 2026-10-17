@@ -236,22 +236,23 @@ export function activate(context: vscode.ExtensionContext) {
           threadId = input.trim();
         }
 
+        taskStore.loadFromDisk();
         const thread = taskStore.getTask(threadId);
         if (!thread) {
           vscode.window.showErrorMessage(`未找到任务: ${threadId}`);
           return;
         }
 
-        const currentRoundNumber = thread.currentRound || 1;
-        const currentRound =
-          thread.rounds.find((r) => r.round === currentRoundNumber) ||
-          thread.rounds[thread.rounds.length - 1];
+        const runningRounds = (thread.rounds || []).filter((r) => r.status === 'running');
+        const targetRound =
+          thread.rounds.find((r) => r.round === thread.currentRound && r.status === 'running') ||
+          runningRounds[runningRounds.length - 1];
 
         // If currently in running/reworking and has a round waiting to execute
-        if (currentRound && currentRound.status === 'running' && currentRound.prompt) {
-          supervisor.executeThreadRound(thread, currentRound);
+        if (targetRound && targetRound.prompt) {
+          supervisor.executeThreadRound(thread, targetRound);
           vscode.window.showInformationMessage(
-            `已恢复执行任务 ${threadId} 第 ${currentRound.round} 轮！`,
+            `已恢复执行任务 ${threadId} 第 ${targetRound.round} 轮！`,
           );
           TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
           return;
@@ -290,13 +291,16 @@ export function activate(context: vscode.ExtensionContext) {
           threadId = input.trim();
         }
 
+        taskStore.loadFromDisk();
         const thread = taskStore.getTask(threadId);
         if (!thread) {
           vscode.window.showErrorMessage(`未找到任务: ${threadId}`);
           return;
         }
 
-        const lastRound = thread.rounds[thread.rounds.length - 1];
+        const lastRound =
+          [...thread.rounds].reverse().find((r) => r.status === 'completed') ||
+          thread.rounds[thread.rounds.length - 1];
         if (!lastRound) {
           vscode.window.showErrorMessage(`任务无有效轮次: ${threadId}`);
           return;

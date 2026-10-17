@@ -13,6 +13,7 @@ export class TaskStore extends EventEmitter {
   private tasks: Map<string, DelegationThread> = new Map();
   private isWatching: boolean = false;
   private watchDebounceTimer: NodeJS.Timeout | null = null;
+  private lastMtimeMs: number = 0;
 
   constructor(customStorageDir?: string) {
     super();
@@ -50,13 +51,16 @@ export class TaskStore extends EventEmitter {
   public loadFromDisk(): void {
     if (!fs.existsSync(this.storageFile)) {
       this.tasks.clear();
+      this.lastMtimeMs = 0;
       return;
     }
 
     try {
+      const stat = fs.statSync(this.storageFile);
       const data = fs.readFileSync(this.storageFile, 'utf8');
       if (!data.trim()) {
         this.tasks.clear();
+        this.lastMtimeMs = stat.mtimeMs;
         return;
       }
       const rawList: DelegationThread[] = JSON.parse(data);
@@ -68,9 +72,23 @@ export class TaskStore extends EventEmitter {
           }
         }
       }
+      this.lastMtimeMs = stat.mtimeMs;
     } catch (err) {
       console.error(`[TaskStore] Failed to parse ${this.storageFile}:`, err);
     }
+  }
+
+  /**
+   * Ensures in-memory cache reflects any external file modifications on disk.
+   */
+  public ensureUpToDate(): void {
+    if (!fs.existsSync(this.storageFile)) return;
+    try {
+      const stat = fs.statSync(this.storageFile);
+      if (stat.mtimeMs > this.lastMtimeMs) {
+        this.loadFromDisk();
+      }
+    } catch {}
   }
 
   /**
@@ -101,6 +119,9 @@ export class TaskStore extends EventEmitter {
     try {
       fs.writeFileSync(tempFile, JSON.stringify(truncated, null, 2), 'utf8');
       fs.renameSync(tempFile, this.storageFile);
+      try {
+        this.lastMtimeMs = fs.statSync(this.storageFile).mtimeMs;
+      } catch {}
       this.emit('changed', truncated);
     } catch (err) {
       console.error(`[TaskStore] Failed to write atomically to ${this.storageFile}:`, err);
@@ -152,6 +173,7 @@ export class TaskStore extends EventEmitter {
    * Retrieve a specific task thread by ID.
    */
   public getTask(threadId: string): DelegationThread | undefined {
+    this.ensureUpToDate();
     return this.tasks.get(threadId);
   }
 
@@ -159,6 +181,25 @@ export class TaskStore extends EventEmitter {
    * Upsert a task thread.
    */
   public upsertTask(thread: DelegationThread): void {
+    this.ensureUpToDate();
+    const existing = this.tasks.get(thread.threadId);
+    if (existing && existing !== thread) {
+      // Merge rounds from existing to prevent losing rounds added concurrently by another process
+      const roundsMap = new Map<number, DelegationRound>();
+      for (const r of existing.rounds || []) {
+        roundsMap.set(r.round, r);
+      }
+      for (const r of thread.rounds || []) {
+        roundsMap.set(r.round, r);
+      }
+      thread.rounds = Array.from(roundsMap.values()).sort((a, b) => a.round - b.round);
+      if (
+        existing.currentRound &&
+        (!thread.currentRound || existing.currentRound > thread.currentRound)
+      ) {
+        thread.currentRound = existing.currentRound;
+      }
+    }
     thread.updatedAt = new Date().toISOString();
     this.tasks.set(thread.threadId, thread);
     this.saveToDisk();
@@ -175,6 +216,7 @@ export class TaskStore extends EventEmitter {
     receiverSessionId?: string,
     callerSessionId?: string,
   ): DelegationThread | undefined {
+    this.ensureUpToDate();
     const thread = this.tasks.get(threadId);
     if (!thread) return undefined;
 
@@ -206,7 +248,12 @@ export class TaskStore extends EventEmitter {
     }
 
     if (newThreadStatus) {
-      thread.status = newThreadStatus;
+      // Only transition thread status if this round is the latest round or newer,
+      // or if explicitly closing task
+      const isLatest = !thread.currentRound || roundNumber >= thread.currentRound;
+      if (isLatest || newThreadStatus === 'completed' || newThreadStatus === 'failed') {
+        thread.status = newThreadStatus;
+      }
     }
 
     // Refresh summary
@@ -233,6 +280,7 @@ export class TaskStore extends EventEmitter {
    * List tasks with pagination and optional filter.
    */
   public listTasks(limit: number = 20, statusFilter?: string): DelegationThread[] {
+    this.ensureUpToDate();
     const safeLimit = Math.min(Math.max(1, limit), MAX_STORED_TASKS);
     let all = Array.from(this.tasks.values()).sort((a, b) => {
       const timeA = new Date(a.updatedAt || a.createdAt).getTime();
@@ -258,6 +306,7 @@ export class TaskStore extends EventEmitter {
    * Return all stored tasks in memory.
    */
   public getAllTasks(): DelegationThread[] {
+    this.ensureUpToDate();
     return Array.from(this.tasks.values());
   }
 
@@ -265,6 +314,7 @@ export class TaskStore extends EventEmitter {
    * Count of stored tasks.
    */
   public count(): number {
+    this.ensureUpToDate();
     return this.tasks.size;
   }
 }

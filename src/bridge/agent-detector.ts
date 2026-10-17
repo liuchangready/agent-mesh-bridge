@@ -63,6 +63,9 @@ export class AgentDetector {
     const home = os.homedir();
     if (process.platform === 'win32') {
       const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+      candidates.push(
+        path.join(appData, 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'),
+      );
       candidates.push(path.join(appData, 'npm', 'claude.cmd'));
       candidates.push(path.join(appData, 'npm', 'claude.ps1'));
       candidates.push(path.join(home, '.claude', 'bin', 'claude.cmd'));

@@ -85,7 +85,8 @@ export class CallbackManager extends EventEmitter {
         const isWindows = process.platform === 'win32';
         const claudePath =
           this.detector.resolveExecutable('claude_code') || (isWindows ? 'claude.cmd' : 'claude');
-        const child = isWindows
+        const isExe = claudePath.toLowerCase().endsWith('.exe');
+        const child = (isWindows && !isExe)
           ? child_process.spawn(
               'cmd.exe',
               [
@@ -112,6 +113,7 @@ export class CallbackManager extends EventEmitter {
                 cwd,
                 detached: true,
                 stdio: 'ignore',
+                windowsHide: true,
                 env: { ...process.env, CI: '1', NON_INTERACTIVE: 'true' },
               },
             );

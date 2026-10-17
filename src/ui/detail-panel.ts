@@ -146,13 +146,13 @@ export class TaskDetailPanel {
     const thread = this.taskStore.getTask(this.currentThreadId);
     if (!thread) return;
 
-    const currentRoundNumber = thread.currentRound || 1;
-    const currentRound =
-      thread.rounds.find((r) => r.round === currentRoundNumber) ||
-      thread.rounds[thread.rounds.length - 1];
+    const runningRounds = (thread.rounds || []).filter((r) => r.status === 'running');
+    const targetRound =
+      thread.rounds.find((r) => r.round === thread.currentRound && r.status === 'running') ||
+      runningRounds[runningRounds.length - 1];
 
-    // If the latest round is already 'running' with a valid prompt, resume execution directly
-    if (currentRound && currentRound.status === 'running' && currentRound.prompt) {
+    // If there is any round in running status with a valid prompt, resume execution directly
+    if (targetRound && targetRound.prompt) {
       await vscode.commands.executeCommand('agent-mesh-bridge.resumeTask', this.currentThreadId);
       this.update();
       return;
