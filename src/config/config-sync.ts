@@ -108,6 +108,10 @@ export class ConfigSyncService {
           'mcp__agent-mesh-bridge__list_recent_tasks',
           'mcp__agent-mesh-bridge__invoke_agent',
           'mcp__agent-mesh-bridge__query_agent_mesh_status',
+          'Bash(*)',
+          'Bash(./gradlew *)',
+          'Bash(gradlew *)',
+          'Bash(git *)',
         ];
 
         let permsChanged = false;
