@@ -124,4 +124,84 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.ok(thread);
     assert.strictEqual(thread.status, 'completed');
   });
+
+  test('should reject invalid callerSessionId (agent literals) and fallback properly', async () => {
+    // 1. Dispatching with invalid callerSessionId "claude_code"
+    const dispatchRes = await dispatcher.dispatchTask({
+      targetAgent: 'antigravity',
+      title: 'Invalid callerSessionId test',
+      prompt: 'Check caller session sanitization',
+      callerSessionId: 'claude_code', // Invalid! Should be ignored
+    });
+
+    const thread1 = taskStore.getTask(dispatchRes.threadId);
+    assert.ok(thread1);
+    assert.notStrictEqual(thread1.callerSessionId, 'claude_code');
+
+    // 2. Requesting rework with invalid callerSessionId "antigravity"
+    await reworkController.requestRework({
+      threadId: dispatchRes.threadId,
+      feedback: 'Fix something',
+      callerSessionId: 'antigravity', // Invalid!
+    });
+
+    const thread2 = taskStore.getTask(dispatchRes.threadId);
+    assert.ok(thread2);
+    assert.notStrictEqual(thread2.callerSessionId, 'antigravity');
+
+    // 3. Requesting rework with a valid UUID
+    const validUuid = '12345678-abcd-ef01-2345-6789abcdef01';
+    await reworkController.requestRework({
+      threadId: dispatchRes.threadId,
+      feedback: 'Fix something else',
+      callerSessionId: validUuid,
+    });
+
+    const thread3 = taskStore.getTask(dispatchRes.threadId);
+    assert.ok(thread3);
+    assert.strictEqual(thread3.callerSessionId, validUuid);
+  });
+
+  test('should retry failed round preserving original round number and prompt', async () => {
+    const dispatchRes = await dispatcher.dispatchTask({
+      targetAgent: 'codex',
+      title: 'Fix edge case in parser',
+      prompt: 'Handle trailing comma in JSON',
+    });
+
+    // Request rework
+    await reworkController.requestRework({
+      threadId: dispatchRes.threadId,
+      feedback: 'Handle comments in JSON',
+    });
+
+    const thread = taskStore.getTask(dispatchRes.threadId);
+    assert.ok(thread);
+    assert.strictEqual(thread.rounds.length, 2);
+
+    // Simulate failure on round 2
+    taskStore.updateRound(
+      thread.threadId,
+      2,
+      { status: 'failed', error: 'Network timeout', durationMs: 5000 },
+      'failed',
+    );
+
+    const failedThread = taskStore.getTask(dispatchRes.threadId);
+    assert.ok(failedThread);
+    assert.strictEqual(failedThread.status, 'failed');
+    assert.strictEqual(failedThread.rounds[1].status, 'failed');
+
+    // Retry failed round
+    const retriedRound = await reworkController.retryFailedRound(dispatchRes.threadId);
+    assert.strictEqual(retriedRound.round, 2);
+    assert.strictEqual(retriedRound.status, 'running');
+    assert.strictEqual(retriedRound.prompt, 'Handle comments in JSON');
+
+    const recoveredThread = taskStore.getTask(dispatchRes.threadId);
+    assert.ok(recoveredThread);
+    assert.strictEqual(recoveredThread.status, 'reworking');
+    assert.strictEqual(recoveredThread.rounds.length, 2); // No duplicate round created!
+    assert.strictEqual(recoveredThread.rounds[1].status, 'running');
+  });
 });

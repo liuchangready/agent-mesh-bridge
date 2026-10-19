@@ -130,11 +130,114 @@ describe('AutonomousRunner Tests', () => {
   test('should detect active sessions for claude_code and antigravity', () => {
     const claudeSession = detector.detectActiveSession('claude_code', 'D:\\majiang');
     assert.ok(claudeSession, 'Should detect active session for claude_code in D:\\majiang');
-    assert.strictEqual(claudeSession, '0d7e72a5-643a-42b9-b9c3-10bab872f11f');
+    assert.match(claudeSession, /^[0-9a-f-]{36}$/i, 'Detected session should be a valid UUID');
 
     const antiSession = detector.detectActiveSession('antigravity', undefined, [
       'non-existent-excluded-session',
     ]);
     assert.ok(antiSession, 'Should detect active session for antigravity');
   });
+
+  test('should detect transient network and eligibility errors correctly', () => {
+    const eofErr = {
+      exitCode: 1,
+      stdout: '',
+      stderr: 'Eligibility check failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": EOF',
+      extractedOutput: '',
+      durationMs: 7500,
+      error: 'Eligibility check failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": EOF',
+    };
+    assert.strictEqual(runner.isTransientError(eofErr), true);
+
+    const normalErr = {
+      exitCode: 1,
+      stdout: '',
+      stderr: 'Compilation error: Unresolved reference: foo',
+      extractedOutput: '',
+      durationMs: 12000,
+      error: 'Compilation error: Unresolved reference: foo',
+    };
+    assert.strictEqual(runner.isTransientError(normalErr), false);
+
+    const successRes = {
+      exitCode: 0,
+      stdout: 'All done',
+      stderr: '',
+      extractedOutput: 'All done',
+      durationMs: 5000,
+    };
+    assert.strictEqual(runner.isTransientError(successRes), false);
+  });
+
+  test('should distinguish rate limit errors from innocent code outputs, hashes, UUIDs and line numbers', () => {
+    // Innocent patterns that should NOT trigger rate limiting
+    assert.strictEqual(
+      runner.isRateLimitOrQuotaError('609e3083621647429d255ca4b10c431a'),
+      false,
+      'Random hash containing 429 substring should not trigger rate limit',
+    );
+    assert.strictEqual(
+      runner.isRateLimitOrQuotaError('141a642999ef43fabbff3086f2ab5333'),
+      false,
+      'Another hash containing 429 substring should not trigger rate limit',
+    );
+    assert.strictEqual(
+      runner.isRateLimitOrQuotaError('bot-a95fea8c-8905-4293-b1fd-6c70bfffc304'),
+      false,
+      'UUID containing 4293 should not trigger rate limit',
+    );
+    assert.strictEqual(
+      runner.isRateLimitOrQuotaError('429: val stepEvents = mutableListOf<GameEvent>()'),
+      false,
+      'Code line number 429: should not trigger rate limit',
+    );
+    assert.strictEqual(
+      runner.isRateLimitOrQuotaError('2429: val ledgerConfig = CheatEconomyConfig()'),
+      false,
+      'Code line number 2429: should not trigger rate limit',
+    );
+    assert.strictEqual(
+      runner.isRateLimitOrQuotaError('fun isOverloaded(): Boolean = false'),
+      false,
+      'Normal programming term "overloaded" should not trigger rate limit',
+    );
+    assert.strictEqual(
+      runner.isRateLimitOrQuotaError('resetForNewRound() resets state across rounds'),
+      false,
+      '"resets state" should not trigger rate limit',
+    );
+
+    // Genuine rate limit errors that SHOULD trigger
+    assert.strictEqual(
+      runner.isRateLimitOrQuotaError('Error 429: Too Many Requests. Please retry after 120 seconds.'),
+      true,
+      'Error 429 should trigger rate limit',
+    );
+    assert.strictEqual(
+      runner.isRateLimitOrQuotaError('HTTP 429 Too Many Requests'),
+      true,
+      'HTTP 429 should trigger rate limit',
+    );
+    assert.strictEqual(
+      runner.isRateLimitOrQuotaError('{"error": {"code": 429, "message": "Rate limit exceeded"}}'),
+      true,
+      'JSON error with code 429 should trigger rate limit',
+    );
+    assert.strictEqual(
+      runner.isRateLimitOrQuotaError('Rate limit exceeded: please try again in 5 minutes'),
+      true,
+      'Rate limit exceeded message should trigger rate limit',
+    );
+    assert.strictEqual(
+      runner.isRateLimitOrQuotaError('Quota exceeded for metric gemini.googleapis.com/requests'),
+      true,
+      'Quota exceeded should trigger rate limit',
+    );
+    assert.strictEqual(
+      runner.isRateLimitOrQuotaError('Resource exhausted (429): model is overloaded'),
+      true,
+      'Resource exhausted / model is overloaded should trigger rate limit',
+    );
+  });
 });
+

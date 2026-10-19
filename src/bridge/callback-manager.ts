@@ -1,6 +1,9 @@
 import * as child_process from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { EventEmitter } from 'events';
-import { DelegationThread, DelegationRound } from './types';
+import { DelegationThread, DelegationRound, isValidSessionId } from './types';
 import { AgentDetector } from './agent-detector';
 
 export class CallbackManager extends EventEmitter {
@@ -18,8 +21,8 @@ export class CallbackManager extends EventEmitter {
     let callerSessionId = thread.callerSessionId;
     const initiator = thread.initiatorAgent;
 
-    // Try auto-detecting callerSessionId if not already set
-    if (!callerSessionId && this.detector) {
+    // Try auto-detecting callerSessionId if not already set or if invalid
+    if ((!callerSessionId || !isValidSessionId(callerSessionId)) && this.detector) {
       callerSessionId = this.detector.detectActiveSession(initiator, thread.workspacePath, [
         thread.receiverSessionId,
       ]);
@@ -33,9 +36,9 @@ export class CallbackManager extends EventEmitter {
 
     this.emit('taskCompleted', { thread, round });
 
-    if (!callerSessionId) {
-      console.log(
-        `[CallbackManager] Thread ${thread.threadId} completed round ${round.round}, but no callerSessionId provided or detected.`,
+    if (!callerSessionId || !isValidSessionId(callerSessionId)) {
+      console.warn(
+        `[CallbackManager] Thread ${thread.threadId} completed round ${round.round}, but no valid callerSessionId provided or detected (got: "${callerSessionId}").`,
       );
       return false;
     }
@@ -51,6 +54,54 @@ export class CallbackManager extends EventEmitter {
     console.log(`[CallbackManager] Waking up caller ${initiator} (session: ${callerSessionId})...`);
 
     const cwd = thread.workspacePath || process.cwd();
+    const logDir = path.join(os.homedir(), '.agent-mesh-bridge');
+    try {
+      fs.mkdirSync(logDir, { recursive: true });
+    } catch {}
+    const logPath = path.join(logDir, 'callbacks.log');
+    let outFd: number | 'ignore' = 'ignore';
+    try {
+      outFd = fs.openSync(logPath, 'a');
+      const banner = `\n--- [${new Date().toISOString()}] Waking up ${initiator} (thread: ${thread.threadId}, round: ${round.round}, session: ${callerSessionId}) ---\n`;
+      fs.writeSync(outFd, banner);
+    } catch (e) {
+      console.warn(`[CallbackManager] Could not open callback log:`, e);
+    }
+
+    const spawnOpts: child_process.SpawnOptions = {
+      cwd,
+      detached: true,
+      stdio: ['ignore', outFd, outFd],
+      windowsHide: true,
+      env: { ...process.env, CI: '1', NON_INTERACTIVE: 'true' },
+    };
+
+    const attachErrorLogging = (child: child_process.ChildProcess) => {
+      child.on('error', (err) => {
+        console.error(`[CallbackManager] Failed to launch ${initiator} callback:`, err);
+        try {
+          if (typeof outFd === 'number') {
+            fs.writeSync(outFd, `Spawn error: ${err.message}\n`);
+          }
+        } catch {}
+        this.emit('callbackFailed', { thread, round, error: err.message });
+      });
+
+      child.on('exit', (code) => {
+        if (code !== 0 && code !== null) {
+          const errMsg = `Caller process for ${initiator} exited with error code ${code}`;
+          console.error(`[CallbackManager] ${errMsg}`);
+          try {
+            if (typeof outFd === 'number') {
+              fs.writeSync(outFd, `\n[Exit] ${errMsg}\n`);
+            }
+          } catch {}
+          this.emit('callbackFailed', { thread, round, error: errMsg });
+        }
+      });
+
+      child.unref();
+    };
 
     try {
       if (initiator === 'antigravity') {
@@ -69,15 +120,9 @@ export class CallbackManager extends EventEmitter {
             '--mode',
             'accept-edits',
           ],
-          {
-            cwd,
-            detached: true,
-            stdio: 'ignore',
-            windowsHide: true,
-            env: { ...process.env, CI: '1', NON_INTERACTIVE: 'true' },
-          },
+          spawnOpts,
         );
-        child.unref();
+        attachErrorLogging(child);
         return true;
       }
 
@@ -98,26 +143,14 @@ export class CallbackManager extends EventEmitter {
                 promptMessage,
                 '--dangerously-skip-permissions',
               ],
-              {
-                cwd,
-                detached: true,
-                stdio: 'ignore',
-                windowsHide: true,
-                env: { ...process.env, CI: '1', NON_INTERACTIVE: 'true' },
-              },
+              spawnOpts,
             )
           : child_process.spawn(
               claudePath,
               ['--resume', callerSessionId, '-p', promptMessage, '--dangerously-skip-permissions'],
-              {
-                cwd,
-                detached: true,
-                stdio: 'ignore',
-                windowsHide: true,
-                env: { ...process.env, CI: '1', NON_INTERACTIVE: 'true' },
-              },
+              spawnOpts,
             );
-        child.unref();
+        attachErrorLogging(child);
         return true;
       }
 
@@ -135,15 +168,9 @@ export class CallbackManager extends EventEmitter {
             promptMessage,
             '--dangerously-bypass-approvals-and-sandbox',
           ],
-          {
-            cwd,
-            detached: true,
-            stdio: 'ignore',
-            windowsHide: true,
-            env: { ...process.env, CI: '1', NON_INTERACTIVE: 'true' },
-          },
+          spawnOpts,
         );
-        child.unref();
+        attachErrorLogging(child);
         return true;
       }
     } catch (err) {

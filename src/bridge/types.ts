@@ -124,3 +124,32 @@ export interface AgentMeshStatus {
   agents: Record<AgentId, AgentInfo>;
   totalLedgerTasks: number;
 }
+
+/**
+ * Validates whether a given string is a genuine session ID/UUID rather than an agent identifier or dummy value.
+ */
+export function isValidSessionId(sessionId?: string | null): boolean {
+  if (!sessionId || typeof sessionId !== 'string') return false;
+  const trimmed = sessionId.trim().toLowerCase();
+  const invalidLiterals = [
+    'claude',
+    'claude_code',
+    'antigravity',
+    'agy',
+    'codex',
+    'default',
+    'null',
+    'undefined',
+    'none',
+    'unknown',
+    'vscode_chat',
+  ];
+  if (invalidLiterals.includes(trimmed)) {
+    return false;
+  }
+  // Session IDs across Claude, Antigravity, and Codex are UUIDs or alphanumeric hashes of at least 8 characters
+  if (trimmed.length < 8) {
+    return false;
+  }
+  return true;
+}

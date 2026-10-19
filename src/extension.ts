@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
+import * as os from 'os';
 import { TaskStore } from './bridge/task-store';
 import { AgentDetector } from './bridge/agent-detector';
 import { ActiveAgentResolver } from './bridge/active-agent-resolver';
@@ -148,6 +150,25 @@ export function activate(context: vscode.ExtensionContext) {
     agentNodesProvider.refresh(false);
   });
 
+  callbackManager.on('callbackFailed', async ({ thread, round, error }) => {
+    vscode.window
+      .showWarningMessage(
+        `⚠️ [Agent Bridge] 自动唤醒下发者 ${thread.initiatorAgent} 失败: ${error}。`,
+        '手动唤醒 (Wake Up)',
+        '查看日志 (View Log)',
+      )
+      .then((choice) => {
+        if (choice === '手动唤醒 (Wake Up)') {
+          vscode.commands.executeCommand('agent-mesh-bridge.wakeUpCaller', thread.threadId);
+        } else if (choice === '查看日志 (View Log)') {
+          const logPath = path.join(os.homedir(), '.agent-mesh-bridge', 'callbacks.log');
+          vscode.workspace
+            .openTextDocument(logPath)
+            .then((doc) => vscode.window.showTextDocument(doc));
+        }
+      });
+  });
+
   // 6. Register Commands
   context.subscriptions.push(
     vscode.commands.registerCommand('agent-mesh-bridge.refreshAgentStatus', async () => {
@@ -291,9 +312,44 @@ export function activate(context: vscode.ExtensionContext) {
           return;
         }
 
+        const lastRound = thread.rounds && thread.rounds[thread.rounds.length - 1];
+        if (lastRound && lastRound.status === 'failed' && lastRound.prompt) {
+          const choice = await vscode.window.showQuickPick(
+            [
+              {
+                label: `$(refresh) 重新执行失败轮次 (第 ${lastRound.round} 轮)`,
+                description: '保留原有一致指令与上下文，重新执行此轮',
+                action: 'retry',
+              },
+              {
+                label: `$(plus) 追加新的一轮返修 (第 ${(thread.currentRound || 1) + 1} 轮)`,
+                description: '输入新的反馈要求，追加后续轮次',
+                action: 'new_round',
+              },
+            ],
+            { placeHolder: `任务第 ${lastRound.round} 轮执行中断/失败，请选择恢复方式:` },
+          );
+
+          if (!choice) return;
+
+          if (choice.action === 'retry') {
+            await reworkController.retryFailedRound(threadId);
+            vscode.window.showInformationMessage(
+              `正在重新执行任务 ${threadId} 第 ${lastRound.round} 轮...`,
+            );
+            TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
+            return;
+          }
+        }
+
+        const defaultValue =
+          lastRound && lastRound.prompt
+            ? lastRound.prompt
+            : '检测到任务中断，请在当前原生会话中继续执行未完成的开发与交付。';
+
         const feedback = await vscode.window.showInputBox({
           prompt: `恢复继续任务 [${thread.title}]：`,
-          value: '检测到任务中断，请在当前原生会话中继续执行未完成的开发与交付。',
+          value: defaultValue,
           placeHolder: '可输入补充要求或直接回车继续...',
         });
         if (!feedback) return;
@@ -306,6 +362,32 @@ export function activate(context: vscode.ExtensionContext) {
           TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
         } catch (e: any) {
           vscode.window.showErrorMessage(`恢复任务失败: ${e.message}`);
+        }
+      },
+    ),
+
+    vscode.commands.registerCommand(
+      'agent-mesh-bridge.retryFailedRound',
+      async (itemOrThreadId?: TaskTreeItem | string) => {
+        let threadId =
+          typeof itemOrThreadId === 'string' ? itemOrThreadId : itemOrThreadId?.thread?.threadId;
+
+        if (!threadId) {
+          const input = await vscode.window.showInputBox({
+            prompt: '输入要重试失败轮次的 Thread ID:',
+          });
+          if (!input) return;
+          threadId = input.trim();
+        }
+
+        try {
+          const retried = await reworkController.retryFailedRound(threadId);
+          vscode.window.showInformationMessage(
+            `正在重新执行任务 ${threadId} 第 ${retried.round} 轮...`,
+          );
+          TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`重试失败轮次失败: ${e.message}`);
         }
       },
     ),

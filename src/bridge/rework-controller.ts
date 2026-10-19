@@ -5,6 +5,7 @@ import {
   RequestReworkResult,
   ApproveTaskParams,
   ApproveResult,
+  isValidSessionId,
 } from './types';
 import { TaskStore } from './task-store';
 import { AgentDetector } from './agent-detector';
@@ -61,9 +62,9 @@ export class ReworkController {
     thread.currentRound = nextRound;
     thread.status = 'reworking';
     thread.updatedAt = nowIso;
-    if (params.callerSessionId) {
+    if (params.callerSessionId && isValidSessionId(params.callerSessionId)) {
       thread.callerSessionId = params.callerSessionId;
-    } else if (!thread.callerSessionId && this.detector) {
+    } else if ((!thread.callerSessionId || !isValidSessionId(thread.callerSessionId)) && this.detector) {
       const detected = this.detector.detectActiveSession(
         thread.initiatorAgent,
         thread.workspacePath,
@@ -106,6 +107,58 @@ export class ReworkController {
       status: 'REWORK_DISPATCHED',
       message: `Rework Round ${nextRound} dispatched to ${thread.targetAgent} in original session (${thread.receiverSessionId}). Conclude your turn and await callback.`,
     };
+  }
+
+  /**
+   * Retries the failed round in-place within the EXACT SAME native session,
+   * preserving the original prompt and avoiding creating duplicate or generic rounds.
+   */
+  public async retryFailedRound(threadId: string): Promise<DelegationRound> {
+    const thread = this.taskStore.getTask(threadId);
+    if (!thread) {
+      throw new Error(`Task thread not found: ${threadId}`);
+    }
+
+    if (!thread.receiverSessionId) {
+      throw new Error(`Cannot retry: thread ${threadId} is missing receiverSessionId.`);
+    }
+
+    const failedRound =
+      [...thread.rounds].reverse().find((r) => r.status === 'failed') ||
+      thread.rounds[thread.rounds.length - 1];
+
+    if (!failedRound) {
+      throw new Error(`No failed round found to retry for thread ${threadId}`);
+    }
+
+    const nowIso = new Date().toISOString();
+    failedRound.status = 'running';
+    failedRound.error = undefined;
+    failedRound.output = undefined;
+    failedRound.timestamp = nowIso;
+
+    thread.currentRound = failedRound.round;
+    thread.status = 'reworking';
+    thread.updatedAt = nowIso;
+    thread.summary.lastPromptSnippet = (failedRound.prompt || '').slice(0, 100);
+    thread.summary.lastOutputSnippet = `Retrying Round ${failedRound.round} in same session...`;
+
+    this.taskStore.upsertTask(thread);
+
+    if (TaskSupervisor.isSupervisorActive()) {
+      console.log(
+        `[ReworkController] Active TaskSupervisor detected. Delegating Round ${failedRound.round} retry to supervisor.`,
+      );
+    } else {
+      this.executeReworkBackground(thread, failedRound.round, failedRound.prompt).catch((err) => {
+        console.error(
+          `[ReworkController] Error executing retry round ${failedRound.round} for ${thread.threadId}:`,
+          err,
+        );
+      });
+    }
+
+    return failedRound;
   }
 
   /**

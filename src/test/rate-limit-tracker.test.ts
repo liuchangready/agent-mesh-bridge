@@ -73,4 +73,16 @@ describe('RateLimitTracker & Agent Status Tests', () => {
     const infoRecovered = await detector.probeAgent('antigravity', true);
     assert.notStrictEqual(infoRecovered.status, 'exhausted');
   });
+
+  test('should extract appropriate reason without false 429 classification', () => {
+    const rec1 = tracker.recordExhaustion('claude_code', 'HTTP 429 Too Many Requests');
+    assert.strictEqual(rec1.reason, '429 Rate Limit Exceeded');
+
+    const rec2 = tracker.recordExhaustion('codex', 'insufficient_quota: You exceeded your current quota');
+    assert.strictEqual(rec2.reason, 'Quota Exhausted');
+
+    const rec3 = tracker.recordExhaustion('antigravity', 'Resource exhausted: model is overloaded');
+    assert.strictEqual(rec3.reason, 'Resource Exhausted');
+  });
 });
+

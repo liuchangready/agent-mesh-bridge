@@ -134,8 +134,8 @@ export class ConfigSyncService {
 
   private syncCodexConfig(): boolean {
     const home = os.homedir();
-    const confPath = path.join(home, '.codex', 'config.json');
-    const dir = path.dirname(confPath);
+    const tomlPath = path.join(home, '.codex', 'config.toml');
+    const dir = path.dirname(tomlPath);
 
     if (!fs.existsSync(dir)) {
       try {
@@ -143,28 +143,53 @@ export class ConfigSyncService {
       } catch {}
     }
 
-    let config: any = {};
-    if (fs.existsSync(confPath)) {
+    // 1. Update config.toml (Codex CLI strictly reads config.toml, not config.json)
+    let tomlContent = '';
+    if (fs.existsSync(tomlPath)) {
       try {
-        config = JSON.parse(fs.readFileSync(confPath, 'utf8'));
+        tomlContent = fs.readFileSync(tomlPath, 'utf8');
       } catch {
-        config = {};
+        tomlContent = '';
       }
     }
 
-    if (!config.mcpServers) {
-      config.mcpServers = {};
-    }
+    const normalizedScriptPath = this.mcpScriptPath.replace(/\\/g, '/');
 
-    config.mcpServers['agent-mesh-bridge'] = {
-      command: 'node',
-      args: [this.mcpScriptPath, '--caller', 'codex'],
-      env: {
-        MESH_CALLER_AGENT: 'codex',
-      },
-    };
+    // Remove old/stale [mcp_servers.agent-mesh-bridge] and [mcp_servers.cross-agent-bridge] blocks
+    const cleanToml = tomlContent
+      .replace(/\[mcp_servers\.agent-mesh-bridge\][\s\S]*?(?=(\n\[|$))/g, '')
+      .replace(/\[mcp_servers\.cross-agent-bridge\][\s\S]*?(?=(\n\[|$))/g, '')
+      .trim();
 
-    fs.writeFileSync(confPath, JSON.stringify(config, null, 2), 'utf8');
+    const mcpBlock = `\n\n[mcp_servers.agent-mesh-bridge]\ncommand = "node"\nargs = ["${normalizedScriptPath}", "--caller", "codex"]\nenv = { MESH_CALLER_AGENT = "codex" }\n\n[mcp_servers.cross-agent-bridge]\ncommand = "node"\nargs = ["${normalizedScriptPath}", "--caller", "codex"]\nenv = { MESH_CALLER_AGENT = "codex" }\n`;
+
+    fs.writeFileSync(tomlPath, cleanToml + mcpBlock, 'utf8');
+
+    // 2. Also write to config.json for compatibility
+    const jsonPath = path.join(home, '.codex', 'config.json');
+    try {
+      let config: any = {};
+      if (fs.existsSync(jsonPath)) {
+        try {
+          config = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+        } catch {
+          config = {};
+        }
+      }
+      if (!config.mcpServers) config.mcpServers = {};
+      config.mcpServers['agent-mesh-bridge'] = {
+        command: 'node',
+        args: [this.mcpScriptPath, '--caller', 'codex'],
+        env: { MESH_CALLER_AGENT: 'codex' },
+      };
+      config.mcpServers['cross-agent-bridge'] = {
+        command: 'node',
+        args: [this.mcpScriptPath, '--caller', 'codex'],
+        env: { MESH_CALLER_AGENT: 'codex' },
+      };
+      fs.writeFileSync(jsonPath, JSON.stringify(config, null, 2), 'utf8');
+    } catch {}
+
     return true;
   }
 

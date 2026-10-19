@@ -158,12 +158,27 @@ export class RateLimitTracker {
   }
 
   private extractReason(text: string): string {
-    const trimmed = text.replace(/[\r\n]+/g, ' ').trim();
-    if (trimmed.includes('429')) return '429 Rate Limit Exceeded';
-    if (/insufficient_quota|quota/i.test(trimmed)) return 'Quota Exhausted';
-    if (/resource_exhausted/i.test(trimmed)) return 'Resource Exhausted';
-    if (/overloaded/i.test(trimmed)) return 'Model Overloaded';
-    return trimmed.slice(0, 100);
+    if (
+      /\b(?:error\s*429|http\s*429|status(?:\s*code)?[:\s]+429|code["':\s]+429|\[429\]|429\s+too\s+many\s+requests|too\s*many\s*requests)\b/i.test(
+        text,
+      )
+    ) {
+      return '429 Rate Limit Exceeded';
+    }
+    if (/\b(?:insufficient_quota|quota[-_\s]*(?:exceeded|exhausted))\b/i.test(text)) {
+      return 'Quota Exhausted';
+    }
+    if (/\bresource[-_\s]*exhausted\b/i.test(text)) {
+      return 'Resource Exhausted';
+    }
+    if (/\b(?:model|server)[-_\s]*(?:is[-_\s]*)?overloaded\b/i.test(text)) {
+      return 'Model Overloaded';
+    }
+    if (/\brate[-_\s]*limit(?:ed)?\b/i.test(text)) {
+      return 'Rate Limit Exceeded';
+    }
+    const firstLine = text.trim().split('\n')[0].replace(/[\r\n]+/g, ' ').trim();
+    return firstLine.slice(0, 80) || 'Rate Limit Exceeded';
   }
 
   private formatResetTime(resetTimestamp: number, remainingSec: number): string {

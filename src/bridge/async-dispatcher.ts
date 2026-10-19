@@ -5,6 +5,7 @@ import {
   DelegationRound,
   DispatchTaskParams,
   DispatchResult,
+  isValidSessionId,
 } from './types';
 import { TaskStore } from './task-store';
 import { AgentDetector } from './agent-detector';
@@ -55,7 +56,10 @@ export class AsyncDispatcher {
     const nowIso = now.toISOString();
     const workspacePath = params.workspacePath || process.cwd();
 
-    let callerSessionId = params.callerSessionId;
+    let callerSessionId =
+      params.callerSessionId && isValidSessionId(params.callerSessionId)
+        ? params.callerSessionId
+        : undefined;
     if (!callerSessionId && this.detector) {
       callerSessionId = this.detector.detectActiveSession(initiatorAgent, workspacePath, [
         receiverSessionId,

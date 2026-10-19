@@ -67,7 +67,7 @@ export class MCPServer {
             callerSessionId: {
               type: 'string',
               description:
-                'Your native session ID so the bridge can proactively wake you up upon completion. If omitted, the bridge automatically auto-detects your active session.',
+                'Your native session UUID so the bridge can proactively wake you up upon completion. Do NOT pass agent names (e.g. "claude_code"). If omitted, the bridge automatically auto-detects your active session.',
             },
             workspacePath: {
               type: 'string',
@@ -94,7 +94,8 @@ export class MCPServer {
             },
             callerSessionId: {
               type: 'string',
-              description: 'Your native session ID for subsequent wake-up callback.',
+              description:
+                'Your native session UUID for subsequent wake-up callback. Do NOT pass agent names (e.g. "claude_code"). If omitted, the bridge automatically auto-detects your active session.',
             },
           },
           required: ['threadId', 'feedback'],
@@ -292,6 +293,39 @@ export class MCPServer {
             codex: codex,
           },
         };
+      }
+
+      case 'invoke_antigravity': {
+        const callerFromEnv = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
+        return await this.dispatcher.dispatchTask({
+          targetAgent: 'antigravity',
+          initiatorAgent: callerFromEnv || 'codex',
+          title: args.title || 'Delegation to Antigravity',
+          prompt: args.prompt,
+          workspacePath: args.workspacePath,
+        });
+      }
+
+      case 'invoke_claude_code': {
+        const callerFromEnv = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
+        return await this.dispatcher.dispatchTask({
+          targetAgent: 'claude_code',
+          initiatorAgent: callerFromEnv || 'codex',
+          title: args.title || 'Delegation to Claude Code',
+          prompt: args.prompt,
+          workspacePath: args.workspacePath,
+        });
+      }
+
+      case 'invoke_codex': {
+        const callerFromEnv = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
+        return await this.dispatcher.dispatchTask({
+          targetAgent: 'codex',
+          initiatorAgent: callerFromEnv || 'antigravity',
+          title: args.title || 'Delegation to Codex',
+          prompt: args.prompt,
+          workspacePath: args.workspacePath,
+        });
       }
 
       default:

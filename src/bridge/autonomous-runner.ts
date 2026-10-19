@@ -11,6 +11,7 @@ export interface RunOptions {
   cwd?: string;
   timeoutMs?: number; // Overall process timeout, default 2 hours (120 mins)
   silenceTimeoutMs?: number; // Silence watchdog timeout, default 180s
+  maxRetries?: number; // Max retries for transient startup/network errors, default 3
   onStdoutChunk?: (chunk: string) => void;
   onStderrChunk?: (chunk: string) => void;
 }
@@ -192,9 +193,71 @@ export class AutonomousRunner {
   }
 
   /**
-   * Executes the agent command with non-interactive flags, watchdog timers, and closes stdin.
+   * Executes the agent command with retry on transient startup/network errors.
    */
-  public execute(options: RunOptions): Promise<RunResult> {
+  public async execute(options: RunOptions): Promise<RunResult> {
+    const maxRetries = options.maxRetries ?? 3;
+    let attempt = 0;
+    while (true) {
+      attempt++;
+      const result = await this.executeOnce(options);
+      if (result.exitCode === 0) {
+        return result;
+      }
+
+      if (attempt <= maxRetries && this.isTransientError(result)) {
+        const backoffMs = Math.min(2000 * Math.pow(2, attempt - 1), 10000);
+        console.warn(
+          `[AutonomousRunner] Transient startup/network error on attempt ${attempt}/${maxRetries} for ${options.agent}: "${result.error}". Retrying in ${backoffMs / 1000}s...`,
+        );
+        await new Promise((r) => setTimeout(r, backoffMs));
+        continue;
+      }
+
+      return result;
+    }
+  }
+
+  /**
+   * Checks if an execution failed due to an ephemeral network or handshake error.
+   */
+  public isTransientError(result: RunResult): boolean {
+    if (result.exitCode === 0) return false;
+    const combined = `${result.stdout}\n${result.stderr}\n${result.error || ''}`.toLowerCase();
+    const transientPatterns = [
+      'eligibility check failed',
+      'eof',
+      'econnreset',
+      'etimedout',
+      'socket hang up',
+      'network is unreachable',
+      'connection reset by peer',
+      'tls handshake timeout',
+      'temporary failure in name resolution',
+      'fetch failed',
+      '502 bad gateway',
+      '503 service unavailable',
+      '504 gateway timeout',
+    ];
+    return transientPatterns.some((pattern) => combined.includes(pattern));
+  }
+
+  /**
+   * Checks if an execution failed due to rate limit or quota exhaustion.
+   * Uses precise token/word boundary matching to prevent false positives from
+   * code line numbers (e.g. "429:"), UUIDs/hashes (e.g. "...429..."), or normal programming terms.
+   */
+  public isRateLimitOrQuotaError(text: string): boolean {
+    if (!text) return false;
+    const rateLimitRegex =
+      /\b(?:error\s*429|http\s*429|status(?:\s*code)?[:\s]+429|code["':\s]+429|\[429\]|429\s+too\s+many\s+requests)\b|\b(?:rate[-_\s]*limit(?:ed)?(?:\s*(?:exceeded|reached|hit|error))?|quota[-_\s]*(?:exceeded|exhausted)|resource[-_\s]*exhausted|insufficient[-_\s]*quota|too[-_\s]*many[-_\s]*requests)\b|\b(?:model|server)[-_\s]*(?:is[-_\s]*)?overloaded\b|\b(?:retry[-_\s]*after|try[-_\s]*again[-_\s]*in|resets?[-_\s]*(?:in|at))\s+\d+/i;
+    return rateLimitRegex.test(text);
+  }
+
+  /**
+   * Executes a single attempt of the agent command.
+   */
+  public executeOnce(options: RunOptions): Promise<RunResult> {
     return new Promise((resolve) => {
       const startTime = Date.now();
       const { command, args, useShell } = this.buildCommand(options);
@@ -332,13 +395,20 @@ export class AutonomousRunner {
           error = stderrData.trim() || `Process exited with non-zero code ${exitCode}`;
         }
 
-        const combinedOutput = `${stdoutData}\n${stderrData}`;
-        if (
-          /429|rate\s*limit|quota\s*exceeded|resource_exhausted|insufficient_quota|overloaded|try\s*again\s*in|resets\s*at|resets\s*in/i.test(
-            combinedOutput,
-          )
-        ) {
-          this.detector.getRateLimitTracker().recordExhaustion(options.agent, combinedOutput);
+        // Process completion & Rate limit evaluation:
+        // 1. If process succeeded (exitCode === 0 and no error), agent is active and healthy. Clear any stale exhaustion.
+        if (exitCode === 0 && !error) {
+          if (this.detector.getRateLimitTracker().isExhausted(options.agent)) {
+            this.detector.getRateLimitTracker().clearExhaustion(options.agent);
+          }
+        } else {
+          // 2. Only on process failure/error do we inspect for quota or rate limit exhaustion.
+          // Prioritize stderrData and error, falling back to stdoutData only on non-zero exit code.
+          const errorContext = `${stderrData}\n${error || ''}\n${stdoutData}`;
+          if (this.isRateLimitOrQuotaError(errorContext)) {
+            const errorSnippet = (stderrData.trim() || error || stdoutData.trim()).slice(0, 500);
+            this.detector.getRateLimitTracker().recordExhaustion(options.agent, errorSnippet);
+          }
         }
 
         resolve({

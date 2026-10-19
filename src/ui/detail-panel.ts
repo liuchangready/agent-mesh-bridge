@@ -53,6 +53,9 @@ export class TaskDetailPanel {
           case 'resumeTask':
             await this.handleResumeTask(message.feedback);
             break;
+          case 'retryFailedRound':
+            await this.handleRetryFailedRound();
+            break;
           case 'wakeUpCaller':
             await vscode.commands.executeCommand(
               'agent-mesh-bridge.wakeUpCaller',
@@ -146,6 +149,23 @@ export class TaskDetailPanel {
     const thread = this.taskStore.getTask(this.currentThreadId);
     if (!thread) return;
 
+    if (thread.status === 'running' || thread.status === 'reworking') {
+      vscode.window.showInformationMessage(
+        `任务当前正在由 ${thread.targetAgent} 自主执行中（Round ${thread.currentRound || 1}），无需重复触发。`,
+      );
+      return;
+    }
+
+    if (thread.status === 'waiting_review') {
+      const choice = await vscode.window.showWarningMessage(
+        `任务当前处于“等待检视”状态：下发方 (${thread.initiatorAgent}) 正在后台独立执行自动化测试与审查（通常耗时 30~60 秒）。确定要打断并提前下发新的返修要求吗？`,
+        { modal: true },
+        '确认提前下发',
+        '取消等待',
+      );
+      if (choice !== '确认提前下发') return;
+    }
+
     const runningRounds = (thread.rounds || []).filter((r) => r.status === 'running');
     const targetRound =
       thread.rounds.find((r) => r.round === thread.currentRound && r.status === 'running') ||
@@ -159,12 +179,17 @@ export class TaskDetailPanel {
     }
 
     if (!feedback || !feedback.trim()) {
+      const lastRound = (thread.rounds || [])[thread.rounds.length - 1];
+      const defaultValue =
+        lastRound && lastRound.status === 'failed' && lastRound.prompt
+          ? lastRound.prompt
+          : '';
       const input = await vscode.window.showInputBox({
-        prompt: `恢复继续任务 [${thread.title}]：`,
-        value: '检测到任务中断，请在当前原生会话中继续执行未完成的开发与交付。',
-        placeHolder: '可输入补充要求或直接回车继续...',
+        prompt: `输入向 [${thread.targetAgent}] 下发的返修指令或补充说明：`,
+        value: defaultValue,
+        placeHolder: '请输入具体修改指令或测试要求...',
       });
-      if (!input) return;
+      if (!input || !input.trim()) return;
       feedback = input;
     }
 
@@ -179,6 +204,18 @@ export class TaskDetailPanel {
       this.update();
     } catch (err: any) {
       vscode.window.showErrorMessage(`恢复任务失败: ${err.message}`);
+    }
+  }
+
+  private async handleRetryFailedRound() {
+    try {
+      const retried = await this.reworkController.retryFailedRound(this.currentThreadId);
+      vscode.window.showInformationMessage(
+        `正在重新执行任务 ${this.currentThreadId} 第 ${retried.round} 轮（保留原反馈与指令）...`,
+      );
+      this.update();
+    } catch (err: any) {
+      vscode.window.showErrorMessage(`重试失败轮次出错: ${err.message}`);
     }
   }
 
@@ -498,13 +535,41 @@ export class TaskDetailPanel {
       <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">由 <strong>${escapeHtml(thread.initiatorAgent)}</strong> 独立运行全部测试套件完成验证，既有测试与回归测试全绿通过。</div>
     </div>
   </div>`
+      : thread.status === 'waiting_review'
+      ? `
+  <div style="background: rgba(59, 130, 246, 0.15); border: 1px solid #3b82f6; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
+    <div style="font-size: 28px;">🔍</div>
+    <div>
+      <div style="font-weight: 700; font-size: 16px; color: #60a5fa;">已完成第 ${thread.currentRound || 1} 轮交付 · 等待下发者自动化跑测验收中</div>
+      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">已主动唤醒 <strong>${escapeHtml(thread.initiatorAgent)}</strong>，正在后台独立执行全量构建与回归跑测（通常耗时 30~60 秒）。任务正常流转中，请等待审查结论。</div>
+    </div>
+  </div>`
+      : (thread.status === 'running' || thread.status === 'reworking')
+      ? `
+  <div style="background: rgba(245, 158, 11, 0.15); border: 1px solid #f59e0b; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
+    <div style="font-size: 28px;">⏳</div>
+    <div>
+      <div style="font-weight: 700; font-size: 16px; color: #fbbf24;">第 ${thread.currentRound || 1} 轮正在自主执行中 (${escapeHtml(thread.targetAgent)})</div>
+      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;"><strong>${escapeHtml(thread.targetAgent)}</strong> 正在原生会话中修改代码与编写测试，后台进程正常运转中，无需人工干预。</div>
+    </div>
+  </div>`
+      : thread.status === 'failed'
+      ? `
+  <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
+    <div style="font-size: 28px;">⚠️</div>
+    <div>
+      <div style="font-weight: 700; font-size: 16px; color: #f87171;">第 ${thread.currentRound || 1} 轮执行异常中断</div>
+      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">进程非零退出或执行超时。可点击下方“重试失败轮次”按钮重新执行该轮次。</div>
+    </div>
+  </div>`
       : ''
   }
 
   <div class="action-bar">
-    ${thread.status !== 'completed' ? `<button class="resume-btn" onclick="resumeTask()">▶ 恢复任务 / 重新执行</button>` : ''}
-    ${thread.status !== 'completed' ? `<button class="notify-btn" onclick="wakeUpCaller()">🔔 唤醒下发者检视</button>` : ''}
-    ${thread.status !== 'completed' ? `<button onclick="approveTask()">✓ Approve Task</button>` : ''}
+    ${(thread.status === 'failed' || thread.rounds.some((r) => r.status === 'failed')) ? `<button class="retry-btn" style="background: #dc2626; color: white;" onclick="retryFailedRound()">🔄 重试失败轮次 (Retry Failed)</button>` : ''}
+    ${thread.status === 'waiting_review' ? `<button class="notify-btn" onclick="wakeUpCaller()">🔔 再次唤醒下发者检视</button>` : ''}
+    ${(thread.status === 'failed' || thread.status === 'waiting_review') ? `<button class="resume-btn" onclick="resumeTask()">▶ 下发返修要求 / 重新执行</button>` : ''}
+    ${thread.status !== 'completed' ? `<button onclick="approveTask()">✓ 手动验收通过 (Approve Task)</button>` : ''}
     <button class="secondary" onclick="openTerminal()">💻 Open Terminal in Session</button>
     <button class="secondary" onclick="refresh()">⟳ Refresh</button>
   </div>
@@ -528,6 +593,10 @@ export class TaskDetailPanel {
 
   <script>
     const vscode = acquireVsCodeApi();
+
+    function retryFailedRound() {
+      vscode.postMessage({ command: 'retryFailedRound' });
+    }
 
     function resumeTask() {
       vscode.postMessage({ command: 'resumeTask' });
