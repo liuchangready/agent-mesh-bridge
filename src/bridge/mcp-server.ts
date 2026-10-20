@@ -8,7 +8,13 @@ import { AutonomousRunner } from './autonomous-runner';
 import { TaskSupervisor } from './task-supervisor';
 import { TaskControlService } from './task-control';
 import { TaskRoleLock } from './task-role-lock';
-import { AgentId, MESH_TASK_THREAD_ENV, isTaskReceiverProcess } from './types';
+import { ModelCatalog, loadModelDefaults } from './model-catalog';
+import {
+  AgentId,
+  MESH_TASK_THREAD_ENV,
+  getModelRouting,
+  isTaskReceiverProcess,
+} from './types';
 
 /**
  * Tools that create new outbound work. A delegated task's receiver must never
@@ -39,6 +45,7 @@ export class MCPServer {
   private resolver: ActiveAgentResolver;
   private runner: AutonomousRunner;
   private taskControl: TaskControlService;
+  private modelCatalog: ModelCatalog;
 
   constructor(
     dispatcher: AsyncDispatcher,
@@ -55,6 +62,7 @@ export class MCPServer {
     this.resolver = resolver;
     this.runner = runner;
     this.taskControl = new TaskControlService(taskStore, runner);
+    this.modelCatalog = new ModelCatalog(detector);
   }
 
   /**
@@ -104,6 +112,16 @@ export class MCPServer {
               items: { type: 'string' },
               description:
                 'Concrete code file paths expected to be modified (e.g. ["src/service/Foo.ts", "lib/parser.ts"]). Do NOT pass folders, trailing slashes, or glob patterns: they are rejected because they would lock unrelated files. Tasks execute strictly one at a time; exact same-file conflicts are additionally tracked.',
+            },
+            model: {
+              type: 'string',
+              description:
+                'Model id the receiver should run this task with (e.g. "gpt-6-sol", "sonnet", "gemini-3.8-flash-high"). Call list_agent_models first to see what the target supports. Omit to use the model configured in the bridge settings for that agent (recommended default).',
+            },
+            initiatorModel: {
+              type: 'string',
+              description:
+                'The model YOU (the caller) are currently running on, recorded as the task\'s sender model so the ledger shows "sender model -> receiver model". Omit to let the bridge infer it from the environment or your configured default.',
             },
           },
           required: ['title', 'prompt'],
@@ -294,6 +312,25 @@ export class MCPServer {
         },
       },
       {
+        name: 'list_agent_models',
+        description:
+          'List the models each agent can run, including the model currently configured as that agent\'s default. Use it before dispatch_task when a task needs a specific model. Results are cached; pass forceRefresh to re-probe the CLIs and provider endpoints.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            targetAgent: {
+              type: 'string',
+              enum: ['all', 'antigravity', 'claude_code', 'codex', 'deepseek_harness'],
+              description: 'Which agent to inspect (default: all).',
+            },
+            forceRefresh: {
+              type: 'boolean',
+              description: 'Re-run discovery instead of using the cached catalogue.',
+            },
+          },
+        },
+      },
+      {
         name: 'invoke_agent',
         description:
           'Synchronously invoke an agent for lightweight queries or code snippet reviews (blocks up to 30s).',
@@ -312,6 +349,11 @@ export class MCPServer {
             timeoutMs: {
               type: 'number',
               description: 'Timeout in milliseconds (default: 30000).',
+            },
+            model: {
+              type: 'string',
+              description:
+                'Optional model override for this query. Omit to use the agent\'s configured default.',
             },
           },
           required: ['prompt'],
@@ -422,6 +464,8 @@ export class MCPServer {
           callerSessionId: args.callerSessionId,
           workspacePath: args.workspacePath,
           expectedFiles: args.expectedFiles,
+          model: args.model,
+          initiatorModel: args.initiatorModel,
         });
       }
 
@@ -492,7 +536,10 @@ export class MCPServer {
       case 'list_recent_tasks': {
         const limit = typeof args.limit === 'number' ? args.limit : 20;
         const statusFilter = args.statusFilter;
-        return this.taskStore.listTasks(limit, statusFilter);
+        const tasks = this.taskStore.listTasks(limit, statusFilter);
+        // Every task carries both ends of its model routing so a caller can see
+        // which model it dispatched from and which model the receiver runs.
+        return tasks.map((task) => ({ ...task, modelRouting: getModelRouting(task) }));
       }
 
       case 'get_thread_details': {
@@ -503,6 +550,7 @@ export class MCPServer {
         const recentLogsInfo = TaskSupervisor.getRecentLogs(args.threadId, 1000, this.taskStore);
         return {
           ...task,
+          modelRouting: getModelRouting(task),
           recentLogs: recentLogsInfo.logs,
           totalLogLines: recentLogsInfo.totalLines,
         };
@@ -511,6 +559,34 @@ export class MCPServer {
       case 'get_recent_logs': {
         const maxLines = typeof args.maxLines === 'number' ? args.maxLines : 1000;
         return TaskSupervisor.getRecentLogs(args.threadId, maxLines, this.taskStore);
+      }
+
+      case 'list_agent_models': {
+        const all = await this.modelCatalog.getAll(!!args.forceRefresh);
+        const defaults = loadModelDefaults();
+        const requested: AgentId[] =
+          args.targetAgent && args.targetAgent !== 'all'
+            ? [args.targetAgent as AgentId]
+            : ['antigravity', 'codex', 'claude_code', 'deepseek_harness'];
+
+        const agents: Record<string, any> = {};
+        for (const agent of requested) {
+          const catalog = all[agent];
+          if (!catalog) continue;
+          agents[agent] = {
+            models: catalog.models,
+            source: catalog.source,
+            updatedAt: catalog.updatedAt,
+            error: catalog.error,
+            configuredModel: defaults[agent] || null,
+          };
+        }
+        return {
+          agents,
+          hint:
+            'Pass `model` to dispatch_task to pin one task; leave it out to use configuredModel. ' +
+            'Change the default with the "Agent Bridge: Select Model for Agent" command in VS Code.',
+        };
       }
 
       case 'invoke_agent': {
@@ -528,6 +604,7 @@ export class MCPServer {
           isRework: false,
           receiverSessionId: `sync_${Date.now()}`,
           timeoutMs: args.timeoutMs || 30000,
+          model: args.model,
         });
 
         return {
@@ -570,6 +647,8 @@ export class MCPServer {
           title: args.title || 'Delegation to Antigravity',
           prompt: args.prompt,
           workspacePath: args.workspacePath,
+          model: args.model,
+          initiatorModel: args.initiatorModel,
         });
       }
 
@@ -581,6 +660,8 @@ export class MCPServer {
           title: args.title || 'Delegation to Claude Code',
           prompt: args.prompt,
           workspacePath: args.workspacePath,
+          model: args.model,
+          initiatorModel: args.initiatorModel,
         });
       }
 
@@ -592,6 +673,8 @@ export class MCPServer {
           title: args.title || 'Delegation to Codex',
           prompt: args.prompt,
           workspacePath: args.workspacePath,
+          model: args.model,
+          initiatorModel: args.initiatorModel,
         });
       }
 

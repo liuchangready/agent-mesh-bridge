@@ -99,6 +99,44 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.strictEqual(stored.receiverSessionId, res.receiverSessionId);
     assert.strictEqual(stored.rounds.length, 1);
     assert.strictEqual(stored.rounds[0].type, 'initial');
+    // No model pinned: the agent's configured default applies at launch time.
+    assert.strictEqual(stored.targetModel, undefined);
+    assert.strictEqual(stored.initiatorModel, undefined);
+    assert.strictEqual(stored.initiatorModelSource, 'none');
+  });
+
+  test('pins the model chosen at dispatch on the task and the runner call', async () => {
+    const received: any[] = [];
+    runner.execute = async (options: any) => {
+      received.push(options);
+      await new Promise((r) => setTimeout(r, 20));
+      return {
+        exitCode: 0,
+        stdout: 'Mock execution finished successfully',
+        stderr: '',
+        extractedOutput: 'Mock execution finished successfully',
+        durationMs: 20,
+      };
+    };
+
+    const res = await dispatcher.dispatchTask({
+      targetAgent: 'codex',
+      title: 'Pin a specific model',
+      prompt: 'Implement the parser',
+      model: '  gpt-6-sol  ',
+      initiatorModel: 'gpt-6.1-sol',
+    });
+    await waitForStatus(res.threadId, 'waiting_review');
+
+    const stored = taskStore.getTask(res.threadId)!;
+    assert.strictEqual(stored.targetModel, 'gpt-6-sol');
+    // Both ends of the routing are persisted, so the ledger can show them.
+    assert.strictEqual(stored.initiatorModel, 'gpt-6.1-sol');
+    assert.strictEqual(stored.initiatorModelSource, 'explicit');
+    assert.match(res.message, /model routing/i);
+    assert.strictEqual(received.length, 1);
+    assert.strictEqual(received[0].model, 'gpt-6-sol');
+    assert.strictEqual(received[0].agent, 'codex');
   });
 
   test('should treat exit 0 with no actual output as a failed response', async () => {

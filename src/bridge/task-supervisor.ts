@@ -461,6 +461,7 @@ export class TaskSupervisor extends EventEmitter {
           cwd: thread.workspacePath,
           taskThreadId: thread.threadId,
           taskRound: roundNumber,
+          model: thread.targetModel,
           onStdoutChunk: (chunk: string) => {
             streamedOutput += chunk;
             const cur = this.liveLogs.get(thread.threadId) || '';

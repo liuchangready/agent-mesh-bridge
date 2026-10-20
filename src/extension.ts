@@ -21,7 +21,33 @@ import {
   DSH_PROVIDER_ID_HINT,
   DshProviderConfig,
   isDshProviderUsable,
+  readDshConfiguredProvider,
 } from './bridge/deepseek-harness';
+import {
+  ModelCatalog,
+  ModelDefaults,
+  invalidateConfiguredModelCache,
+  normalizeModelId,
+  resolveConfiguredModel,
+  saveModelDefaults,
+} from './bridge/model-catalog';
+
+/** Settings key holding the default model of each agent. */
+const MODEL_SETTING_KEYS: Record<AgentId, string> = {
+  antigravity: 'models.antigravity',
+  codex: 'models.codex',
+  claude_code: 'models.claudeCode',
+  deepseek_harness: 'models.deepseekHarness',
+  vscode_chat: 'models.vscodeChat',
+};
+
+const AGENT_LABELS: Record<AgentId, string> = {
+  antigravity: 'Google Antigravity',
+  codex: 'OpenAI Codex',
+  claude_code: 'Anthropic Claude Code',
+  deepseek_harness: 'DeepSeek Harness',
+  vscode_chat: 'VSCode Chat',
+};
 
 export function activate(context: vscode.ExtensionContext) {
   console.log('[Agent Mesh Bridge] Activating extension...');
@@ -86,6 +112,33 @@ export function activate(context: vscode.ExtensionContext) {
   const taskStore = TaskStore.getInstance();
   const detector = new AgentDetector(customPaths);
   const resolver = new ActiveAgentResolver(detector);
+  const modelCatalog = new ModelCatalog(detector);
+
+  /**
+   * Mirror the per-agent model settings into `~/.agent-mesh-bridge/model-config.json`.
+   *
+   * The MCP server runs in its own process (spawned by each agent, without VS
+   * Code APIs), so the settings are not directly visible to it. This snapshot is
+   * what `dispatch_task` uses when the caller does not pin a model.
+   */
+  const readModelSettings = (): ModelDefaults => {
+    const modelCfg = vscode.workspace.getConfiguration('agentMeshBridge');
+    const defaults: ModelDefaults = {};
+    for (const agent of ['antigravity', 'codex', 'claude_code', 'deepseek_harness'] as AgentId[]) {
+      const value = normalizeModelId(modelCfg.get<string>(MODEL_SETTING_KEYS[agent]));
+      if (value) defaults[agent] = value;
+    }
+    return defaults;
+  };
+
+  const applyModelSettings = (): ModelDefaults => {
+    const defaults = readModelSettings();
+    saveModelDefaults(defaults);
+    invalidateConfiguredModelCache();
+    return defaults;
+  };
+
+  applyModelSettings();
   const timeoutMinutes = config.get<number>('taskTimeoutMinutes', 120);
   const runner = new AutonomousRunner(detector, timeoutMinutes * 60 * 1000);
   const callbackManager = new CallbackManager(detector);
@@ -686,11 +739,137 @@ export function activate(context: vscode.ExtensionContext) {
       }
     }),
 
+    vscode.commands.registerCommand(
+      'agent-mesh-bridge.selectAgentModel',
+      async (item?: AgentNodeItem) => {
+        const targets: AgentId[] = ['antigravity', 'codex', 'claude_code', 'deepseek_harness'];
+
+        let agent = item?.info?.id;
+        if (!agent || agent === 'vscode_chat') {
+          const pick = await vscode.window.showQuickPick(
+            targets.map((a) => ({
+              label: AGENT_LABELS[a],
+              description: resolveConfiguredModel(a) || 'Agent 默认模型',
+              agent: a,
+            })),
+            { placeHolder: '选择要配置默认模型的 Agent' },
+          );
+          if (!pick) return;
+          agent = pick.agent;
+        }
+        const targetAgent: AgentId = agent;
+        const modelCfg = vscode.workspace.getConfiguration('agentMeshBridge');
+
+        for (;;) {
+          const catalog = await vscode.window.withProgress(
+            {
+              location: vscode.ProgressLocation.Notification,
+              title: `Agent Bridge: 正在探测 ${AGENT_LABELS[targetAgent]} 可用模型...`,
+            },
+            () => modelCatalog.get(targetAgent, false),
+          );
+
+          if (catalog.error) {
+            vscode.window.showWarningMessage(
+              `探测 ${AGENT_LABELS[targetAgent]} 模型不完整: ${catalog.error}`,
+            );
+          }
+
+          const current = resolveConfiguredModel(targetAgent);
+          const items: any[] = [
+            {
+              label: '$(check) 使用 Agent 默认模型',
+              description: current ? `当前: ${current}（选择后清除）` : '当前已使用 Agent 默认',
+              action: 'clear',
+            },
+            ...catalog.models.map((m) => ({
+              label: current === m.id ? `$(check) ${m.label || m.id}` : m.label || m.id,
+              description: m.id,
+              detail: m.hint ? `标记: ${m.hint}` : undefined,
+              action: 'set',
+              model: m.id,
+            })),
+            {
+              label: '$(refresh) 重新探测可用模型',
+              description: `来源: ${catalog.source} · 共 ${catalog.models.length} 个`,
+              action: 'refresh',
+            },
+            {
+              label: '$(edit) 手动输入模型 ID',
+              description: '适用于列表外的自定义模型',
+              action: 'manual',
+            },
+          ];
+
+          const selected = await vscode.window.showQuickPick(items, {
+            placeHolder: `${AGENT_LABELS[targetAgent]} 默认模型 · 来源: ${catalog.source}`,
+            matchOnDescription: true,
+          });
+          if (!selected) return;
+
+          if (selected.action === 'refresh') {
+            await modelCatalog.get(targetAgent, true);
+            continue;
+          }
+
+          let model: string | undefined;
+          if (selected.action === 'manual') {
+            const input = await vscode.window.showInputBox({
+              prompt: `输入 ${AGENT_LABELS[targetAgent]} 要使用的模型 ID`,
+              value: current || '',
+              placeHolder: '例如 gpt-6-sol / sonnet / gemini-3.8-flash-high',
+            });
+            if (input === undefined) continue;
+            model = normalizeModelId(input);
+            if (!model) {
+              vscode.window.showWarningMessage('模型 ID 不能为空。');
+              continue;
+            }
+          } else if (selected.action === 'clear') {
+            model = undefined;
+          } else {
+            model = selected.model;
+          }
+
+          if (targetAgent === 'deepseek_harness' && model && !readDshConfiguredProvider()) {
+            vscode.window.showWarningMessage(
+              'DeepSeek Harness 需先配置 provider 路由（agentMeshBridge.deepseekHarness.provider / baseUrl / apiKey）才能按任务切换模型。',
+            );
+          }
+
+          await modelCfg.update(
+            MODEL_SETTING_KEYS[targetAgent],
+            model ?? '',
+            vscode.ConfigurationTarget.Global,
+          );
+          applyModelSettings();
+          agentNodesProvider.refresh(false);
+
+          vscode.window.showInformationMessage(
+            model
+              ? `Agent Bridge: ${AGENT_LABELS[targetAgent]} 默认模型已设为 ${model}，后续下发任务将使用该模型。`
+              : `Agent Bridge: 已清除 ${AGENT_LABELS[targetAgent]} 的模型配置，恢复使用 Agent 默认模型。`,
+          );
+          return;
+        }
+      },
+    ),
+
     vscode.commands.registerCommand('agent-mesh-bridge.configureDeepSeekHarness', async () => {
       await vscode.commands.executeCommand(
         'workbench.action.openSettings',
         'agentMeshBridge.deepseekHarness',
       );
+    }),
+  );
+
+  // Keep the mirrored model defaults in sync with the settings. The picker
+  // writes the setting, which lands here; hand-edited settings land here too.
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (!e.affectsConfiguration('agentMeshBridge.models')) return;
+      applyModelSettings();
+      agentNodesProvider.refresh(false);
     }),
   );
 

@@ -580,6 +580,16 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}</pre>
         <div class="meta-label">Current Round</div>
         <div class="meta-val">${thread.currentRound || 1}</div>
       </div>
+      <div class="meta-item" style="grid-column: 1 / -1;">
+        <div class="meta-label">Model Routing / 模型路由 (发送 ➔ 接收)</div>
+        <div class="meta-val">
+          <strong>发送 ${escapeHtml(thread.initiatorAgent)}</strong> [${escapeHtml(thread.initiatorModel || 'Agent 默认')}${
+            thread.initiatorModelSource === 'configured' ? ' · 配置默认' : ''
+          }]
+          ➔
+          <strong>接收 ${escapeHtml(thread.targetAgent)}</strong> [${escapeHtml(thread.targetModel || 'Agent 默认')}]
+        </div>
+      </div>
       <div class="meta-item">
         <div class="meta-label">Workspace</div>
         <div class="meta-val">${escapeHtml(thread.workspacePath)}</div>

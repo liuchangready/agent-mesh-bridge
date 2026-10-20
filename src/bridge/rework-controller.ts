@@ -428,6 +428,7 @@ export class ReworkController {
           cwd: thread.workspacePath,
           taskThreadId: thread.threadId,
           taskRound: roundNumber,
+          model: thread.targetModel,
         });
       } catch (err: any) {
         result = {

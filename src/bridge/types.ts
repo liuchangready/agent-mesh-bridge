@@ -11,6 +11,9 @@ export type AgentId =
 
 export type TargetAgentSelection = 'default' | AgentId;
 
+/** How the sender/receiver model recorded on a task was determined. */
+export type ModelResolutionSource = 'explicit' | 'env' | 'configured' | 'none';
+
 export type ThreadStatus =
   | 'queued'
   | 'running'
@@ -145,6 +148,25 @@ export interface DelegationThread {
   callerSessionId?: string; // Caller session ID for reactive wake-up callbacks
   workspacePath: string; // Working directory
 
+  /**
+   * Model the sender (initiator) was running when it dispatched the task.
+   *
+   * The bridge cannot always introspect another agent's live session, so this is
+   * best-effort: an explicit `initiatorModel`, then an agent-specific env hint,
+   * then the initiator's configured default model. `initiatorModelSource` says
+   * which of those produced the value.
+   */
+  initiatorModel?: string;
+  initiatorModelSource?: ModelResolutionSource;
+
+  /**
+   * Model the receiver (target agent) runs this task with, resolved at dispatch
+   * from the explicit `model` argument or the target agent's configured default.
+   * Pinned on the task so every rework/retry round keeps one model instead of
+   * silently drifting to the agent's current default.
+   */
+  targetModel?: string;
+
   /** Latest pause/stop/interruption, if any. Cleared when execution resumes. */
   interruption?: TaskInterruption;
   /** Full interruption history, newest last. */
@@ -171,6 +193,17 @@ export interface DispatchTaskParams {
   initiatorAgent?: AgentId;
   workspacePath?: string;
   /**
+   * Model the receiver should run this task with. Omitted = the model configured
+   * for that agent in the bridge settings.
+   */
+  model?: string;
+  /**
+   * Model the caller itself is running on, recorded for the task's
+   * "sender model -> receiver model" badge. Optional; detected from the
+   * environment / configured default when omitted.
+   */
+  initiatorModel?: string;
+  /**
    * Concrete code file paths expected to be modified. Directories and glob
    * patterns are rejected so the lock scope stays per-file.
    */
@@ -185,6 +218,19 @@ export interface DispatchResult {
   targetAgent: AgentId;
   status: DispatchStatus;
   message: string;
+  /** Sender -> receiver model routing recorded on the task. */
+  modelRouting?: ModelRoutingSummary;
+}
+
+/** Compact "who sends with which model, who receives with which model" view. */
+export interface ModelRoutingSummary {
+  initiatorAgent: AgentId;
+  initiatorModel?: string;
+  initiatorModelSource: ModelResolutionSource;
+  targetAgent: AgentId;
+  targetModel?: string;
+  /** One-line human-readable form used by messages and the task tree. */
+  text: string;
 }
 
 export interface RequestReworkParams {
@@ -381,4 +427,35 @@ export function describeRoundInFlight(thread: DelegationThread, inFlight: Delega
     `a task may only have one round in flight at a time. ` +
     `Wait for round ${inFlight.round} to finish, or finalize it (retry/resume) before starting another round.`
   );
+}
+
+/**
+ * The sender model and receiver model recorded on a task.
+ *
+ * A task always shows both ends: which model the caller dispatched from and
+ * which model the receiver executes with. Missing values mean "the agent's own
+ * default", which is why they are rendered as such instead of as an empty field.
+ */
+export function getModelRouting(thread: DelegationThread): ModelRoutingSummary {
+  const initiatorModel = thread.initiatorModel;
+  const targetModel = thread.targetModel;
+  const initiatorModelSource: ModelResolutionSource = initiatorModel
+    ? thread.initiatorModelSource || 'explicit'
+    : 'none';
+  const from = initiatorModel || 'agent default';
+  const to = targetModel || 'agent default';
+  return {
+    initiatorAgent: thread.initiatorAgent,
+    initiatorModel,
+    initiatorModelSource,
+    targetAgent: thread.targetAgent,
+    targetModel,
+    text: `sender ${thread.initiatorAgent}: ${from} -> receiver ${thread.targetAgent}: ${to}`,
+  };
+}
+
+/** Localized one-liner for UI: `发送 Codex(gpt-6.1-sol) ➔ 接收 Antigravity(gemini-3.8-flash-high)`. */
+export function describeModelRouting(thread: DelegationThread): string {
+  const routing = getModelRouting(thread);
+  return `发送 ${routing.initiatorAgent}(${routing.initiatorModel || 'Agent 默认'}) ➔ 接收 ${routing.targetAgent}(${routing.targetModel || 'Agent 默认'})`;
 }

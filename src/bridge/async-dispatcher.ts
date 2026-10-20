@@ -9,6 +9,7 @@ import {
   DispatchTaskParams,
   DispatchResult,
   DispatchStatus,
+  getModelRouting,
   isTaskUnfinished,
   isValidSessionId,
   shouldResumeNativeSession,
@@ -23,6 +24,11 @@ import { findFileConflicts, validateExpectedFiles } from './file-scope';
 import { ExecutionGate, ExecutionOwner } from './execution-gate';
 import { QueueDrainer, QueuedExecution } from './queue-drainer';
 import { TaskRoleLock } from './task-role-lock';
+import {
+  normalizeModelId,
+  resolveConfiguredModel,
+  resolveInitiatorModel,
+} from './model-catalog';
 
 export class AsyncDispatcher {
   private taskStore: TaskStore;
@@ -136,6 +142,13 @@ export class AsyncDispatcher {
           new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
       );
 
+    // Record both ends of the model routing: the model the sender is on (best
+    // effort) and the model the receiver will execute with. Pinning the receiver
+    // model here keeps rework/retry rounds on one model and makes the task list
+    // show exactly what will run.
+    const initiatorModel = resolveInitiatorModel(initiatorAgent, params.initiatorModel);
+    const targetModel = normalizeModelId(params.model) || resolveConfiguredModel(targetAgent);
+
     const tempCandidate: DelegationThread = {
       threadId,
       title: params.title || 'Untitled Delegation Task',
@@ -148,6 +161,9 @@ export class AsyncDispatcher {
       receiverSessionId,
       callerSessionId,
       workspacePath,
+      initiatorModel: initiatorModel.model,
+      initiatorModelSource: initiatorModel.source,
+      targetModel,
       expectedFiles:
         expectedFilesValidation.files.length > 0 ? expectedFilesValidation.files : undefined,
       summary: {
@@ -214,9 +230,11 @@ export class AsyncDispatcher {
     }
 
     const dispatchStatus: DispatchStatus = isQueued ? 'QUEUED' : 'DISPATCHED';
+    const routing = getModelRouting(thread);
+    const modelLine = `Model routing: ${routing.text}.`;
     const message = isQueued
-      ? `Task queued (Thread: ${threadId}). ${queueDetail} It will execute when the workspace is free.`
-      : `Task successfully dispatched to ${targetAgent} (Thread: ${threadId}). Conclude your current turn and await callback.`;
+      ? `Task queued (Thread: ${threadId}). ${modelLine} ${queueDetail} It will execute when the workspace is free.`
+      : `Task successfully dispatched to ${targetAgent} (Thread: ${threadId}). ${modelLine} Conclude your current turn and await callback.`;
 
     return {
       threadId,
@@ -224,6 +242,7 @@ export class AsyncDispatcher {
       targetAgent,
       status: dispatchStatus,
       message,
+      modelRouting: routing,
     };
   }
 
@@ -330,6 +349,7 @@ export class AsyncDispatcher {
           cwd: thread.workspacePath,
           taskThreadId: thread.threadId,
           taskRound: roundNumber,
+          model: thread.targetModel,
           onStdoutChunk: (chunk: string) => {
             streamedOutput += chunk;
             try {

@@ -10,6 +10,7 @@ import {
 } from './types';
 import { AgentDetector } from './agent-detector';
 import { buildDshHeadlessCommand } from './deepseek-harness';
+import { normalizeModelId, resolveConfiguredModel, writeDshModelOverlay } from './model-catalog';
 import {
   CancellationAction,
   CancellationRegistry,
@@ -42,6 +43,12 @@ export interface RunOptions {
   /** Round being executed (used for diagnostics and receiver guard). */
   taskRound?: number;
   /**
+   * Model to run this round with. When omitted the bridge falls back to the
+   * model configured for the agent (settings -> `model-config.json`), and only
+   * then to whatever default the CLI itself ships with.
+   */
+  model?: string;
+  /**
    * Mark the launched agent as a delegated-task receiver. Defaults to `true`:
    * any process this runner starts is executing work on somebody else's behalf
    * and must not delegate further.
@@ -71,6 +78,9 @@ export class AutonomousRunner {
   private cancellationRegistry: CancellationRegistry;
   private activeChildren: Map<string, child_process.ChildProcess> = new Map();
   private localCancellations: Map<string, CancellationRequest> = new Map();
+  /** Where an unspecified model comes from; replaceable for tests. */
+  private modelResolver: (agent: AgentId) => string | undefined = (agent) =>
+    resolveConfiguredModel(agent);
 
   constructor(
     detector: AgentDetector,
@@ -118,12 +128,35 @@ export class AutonomousRunner {
   }
 
   /**
+   * Override how the default model for an agent is looked up. The default
+   * implementation reads the shared `model-config.json`, which is written by the
+   * extension host; tests inject a stub instead.
+   */
+  public setModelResolver(resolver: (agent: AgentId) => string | undefined): void {
+    this.modelResolver = resolver;
+  }
+
+  /**
+   * The model this run will actually use: an explicit per-task choice wins,
+   * otherwise the agent's configured default, otherwise the CLI's own default.
+   */
+  public resolveModel(agent: AgentId, requested?: string): string | undefined {
+    return normalizeModelId(requested) || normalizeModelId(this.modelResolver(agent));
+  }
+
+  /**
    * Builds execution command and arguments for the target agent adhering to skip-danger standards.
    */
   public buildCommand(options: RunOptions): RunCommand {
     const { agent, prompt, isRework, receiverSessionId, title } = options;
     const resolvedPath = this.detector.resolveExecutable(agent);
     const isWindows = process.platform === 'win32';
+    const model = this.resolveModel(agent, options.model);
+    // Codex accepts `--model` only on some subcommands, so the model travels as
+    // a global `-c model="..."` config override: it parses identically for a
+    // fresh run and for `exec resume`, and cannot be mistaken for a positional.
+    const codexModelArgs = model ? ['-c', `model="${model}"`] : [];
+    const modelFlagArgs = model ? ['--model', model] : [];
 
     if (agent === 'codex') {
       const exec = resolvedPath || (isWindows ? 'codex.exe' : 'codex');
@@ -136,6 +169,7 @@ export class AutonomousRunner {
         return {
           command: exec,
           args: [
+            ...codexModelArgs,
             '--ask-for-approval',
             'never',
             'exec',
@@ -154,6 +188,7 @@ export class AutonomousRunner {
         return {
           command: exec,
           args: [
+            ...codexModelArgs,
             '--ask-for-approval',
             'never',
             'exec',
@@ -185,6 +220,7 @@ export class AutonomousRunner {
                 '--dangerously-skip-permissions',
                 '--output-format',
                 'json',
+                ...modelFlagArgs,
               ]
             : [
                 '-p',
@@ -194,6 +230,7 @@ export class AutonomousRunner {
                 '--dangerously-skip-permissions',
                 '--output-format',
                 'json',
+                ...modelFlagArgs,
               ],
           useShell: false,
         };
@@ -215,6 +252,7 @@ export class AutonomousRunner {
                 '--dangerously-skip-permissions',
                 '--output-format',
                 'json',
+                ...modelFlagArgs,
               ]
             : [
                 '-p',
@@ -226,6 +264,7 @@ export class AutonomousRunner {
                 '--dangerously-skip-permissions',
                 '--output-format',
                 'json',
+                ...modelFlagArgs,
               ],
           useShell: false,
         };
@@ -248,6 +287,7 @@ export class AutonomousRunner {
             'accept-edits',
             '--output-format',
             'stream-json',
+            ...modelFlagArgs,
           ],
           useShell: false,
         };
@@ -264,6 +304,7 @@ export class AutonomousRunner {
             'accept-edits',
             '--output-format',
             'stream-json',
+            ...modelFlagArgs,
           ],
           useShell: false,
         };
@@ -280,6 +321,8 @@ export class AutonomousRunner {
           prompt,
           sessionId: isRework ? receiverSessionId : undefined,
           json: true,
+          // DSH has no `--model`; a per-run overlay patch switches the route.
+          modelOverlayPath: model ? writeDshModelOverlay(model) : undefined,
         });
         if (built) {
           return built;
@@ -290,7 +333,7 @@ export class AutonomousRunner {
     // Default generic fallback
     return {
       command: resolvedPath || agent,
-      args: ['-p', prompt],
+      args: ['-p', prompt, ...modelFlagArgs],
       useShell: isWindows,
     };
   }

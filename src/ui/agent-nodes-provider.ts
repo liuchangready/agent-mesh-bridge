@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { AgentDetector } from '../bridge/agent-detector';
 import { ActiveAgentResolver } from '../bridge/active-agent-resolver';
 import { AgentId, AgentInfo, AgentStatusType } from '../bridge/types';
+import { resolveConfiguredModel } from '../bridge/model-catalog';
 
 export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem> {
   private _onDidChangeTreeData: vscode.EventEmitter<AgentNodeItem | undefined | void> =
@@ -111,6 +112,22 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     statusSub.description = info.statusDetails || '';
     statusSub.iconPath = new vscode.ThemeIcon('pulse');
     subItems.push(statusSub);
+
+    // 1b. Configured model for this agent (click to change it)
+    const configuredModel = resolveConfiguredModel(info.id);
+    const modelSub = new AgentNodeItem(
+      `模型: ${configuredModel || 'Agent 默认'}`,
+      vscode.TreeItemCollapsibleState.None,
+    );
+    modelSub.description = '点击选择可用模型';
+    modelSub.iconPath = new vscode.ThemeIcon('chip');
+    modelSub.contextValue = 'agent_model';
+    modelSub.command = {
+      command: 'agent-mesh-bridge.selectAgentModel',
+      title: 'Select Model',
+      arguments: [item],
+    };
+    subItems.push(modelSub);
 
     // 2. Rate limit / Exhaustion recovery time (if exhausted or has rateLimit info)
     if (info.rateLimit && (info.status === 'exhausted' || info.rateLimit.isExhausted)) {

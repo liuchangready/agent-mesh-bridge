@@ -289,6 +289,16 @@ export interface DshHeadlessOptions {
   sessionId?: string;
   /** Emit newline-delimited run events (needed to capture the session id). */
   json?: boolean;
+  /**
+   * Extra patch layer overriding the model route for this run only.
+   *
+   * `dsh headless` has no `--model` flag: the model is part of the profile's
+   * `agent-default-model` route. Passing a generated overlay keeps the user's
+   * profile untouched while still letting one task pick a different model.
+   * Verified against the launcher: `dsh headless --patch <file> --dump-config`
+   * applies the overlay after the profile layer.
+   */
+  modelOverlayPath?: string;
 }
 
 /**
@@ -305,6 +315,11 @@ export function buildDshHeadlessCommand(
   if (!install) return null;
 
   const appArgs: string[] = ['headless'];
+  // Launcher options (`--patch`) parse after the profile name; passing them
+  // before it makes the launcher reject the invocation.
+  if (options.modelOverlayPath) {
+    appArgs.push('--patch', options.modelOverlayPath);
+  }
   if (options.json !== false) appArgs.push('--json');
   // `--session-id` adopts a persisted Session; never pass it for a fresh task.
   if (options.sessionId) appArgs.push('--session-id', options.sessionId);

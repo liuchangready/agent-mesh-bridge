@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { TaskStore } from '../bridge/task-store';
-import { DelegationThread } from '../bridge/types';
+import { DelegationThread, describeModelRouting, getModelRouting } from '../bridge/types';
 
 export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
   private _onDidChangeTreeData: vscode.EventEmitter<TaskTreeItem | undefined | void> =
@@ -85,7 +85,12 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     const durationText =
       durationSec > 60 ? `${Math.floor(durationSec / 60)}m${durationSec % 60}s` : `${durationSec}s`;
 
-    const description = `${statusLabel} · ${durationText}`;
+    // Both ends of the model routing are always visible: which model the sender
+    // dispatched from (↑) and which model the receiver executes with (↓).
+    const routing = getModelRouting(thread);
+    const modelBadge = ` · ↑${routing.initiatorModel || '默认'} → ↓${routing.targetModel || '默认'}`;
+
+    const description = `${statusLabel} · ${durationText}${modelBadge}`;
 
     const item = new TaskTreeItem(label, vscode.TreeItemCollapsibleState.Collapsed, thread);
     item.description = description;
@@ -140,6 +145,13 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     const outputItem = new TaskTreeItem(outputSnippet, vscode.TreeItemCollapsibleState.None);
     outputItem.iconPath = new vscode.ThemeIcon('output');
     subItems.push(outputItem);
+
+    const modelItem = new TaskTreeItem(
+      `模型: ${describeModelRouting(thread)}`,
+      vscode.TreeItemCollapsibleState.None,
+    );
+    modelItem.iconPath = new vscode.ThemeIcon('chip');
+    subItems.push(modelItem);
 
     item.subItems = subItems;
     return item;

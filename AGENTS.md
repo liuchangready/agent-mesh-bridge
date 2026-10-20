@@ -100,6 +100,7 @@ src/
 │   ├── callback-manager.ts    # 回调唤醒引擎 (Codex queue / Claude resume / Anti wake / DSH headless)
 │   ├── task-store.ts          # 1000 条任务持久化、原子写入与 LRU 淘汰
 │   ├── agent-detector.ts      # 本地可执行文件与健康度探测
+│   ├── model-catalog.ts       # 模型发现/缓存/默认值解析 (models-cache.json, model-config.json)
 │   ├── deepseek-harness.ts    # DeepSeek Harness 专属接入面 (安装探测/headless 契约/原生会话/MCP patch)
 │   └── mcp-server.ts          # MCP JSON-RPC 协议解析与工具处理
 ├── config/
@@ -118,7 +119,7 @@ src/
 
 | 工具名                    | 关键入参                                                           | 语义与行为                                                                                    |
 | :------------------------ | :----------------------------------------------------------------- | :-------------------------------------------------------------------------------------------- |
-| `dispatch_task`           | `targetAgent`, `title`, `prompt`, `expectedFiles?`, `callerSessionId?` | 异步发起新任务，`expectedFiles` 必须是**具体代码文件**（禁止目录、结尾斜杠、`*`/`?` 通配符），派发前校验失败即拒绝。只要存在任何**未完成任务**（含 `waiting_review` / `paused`）就进入任务级 FIFO 队列；接收方进程内不可用 |
+| `dispatch_task`           | `targetAgent`, `title`, `prompt`, `expectedFiles?`, `callerSessionId?`, `model?`, `initiatorModel?` | 异步发起新任务，`expectedFiles` 必须是**具体代码文件**（禁止目录、结尾斜杠、`*`/`?` 通配符），派发前校验失败即拒绝。`model?` 固定**接收方模型**（缺省用该 Agent 配置的默认模型），`initiatorModel?` 声明**发送方模型**（缺省按 环境提示 → 发送方配置默认 推断）；两端模型都随任务落账本，任务树/详情/MCP 响应统一展示 `发送 A(x) ➔ 接收 B(y)`，返修/重试沿用同一接收方模型。只要存在任何**未完成任务**（含 `waiting_review` / `paused`）就进入任务级 FIFO 队列；接收方进程内不可用 |
 | `request_rework`          | `threadId`, `feedback`                                             | **在同一个原生会话中唤醒接收方返修**，进入第 N+1 轮                                           |
 | `approve_task`            | `threadId`, `remarks?`                                             | 验收通过，标记为 `COMPLETED`，归档任务                                                        |
 | `pause_task`              | `threadId`, `reason`                                               | 暂停运行中/排队中的任务：终止 Agent 进程、轮次标记 `paused`、记录中断原因，可随后恢复          |
@@ -128,7 +129,8 @@ src/
 | `list_recent_tasks`       | `limit` (最大1000), `statusFilter?`                                | 查询任务列表（包含 `A -> B 标题 摘要` 与 `queued/running` 状态）                               |
 | `get_thread_details`      | `threadId`                                                         | 查询该任务全部轮次（提示词、30s实时输出、Diff、耗时、文件范围、最近日志）                    |
 | `get_recent_logs`         | `threadId`, `maxLines?` (默认1000)                                 | **获取运行中或历史任务最近 1,000 行实时日志**（流式捕获与磁盘持久化对齐）                      |
-| `invoke_agent`            | `targetAgent`, `prompt`                                            | 同步阻塞调用（仅限轻量即时问询）                                                              |
+| `invoke_agent`            | `targetAgent`, `prompt`, `model?`                                  | 同步阻塞调用（仅限轻量即时问询）                                                              |
+| `list_agent_models`       | `targetAgent?` (`all` 或具体 Agent), `forceRefresh?`                | **读取各 Agent 可用模型**：Antigravity 走 `agy models`、Codex 走 `codex debug models`、Claude/DSH 走各自 provider 的 `/models`；同时返回该 Agent 当前配置的默认模型 |
 | `query_agent_mesh_status` | 无                                                                 | 查询四端 Agent 在网格中的连接与版本状态                                                       |
 
 ---
@@ -209,3 +211,9 @@ code --install-extension agent-mesh-bridge-1.0.0.vsix
    - 调用者/检视方在 approve 后汇总同批改动，只创建一个 MR，推送远端，并调用 `record_merge_request`.
    - `record_merge_request` 必须持久化到 `thread.mergeRequest`（url/branch/commit/remote/baseBranch/status/summary），并在任务树与详情面板展示。
    - receiver 进程调用该工具必须被拒绝；已完成任务仍允许补记 MR。
+
+16. **模型两端必须留痕**：每条任务必须同时记录**发送方模型**与**接收方模型**。
+   - `targetModel` 在派发时解析并固定（显式 `model` → 接收方配置默认），返修/重试沿用同一模型，不得中途静默换模型。
+   - `initiatorModel` 按 `显式传参 → 环境提示（如 ANTHROPIC_MODEL / CODEX_MODEL）→ 发送方配置默认` 推断，并用 `initiatorModelSource` 标注来源，禁止把推断值伪装成用户显式选择。
+   - 任务树、详情面板、`dispatch_task` 响应、`list_recent_tasks` / `get_thread_details` 必须统一使用 `getModelRouting()` 输出 `sender A: x -> receiver B: y`，不得各写一套格式。
+   - 模型参数注入必须按各 CLI 语法落位：Codex 用全局 `-c model="..."`（在 `exec` 之前），Claude / Antigravity 用 `--model`，DSH 用一次性 `--patch` overlay（不得改写用户 profile patch）。

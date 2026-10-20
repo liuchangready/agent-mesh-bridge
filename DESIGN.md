@@ -191,6 +191,15 @@ interface ResponseAssessment {
 - **删除**：`TaskControlService.deleteTask()` 先发布 `delete` 取消请求并终止进程，再 `TaskStore.deleteTask()` 移除账本条目，并把 `{ threadId, title, statusAtDeletion, reason, by, at }` 追加到 `~/.agent-mesh-bridge/deleted_tasks.log` 墓碑日志。
 - **自动中断**：看门狗与总超时由 runner 直接写入 `interruption.kind = 'watchdog' | 'timeout'`；所有执行器通过 `TaskStore.updateRound(..., interruption)` 统一落盘，UI 在任务详情与轮次卡片中展示原因。
 
+### 2.7 模型发现与发送/接收模型路由
+
+四端 CLI 的模型能力并不一致，因此每条下发任务都同时记录**发送方模型**与**接收方模型**：
+
+- **发现（`list_agent_models`）**：Antigravity 解析 `agy models`；Codex 解析 `codex debug models`（失败时回退 `~/.codex/models_cache.json` 与 `config.toml`）；Claude Code 查询其网关的 `GET {ANTHROPIC_BASE_URL}/v1/models`（失败时回退 `sonnet/opus/haiku` 别名与 `settings.json` 的别名映射）；DeepSeek Harness 查询 provider 的 `GET {baseUrl}/models`（失败时回退 profile 路由里的模型）。结果缓存于 `~/.agent-mesh-bridge/models-cache.json`（默认 6 小时）。
+- **配置**：`agentMeshBridge.models.<agent>` 设置项（或命令 **Agent Bridge: Select Model for Agent**）写入 `~/.agent-mesh-bridge/model-config.json`，供无 VS Code API 的独立 MCP server 进程读取。
+- **注入**：Codex 用全局 `-c model="..."`（对 `exec` 与 `exec resume` 都有效，且不会误判为位置参数）；Claude 用 `--model`；Antigravity 用 `--model`；DSH 无 `--model`，改为生成一次性 overlay patch 并以 `dsh headless --patch <file>` 应用（`--dump-config` 已验证：只覆盖本次运行的 `agent-default-model` 与 `llm-pi-ai`，不改用户 profile）。
+- **记录**：`dispatch_task` 把 `initiatorModel`（显式传参 → 环境提示 → 发送方配置默认）与 `targetModel`（显式 `model` → 接收方配置默认）落到账本；返修/重试沿用同一 `targetModel`，避免中途换模型。任务树、详情面板与 MCP 响应统一用 `getModelRouting()` 输出 `sender A: x -> receiver B: y`。
+
 ---
 
 ## 3. 核心业务流程与交互时序
@@ -283,6 +292,11 @@ export interface DelegationThread {
   receiverSessionCaptured?: boolean; // 是否已捕获真实原生会话（决定暂停恢复能否续聊）
   callerSessionId?: string; // 发起方会话 ID (用于回调定位)
   workspacePath: string; // 执行工作区绝对路径
+
+  // 模型路由 (任务列表/详情/MCP 响应都展示两端)
+  initiatorModel?: string; // 发送方模型 (显式 > 环境提示 > 配置默认)
+  initiatorModelSource?: 'explicit' | 'env' | 'configured' | 'none';
+  targetModel?: string; // 接收方模型 (显式 model > 接收方配置默认), 返修/重试沿用
 
   // 中断追溯
   interruption?: TaskInterruption; // 最近一次暂停/停止/超时

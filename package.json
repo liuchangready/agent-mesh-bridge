@@ -82,6 +82,11 @@
         "title": "Agent Bridge: Switch Active Agent"
       },
       {
+        "command": "agent-mesh-bridge.selectAgentModel",
+        "title": "Agent Bridge: Select Model for Agent / 选择默认模型",
+        "icon": "$(chip)"
+      },
+      {
         "command": "agent-mesh-bridge.openTaskDetail",
         "title": "Open Task Details"
       },
@@ -152,6 +157,11 @@
           "group": "1_actions"
         },
         {
+          "command": "agent-mesh-bridge.selectAgentModel",
+          "when": "view == agent-mesh-bridge.agent-nodes",
+          "group": "1_actions"
+        },
+        {
           "command": "agent-mesh-bridge.openTaskDetail",
           "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
           "group": "inline"
@@ -207,6 +217,26 @@
           ],
           "default": "auto",
           "description": "Default target agent for task delegation when not explicitly specified."
+        },
+        "agentMeshBridge.models.antigravity": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Default model for Google Antigravity (forwarded as `agy --model`). Leave empty to keep the agent's own default. Run **Agent Bridge: Select Model for Agent** to choose from the models reported by `agy models`."
+        },
+        "agentMeshBridge.models.codex": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Default model for OpenAI Codex (forwarded as `codex -c model=\"...\"`, so it also applies to resumed sessions). Leave empty to keep the agent's own default. Run **Agent Bridge: Select Model for Agent** to choose from the models reported by `codex debug models`."
+        },
+        "agentMeshBridge.models.claudeCode": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Default model for Anthropic Claude Code (forwarded as `claude --model`). Accepts an alias such as `sonnet`/`opus`/`haiku` or a full model id. Leave empty to keep the agent's own default."
+        },
+        "agentMeshBridge.models.deepseekHarness": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Default model for bridge-launched DeepSeek Harness runs. DSH has no `--model` flag, so each run receives a generated profile overlay; this requires a configured provider route (`#agentMeshBridge.deepseekHarness.provider#`). Leave empty to keep the route's own model."
         },
         "agentMeshBridge.maxTasks": {
           "type": "number",

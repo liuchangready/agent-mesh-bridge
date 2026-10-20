@@ -87,7 +87,7 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(res.result.capabilities.tools);
   });
 
-  test('should handle tools/list and return all 12 specified tools', async () => {
+  test('should handle tools/list and return all 13 specified tools', async () => {
     const listReq = {
       jsonrpc: '2.0',
       id: 2,
@@ -113,7 +113,8 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(toolNames.includes('invoke_agent'));
     assert.ok(toolNames.includes('query_agent_mesh_status'));
     assert.ok(toolNames.includes('get_recent_logs'));
-    assert.strictEqual(toolNames.length, 12);
+    assert.ok(toolNames.includes('list_agent_models'));
+    assert.strictEqual(toolNames.length, 13);
   });
 
   test('should execute dispatch_task, get_thread_details, request_rework, and approve_task via tools/call', async () => {
