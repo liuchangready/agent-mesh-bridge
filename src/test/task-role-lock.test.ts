@@ -123,6 +123,7 @@ describe('Task role enforcement in execution', () => {
     };
     const callbackManager = new CallbackManager(detector);
     callbackManager.notifyCaller = async () => true;
+    callbackManager.notifyCallerOfFailure = async () => false;
     const supervisor = new TaskSupervisor(
       store,
       runner,

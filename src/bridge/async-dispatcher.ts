@@ -12,6 +12,7 @@ import {
   getModelRouting,
   isTaskUnfinished,
   isValidSessionId,
+  isUserInterruption,
   shouldResumeNativeSession,
 } from './types';
 import { TaskStore } from './task-store';
@@ -20,7 +21,14 @@ import { ActiveAgentResolver } from './active-agent-resolver';
 import { AutonomousRunner, RunResult } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
 import { TaskSupervisor } from './task-supervisor';
-import { findFileConflicts, validateExpectedFiles } from './file-scope';
+import {
+  findFileConflicts,
+  validateExpectedFiles,
+  findScopeConflicts,
+  describeScopeConflict,
+  ScopeConflict,
+} from './file-scope';
+import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
 import { ExecutionGate, ExecutionOwner } from './execution-gate';
 import { QueueDrainer, QueuedExecution } from './queue-drainer';
 import { TaskRoleLock } from './task-role-lock';
@@ -103,6 +111,20 @@ export class AsyncDispatcher {
           `Use concrete code file paths (e.g. ["src/service/foo.ts"]), never folders or glob patterns.`,
       );
     }
+    // A declared scope is what lets the bridge refuse to start this task on a
+    // file another open task already changed. Callers that genuinely touch no
+    // workspace file must say so explicitly instead of silently omitting it.
+    if (
+      expectedFilesValidation.files.length === 0 &&
+      params.requireScope === true &&
+      !params.allowNoScope
+    ) {
+      throw new Error(
+        `dispatch_task requires expectedFiles for task "${params.title}": list the concrete code files this ` +
+          `task will modify (e.g. ["engine/src/main/kotlin/Foo.kt"]) so two tasks cannot edit the same file. ` +
+          `If the task touches no workspace file, pass allowNoScope: true.`,
+      );
+    }
 
     let callerSessionId =
       params.callerSessionId && isValidSessionId(params.callerSessionId)
@@ -134,13 +156,16 @@ export class AsyncDispatcher {
     this.taskStore.loadFromDisk();
     // Task-level queue: one unfinished task (including waiting_review/paused)
     // blocks every younger task, regardless of whether a round is in flight.
-    const activeTasks = this.taskStore
-      .getAllTasks()
+    const allKnownTasks = this.taskStore.getAllTasks();
+    const activeTasks = allKnownTasks
       .filter((t) => t.threadId !== threadId && isTaskUnfinished(t))
       .sort(
         (a, b) =>
           new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
       );
+    // The scope gate also looks at accepted-but-unmerged tasks: their edits are
+    // still in the working tree even though they no longer hold the queue.
+    const scopePeers = allKnownTasks.filter((t) => t.threadId !== threadId);
 
     // Record both ends of the model routing: the model the sender is on (best
     // effort) and the model the receiver will execute with. Pinning the receiver
@@ -166,6 +191,7 @@ export class AsyncDispatcher {
       targetModel,
       expectedFiles:
         expectedFilesValidation.files.length > 0 ? expectedFilesValidation.files : undefined,
+      scopeOverride: params.allowScopeOverlap ? true : undefined,
       summary: {
         lastPromptSnippet: (params.prompt || '').slice(0, 100),
         lastOutputSnippet: 'Executing in background...',
@@ -175,14 +201,24 @@ export class AsyncDispatcher {
     };
 
     const conflict = findFileConflicts(tempCandidate, activeTasks);
+    // Batch-level scope gate: refuse to schedule a task whose declared files are
+    // still owned by another open task (declared or actually touched).
+    const scopeConflict = findScopeConflicts(tempCandidate, scopePeers);
     const gateOwner = this.executionGate.getOwner();
     const globalOwner = gateOwner && gateOwner.threadId !== threadId ? gateOwner : undefined;
     const blockingTask = activeTasks[0];
     const globallyBusy = !!globalOwner || !!blockingTask;
-    const isQueued = conflict.hasConflict || globallyBusy;
+    const isQueued = conflict.hasConflict || !!scopeConflict || globallyBusy;
 
     let queueDetail = '';
-    if (conflict.hasConflict && conflict.conflictingThread) {
+    if (scopeConflict) {
+      tempCandidate.scopeBlockedBy = {
+        threadId: scopeConflict.threadId,
+        title: scopeConflict.title,
+        files: scopeConflict.files,
+      };
+      queueDetail = describeScopeConflict(scopeConflict);
+    } else if (conflict.hasConflict && conflict.conflictingThread) {
       queueDetail = `Queued: Waiting for task ${conflict.conflictingThread.threadId} to release the same file(s) [${(conflict.conflictingFiles || []).join(', ')}]`;
     } else if (globalOwner) {
       queueDetail = `Queued: Waiting for task ${globalOwner.threadId} (round ${globalOwner.round}) to finish; tasks execute strictly one at a time.`;
@@ -255,6 +291,22 @@ export class AsyncDispatcher {
     prompt: string,
     isRework: boolean,
   ): Promise<void> {
+    // Batch-level scope gate: never start a round on files another open task is
+    // still holding (declared or measured). Checked before any lease is taken so
+    // a blocked task cannot sit on the global slot.
+    this.taskStore.loadFromDisk();
+    const scopeConflict = findScopeConflicts(thread, this.taskStore.getAllTasks());
+    if (scopeConflict) {
+      this.markThreadQueued(
+        thread,
+        undefined,
+        describeScopeConflict(scopeConflict),
+        scopeConflict,
+      );
+      this.queueDrainer.schedule(1_500);
+      return;
+    }
+
     // Per-task role exclusivity: the developer may only run after the reviewer
     // has handed off (request_rework/approve_task), and never while another
     // reviewer/developer process owns the task.
@@ -299,6 +351,7 @@ export class AsyncDispatcher {
       }
       const current = stored;
       current.status = isRework ? 'reworking' : 'running';
+      current.scopeBlockedBy = undefined;
       current.summary.lastOutputSnippet = 'Executing in background...';
       if (thread.targetAgent === 'claude_code' && !isRework) {
         current.receiverSessionCaptured = true;
@@ -339,6 +392,10 @@ export class AsyncDispatcher {
       } catch {}
 
       let result: RunResult;
+      // Baseline right before the agent starts: the diff afterwards tells us
+      // exactly which files this round changed, even if the caller declared
+      // nothing or the agent edited outside its declared scope.
+      const scopeBefore = captureWorkspaceSnapshot(thread.workspacePath);
       try {
         result = await this.runner.execute({
           agent: thread.targetAgent,
@@ -350,6 +407,7 @@ export class AsyncDispatcher {
           taskThreadId: thread.threadId,
           taskRound: roundNumber,
           model: thread.targetModel,
+          onChildPid: (pid) => this.executionGate.attachChildPid(pid),
           onStdoutChunk: (chunk: string) => {
             streamedOutput += chunk;
             try {
@@ -378,6 +436,13 @@ export class AsyncDispatcher {
           streamTimer = null;
         }
       }
+
+      // Attribute the files this round changed while the tree state is still
+      // fresh (a pause between here and the finalize below must not lose it).
+      const touchedFiles = diffWorkspaceSnapshots(
+        scopeBefore,
+        captureWorkspaceSnapshot(thread.workspacePath),
+      );
 
       this.taskStore.loadFromDisk();
       const latest = this.taskStore.getTask(thread.threadId);
@@ -420,6 +485,7 @@ export class AsyncDispatcher {
           durationMs: result.durationMs,
           status: finalRoundStatus,
           assessment: result.assessment,
+          touchedFiles: touchedFiles.length > 0 ? touchedFiles : undefined,
         },
         finalThreadStatus,
         nativeSessionId,
@@ -427,12 +493,21 @@ export class AsyncDispatcher {
         interruption,
       );
 
-      if (updatedThread && !interruption && this.taskStore.getTask(updatedThread.threadId)) {
+      if (updatedThread && this.taskStore.getTask(updatedThread.threadId)) {
         const completedRound = updatedThread.rounds.find((r) => r.round === roundNumber);
         if (completedRound) {
           // Hand the task from developer to reviewer.
           roleLock.release(roleLease);
-          await this.callbackManager.notifyCaller(updatedThread, completedRound);
+          if (!interruption && isSuccess) {
+            await this.callbackManager.notifyCaller(updatedThread, completedRound);
+          } else if (!isUserInterruption(interruption)) {
+            const notified = await this.callbackManager.notifyCallerOfFailure(
+              updatedThread,
+              roundNumber,
+              result,
+            );
+            if (notified) this.taskStore.upsertTask(updatedThread);
+          }
         }
       }
     } finally {
@@ -458,6 +533,7 @@ export class AsyncDispatcher {
     thread: DelegationThread,
     owner?: ExecutionOwner,
     detail?: string,
+    scopeConflict?: ScopeConflict,
   ): void {
     const fresh = this.taskStore.getTask(thread.threadId) || thread;
     const message =
@@ -465,7 +541,16 @@ export class AsyncDispatcher {
       (owner
         ? `Queued: Waiting for task ${owner.threadId} (round ${owner.round}) to finish; tasks execute strictly one at a time.`
         : 'Queued: Waiting for the current task to finish; tasks execute strictly one at a time.');
-    if (fresh.status === 'queued' && fresh.summary.lastOutputSnippet === message) return;
+    // Persist on the object that is actually written, not on the caller's copy.
+    const nextBlock = scopeConflict
+      ? { threadId: scopeConflict.threadId, title: scopeConflict.title, files: scopeConflict.files }
+      : undefined;
+    const blockChanged =
+      JSON.stringify(fresh.scopeBlockedBy || null) !== JSON.stringify(nextBlock || null);
+    fresh.scopeBlockedBy = nextBlock;
+    if (fresh.status === 'queued' && fresh.summary.lastOutputSnippet === message && !blockChanged) {
+      return;
+    }
 
     fresh.status = 'queued';
     fresh.summary.lastOutputSnippet = message;

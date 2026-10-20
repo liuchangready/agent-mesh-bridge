@@ -91,10 +91,18 @@ flowchart TD
    - 跨进程文件监听与原子写入。
 7. **`ExecutionGate`（跨进程全局单飞）**：
    - 以 `~/.agent-mesh-bridge/execution.lock` 的原子 `wx` 创建作为唯一裁决点，协调“扩展宿主 supervisor + 各 Agent 独立 MCP server”多个进程；
-   - 5 秒心跳刷新、30 秒僵尸判定、按 token 安全释放；进程崩溃后锁可被安全接管。
+   - 5 秒心跳刷新、30 秒僵尸判定、按 token 安全释放；进程崩溃后锁可被安全接管；
+   - 锁内额外记录真实 Agent 子进程 `childPid`（spawn 后由 `onChildPid` 回填、子进程退出时清空）。Windows 上父进程崩溃不会连带杀掉子进程，因此存活判定必须同时探活宿主与子进程：宿主已死但子进程仍在时，租约在整个**孤儿宽限期**（默认 120s）内仍视为占用；超过宽限期则先 `taskkill /T /F` 杀掉孤儿，再接管锁，避免新轮次与残留 Agent 同时改同一工作区；
+   - `pause_task` / `delete_task` 会调用 `killOrphanChild(threadId)`：宿主存活时交给其自身的取消轮询，宿主已死时直接杀掉锁里记录的孤儿进程。
 8. **`QueueDrainer`（回退队列泵）**：
    - 无常驻 supervisor 时，轮次结束后由当前 MCP 进程按 FIFO 继续泵下一轮；
    - 每个进程都可以泵，但只有拿到 `ExecutionGate` 租约的进程真正执行。
+9. **`git-probe` + scope gate（文件归属互斥）**：
+   - 单飞锁只解决「不同时改」。两个任务先后改同一文件、后一个覆盖前一个未收口的改动，锁管不到。
+   - 每个轮次在 spawn 前 `captureWorkspaceSnapshot()`、结束后 `diffWorkspaceSnapshots()`，把本轮**实际改动**的文件写入 `round.touchedFiles`（`git status --porcelain=v1 -z` 签名对比 + HEAD 变化；非 git 工作区返回空）。
+   - 启动任何轮次前 `findScopeConflicts(candidate, others)`：候选 `expectedFiles` 与**未收口任务**的 `expectedFiles ∪ touchedFiles` 有交集即拒绝启动，置 `queued` 并记录 `thread.scopeBlockedBy`。
+   - 「未收口」= 未完成任务，或已完成但没有 `mergeRequest` 且在 24h 内；`failed` 不阻塞。
+   - 放行：`allow_scope_overlap(threadId)` 或派发时 `allowScopeOverlap: true`。`dispatch_task` 必须声明 `expectedFiles`，除非显式 `allowNoScope: true`。
 
 ### 2.1 运行时三条硬准则
 
@@ -392,12 +400,15 @@ export interface DelegationRound {
   - `remarks` (string, 可选): 最终总结或确认信息
 - **返回值**：`{ threadId, status: "COMPLETED", message: "Task approved and archived." }`
 
-### 3.1 `pause_task` / `resume_task` / `delete_task`（暂停、恢复、删除）
+### 3.1 `pause_task` / `resume_task` / `retry_task` / `delete_task`（暂停、恢复、重试、删除）
 
 - **`pause_task(threadId, reason)`**：终止运行中的 Agent 进程，轮次标记 `paused`，记录中断原因；排队中的任务只标记暂停。
 - **`resume_task(threadId)`**：恢复暂停轮次；已捕获原生会话时续聊，否则以初始轮重新执行。
+- **`retry_task(threadId)`**：原地重跑失败轮——复用同一轮号、同一 prompt、同一原生会话，不追加新轮次。调用者想「把原任务再做一遍」时用它；把原始 prompt 原样传给 `request_rework` 会在账本里留下两条指令完全相同的轮次（`repeatOfRound` 会标记这种重复）。
 - **`delete_task(threadId, reason)`**：先终止进程，再移除账本条目；原因写入 `deleted_tasks.log` 墓碑日志。
-- 三者均为控制面操作，接收方进程不能对自己正在执行的任务调用。
+- 失败回调：轮次进入 `failed` 时，`CallbackManager.notifyCallerOfFailure()` 会唤醒调用方并给出上述处置选项；同一轮只通知一次（`thread.failureNotifications`），每个任务最多 3 次，`paused`/`stopped` 等用户主动中断不通知。
+- 四者均为控制面操作，接收方进程不能对自己正在执行的任务调用。
+- 失败轮若仍持有已捕获的原生会话，`AutonomousRunner` 的进程内重试（网络抖动）会**续聊该会话**，而不是另开一个新会话重做整件事。
 
 ### 4. `list_recent_tasks`（查询历史任务列表）
 
@@ -477,6 +488,7 @@ D:\agent_bridge\
 │   │   ├── types.ts               # DelegationThread, AgentId, Round 等类型定义
 │   │   ├── active-agent-resolver.ts# 默认 Agent 探测与选路算法
 │   │   ├── execution-gate.ts      # 跨进程全局单飞租约 (execution.lock)
+│   │   ├── git-probe.ts           # 轮次改动测量 (git status 前后快照 -> round.touchedFiles)
 │   │   ├── cancellation-registry.ts# 跨进程暂停/删除信号
 │   │   ├── task-role-lock.ts      # 单任务 reviewer/developer 角色锁
 │   │   ├── task-control.ts        # 暂停/删除控制面与删除墓碑

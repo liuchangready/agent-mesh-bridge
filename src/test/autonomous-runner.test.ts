@@ -352,6 +352,155 @@ describe('AutonomousRunner Tests', () => {
     assert.strictEqual(runner.isTransientError(successRes), false);
   });
 
+  test('should treat the DSH transport connection error as transient and retryable', () => {
+    const transportFailure = {
+      exitCode: 1,
+      stdout: '',
+      stderr: 'dsh: TRANSPORT: Connection error.',
+      extractedOutput: '',
+      durationMs: 900,
+      error: 'dsh: TRANSPORT: Connection error.',
+    };
+    assert.strictEqual(runner.isTransportFailure(transportFailure), true);
+    assert.strictEqual(runner.isTransientError(transportFailure), true);
+    assert.strictEqual(runner.isRetryableFailure(transportFailure), true);
+
+    // A genuine failure must not be replayed just because it mentions a socket.
+    const realFailure = {
+      exitCode: 1,
+      stdout: '',
+      stderr: 'error TS2304: Cannot find name "connection".',
+      extractedOutput: '',
+      durationMs: 12_000,
+    };
+    assert.strictEqual(runner.isTransportFailure(realFailure), false);
+    assert.strictEqual(runner.isRetryableFailure(realFailure), false);
+  });
+
+  test('should retry a dropped transport that still exited 0 with no final answer', () => {
+    const emptyStream = {
+      chunkCount: 1,
+      stdoutBytes: 0,
+      stderrBytes: 34,
+      maxGapMs: 0,
+      gapThresholdMs: 600_000,
+      hasActualOutput: false,
+      continuous: true,
+    };
+    const swallowedTransport = {
+      exitCode: 0,
+      stdout: '',
+      stderr: 'dsh: TRANSPORT: Connection error.',
+      extractedOutput: '',
+      durationMs: 800,
+      assessment: {
+        success: false,
+        errorCode: 'EMPTY_OUTPUT',
+        exitCode: 0,
+        stream: emptyStream,
+        reason: 'no final answer',
+      },
+    };
+    assert.strictEqual(runner.isRetryableFailure(swallowedTransport as any), true);
+
+    // Exit 0 + empty output with no transport evidence stays a hard failure.
+    const quietEmpty = {
+      ...swallowedTransport,
+      stderr: '',
+      assessment: { ...swallowedTransport.assessment, reason: 'no final answer' },
+    };
+    assert.strictEqual(runner.isRetryableFailure(quietEmpty as any), false);
+
+    // A paused/stopped run must never be revived by the retry loop.
+    const paused = {
+      ...swallowedTransport,
+      exitCode: 1,
+      interruption: { kind: 'paused', reason: 'user pause', at: new Date().toISOString() },
+    };
+    assert.strictEqual(runner.isRetryableFailure(paused as any), false);
+  });
+
+  test('execute replays the same prompt after a transport drop and returns the good attempt', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-retry-'));
+    const counterFile = path.join(tempDir, 'attempts.txt');
+    const retryRunner = new AutonomousRunner(detector);
+    retryRunner.buildCommand = () => {
+      const seen = fs.existsSync(counterFile) ? Number(fs.readFileSync(counterFile, 'utf8')) : 0;
+      fs.writeFileSync(counterFile, String(seen + 1));
+      const script =
+        seen === 0
+          ? 'process.stderr.write("dsh: TRANSPORT: Connection error.\\n"); process.exit(0);'
+          : 'process.stdout.write("recovered answer\\n");';
+      return { command: process.execPath, args: ['-e', script], useShell: false };
+    };
+
+    try {
+      const result = await retryRunner.execute({
+        agent: 'deepseek_harness',
+        prompt: 'same prompt',
+        isRework: false,
+        receiverSessionId: 'session-retry',
+        maxRetries: 2,
+        retryBackoffMs: 10,
+      });
+
+      assert.strictEqual(result.exitCode, 0);
+      assert.strictEqual(result.assessment?.success, true);
+      assert.match(result.extractedOutput, /recovered answer/);
+      assert.strictEqual(fs.readFileSync(counterFile, 'utf8').trim(), '2');
+    } finally {
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
+  test('execute resumes the native session opened by the failed attempt instead of starting a new one', async () => {
+    const retryRunner = new AutonomousRunner(detector);
+    const seen: any[] = [];
+    retryRunner.executeOnce = async (options: any) => {
+      seen.push(options);
+      if (seen.length === 1) {
+        return {
+          exitCode: 1,
+          stdout: '',
+          stderr: 'dsh: TRANSPORT: Connection error.',
+          extractedOutput: '',
+          durationMs: 5,
+          actualSessionId: 'session-carried-1',
+          error: 'dsh: TRANSPORT: Connection error.',
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: 'done',
+        stderr: '',
+        extractedOutput: 'done',
+        durationMs: 5,
+        actualSessionId: 'session-carried-1',
+      };
+    };
+
+    const result = await retryRunner.execute({
+      agent: 'deepseek_harness',
+      prompt: 'same prompt',
+      isRework: false,
+      receiverSessionId: '',
+      maxRetries: 1,
+      retryBackoffMs: 5,
+    });
+
+    assert.strictEqual(result.exitCode, 0);
+    assert.strictEqual(seen.length, 2);
+    assert.strictEqual(seen[0].isRework, false);
+    assert.strictEqual(
+      seen[1].isRework,
+      true,
+      'the retry must continue the session the failed attempt already opened',
+    );
+    assert.strictEqual(seen[1].receiverSessionId, 'session-carried-1');
+  });
+
   test('should distinguish rate limit errors from innocent code outputs, hashes, UUIDs and line numbers', () => {
     // Innocent patterns that should NOT trigger rate limiting
     assert.strictEqual(

@@ -243,3 +243,99 @@ export function findFileConflicts(
 
   return { hasConflict: false };
 }
+
+/**
+ * How long a task that finished without a recorded merge request keeps blocking
+ * later tasks from the same files.
+ *
+ * Unmerged work is the real hazard: a task that was accepted but never pushed
+ * still lives in the working tree, and the next task would overwrite it. The
+ * window keeps that protection meaningful without letting an ancient ledger
+ * entry block the workspace forever.
+ */
+export const SCOPE_BLOCK_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+export interface ScopeConflict {
+  /** Task that already owns the overlapping files. */
+  threadId: string;
+  title?: string;
+  /** Declared file(s) of the candidate that overlap. */
+  files: string[];
+}
+
+/** Every file a task is known to have touched: declared scope + measured changes. */
+export function knownTaskFiles(thread: DelegationThread): string[] {
+  const files = new Set<string>(thread.expectedFiles || []);
+  for (const round of thread.rounds || []) {
+    for (const touched of round.touchedFiles || []) files.add(touched);
+  }
+  return [...files];
+}
+
+/** True when another open task still occupies this task's declared files. */
+function isScopeBlocking(thread: DelegationThread, now: number): boolean {
+  if (thread.status === 'failed') return false; // terminal; caller decides
+  if (thread.status === 'completed') {
+    if (thread.mergeRequest) return false; //收口完成：改动已经推出工作区
+    const updated = new Date(thread.updatedAt || thread.createdAt || 0).getTime();
+    if (!Number.isFinite(updated)) return false;
+    return now - updated <= SCOPE_BLOCK_WINDOW_MS;
+  }
+  return true; // queued / running / reworking / waiting_review / paused
+}
+
+/**
+ * Batch-level scope gate.
+ *
+ * A task may only start when none of the files it declares are already owned by
+ * another open task — either declared by it or actually touched by one of its
+ * rounds. This is what stops a later task from silently overwriting an earlier
+ * task's uncommitted work, since the global single-flight lock only prevents
+ * *simultaneous* edits.
+ *
+ * Tasks without a declared scope cannot be checked up front; their measured
+ * `touchedFiles` still protect everyone who runs after them.
+ */
+export function findScopeConflicts(
+  candidate: DelegationThread,
+  others: DelegationThread[],
+  now: number = Date.now(),
+): ScopeConflict | undefined {
+  if (candidate.scopeOverride) return undefined;
+  const declared = candidate.expectedFiles || [];
+  if (declared.length === 0) return undefined;
+
+  for (const other of others) {
+    if (other.threadId === candidate.threadId) continue;
+    if (!isScopeBlocking(other, now)) continue;
+
+    const theirs = knownTaskFiles(other);
+    if (theirs.length === 0) continue;
+
+    const overlapping: string[] = [];
+    for (const file of declared) {
+      const normalized = normalizeWorkspacePath(file, candidate.workspacePath);
+      const hit = theirs.some(
+        (otherFile) =>
+          doPathsConflict(normalized, normalizeWorkspacePath(otherFile, other.workspacePath)),
+      );
+      if (hit) overlapping.push(file);
+    }
+
+    if (overlapping.length > 0) {
+      return { threadId: other.threadId, title: other.title, files: overlapping };
+    }
+  }
+
+  return undefined;
+}
+
+/** Human-readable queue reason for a scope-blocked task. */
+export function describeScopeConflict(conflict: ScopeConflict): string {
+  const files = conflict.files.join(', ');
+  return (
+    `Queued (scope): file(s) [${files}] are already owned by task ${conflict.threadId}` +
+    `${conflict.title ? ` "${conflict.title}"` : ''}, which has not been closed out yet. ` +
+    `Finish it (approve_task + record_merge_request) or call allow_scope_overlap to override.`
+  );
+}

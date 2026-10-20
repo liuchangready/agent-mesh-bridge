@@ -9,6 +9,7 @@ import {
   describeRoundInFlight,
   findInFlightRound,
   isTaskUnfinished,
+  isUserInterruption,
   nextRoundNumber,
   shouldResumeNativeSession,
 } from './types';
@@ -17,6 +18,8 @@ import { AgentDetector } from './agent-detector';
 import { AutonomousRunner } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
 import { TaskSupervisor } from './task-supervisor';
+import { findScopeConflicts, describeScopeConflict, ScopeConflict } from './file-scope';
+import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
 import { ExecutionGate, ExecutionOwner } from './execution-gate';
 import { QueueDrainer, QueuedExecution } from './queue-drainer';
 import { CancellationRegistry } from './cancellation-registry';
@@ -87,6 +90,23 @@ export class ReworkController {
       durationMs: 0,
       timestamp: nowIso,
     };
+
+    // A caller with nothing new to say re-sends the original instruction to mean
+    // "do it again". Record that explicitly so the ledger reads as a repeat of an
+    // earlier round rather than as a second, independent task.
+    const previousRound = thread.rounds[thread.rounds.length - 1];
+    const normalizedFeedback = (params.feedback || '').trim();
+    if (
+      previousRound?.prompt &&
+      normalizedFeedback.length > 0 &&
+      previousRound.prompt.trim() === normalizedFeedback
+    ) {
+      reworkRound.repeatOfRound = previousRound.round;
+      console.warn(
+        `[ReworkController] Round ${nextRound} of ${thread.threadId} repeats the instruction of round ${previousRound.round} verbatim; ` +
+          `use retry_task to re-run a failed round in place instead of re-sending its prompt.`,
+      );
+    }
 
     thread.currentRound = nextRound;
     thread.status = 'reworking';
@@ -364,6 +384,16 @@ export class ReworkController {
     feedback: string,
     isRework: boolean = true,
   ): Promise<void> {
+    // Batch-level scope gate: a rework/retry round must not start on files that
+    // another open task still owns, otherwise it would rewrite their work.
+    this.taskStore.loadFromDisk();
+    const scopeConflict = findScopeConflicts(thread, this.taskStore.getAllTasks());
+    if (scopeConflict) {
+      this.markQueued(thread, undefined, describeScopeConflict(scopeConflict), scopeConflict);
+      this.queueDrainer.schedule(1_500);
+      return;
+    }
+
     // A reviewer decision creates the next developer round, but the developer
     // must not start until the reviewer role has handed off. This also blocks
     // a second reviewer/developer process for the same task.
@@ -404,6 +434,7 @@ export class ReworkController {
       }
       const current = stored;
       current.status = isRework ? 'reworking' : 'running';
+      current.scopeBlockedBy = undefined;
       current.summary.lastOutputSnippet = 'Executing in background...';
       if (thread.targetAgent === 'claude_code' && !isRework) {
         // Claude's preassigned --session-id is the native session id.
@@ -418,6 +449,7 @@ export class ReworkController {
       );
 
       let result;
+      const scopeBefore = captureWorkspaceSnapshot(thread.workspacePath);
       try {
         result = await this.runner.execute({
           agent: thread.targetAgent,
@@ -429,6 +461,9 @@ export class ReworkController {
           taskThreadId: thread.threadId,
           taskRound: roundNumber,
           model: thread.targetModel,
+          // Record the real agent child so a crashed host cannot leave an orphan
+          // editing the workspace while the next task starts.
+          onChildPid: (pid) => this.executionGate.attachChildPid(pid),
         });
       } catch (err: any) {
         result = {
@@ -440,6 +475,11 @@ export class ReworkController {
           error: `Execution error: ${err?.message || err}`,
         };
       }
+
+      const touchedFiles = diffWorkspaceSnapshots(
+        scopeBefore,
+        captureWorkspaceSnapshot(thread.workspacePath),
+      );
 
       this.taskStore.loadFromDisk();
       const latest = this.taskStore.getTask(thread.threadId);
@@ -482,6 +522,7 @@ export class ReworkController {
           durationMs: result.durationMs,
           status: finalRoundStatus,
           assessment: result.assessment,
+          touchedFiles: touchedFiles.length > 0 ? touchedFiles : undefined,
         },
         finalThreadStatus,
         nativeSessionId,
@@ -489,12 +530,23 @@ export class ReworkController {
         interruption,
       );
 
-      if (updatedThread && !interruption && this.taskStore.getTask(updatedThread.threadId)) {
+      if (updatedThread && this.taskStore.getTask(updatedThread.threadId)) {
         const completedRound = updatedThread.rounds.find((r) => r.round === roundNumber);
         if (completedRound) {
           // Hand the task from developer to reviewer.
           roleLock.release(roleLease);
-          await this.callbackManager.notifyCaller(updatedThread, completedRound);
+          if (!interruption && isSuccess) {
+            await this.callbackManager.notifyCaller(updatedThread, completedRound);
+          } else if (!isUserInterruption(interruption)) {
+            // The receiver died; the caller must learn about it, otherwise the
+            // task silently rots in `failed` until somebody polls the ledger.
+            const notified = await this.callbackManager.notifyCallerOfFailure(
+              updatedThread,
+              roundNumber,
+              result,
+            );
+            if (notified) this.taskStore.upsertTask(updatedThread);
+          }
         }
       }
     } finally {
@@ -527,13 +579,22 @@ export class ReworkController {
     thread: DelegationThread,
     owner?: ExecutionOwner,
     detail?: string,
+    scopeConflict?: ScopeConflict,
   ): void {
     const message =
       detail ||
       (owner
         ? `Queued: Waiting for task ${owner.threadId} (round ${owner.round}) to finish; tasks execute strictly one at a time.`
         : 'Queued: Waiting for the current task to finish; tasks execute strictly one at a time.');
-    if (thread.status === 'queued' && thread.summary.lastOutputSnippet === message) return;
+    const nextBlock = scopeConflict
+      ? { threadId: scopeConflict.threadId, title: scopeConflict.title, files: scopeConflict.files }
+      : undefined;
+    const blockChanged =
+      JSON.stringify(thread.scopeBlockedBy || null) !== JSON.stringify(nextBlock || null);
+    thread.scopeBlockedBy = nextBlock;
+    if (thread.status === 'queued' && thread.summary.lastOutputSnippet === message && !blockChanged) {
+      return;
+    }
 
     thread.status = 'queued';
     thread.summary.lastOutputSnippet = message;

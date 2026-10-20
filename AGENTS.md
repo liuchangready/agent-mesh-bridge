@@ -44,6 +44,13 @@
       - `RunResult.assessment` 必须持久化到 `round.assessment`，字段包括 `success`、`errorCode`、`exitCode`、`stream.{chunkCount, stdoutBytes, stderrBytes, firstOutputAtMs, lastOutputAtMs, maxGapMs, gapThresholdMs, hasActualOutput, continuous}`。
       - 任何 `exitCode === 0` 但不能提取实际输出（例如只有 JSON status/metadata）的轮次必须判定为 `failed`，不得进入 `waiting_review`，更不得唤醒 reviewer。
 
+  17. **文件归属互斥（scope gate，硬不变量）**：全局单飞只保证「不同时改」，**不保证「不重复改」**——同一文件被前后两个任务先后覆盖，锁管不到。因此：
+      - `dispatch_task` 必须声明 `expectedFiles`（具体代码文件）；确实不触碰工作区文件的，显式传 `allowNoScope: true`。
+      - 每个轮次用 git probe 测量**实际改动了哪些文件**（`git status --porcelain -z` 前后快照 + HEAD 变化），写入 `round.touchedFiles`；即使调用方没申报、或 agent 改了申报范围外的文件，也能被记录并保护后续任务。
+      - 任何轮次启动前必须执行 `findScopeConflicts()`：候选任务的 `expectedFiles` 与其他**未收口任务**的 `expectedFiles ∪ touchedFiles` 有交集时**不得启动**，置 `queued` 并把冲突方与文件写入 `thread.scopeBlockedBy`。
+      - 「未收口」= 未完成（`queued`/`running`/`reworking`/`waiting_review`/`paused`），或已完成但**没有** `mergeRequest` 且在 `SCOPE_BLOCK_WINDOW_MS`（24h）内；`failed` 不再阻塞。
+      - 放行只能通过 `allow_scope_overlap(threadId)`（或派发时 `allowScopeOverlap: true`），任务树显示 `⛔scope`、详情面板显示冲突文件。
+
 详细架构设计见 [DESIGN.md](DESIGN.md)。
 
 ---
@@ -119,11 +126,13 @@ src/
 
 | 工具名                    | 关键入参                                                           | 语义与行为                                                                                    |
 | :------------------------ | :----------------------------------------------------------------- | :-------------------------------------------------------------------------------------------- |
-| `dispatch_task`           | `targetAgent`, `title`, `prompt`, `expectedFiles?`, `callerSessionId?`, `model?`, `initiatorModel?` | 异步发起新任务，`expectedFiles` 必须是**具体代码文件**（禁止目录、结尾斜杠、`*`/`?` 通配符），派发前校验失败即拒绝。`model?` 固定**接收方模型**（缺省用该 Agent 配置的默认模型），`initiatorModel?` 声明**发送方模型**（缺省按 环境提示 → 发送方配置默认 推断）；两端模型都随任务落账本，任务树/详情/MCP 响应统一展示 `发送 A(x) ➔ 接收 B(y)`，返修/重试沿用同一接收方模型。只要存在任何**未完成任务**（含 `waiting_review` / `paused`）就进入任务级 FIFO 队列；接收方进程内不可用 |
+| `dispatch_task`           | `targetAgent`, `title`, `prompt`, `expectedFiles`（必填）, `allowNoScope?`, `allowScopeOverlap?`, `callerSessionId?`, `model?`, `initiatorModel?` | 异步发起新任务，`expectedFiles` 必须是**具体代码文件**（禁止目录、结尾斜杠、`*`/`?` 通配符），派发前校验失败即拒绝；**缺省即拒绝**（确实不改任何工作区文件时显式传 `allowNoScope: true`）。`model?` 固定**接收方模型**（缺省用该 Agent 配置的默认模型），`initiatorModel?` 声明**发送方模型**（缺省按 环境提示 → 发送方配置默认 推断）；两端模型都随任务落账本，任务树/详情/MCP 响应统一展示 `发送 A(x) ➔ 接收 B(y)`，返修/重试沿用同一接收方模型。只要存在任何**未完成任务**（含 `waiting_review` / `paused`）就进入任务级 FIFO 队列；接收方进程内不可用 |
 | `request_rework`          | `threadId`, `feedback`                                             | **在同一个原生会话中唤醒接收方返修**，进入第 N+1 轮                                           |
 | `approve_task`            | `threadId`, `remarks?`                                             | 验收通过，标记为 `COMPLETED`，归档任务                                                        |
 | `pause_task`              | `threadId`, `reason`                                               | 暂停运行中/排队中的任务：终止 Agent 进程、轮次标记 `paused`、记录中断原因，可随后恢复          |
 | `resume_task`             | `threadId`                                                         | 恢复暂停轮次：保留原 prompt 与原生会话；未捕获原生会话时以初始轮重新执行                        |
+| `retry_task`              | `threadId`                                                         | **原地重跑失败轮**：复用同一轮号、同一 prompt、同一原生会话；不追加新轮次，因此不会在账本里出现"看起来重复的第二轮"。调用者想"把原任务再做一遍"时必须用它，**不要**把原始 prompt 原样传给 `request_rework` |
+| `allow_scope_overlap`     | `threadId`, `reason?`                                              | **放行文件归属互斥**：让被 scope 闸门挡住的任务继续执行（仅当重叠确实安全，例如前一个任务已提交）。调用者控制面工具，receiver 不可用 |
 | `delete_task`             | `threadId`, `reason`                                               | 永久删除任务：先终止进程，再移除账本条目，原因写入 `deleted_tasks.log` 墓碑                     |
 | `record_merge_request`    | `threadId`, `url?`, `branch?`, `commit?`, `remote?`, `baseBranch?`, `status?`, `summary?` | **调用者/检视方专用**：任务或批次验收通过后，记录 MR URL/分支/提交/远端与状态；MR 由调用者创建并推送，receiver 不可调用 |
 | `list_recent_tasks`       | `limit` (最大1000), `statusFilter?`                                | 查询任务列表（包含 `A -> B 标题 摘要` 与 `queued/running` 状态）                               |
@@ -177,6 +186,8 @@ code --install-extension agent-mesh-bridge-1.0.0.vsix
    - `expectedFiles` 的锁范围必须收窄到**具体代码文件**：`validateExpectedFiles()` 拒绝目录、结尾斜杠、`*`/`?` 通配符；`doPathsConflict()` 只做精确同文件匹配，不再做目录前缀/glob 展开。
    - 非 supervisor 路径（独立 MCP server 进程）在轮次结束后必须调用 `QueueDrainer.schedule()` 泵下一轮，避免队头完成后队列永久停滞。
    - 锁文件带 5s 心跳与 30s 僵尸判定；进程崩溃后可以安全接管，但**不得**手动删除仍新鲜的锁。
+   - 锁内必须记录真实 Agent 子进程 `childPid`（`onChildPid` 回填，子进程退出清空）。Windows 上父进程崩溃不杀子进程，存活判定必须同时探活宿主与子进程：宿主已死但子进程仍活着时，锁在整个孤儿宽限期（120s）内继续占用；超期后先 `taskkill /T /F` 杀掉孤儿再接管，**禁止**在孤儿仍存活时让下一个轮次开跑。
+   - `pause_task` / `delete_task` 必须调用 `ExecutionGate.killOrphanChild(threadId)`，使宿主重启后仍能杀掉上一轮遗留的子进程。
 9. **接收方身份必须显式标记**：`AutonomousRunner` 拉起任务进程时必须写入 `MESH_TASK_RECEIVER=1`、`MESH_TASK_THREAD_ID`、`MESH_TASK_ROUND`。
    - `CallbackManager` 唤醒发起方时**必须清除**这些变量，否则发起方会被误判为 receiver 而无法调用 `request_rework` / `approve_task`。
    - MCP server 的 `dispatch_task` / `invoke_agent` / `invoke_*` 在 receiver 进程中必须从 `tools/list` 隐藏且调用即拒绝；`request_rework` / `approve_task` 仅允许作用于“自己作为发起方”的其他线程。
@@ -217,3 +228,9 @@ code --install-extension agent-mesh-bridge-1.0.0.vsix
    - `initiatorModel` 按 `显式传参 → 环境提示（如 ANTHROPIC_MODEL / CODEX_MODEL）→ 发送方配置默认` 推断，并用 `initiatorModelSource` 标注来源，禁止把推断值伪装成用户显式选择。
    - 任务树、详情面板、`dispatch_task` 响应、`list_recent_tasks` / `get_thread_details` 必须统一使用 `getModelRouting()` 输出 `sender A: x -> receiver B: y`，不得各写一套格式。
    - 模型参数注入必须按各 CLI 语法落位：Codex 用全局 `-c model="..."`（在 `exec` 之前），Claude / Antigravity 用 `--model`，DSH 用一次性 `--patch` overlay（不得改写用户 profile patch）。
+
+17. **文件归属互斥不可绕过**：
+   - `AsyncDispatcher` / `TaskSupervisor` / `ReworkController` 在 spawn 前都必须调用 `findScopeConflicts()`，命中即 `markQueued(..., scopeConflict)`；**不得**只在 dispatch 时检查一次就放行。
+   - 每个轮次必须用 `captureWorkspaceSnapshot()` / `diffWorkspaceSnapshots()` 记录 `round.touchedFiles`；非 git 工作区允许为空（`available: false`，不得因此把整棵树当成"全被改动"）。
+   - `expectedFiles` 必填由 MCP 层 `requireScope: true` 触发（内部调用与测试保持宽松），**不得**删除 MCP 侧校验。
+   - `scopeBlockedBy` 必须写在实际被 `upsertTask` 的对象上（`markQueued` 内部处理），否则 UI 与账本会丢失阻塞原因。

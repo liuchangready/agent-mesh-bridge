@@ -90,7 +90,17 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     const routing = getModelRouting(thread);
     const modelBadge = ` · ↑${routing.initiatorModel || '默认'} → ↓${routing.targetModel || '默认'}`;
 
-    const description = `${statusLabel} · ${durationText}${modelBadge}`;
+    // Surface a round that merely repeats an earlier instruction: it is a
+    // re-send of the same prompt, not a second task.
+    const latestRound =
+      thread.rounds && thread.rounds.length > 0 ? thread.rounds[thread.rounds.length - 1] : undefined;
+    const repeatBadge =
+      latestRound?.repeatOfRound !== undefined ? ` · ↻重复R${latestRound.repeatOfRound}` : '';
+    const scopeBadge = thread.scopeBlockedBy
+      ? ` · ⛔scope 等 ${thread.scopeBlockedBy.threadId}`
+      : '';
+
+    const description = `${statusLabel} · ${durationText}${modelBadge}${repeatBadge}${scopeBadge}`;
 
     const item = new TaskTreeItem(label, vscode.TreeItemCollapsibleState.Collapsed, thread);
     item.description = description;

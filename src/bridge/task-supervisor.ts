@@ -13,9 +13,16 @@ import {
   findInFlightRound,
   findQueueHead,
   getInFlightRounds,
+  isUserInterruption,
   shouldResumeNativeSession,
 } from './types';
-import { findFileConflicts } from './file-scope';
+import {
+  findFileConflicts,
+  findScopeConflicts,
+  describeScopeConflict,
+  ScopeConflict,
+} from './file-scope';
+import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
 import { ExecutionGate, ExecutionOwner } from './execution-gate';
 import { TaskRoleLock } from './task-role-lock';
 
@@ -288,6 +295,15 @@ export class TaskSupervisor extends EventEmitter {
         continue;
       }
 
+      // Batch-level scope gate: single flight only stops *simultaneous* edits.
+      // This stops a task from starting on files another open task already
+      // changed (declared scope or measured touchedFiles) and overwriting them.
+      const scopeConflict = findScopeConflicts(thread, allTasks);
+      if (scopeConflict) {
+        this.markQueued(thread, undefined, describeScopeConflict(scopeConflict), scopeConflict);
+        continue;
+      }
+
       // File-scope check is now normally moot (nothing else is executing), but
       // keep it for ledgers/threads that were already in flight when the global
       // gate was introduced.
@@ -308,6 +324,7 @@ export class TaskSupervisor extends EventEmitter {
           const restoredStatus: ThreadStatus =
             targetRound.type === 'rework' ? 'reworking' : 'running';
           thread.status = restoredStatus;
+          thread.scopeBlockedBy = undefined;
           thread.summary.lastOutputSnippet = 'Executing in background...';
           this.taskStore.upsertTask(thread);
         }
@@ -323,14 +340,27 @@ export class TaskSupervisor extends EventEmitter {
     }
   }
 
-  private markQueued(thread: DelegationThread, owner?: ExecutionOwner, detail?: string): void {
+  private markQueued(
+    thread: DelegationThread,
+    owner?: ExecutionOwner,
+    detail?: string,
+    scopeConflict?: ScopeConflict,
+  ): void {
     const snippet =
       detail ||
       (owner
         ? `Queued: Waiting for task ${owner.threadId} (round ${owner.round}) to finish; tasks execute strictly one at a time.`
         : 'Queued: Waiting for the current task to finish; tasks execute strictly one at a time.');
 
-    if (thread.status === 'queued' && thread.summary.lastOutputSnippet === snippet) return;
+    const nextBlock = scopeConflict
+      ? { threadId: scopeConflict.threadId, title: scopeConflict.title, files: scopeConflict.files }
+      : undefined;
+    const blockChanged =
+      JSON.stringify(thread.scopeBlockedBy || null) !== JSON.stringify(nextBlock || null);
+    thread.scopeBlockedBy = nextBlock;
+    if (thread.status === 'queued' && thread.summary.lastOutputSnippet === snippet && !blockChanged) {
+      return;
+    }
 
     thread.status = 'queued';
     thread.summary.lastOutputSnippet = snippet;
@@ -451,6 +481,9 @@ export class TaskSupervisor extends EventEmitter {
       this.liveLogs.set(thread.threadId, '');
 
       let result: RunResult;
+      // Baseline before the agent starts: the diff afterwards attributes exactly
+      // which files this round changed.
+      const scopeBefore = captureWorkspaceSnapshot(thread.workspacePath);
       try {
         result = await this.runner.execute({
           agent: thread.targetAgent,
@@ -462,6 +495,7 @@ export class TaskSupervisor extends EventEmitter {
           taskThreadId: thread.threadId,
           taskRound: roundNumber,
           model: thread.targetModel,
+          onChildPid: (pid) => this.executionGate.attachChildPid(pid),
           onStdoutChunk: (chunk: string) => {
             streamedOutput += chunk;
             const cur = this.liveLogs.get(thread.threadId) || '';
@@ -494,6 +528,11 @@ export class TaskSupervisor extends EventEmitter {
           streamTimer = null;
         }
       }
+
+      const touchedFiles = diffWorkspaceSnapshots(
+        scopeBefore,
+        captureWorkspaceSnapshot(thread.workspacePath),
+      );
 
       // Re-read latest task from disk to avoid overwriting newer state
       this.taskStore.loadFromDisk();
@@ -547,6 +586,7 @@ export class TaskSupervisor extends EventEmitter {
           durationMs: result.durationMs,
           status: finalRoundStatus,
           assessment: result.assessment,
+          touchedFiles: touchedFiles.length > 0 ? touchedFiles : undefined,
         },
         threadStatusToApply,
         nativeSessionId,
@@ -567,6 +607,18 @@ export class TaskSupervisor extends EventEmitter {
               // reviewer starts. Keep one role active per task.
               roleLock.release(roleLease);
               await this.callbackManager.notifyCaller(updatedThread, completedRound);
+            } else if (isLatestRound && !isSuccess && !isUserInterruption(interruption)) {
+              console.log(
+                `[TaskSupervisor] Round ${roundNumber} failed. Notifying caller ${updatedThread.initiatorAgent} so it can retry_task...`,
+              );
+              roleLock.release(roleLease);
+              const notified = await this.callbackManager.notifyCallerOfFailure(
+                updatedThread,
+                roundNumber,
+                result,
+              );
+              // Persist the dedupe marker so a restart cannot wake the caller twice.
+              if (notified) this.taskStore.upsertTask(updatedThread);
             }
           }
         }

@@ -48,6 +48,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     };
     callbackManager = new CallbackManager(detector);
     callbackManager.notifyCaller = async () => true;
+    callbackManager.notifyCallerOfFailure = async () => false;
     const gate = new ExecutionGate(tempDir);
     dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector, gate);
     reworkController = new ReworkController(taskStore, runner, callbackManager, detector, gate);

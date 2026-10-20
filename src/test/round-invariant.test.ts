@@ -116,6 +116,8 @@ describe('Round invariant - ReworkController refuses to overlap rounds', () => {
     runner = new AutonomousRunner(detector);
     const callbackManager = new CallbackManager(detector);
     callbackManager.notifyCaller = async () => true;
+    // Never spawn a real caller CLI from a unit test.
+    callbackManager.notifyCallerOfFailure = async () => false;
     reworkController = new ReworkController(taskStore, runner, callbackManager, detector);
   });
 

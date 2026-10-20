@@ -46,6 +46,8 @@ describe('MCPServer Protocol Tests', () => {
     });
     callbackManager = new CallbackManager(detector);
     callbackManager.notifyCaller = async () => true;
+    // Never spawn a real caller CLI from a protocol test.
+    callbackManager.notifyCallerOfFailure = async () => false;
     const gate = new ExecutionGate(tempDir);
     dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector, gate);
     reworkController = new ReworkController(taskStore, runner, callbackManager, detector, gate);
@@ -87,7 +89,7 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(res.result.capabilities.tools);
   });
 
-  test('should handle tools/list and return all 13 specified tools', async () => {
+  test('should handle tools/list and return all 15 specified tools', async () => {
     const listReq = {
       jsonrpc: '2.0',
       id: 2,
@@ -106,6 +108,8 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(toolNames.includes('approve_task'));
     assert.ok(toolNames.includes('pause_task'));
     assert.ok(toolNames.includes('resume_task'));
+    assert.ok(toolNames.includes('retry_task'));
+    assert.ok(toolNames.includes('allow_scope_overlap'));
     assert.ok(toolNames.includes('delete_task'));
     assert.ok(toolNames.includes('record_merge_request'));
     assert.ok(toolNames.includes('list_recent_tasks'));
@@ -114,7 +118,7 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(toolNames.includes('query_agent_mesh_status'));
     assert.ok(toolNames.includes('get_recent_logs'));
     assert.ok(toolNames.includes('list_agent_models'));
-    assert.strictEqual(toolNames.length, 13);
+    assert.strictEqual(toolNames.length, 15);
   });
 
   test('should execute dispatch_task, get_thread_details, request_rework, and approve_task via tools/call', async () => {
@@ -129,6 +133,7 @@ describe('MCPServer Protocol Tests', () => {
           targetAgent: 'codex',
           title: 'Refactor Cache Layer',
           prompt: 'Use LRU cache with 500 items max',
+          expectedFiles: ['src/cache/lru.ts'],
           callerSessionId: 'caller_mcp_1',
         },
       },
@@ -382,5 +387,199 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(data.agents.antigravity);
     assert.ok(data.agents.claude_code);
     assert.ok(data.agents.codex);
+  });
+
+  test('retry_task re-runs the failed round in place instead of creating a duplicate round', async () => {
+    let shouldFail = true;
+    runner.execute = async () =>
+      shouldFail
+        ? {
+            exitCode: 1,
+            stdout: '',
+            stderr: 'dsh: TRANSPORT: Connection error.',
+            extractedOutput: '',
+            durationMs: 5,
+            error: 'dsh: TRANSPORT: Connection error.',
+          }
+        : {
+            exitCode: 0,
+            stdout: 'ok',
+            stderr: '',
+            extractedOutput: 'ok',
+            durationMs: 5,
+            actualSessionId: 'session-retry-0001',
+          };
+
+    const dispatchRes = await mcpServer.handleRpcMessage({
+      jsonrpc: '2.0',
+      id: 40,
+      method: 'tools/call',
+      params: {
+        name: 'dispatch_task',
+        arguments: {
+          targetAgent: 'codex',
+          title: 'Retry in place',
+          prompt: 'Implement the extension exactly as designed',
+          expectedFiles: ['src/extension/sleeve.ts'],
+          callerSessionId: 'caller_mcp_retry',
+        },
+      },
+    });
+    const threadId = JSON.parse(dispatchRes.result.content[0].text).threadId;
+    await waitForStatus(threadId, 'failed', 5000);
+
+    const before = taskStore.getTask(threadId)!;
+    const originalPrompt = before.rounds[0].prompt;
+    assert.strictEqual(before.rounds.length, 1);
+
+    shouldFail = false;
+    const retryRes = await mcpServer.handleRpcMessage({
+      jsonrpc: '2.0',
+      id: 41,
+      method: 'tools/call',
+      params: { name: 'retry_task', arguments: { threadId } },
+    });
+    const retryData = JSON.parse(retryRes.result.content[0].text);
+    assert.strictEqual(retryData.status, 'RETRYING');
+    assert.strictEqual(retryData.round, 1, 'retry must reuse the failed round number');
+
+    await waitForStatus(threadId, 'waiting_review', 5000);
+    const after = taskStore.getTask(threadId)!;
+    assert.strictEqual(after.rounds.length, 1, 'retry must not append a second round');
+    assert.strictEqual(after.rounds[0].prompt, originalPrompt);
+  });
+
+  test('request_rework flags a round whose instruction repeats an earlier one', async () => {
+    const prompt = 'Implement the sleeve bloom extension as designed';
+    const dispatchRes = await mcpServer.handleRpcMessage({
+      jsonrpc: '2.0',
+      id: 50,
+      method: 'tools/call',
+      params: {
+        name: 'dispatch_task',
+        arguments: {
+          targetAgent: 'codex',
+          title: 'Repeat instruction',
+          prompt,
+          expectedFiles: ['src/extension/repeat.ts'],
+          callerSessionId: 'caller_mcp_repeat',
+        },
+      },
+    });
+    const threadId = JSON.parse(dispatchRes.result.content[0].text).threadId;
+    await waitForStatus(threadId, 'waiting_review');
+
+    new TaskRoleLock().tryAcquire(threadId, 'reviewer');
+    const reworkRes = await mcpServer.handleRpcMessage({
+      jsonrpc: '2.0',
+      id: 51,
+      method: 'tools/call',
+      params: { name: 'request_rework', arguments: { threadId, feedback: prompt } },
+    });
+    assert.ok(reworkRes.result);
+
+    const thread = taskStore.getTask(threadId)!;
+    const reworkRound = thread.rounds.find((r) => r.round === 2);
+    assert.ok(reworkRound);
+    assert.strictEqual(
+      reworkRound!.repeatOfRound,
+      1,
+      'a rework that re-sends the original prompt must be marked as repeating round 1',
+    );
+  });
+
+  test('requires a declared scope unless the caller explicitly opts out', async () => {
+    const noScope = await mcpServer.handleRpcMessage({
+      jsonrpc: '2.0',
+      id: 60,
+      method: 'tools/call',
+      params: {
+        name: 'dispatch_task',
+        arguments: { targetAgent: 'codex', title: 'No scope', prompt: 'do work' },
+      },
+    });
+    assert.ok(noScope.error, 'a dispatch without expectedFiles must be rejected');
+    assert.match(noScope.error.message, /expectedFiles/);
+
+    const optedOut = await mcpServer.handleRpcMessage({
+      jsonrpc: '2.0',
+      id: 61,
+      method: 'tools/call',
+      params: {
+        name: 'dispatch_task',
+        arguments: {
+          targetAgent: 'codex',
+          title: 'Docs only',
+          prompt: 'answer a question',
+          allowNoScope: true,
+        },
+      },
+    });
+    assert.ok(optedOut.result, 'allowNoScope must be accepted');
+    assert.strictEqual(JSON.parse(optedOut.result.content[0].text).status, 'DISPATCHED');
+  });
+
+  test('blocks a task whose declared files another open task already owns', async () => {
+    // A task that was accepted but never收口 (no merge request) still owns its
+    // files: the next task would overwrite the uncommitted work.
+    const now = new Date().toISOString();
+    taskStore.upsertTask({
+      threadId: 'thread_seeded_owner',
+      title: 'Earlier overlapping task',
+      initiatorAgent: 'codex',
+      targetAgent: 'deepseek_harness',
+      status: 'completed',
+      currentRound: 1,
+      createdAt: now,
+      updatedAt: now,
+      receiverSessionId: 'session-seeded-owner',
+      callerSessionId: 'caller-seeded',
+      workspacePath: process.cwd(),
+      expectedFiles: ['engine/src/shared/TableAuthority.kt'],
+      summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
+      rounds: [
+        {
+          round: 1,
+          type: 'initial',
+          prompt: 'touch TableAuthority',
+          status: 'completed',
+          durationMs: 1,
+          timestamp: now,
+        },
+      ],
+    });
+
+    const blocked = await mcpServer.handleRpcMessage({
+      jsonrpc: '2.0',
+      id: 70,
+      method: 'tools/call',
+      params: {
+        name: 'dispatch_task',
+        arguments: {
+          targetAgent: 'codex',
+          title: 'Overlapping follow-up',
+          prompt: 'also touch TableAuthority',
+          expectedFiles: ['engine/src/shared/TableAuthority.kt'],
+        },
+      },
+    });
+    const data = JSON.parse(blocked.result.content[0].text);
+    assert.strictEqual(data.status, 'QUEUED');
+    assert.match(data.message, /scope/i);
+    assert.match(data.message, /thread_seeded_owner/);
+
+    const thread = taskStore.getTask(data.threadId)!;
+    assert.deepStrictEqual(thread.scopeBlockedBy?.files, ['engine/src/shared/TableAuthority.kt']);
+
+    const override = await mcpServer.handleRpcMessage({
+      jsonrpc: '2.0',
+      id: 71,
+      method: 'tools/call',
+      params: { name: 'allow_scope_overlap', arguments: { threadId: data.threadId, reason: 'reviewed' } },
+    });
+    assert.strictEqual(JSON.parse(override.result.content[0].text).status, 'SCOPE_OVERRIDE');
+    const after = taskStore.getTask(data.threadId)!;
+    assert.strictEqual(after.scopeOverride, true);
+    assert.strictEqual(after.scopeBlockedBy, undefined);
   });
 });

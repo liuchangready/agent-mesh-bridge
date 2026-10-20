@@ -33,6 +33,8 @@ const FORWARDING_TOOLS = new Set([
 const CONTROL_TOOLS = new Set([
   'pause_task',
   'resume_task',
+  'retry_task',
+  'allow_scope_overlap',
   'delete_task',
   'record_merge_request',
 ]);
@@ -111,7 +113,17 @@ export class MCPServer {
               type: 'array',
               items: { type: 'string' },
               description:
-                'Concrete code file paths expected to be modified (e.g. ["src/service/Foo.ts", "lib/parser.ts"]). Do NOT pass folders, trailing slashes, or glob patterns: they are rejected because they would lock unrelated files. Tasks execute strictly one at a time; exact same-file conflicts are additionally tracked.',
+                'Concrete code file paths this task will modify (e.g. ["src/service/Foo.ts", "lib/parser.ts"]). REQUIRED: the bridge refuses to start a task on a file another open task already declared or actually changed, and it cannot enforce that without your scope. Do NOT pass folders, trailing slashes, or glob patterns (rejected). Pass allowNoScope: true only if the task touches no workspace file.',
+            },
+            allowNoScope: {
+              type: 'boolean',
+              description:
+                'Explicitly declare that this task modifies no workspace file, skipping the scope requirement. Omit when you pass expectedFiles.',
+            },
+            allowScopeOverlap: {
+              type: 'boolean',
+              description:
+                'Accept running on top of files another open task already changed (use only when you know the two edits do not conflict, e.g. the earlier task was already committed).',
             },
             model: {
               type: 'string',
@@ -124,7 +136,7 @@ export class MCPServer {
                 'The model YOU (the caller) are currently running on, recorded as the task\'s sender model so the ledger shows "sender model -> receiver model". Omit to let the bridge infer it from the environment or your configured default.',
             },
           },
-          required: ['title', 'prompt'],
+          required: ['title', 'prompt', 'expectedFiles'],
         },
       },
       {
@@ -199,6 +211,40 @@ export class MCPServer {
             threadId: {
               type: 'string',
               description: 'Task thread ID to resume.',
+            },
+          },
+          required: ['threadId'],
+        },
+      },
+      {
+        name: 'retry_task',
+        description:
+          'Retry a failed round in place: same round number, same prompt, same native session. Use this instead of request_rework when you simply want the receiver to run the failed instruction again — re-sending the original prompt as feedback creates a second round that looks like a duplicate task.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            threadId: {
+              type: 'string',
+              description: 'Task thread ID whose latest failed round should be retried.',
+            },
+          },
+          required: ['threadId'],
+        },
+      },
+      {
+        name: 'allow_scope_overlap',
+        description:
+          'Override the file-scope gate for a queued task: allow it to run even though another open task already changed some of the same files. Only use it when the overlap is genuinely safe (e.g. the earlier task was already committed or its change is unrelated).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            threadId: {
+              type: 'string',
+              description: 'Task thread ID to unblock.',
+            },
+            reason: {
+              type: 'string',
+              description: 'Why the overlap is safe (recorded for audit).',
             },
           },
           required: ['threadId'],
@@ -464,6 +510,11 @@ export class MCPServer {
           callerSessionId: args.callerSessionId,
           workspacePath: args.workspacePath,
           expectedFiles: args.expectedFiles,
+          allowNoScope: args.allowNoScope === true,
+          allowScopeOverlap: args.allowScopeOverlap === true,
+          // Agent callers must declare a scope; that is what makes the
+          // file-ownership gate enforceable for tasks dispatched over MCP.
+          requireScope: true,
           model: args.model,
           initiatorModel: args.initiatorModel,
         });
@@ -499,6 +550,38 @@ export class MCPServer {
 
       case 'resume_task': {
         return this.reworkController.resumePausedTask(args.threadId);
+      }
+
+      case 'allow_scope_overlap': {
+        const thread = this.taskStore.getTask(args.threadId);
+        if (!thread) {
+          throw new Error(`Task thread not found: ${args.threadId}`);
+        }
+        thread.scopeOverride = true;
+        thread.scopeBlockedBy = undefined;
+        thread.updatedAt = new Date().toISOString();
+        this.taskStore.upsertTask(thread);
+        return {
+          threadId: args.threadId,
+          status: 'SCOPE_OVERRIDE',
+          message:
+            `Task ${args.threadId} may now run on files owned by other open tasks` +
+            `${args.reason ? ` (reason: ${args.reason})` : ''}. ` +
+            `The queue advances on its own; you will be woken when the round finishes.`,
+        };
+      }
+
+      case 'retry_task': {
+        const retried = await this.reworkController.retryFailedRound(args.threadId);
+        return {
+          threadId: args.threadId,
+          status: 'RETRYING',
+          round: retried.round,
+          message:
+            `Retrying Round ${retried.round} in place: same prompt, same native session ` +
+            `(the failed round is reused, so the ledger will not show a duplicate round). ` +
+            `Conclude your turn and await the callback.`,
+        };
       }
 
       case 'delete_task': {
