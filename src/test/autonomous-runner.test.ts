@@ -9,6 +9,8 @@ import {
 } from '../bridge/autonomous-runner';
 import { AgentDetector } from '../bridge/agent-detector';
 import { CancellationRegistry } from '../bridge/cancellation-registry';
+import { TaskStore } from '../bridge/task-store';
+import { DelegationThread } from '../bridge/types';
 
 describe('AutonomousRunner Tests', () => {
   const detector = new AgentDetector();
@@ -499,6 +501,184 @@ describe('AutonomousRunner Tests', () => {
       'the retry must continue the session the failed attempt already opened',
     );
     assert.strictEqual(seen[1].receiverSessionId, 'session-carried-1');
+  });
+
+  test('execute aborts retry loop and does not spawn subsequent attempts when cancelled during backoff sleep', async () => {
+    const retryRunner = new AutonomousRunner(detector);
+    let attempts = 0;
+    retryRunner.executeOnce = async () => {
+      attempts++;
+      return {
+        exitCode: 1,
+        stdout: '',
+        stderr: 'dsh: TRANSPORT: Connection error.',
+        extractedOutput: '',
+        durationMs: 5,
+        error: 'dsh: TRANSPORT: Connection error.',
+      };
+    };
+
+    const execution = retryRunner.execute({
+      agent: 'deepseek_harness',
+      prompt: 'will be cancelled',
+      isRework: false,
+      receiverSessionId: '',
+      taskThreadId: 'thread_cancel_sleep',
+      maxRetries: 3,
+      retryBackoffMs: 500,
+    });
+
+    // Wait until attempt 1 fails and enters cancellable backoff sleep
+    await new Promise((r) => setTimeout(r, 60));
+    retryRunner.cancelThread('thread_cancel_sleep', 'delete', 'user deleted task', 'test');
+
+    const result = await execution;
+    assert.strictEqual(result.interruption?.kind, 'deleted');
+    assert.strictEqual(result.interruption?.reason, 'user deleted task');
+    assert.strictEqual(attempts, 1, 'retry runner must never spawn attempt 2 after cancellation');
+  });
+
+  test('pre-spawn cancellation check prevents any process from being spawned', async () => {
+    const runner = new AutonomousRunner(detector);
+    let spawned = false;
+    runner.buildCommand = () => {
+      spawned = true;
+      return { command: process.execPath, args: ['-e', 'process.exit(0)'], useShell: false };
+    };
+
+    // Pre-cancel before execute is called
+    runner.cancelThread('thread_precancel', 'pause', 'pre-spawn pause', 'test');
+
+    const result = await runner.execute({
+      agent: 'antigravity',
+      prompt: 'should never run',
+      isRework: false,
+      receiverSessionId: '',
+      taskThreadId: 'thread_precancel',
+      taskRound: 1,
+    });
+
+    assert.strictEqual(result.interruption?.kind, 'paused');
+    assert.strictEqual(result.interruption?.reason, 'pre-spawn pause');
+    assert.strictEqual(spawned, false, 'process must never be spawned when cancelled upfront');
+  });
+
+  test('a pause remembered without a child must be cleared before a resume can run', async () => {
+    const resumeRunner = new AutonomousRunner(detector);
+    let spawns = 0;
+    resumeRunner.buildCommand = () => {
+      spawns++;
+      return {
+        command: process.execPath,
+        args: ['-e', 'console.log("resumed")'],
+        useShell: false,
+      };
+    };
+
+    // A pause that landed while the round had no child yet (queued / pre-spawn).
+    // No settling round ever consumes it, so it stays remembered.
+    resumeRunner.cancelThread('thread_remembered_pause', 'pause', 'queued pause', 'test');
+
+    const blocked = await resumeRunner.execute({
+      agent: 'antigravity',
+      prompt: 'resume me',
+      isRework: true,
+      receiverSessionId: '',
+      taskThreadId: 'thread_remembered_pause',
+      taskRound: 1,
+      maxRetries: 0,
+    });
+    assert.strictEqual(blocked.interruption?.kind, 'paused');
+    assert.strictEqual(spawns, 0, 'a remembered pause must still stop the run it was raised for');
+
+    // Resuming re-arms the same task; the resume path clears the remembered pause.
+    resumeRunner.clearPendingCancellation('thread_remembered_pause');
+    const resumed = await resumeRunner.execute({
+      agent: 'antigravity',
+      prompt: 'resume me',
+      isRework: true,
+      receiverSessionId: '',
+      taskThreadId: 'thread_remembered_pause',
+      taskRound: 1,
+      maxRetries: 0,
+    });
+
+    assert.strictEqual(resumed.interruption, undefined, 'the resumed round must actually run');
+    assert.strictEqual(resumed.exitCode, 0);
+    assert.strictEqual(spawns, 1);
+  });
+
+  test('a runner holding the task store reports a paused or deleted task as cancelled', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-runner-store-'));
+    const store = new TaskStore(dir);
+    const now = new Date().toISOString();
+    const storeRunner = new AutonomousRunner(
+      detector,
+      undefined,
+      new CancellationRegistry(dir),
+      store,
+    );
+
+    try {
+      store.upsertTask({
+        threadId: 'thread_store_1',
+        title: 'store-driven cancellation',
+        initiatorAgent: 'codex',
+        targetAgent: 'antigravity',
+        status: 'running',
+        currentRound: 1,
+        createdAt: now,
+        updatedAt: now,
+        receiverSessionId: '',
+        workspacePath: process.cwd(),
+        summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
+        rounds: [
+          {
+            round: 1,
+            type: 'initial',
+            prompt: 'do the work',
+            status: 'running',
+            durationMs: 0,
+            timestamp: now,
+          },
+        ],
+      } as DelegationThread);
+
+      assert.strictEqual(
+        storeRunner.checkPendingCancellation('thread_store_1', true),
+        undefined,
+        'a healthy running task is not cancelled',
+      );
+
+      const paused = store.getTask('thread_store_1')!;
+      paused.status = 'paused';
+      paused.interruption = {
+        kind: 'paused',
+        reason: 'paused in store',
+        at: now,
+        by: 'user',
+      };
+      store.upsertTask(paused);
+
+      const pauseRequest = storeRunner.checkPendingCancellation('thread_store_1', true);
+      assert.strictEqual(pauseRequest?.action, 'pause');
+      assert.strictEqual(pauseRequest?.reason, 'paused in store');
+
+      store.deleteTask('thread_store_1');
+      assert.strictEqual(
+        storeRunner.checkPendingCancellation('thread_store_1', true)?.action,
+        'delete',
+        'a task deleted from the store aborts its running round',
+      );
+      assert.strictEqual(
+        storeRunner.checkPendingCancellation('thread_store_1', false),
+        undefined,
+        'a task that never existed is not reported as deleted',
+      );
+    } finally {
+      store.dispose();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('should distinguish rate limit errors from innocent code outputs, hashes, UUIDs and line numbers', () => {

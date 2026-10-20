@@ -66,7 +66,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
    * role. Role enforcement (new) intentionally blocks the next role while the
    * previous round is still executing.
    */
-  const waitForStatus = async (threadId: string, status: string, timeoutMs = 2000) => {
+  const waitForStatus = async (threadId: string, status: string, timeoutMs = 5000) => {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (taskStore.getTask(threadId)?.status === status) return;

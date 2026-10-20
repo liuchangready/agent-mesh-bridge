@@ -16,6 +16,7 @@ import {
   CancellationRegistry,
   CancellationRequest,
 } from './cancellation-registry';
+import type { TaskStore } from './task-store';
 
 /** Default silence watchdog: 10 minutes (long model reasoning is not a hang). */
 export const DEFAULT_SILENCE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -116,8 +117,10 @@ export class AutonomousRunner {
   private detector: AgentDetector;
   private defaultTimeoutMs: number;
   private cancellationRegistry: CancellationRegistry;
+  private taskStore?: TaskStore;
   private activeChildren: Map<string, child_process.ChildProcess> = new Map();
   private localCancellations: Map<string, CancellationRequest> = new Map();
+  private executingThreads: Set<string> = new Set();
   /** Where an unspecified model comes from; replaceable for tests. */
   private modelResolver: (agent: AgentId) => string | undefined = (agent) =>
     resolveConfiguredModel(agent);
@@ -126,14 +129,17 @@ export class AutonomousRunner {
     detector: AgentDetector,
     defaultTimeoutMs: number = 2 * 60 * 60 * 1000,
     cancellationRegistry?: CancellationRegistry,
+    taskStore?: TaskStore,
   ) {
     this.detector = detector;
     this.defaultTimeoutMs = defaultTimeoutMs;
     this.cancellationRegistry = cancellationRegistry || new CancellationRegistry();
+    this.taskStore = taskStore;
   }
 
   /**
-   * Kill the child process currently executing `threadId` (same process only).
+   * Kill the child process currently executing `threadId` (same process only)
+   * and record the cancellation so pending/retrying runs abort immediately.
    *
    * Cross-process pause/delete is handled by `CancellationRegistry`: the owning
    * runner polls that file and calls this same path.
@@ -144,23 +150,159 @@ export class AutonomousRunner {
     reason: string,
     by: string = 'user',
   ): boolean {
-    const child = this.activeChildren.get(threadId);
-    if (!child) return false;
-
     this.localCancellations.set(threadId, {
       action,
       reason: reason || 'No reason provided',
       at: new Date().toISOString(),
       by,
     });
-    try {
-      this.killProcess(child);
-    } catch {}
+    const child = this.activeChildren.get(threadId);
+    if (child) {
+      try {
+        this.killProcess(child);
+      } catch {}
+    }
     return true;
   }
 
   public isExecutingThread(threadId: string): boolean {
-    return this.activeChildren.has(threadId);
+    return this.executingThreads.has(threadId) || this.activeChildren.has(threadId);
+  }
+
+  /**
+   * Inspects local cancellations, external cancellation files, and the task store
+   * to determine whether `taskThreadId` has been cancelled, paused, or deleted.
+   */
+  public checkPendingCancellation(
+    taskThreadId: string | undefined,
+    initialTaskExisted?: boolean,
+  ): CancellationRequest | undefined {
+    if (!taskThreadId) return undefined;
+
+    const local = this.localCancellations.get(taskThreadId);
+    if (local) return local;
+
+    const external = this.cancellationRegistry.peek(taskThreadId);
+    if (external) return external;
+
+    if (this.taskStore) {
+      const stored = this.taskStore.getTask(taskThreadId);
+      if (initialTaskExisted && !stored) {
+        return {
+          action: 'delete',
+          reason: 'Task was deleted from store during execution',
+          at: new Date().toISOString(),
+          by: 'task_store',
+        };
+      }
+      if (stored?.status === 'paused') {
+        return {
+          action: 'pause',
+          reason: stored.interruption?.reason || 'Task was paused in store',
+          at: stored.interruption?.at || new Date().toISOString(),
+          by: stored.interruption?.by || 'task_store',
+        };
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Drops every remembered pause/delete for `taskThreadId`, in memory and on disk.
+   *
+   * A resume must call this: a pause that landed before any child existed is never
+   * consumed by a settling round, so without this the next attempt would be
+   * cancelled on sight.
+   */
+  public clearPendingCancellation(taskThreadId: string | undefined): void {
+    if (!taskThreadId) return;
+    this.localCancellations.delete(taskThreadId);
+    this.cancellationRegistry.clear(taskThreadId);
+  }
+
+  /**
+   * Consumes and clears any pending cancellation for `taskThreadId`.
+   */
+  public consumeCancellation(taskThreadId: string | undefined): CancellationRequest | undefined {
+    if (!taskThreadId) return undefined;
+    const local = this.localCancellations.get(taskThreadId);
+    const external = this.cancellationRegistry.consume(taskThreadId);
+    this.clearPendingCancellation(taskThreadId);
+    return local || external;
+  }
+
+  /**
+   * Synthesize a compliant RunResult when execution was cancelled before or during retries.
+   */
+  public buildInterruptedResult(
+    cancellation: CancellationRequest,
+    baseResult?: RunResult,
+  ): RunResult {
+    const kind =
+      cancellation.action === 'pause'
+        ? 'paused'
+        : cancellation.action === 'delete'
+          ? 'deleted'
+          : 'stopped';
+    const interruption: TaskInterruption = {
+      kind,
+      reason: cancellation.reason,
+      at: cancellation.at || new Date().toISOString(),
+      by: cancellation.by,
+    };
+    const error =
+      `Task ${cancellation.action} requested` +
+      `${cancellation.by ? ` by ${cancellation.by}` : ''}: ${cancellation.reason}`;
+
+    const stream: StreamAssessment = baseResult?.assessment?.stream || {
+      chunkCount: 0,
+      stdoutBytes: 0,
+      stderrBytes: 0,
+      maxGapMs: 0,
+      gapThresholdMs: DEFAULT_SILENCE_TIMEOUT_MS,
+      hasActualOutput: false,
+      continuous: false,
+    };
+
+    return {
+      exitCode: -1,
+      stdout: baseResult?.stdout || '',
+      stderr: baseResult?.stderr || '',
+      extractedOutput: baseResult?.extractedOutput || '',
+      actualSessionId: baseResult?.actualSessionId,
+      durationMs: baseResult?.durationMs || 0,
+      error,
+      interruption,
+      assessment: {
+        success: false,
+        errorCode: kind.toUpperCase(),
+        exitCode: -1,
+        stream,
+        reason: cancellation.reason,
+      },
+    };
+  }
+
+  /**
+   * Sleep for `ms` milliseconds, checking periodically (every 100ms) for cancellations.
+   * Returns the CancellationRequest if cancelled, or undefined if the sleep completed.
+   */
+  public async cancellableSleep(
+    ms: number,
+    taskThreadId: string | undefined,
+    initialTaskExisted?: boolean,
+  ): Promise<CancellationRequest | undefined> {
+    const pollInterval = 100;
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      const cancel = this.checkPendingCancellation(taskThreadId, initialTaskExisted);
+      if (cancel) return cancel;
+      const waitTime = Math.min(pollInterval, deadline - Date.now());
+      if (waitTime <= 0) break;
+      await new Promise((r) => setTimeout(r, waitTime));
+    }
+    return this.checkPendingCancellation(taskThreadId, initialTaskExisted);
   }
 
   public setDefaultTimeoutMs(ms: number): void {
@@ -389,44 +531,87 @@ export class AutonomousRunner {
   public async execute(options: RunOptions): Promise<RunResult> {
     const maxRetries = options.maxRetries ?? 3;
     const baseBackoffMs = options.retryBackoffMs ?? 2000;
-    let attemptOptions = options;
-    let attempt = 0;
-    while (true) {
-      attempt++;
-      const result = await this.executeOnce(attemptOptions);
-      const succeeded =
-        result.exitCode === 0 && (!result.assessment || result.assessment.success);
-      if (succeeded) {
-        return result;
-      }
+    const taskThreadId = options.taskThreadId;
+    const initialTaskExisted =
+      taskThreadId && this.taskStore ? Boolean(this.taskStore.getTask(taskThreadId)) : false;
 
-      if (result.interruption) {
-        return result;
-      }
+    if (taskThreadId) {
+      this.executingThreads.add(taskThreadId);
+    }
 
-      if (attempt <= maxRetries && this.isRetryableFailure(result)) {
-        const backoffMs = Math.min(baseBackoffMs * Math.pow(2, attempt - 1), 10_000);
-        console.warn(
-          `[AutonomousRunner] Transient startup/network error on attempt ${attempt}/${maxRetries} for ${options.agent}: "${result.error || result.assessment?.reason || result.stderr.trim()}". Retrying in ${backoffMs / 1000}s...`,
-        );
-        await new Promise((r) => setTimeout(r, backoffMs));
-        // A dead attempt may already have opened a native session. Continuing
-        // that session keeps the work the receiver already did; starting a
-        // second fresh session would redo the whole task in a new context.
-        if (!attemptOptions.isRework && result.actualSessionId) {
-          attemptOptions = {
-            ...attemptOptions,
-            isRework: true,
-            receiverSessionId: result.actualSessionId,
-          };
-          console.log(
-            `[AutonomousRunner] Retry for ${options.agent} resumes native session ${result.actualSessionId} instead of starting a fresh one.`,
-          );
+    try {
+      let attemptOptions = options;
+      let attempt = 0;
+      while (true) {
+        attempt++;
+
+        // Pre-attempt cancellation check
+        const preCancel = this.checkPendingCancellation(taskThreadId, initialTaskExisted);
+        if (preCancel) {
+          this.consumeCancellation(taskThreadId);
+          return this.buildInterruptedResult(preCancel);
         }
-        continue;
-      }
 
-      return result;
+        const result = await this.executeOnce(attemptOptions);
+        const succeeded =
+          result.exitCode === 0 && (!result.assessment || result.assessment.success);
+        if (succeeded) {
+          return result;
+        }
+
+        if (result.interruption) {
+          return result;
+        }
+
+        if (attempt <= maxRetries && this.isRetryableFailure(result)) {
+          const backoffMs = Math.min(baseBackoffMs * Math.pow(2, attempt - 1), 10_000);
+          console.warn(
+            `[AutonomousRunner] Transient startup/network error on attempt ${attempt}/${maxRetries} for ${options.agent}: "${result.error || result.assessment?.reason || result.stderr.trim()}". Retrying in ${backoffMs / 1000}s...`,
+          );
+
+          // Check cancellation before sleeping
+          const earlyCancel = this.checkPendingCancellation(taskThreadId, initialTaskExisted);
+          if (earlyCancel) {
+            this.consumeCancellation(taskThreadId);
+            return this.buildInterruptedResult(earlyCancel, result);
+          }
+
+          // Cancellable sleep: checks cancellation every 100ms
+          const sleepCancel = await this.cancellableSleep(backoffMs, taskThreadId, initialTaskExisted);
+          if (sleepCancel) {
+            this.consumeCancellation(taskThreadId);
+            return this.buildInterruptedResult(sleepCancel, result);
+          }
+
+          // Check cancellation after sleeping before continuing
+          const postCancel = this.checkPendingCancellation(taskThreadId, initialTaskExisted);
+          if (postCancel) {
+            this.consumeCancellation(taskThreadId);
+            return this.buildInterruptedResult(postCancel, result);
+          }
+
+          // A dead attempt may already have opened a native session. Continuing
+          // that session keeps the work the receiver already did; starting a
+          // second fresh session would redo the whole task in a new context.
+          if (!attemptOptions.isRework && result.actualSessionId) {
+            attemptOptions = {
+              ...attemptOptions,
+              isRework: true,
+              receiverSessionId: result.actualSessionId,
+            };
+            console.log(
+              `[AutonomousRunner] Retry for ${options.agent} resumes native session ${result.actualSessionId} instead of starting a fresh one.`,
+            );
+          }
+          continue;
+        }
+
+        return result;
+      }
+    } finally {
+      if (taskThreadId) {
+        this.executingThreads.delete(taskThreadId);
+      }
     }
   }
 
@@ -715,6 +900,15 @@ export class AutonomousRunner {
         return byteLength;
       };
 
+      const taskThreadId = options.taskThreadId;
+      const initialTaskExisted =
+        taskThreadId && this.taskStore ? Boolean(this.taskStore.getTask(taskThreadId)) : false;
+      const preCancel = this.checkPendingCancellation(taskThreadId, initialTaskExisted);
+      if (preCancel) {
+        this.consumeCancellation(taskThreadId);
+        return resolve(this.buildInterruptedResult(preCancel));
+      }
+
       let child: child_process.ChildProcess;
       try {
         child = child_process.spawn(command, args, {
@@ -759,7 +953,6 @@ export class AutonomousRunner {
       // Cross-process pause/delete: a control plane running elsewhere writes a
       // cancellation file; this runner owns the child and is the only one that
       // can actually kill it.
-      const taskThreadId = options.taskThreadId;
       let cancellationPoll: NodeJS.Timeout | null = null;
       let externalCancellation: CancellationRequest | undefined;
 
@@ -785,8 +978,9 @@ export class AutonomousRunner {
 
         // A pause/delete may have landed between dispatch and spawn.
         const pending = this.cancellationRegistry.consume(taskThreadId);
-        if (pending) {
-          externalCancellation = pending;
+        const local = this.localCancellations.get(taskThreadId);
+        if (pending || local) {
+          externalCancellation = pending || local;
           try {
             this.killProcess(child);
           } catch {}
@@ -794,7 +988,8 @@ export class AutonomousRunner {
 
         cancellationPoll = setInterval(() => {
           if (isSettled || !taskThreadId) return;
-          const request = this.cancellationRegistry.consume(taskThreadId);
+          const currentLocal = this.localCancellations.get(taskThreadId);
+          const request = currentLocal || this.cancellationRegistry.consume(taskThreadId);
           if (request) {
             externalCancellation = request;
             console.warn(

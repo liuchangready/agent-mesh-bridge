@@ -119,6 +119,15 @@ describe('ExecutionGate - cross-process single flight', () => {
         'a live host handles its own child through the cancellation file',
       );
       assert.strictEqual(gate.killOrphanChild('thread_other'), false);
+
+      // With force=true, the child is killed even if host is alive
+      assert.strictEqual(
+        gate.killOrphanChild('thread_live_host', true),
+        true,
+        'force=true kills active child even when host is alive',
+      );
+      const ownerAfter = JSON.parse(fs.readFileSync(gate.getLockFilePath(), 'utf8'));
+      assert.strictEqual(ownerAfter.childPid, undefined, 'childPid is cleared from lock file');
     } finally {
       try {
         child.kill('SIGKILL');

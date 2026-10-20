@@ -87,7 +87,7 @@ export class TaskControlService {
       this.runner?.cancelThread(threadId, 'pause', normalizedReason, by);
       // A host restart drops the in-memory child handle; the execution lease is
       // the only place the real agent PID survives.
-      this.executionGate.killOrphanChild(threadId);
+      this.executionGate.killOrphanChild(threadId, true);
       return {
         threadId,
         status: 'PAUSED',
@@ -145,7 +145,7 @@ export class TaskControlService {
     if (active) {
       this.cancellationRegistry.request(threadId, 'delete', normalizedReason, by);
       this.runner?.cancelThread(threadId, 'delete', normalizedReason, by);
-      this.executionGate.killOrphanChild(threadId);
+      this.executionGate.killOrphanChild(threadId, true);
     }
 
     this.taskStore.deleteTask(threadId);

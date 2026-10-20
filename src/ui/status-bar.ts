@@ -119,6 +119,10 @@ export class StatusBarController {
         label: '$(refresh) 刷新所有 Agent 节点状态 (Refresh Status)',
         description: '重新探测各 Agent 可执行文件、登录态与限流恢复时间',
       },
+      {
+        label: '$(gear) 配置 DeepSeek Harness 接口与密钥',
+        description: '配置或修改 DeepSeek Harness 的 API Base URL 与密钥 (API Key)',
+      },
     ];
 
     const pick = await vscode.window.showQuickPick(items, {
@@ -131,6 +135,11 @@ export class StatusBarController {
       await this.detector.probeAll(true);
       await this.update();
       vscode.window.showInformationMessage('Agent Mesh Bridge: 节点状态探测已刷新。');
+      return;
+    }
+
+    if (pick.label.includes('配置 DeepSeek Harness')) {
+      await vscode.commands.executeCommand('agent-mesh-bridge.configureDeepSeekHarness');
       return;
     }
 
@@ -150,9 +159,7 @@ export class StatusBarController {
       );
     } else if (pick.label.includes('DeepSeek Harness')) {
       this.resolver.setManualOverride('deepseek_harness');
-      vscode.window.showInformationMessage(
-        'Agent Mesh Bridge: 目标已锁定为 DeepSeek Harness。',
-      );
+      vscode.window.showInformationMessage('Agent Mesh Bridge: 目标已锁定为 DeepSeek Harness。');
     }
 
     await this.update();

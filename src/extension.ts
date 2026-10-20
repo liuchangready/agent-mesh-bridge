@@ -22,6 +22,7 @@ import {
   DshProviderConfig,
   isDshProviderUsable,
   readDshConfiguredProvider,
+  resolveDshProviderSettings,
 } from './bridge/deepseek-harness';
 import {
   ModelCatalog,
@@ -76,17 +77,39 @@ export function activate(context: vscode.ExtensionContext) {
    * process itself, so ambient environment inheritance is not reliable.
    */
   let dshApiKey = '';
+  let lastInjectedKey = '';
+  /** Environment variable names the last non-empty key was written to. */
+  let injectedKeyVars: string[] = [];
   const applyDshProviderSettings = (): DshProviderConfig | null => {
     const dshCfg = vscode.workspace.getConfiguration('agentMeshBridge.deepseekHarness');
-    const candidate: DshProviderConfig = {
-      provider: (dshCfg.get<string>('provider') || '').trim(),
-      api: (dshCfg.get<string>('api') || '').trim() || 'openai-completions',
-      baseUrl: (dshCfg.get<string>('baseUrl') || '').trim(),
-      model: (dshCfg.get<string>('model') || '').trim(),
-      apiKeyEnv: (dshCfg.get<string>('apiKeyEnv') || '').trim() || 'COMMANDCODE_API_KEY',
-    };
     const apiKey = (dshCfg.get<string>('apiKey') || '').trim();
     dshApiKey = apiKey;
+
+    const candidate = resolveDshProviderSettings({
+      provider: dshCfg.get<string>('provider'),
+      api: dshCfg.get<string>('api'),
+      baseUrl: dshCfg.get<string>('baseUrl'),
+      model: dshCfg.get<string>('model'),
+      apiKeyEnv: dshCfg.get<string>('apiKeyEnv'),
+    });
+
+    // Every name DSH could read the key from, including the configured
+    // provider's own variable, so a custom route never has to fall back.
+    const keyVars = ['DEEPSEEK_API_KEY', 'DSH_API_KEY', candidate.apiKeyEnv];
+
+    if (apiKey) {
+      for (const name of keyVars) process.env[name] = apiKey;
+      injectedKeyVars = keyVars;
+      lastInjectedKey = apiKey;
+    } else if (lastInjectedKey) {
+      // The key was cleared: remove it from every name it was written to, not
+      // just the official spellings, so no stale credential keeps authorizing.
+      for (const name of injectedKeyVars) {
+        if (process.env[name] === lastInjectedKey) delete process.env[name];
+      }
+      injectedKeyVars = [];
+      lastInjectedKey = '';
+    }
 
     if (!isDshProviderUsable(candidate)) {
       delete process.env[DSH_PROVIDER_ENV_HINT];
@@ -94,17 +117,23 @@ export function activate(context: vscode.ExtensionContext) {
       return null;
     }
 
-    if (apiKey) {
-      process.env[candidate.apiKeyEnv] = apiKey;
-    }
     process.env[DSH_PROVIDER_ENV_HINT] = candidate.apiKeyEnv;
     process.env[DSH_PROVIDER_ID_HINT] = candidate.provider;
     return candidate;
   };
 
   /** Variables every registered bridge MCP process receives. */
-  const agentMcpEnvFor = (provider: DshProviderConfig | null): Record<string, string> =>
-    provider && dshApiKey ? { [provider.apiKeyEnv]: dshApiKey } : {};
+  const agentMcpEnvFor = (provider: DshProviderConfig | null): Record<string, string> => {
+    const env: Record<string, string> = {};
+    if (dshApiKey) {
+      env.DEEPSEEK_API_KEY = dshApiKey;
+      env.DSH_API_KEY = dshApiKey;
+      if (provider?.apiKeyEnv) {
+        env[provider.apiKeyEnv] = dshApiKey;
+      }
+    }
+    return env;
+  };
 
   const dshProvider = applyDshProviderSettings();
 
@@ -140,7 +169,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   applyModelSettings();
   const timeoutMinutes = config.get<number>('taskTimeoutMinutes', 120);
-  const runner = new AutonomousRunner(detector, timeoutMinutes * 60 * 1000);
+  const runner = new AutonomousRunner(detector, timeoutMinutes * 60 * 1000, undefined, taskStore);
   const callbackManager = new CallbackManager(detector);
   const _dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector);
   const reworkController = new ReworkController(taskStore, runner, callbackManager, detector);
@@ -215,15 +244,18 @@ export function activate(context: vscode.ExtensionContext) {
       if (t.status === 'completed' && !knownCompletedThreadIds.has(t.threadId)) {
         knownCompletedThreadIds.add(t.threadId);
         const lastRound = t.rounds && t.rounds[t.rounds.length - 1];
-        const snippet = lastRound && lastRound.prompt ? `\n验收备注: ${lastRound.prompt.slice(0, 100)}` : '';
-        vscode.window.showInformationMessage(
-          `🎉 [Agent Bridge] 任务【${t.title}】已由 ${t.initiatorAgent} 验收通过并正式归档！${snippet}`,
-          '查看详情 (View Details)',
-        ).then((choice) => {
-          if (choice === '查看详情 (View Details)') {
-            TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, t.threadId);
-          }
-        });
+        const snippet =
+          lastRound && lastRound.prompt ? `\n验收备注: ${lastRound.prompt.slice(0, 100)}` : '';
+        vscode.window
+          .showInformationMessage(
+            `🎉 [Agent Bridge] 任务【${t.title}】已由 ${t.initiatorAgent} 验收通过并正式归档！${snippet}`,
+            '查看详情 (View Details)',
+          )
+          .then((choice) => {
+            if (choice === '查看详情 (View Details)') {
+              TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, t.threadId);
+            }
+          });
       }
     }
   });
@@ -375,7 +407,9 @@ export function activate(context: vscode.ExtensionContext) {
 
         const logInfo = TaskSupervisor.getRecentLogs(threadId, 1000, taskStore);
 
-        const channel = vscode.window.createOutputChannel(`Agent Bridge: ${title.slice(0, 20)} Logs`);
+        const channel = vscode.window.createOutputChannel(
+          `Agent Bridge: ${title.slice(0, 20)} Logs`,
+        );
         context.subscriptions.push(channel);
 
         channel.clear();
@@ -559,7 +593,10 @@ export function activate(context: vscode.ExtensionContext) {
           return;
         }
 
-        if (thread.status === 'paused' || (thread.rounds || []).some((r) => r.status === 'paused')) {
+        if (
+          thread.status === 'paused' ||
+          (thread.rounds || []).some((r) => r.status === 'paused')
+        ) {
           try {
             const round = await reworkController.resumePausedTask(threadId);
             vscode.window.showInformationMessage(
@@ -856,10 +893,94 @@ export function activate(context: vscode.ExtensionContext) {
     ),
 
     vscode.commands.registerCommand('agent-mesh-bridge.configureDeepSeekHarness', async () => {
-      await vscode.commands.executeCommand(
-        'workbench.action.openSettings',
-        'agentMeshBridge.deepseekHarness',
+      const dshCfg = vscode.workspace.getConfiguration('agentMeshBridge.deepseekHarness');
+      const currentUrl = (dshCfg.get<string>('baseUrl') || '').trim();
+      const currentKey = (dshCfg.get<string>('apiKey') || '').trim();
+      const currentProvider = (dshCfg.get<string>('provider') || '').trim();
+
+      const maskedKey = currentKey
+        ? `${currentKey.slice(0, 3)}...${currentKey.slice(-4)}`
+        : '未配置 (未设置密钥)';
+
+      const action = await vscode.window.showQuickPick(
+        [
+          {
+            label: '$(edit) 配置 / 修改 URL 与 API 密钥',
+            description: `URL: ${currentUrl || '官方默认'} · 密钥: ${currentKey ? '已配置' : '未配置'}`,
+            detail: '交互式配置 DeepSeek Harness 的 API 调用 URL (Base URL) 与 API 密钥 (API Key)',
+            action: 'wizard',
+          },
+          {
+            label: '$(gear) 打开完整设置面板 (Open Settings)',
+            description: '查看并编辑全部 DeepSeek Harness 设置 (Provider, Model, API, 等)',
+            detail: '打开 VS Code 设置页面中的 agentMeshBridge.deepseekHarness 配置项',
+            action: 'settings',
+          },
+        ],
+        {
+          placeHolder: `配置 DeepSeek Harness (当前接口: ${currentUrl || '官方默认 (https://api.deepseek.com)'} · 密钥: ${maskedKey})`,
+        },
       );
+
+      if (!action) return;
+
+      if (action.action === 'settings') {
+        await vscode.commands.executeCommand(
+          'workbench.action.openSettings',
+          'agentMeshBridge.deepseekHarness',
+        );
+        return;
+      }
+
+      // Step 1: Input / Modify Base URL
+      const urlInput = await vscode.window.showInputBox({
+        title: 'DeepSeek Harness 配置 (1/2) - 调用 URL (Base URL)',
+        prompt:
+          '输入 API Base URL。留空使用 DeepSeek 官方默认接口 (https://api.deepseek.com)，也可指定第三方代理或网关地址',
+        value: currentUrl,
+        placeHolder:
+          '例如 https://api.deepseek.com 或 https://api.deepseek.com/v1 或 https://api.siliconflow.cn/v1',
+        ignoreFocusOut: true,
+      });
+      if (urlInput === undefined) return;
+
+      // Step 2: Input / Modify API Key
+      const keyPrompt = currentKey
+        ? `当前已配置密钥 (${maskedKey})。直接回车保持不变，输入新密钥覆盖，或输入 clear 清除密钥`
+        : '输入 DeepSeek API 密钥 (API Key，例如 sk-...)';
+
+      const keyInput = await vscode.window.showInputBox({
+        title: 'DeepSeek Harness 配置 (2/2) - API 密钥 (API Key)',
+        prompt: keyPrompt,
+        value: '',
+        password: true,
+        placeHolder: currentKey ? '回车保持当前密钥不变，或输入新密钥' : 'sk-...',
+        ignoreFocusOut: true,
+      });
+      if (keyInput === undefined) return;
+
+      let newKey = currentKey;
+      if (keyInput.trim().toLowerCase() === 'clear') {
+        newKey = '';
+      } else if (keyInput.trim()) {
+        newKey = keyInput.trim();
+      }
+
+      const trimmedUrl = urlInput.trim();
+
+      // Save to global machine settings
+      await dshCfg.update('baseUrl', trimmedUrl, vscode.ConfigurationTarget.Global);
+      await dshCfg.update('apiKey', newKey, vscode.ConfigurationTarget.Global);
+
+      // If baseUrl is provided and provider wasn't set, auto-set provider
+      if (trimmedUrl && !currentProvider) {
+        const autoProvider = /commandcode/i.test(trimmedUrl)
+          ? 'commandcode'
+          : /deepseek/i.test(trimmedUrl)
+            ? 'deepseek'
+            : 'custom';
+        await dshCfg.update('provider', autoProvider, vscode.ConfigurationTarget.Global);
+      }
     }),
   );
 
@@ -875,20 +996,26 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Re-apply the DeepSeek Harness model route whenever its settings change, so
   // the profile patch and the reported login state follow the configuration.
+  let dshConfigSyncTimer: NodeJS.Timeout | undefined;
   context.subscriptions.push(
-    vscode.workspace.onDidChangeConfiguration(async (e) => {
+    vscode.workspace.onDidChangeConfiguration((e) => {
       if (!e.affectsConfiguration('agentMeshBridge.deepseekHarness')) return;
-      const provider = applyDshProviderSettings();
-      configSync.setDshProvider(provider);
-      configSync.setAgentMcpEnv(agentMcpEnvFor(provider));
-      await configSync.syncAll();
-      await agentNodesProvider.refresh(true);
-      await statusBar.update();
-      vscode.window.showInformationMessage(
-        provider
-          ? `Agent Mesh Bridge: DeepSeek Harness 模型路由已更新 (provider: ${provider.provider})。`
-          : 'Agent Mesh Bridge: DeepSeek Harness 已恢复为官方 provider 路由。',
-      );
+      if (dshConfigSyncTimer) clearTimeout(dshConfigSyncTimer);
+      dshConfigSyncTimer = setTimeout(async () => {
+        const provider = applyDshProviderSettings();
+        configSync.setDshProvider(provider);
+        configSync.setAgentMcpEnv(agentMcpEnvFor(provider));
+        await configSync.syncAll();
+        await agentNodesProvider.refresh(true);
+        await statusBar.update();
+        vscode.window.showInformationMessage(
+          provider
+            ? `Agent Mesh Bridge: DeepSeek Harness 配置已更新 (provider: ${provider.provider})。`
+            : dshApiKey
+              ? 'Agent Mesh Bridge: DeepSeek Harness 配置已更新 (官方路由 · 已配置 API Key)。'
+              : 'Agent Mesh Bridge: DeepSeek Harness 已恢复为官方默认配置。',
+        );
+      }, 100);
     }),
   );
 

@@ -71,7 +71,7 @@ function parsePorcelainZ(cwd: string, raw: string, prefix: string): Map<string, 
     const token = tokens[i];
     if (!token || token.length < 4) continue;
     const status = token.slice(0, 2);
-    let relPath = token.slice(3);
+    const relPath = token.slice(3);
     if (status[0] === 'R' || status[0] === 'C') i++; // skip the original path
 
     if (prefix && !relPath.startsWith(prefix)) continue; // outside this workspace

@@ -124,7 +124,8 @@
       },
       {
         "command": "agent-mesh-bridge.configureDeepSeekHarness",
-        "title": "Configure DeepSeek Harness Model Route"
+        "title": "Agent Bridge: Configure DeepSeek Harness (URL & Key) / 配置 DeepSeek Harness 接口与密钥",
+        "icon": "$(gear)"
       },
       {
         "command": "agent-mesh-bridge.printRecentLogs",
@@ -136,6 +137,11 @@
       "view/title": [
         {
           "command": "agent-mesh-bridge.refreshAgentStatus",
+          "when": "view == agent-mesh-bridge.agent-nodes",
+          "group": "navigation"
+        },
+        {
+          "command": "agent-mesh-bridge.configureDeepSeekHarness",
           "when": "view == agent-mesh-bridge.agent-nodes",
           "group": "navigation"
         },
@@ -158,6 +164,11 @@
         },
         {
           "command": "agent-mesh-bridge.selectAgentModel",
+          "when": "view == agent-mesh-bridge.agent-nodes",
+          "group": "1_actions"
+        },
+        {
+          "command": "agent-mesh-bridge.configureDeepSeekHarness",
           "when": "view == agent-mesh-bridge.agent-nodes",
           "group": "1_actions"
         },
@@ -271,7 +282,7 @@
         "agentMeshBridge.deepseekHarness.provider": {
           "type": "string",
           "default": "",
-          "description": "Model provider written into the DeepSeek Harness 'headless' profile for bridge-launched runs (e.g. \"commandcode\"). Leave empty to keep DSH's shipped deepseek-official route."
+          "markdownDescription": "Model provider written into the DeepSeek Harness 'headless' profile (e.g. \"custom\", \"commandcode\"). 留空时若配置了 Base URL 则自动派生 provider，未配置 Base URL 则使用 DSH 原生 deepseek-official 路由。"
         },
         "agentMeshBridge.deepseekHarness.api": {
           "type": "string",
@@ -284,24 +295,24 @@
         },
         "agentMeshBridge.deepseekHarness.baseUrl": {
           "type": "string",
-          "default": "https://api.commandcode.ai/provider/v1",
-          "description": "Base URL of the configured DeepSeek Harness provider."
+          "default": "",
+          "markdownDescription": "DeepSeek Harness API Base URL (调用的 URL / 接口地址)。留空使用 DeepSeek 官方默认接口 (`https://api.deepseek.com`)，也可指定自定义或第三方代理网关 (例如 `https://api.siliconflow.cn/v1` 或 `https://api.commandcode.ai/provider/v1`)。"
         },
         "agentMeshBridge.deepseekHarness.model": {
           "type": "string",
-          "default": "deepseek/deepseek-v4.1-flash",
-          "description": "Model id made the default for bridge-launched DeepSeek Harness runs."
+          "default": "",
+          "markdownDescription": "Default model id for bridge-launched DeepSeek Harness runs (e.g. `deepseek-chat`, `deepseek-reasoner`)。留空时自动派生：命名了 provider 的旧配置沿用该 provider 的既有默认模型，否则使用 `deepseek-chat`。"
         },
         "agentMeshBridge.deepseekHarness.apiKeyEnv": {
           "type": "string",
-          "default": "COMMANDCODE_API_KEY",
-          "description": "Environment variable the DeepSeek Harness provider reads its API key from. The extension exports this variable to the DSH process it launches."
+          "default": "",
+          "markdownDescription": "Environment variable the DeepSeek Harness provider reads its API key from. The extension exports this variable to the DSH process it launches. 留空时自动派生：`commandcode` provider 使用 `COMMANDCODE_API_KEY`，其余使用 `DEEPSEEK_API_KEY`。"
         },
         "agentMeshBridge.deepseekHarness.apiKey": {
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "API key for the configured DeepSeek Harness provider. Exported to the launched DSH process through `#agentMeshBridge.deepseekHarness.apiKeyEnv#`. Kept in machine-scope settings so it is never synced; leave empty to supply the key through the environment variable instead."
+          "markdownDescription": "DeepSeek Harness API Key (调用的 API 密钥)。保存在 machine scope（仅本机有效不随设置同步），将自动注入为对应环境变量供 DeepSeek Harness headless 调用。"
         },
         "agentMeshBridge.autoSyncMcp": {
           "type": "boolean",

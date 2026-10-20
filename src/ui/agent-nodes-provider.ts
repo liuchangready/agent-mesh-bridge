@@ -40,12 +40,7 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     }
 
     const activeResolution = await this.resolver.resolveActiveAgent();
-    const agentsList: AgentId[] = [
-      'antigravity',
-      'codex',
-      'claude_code',
-      'deepseek_harness',
-    ];
+    const agentsList: AgentId[] = ['antigravity', 'codex', 'claude_code', 'deepseek_harness'];
 
     const items: AgentNodeItem[] = [];
     for (const agentId of agentsList) {
@@ -146,7 +141,31 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
       vscode.TreeItemCollapsibleState.None,
     );
     authSub.iconPath = new vscode.ThemeIcon('shield');
+    if (info.id === 'deepseek_harness') {
+      authSub.description = '点击配置 URL 与 API 密钥';
+      authSub.command = {
+        command: 'agent-mesh-bridge.configureDeepSeekHarness',
+        title: 'Configure DeepSeek Harness',
+      };
+    }
     subItems.push(authSub);
+
+    // 3b. Endpoint for DeepSeek Harness
+    if (info.id === 'deepseek_harness') {
+      const dshCfg = vscode.workspace.getConfiguration('agentMeshBridge.deepseekHarness');
+      const currentUrl = (dshCfg.get<string>('baseUrl') || '').trim();
+      const endpointSub = new AgentNodeItem(
+        `接口: ${currentUrl || '官方默认 (https://api.deepseek.com)'}`,
+        vscode.TreeItemCollapsibleState.None,
+      );
+      endpointSub.description = '点击修改 URL 与密钥';
+      endpointSub.iconPath = new vscode.ThemeIcon('link');
+      endpointSub.command = {
+        command: 'agent-mesh-bridge.configureDeepSeekHarness',
+        title: 'Configure DeepSeek Harness',
+      };
+      subItems.push(endpointSub);
+    }
 
     // 4. Executable path
     if (info.executablePath) {

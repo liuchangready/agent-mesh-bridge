@@ -17,6 +17,7 @@ import {
   readDshConfiguredProvider,
   removeManagedPatchBlock,
   resolveDshInstall,
+  resolveDshProviderSettings,
 } from '../bridge/deepseek-harness';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { AgentDetector } from '../bridge/agent-detector';
@@ -432,5 +433,111 @@ describe('DeepSeek Harness - configurable model provider', () => {
       if (previousDeepseek === undefined) delete process.env.DEEPSEEK_API_KEY;
       else process.env.DEEPSEEK_API_KEY = previousDeepseek;
     }
+  });
+
+  test('should authenticate official route with DEEPSEEK_API_KEY when no custom provider is configured', () => {
+    const saved = {
+      dshHome: process.env.DSH_HOME,
+      hintEnv: process.env[DSH_PROVIDER_ENV_HINT],
+      hintId: process.env[DSH_PROVIDER_ID_HINT],
+      deepseek: process.env.DEEPSEEK_API_KEY,
+      dshKey: process.env.DSH_API_KEY,
+    };
+    try {
+      const emptyHome = makeTempDir('dsh-empty-home-');
+      process.env.DSH_HOME = emptyHome;
+      delete process.env[DSH_PROVIDER_ENV_HINT];
+      delete process.env[DSH_PROVIDER_ID_HINT];
+      delete process.env.DSH_API_KEY;
+      delete process.env.DEEPSEEK_API_KEY;
+
+      const unauth = checkDshAuth();
+      assert.strictEqual(unauth.authenticated, false);
+
+      process.env.DEEPSEEK_API_KEY = 'sk-official-test-key';
+      const auth = checkDshAuth();
+      assert.strictEqual(auth.authenticated, true);
+      assert.match(auth.details, /DEEPSEEK_API_KEY/);
+    } finally {
+      if (saved.dshHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = saved.dshHome;
+      if (saved.hintEnv === undefined) delete process.env[DSH_PROVIDER_ENV_HINT];
+      else process.env[DSH_PROVIDER_ENV_HINT] = saved.hintEnv;
+      if (saved.hintId === undefined) delete process.env[DSH_PROVIDER_ID_HINT];
+      else process.env[DSH_PROVIDER_ID_HINT] = saved.hintId;
+      if (saved.deepseek === undefined) delete process.env.DEEPSEEK_API_KEY;
+      else process.env.DEEPSEEK_API_KEY = saved.deepseek;
+      if (saved.dshKey === undefined) delete process.env.DSH_API_KEY;
+      else process.env.DSH_API_KEY = saved.dshKey;
+    }
+  });
+});
+
+describe('DeepSeek Harness - model route resolution', () => {
+  test('every setting blank keeps the shipped deepseek-official route', () => {
+    const resolved = resolveDshProviderSettings({});
+    assert.strictEqual(resolved.provider, '');
+    assert.strictEqual(resolved.baseUrl, '');
+    assert.strictEqual(resolved.apiKeyEnv, 'DEEPSEEK_API_KEY');
+    assert.strictEqual(
+      isDshProviderUsable(resolved),
+      false,
+      'a route with no URL must not be written into the headless profile',
+    );
+  });
+
+  test('a URL without a provider derives one, plus its key variable and model', () => {
+    const custom = resolveDshProviderSettings({ baseUrl: 'https://api.siliconflow.cn/v1/' });
+    assert.strictEqual(custom.provider, 'custom');
+    assert.strictEqual(custom.apiKeyEnv, 'DEEPSEEK_API_KEY');
+    assert.strictEqual(custom.model, 'deepseek-chat');
+    assert.strictEqual(custom.api, 'openai-completions');
+
+    const commandcode = resolveDshProviderSettings({
+      baseUrl: 'https://api.commandcode.ai/provider/v1',
+    });
+    assert.strictEqual(commandcode.provider, 'commandcode');
+    assert.strictEqual(commandcode.apiKeyEnv, 'COMMANDCODE_API_KEY');
+  });
+
+  test('a named legacy provider with no URL keeps its shipped endpoint and model', () => {
+    const resolved = resolveDshProviderSettings({ provider: 'commandcode' });
+    assert.strictEqual(resolved.baseUrl, 'https://api.commandcode.ai/provider/v1');
+    assert.strictEqual(resolved.model, 'deepseek/deepseek-v4.1-flash');
+    assert.strictEqual(resolved.apiKeyEnv, 'COMMANDCODE_API_KEY');
+    assert.strictEqual(
+      isDshProviderUsable(resolved),
+      true,
+      'a pre-existing commandcode route must not silently fall back to the official endpoint',
+    );
+
+    // The same pairing holds when the user wrote the URL out explicitly.
+    const explicitUrl = resolveDshProviderSettings({
+      provider: 'commandcode',
+      baseUrl: 'https://api.commandcode.ai/provider/v1',
+    });
+    assert.strictEqual(explicitUrl.model, 'deepseek/deepseek-v4.1-flash');
+    assert.strictEqual(explicitUrl.apiKeyEnv, 'COMMANDCODE_API_KEY');
+  });
+
+  test('explicit values win over every derived one', () => {
+    const resolved = resolveDshProviderSettings({
+      provider: 'commandcode',
+      baseUrl: 'https://gateway.example/v1',
+      model: 'my-model',
+      apiKeyEnv: 'MY_KEY',
+      api: 'anthropic-messages',
+    });
+    assert.strictEqual(resolved.provider, 'commandcode');
+    assert.strictEqual(resolved.baseUrl, 'https://gateway.example/v1');
+    assert.strictEqual(resolved.model, 'my-model');
+    assert.strictEqual(resolved.apiKeyEnv, 'MY_KEY');
+    assert.strictEqual(resolved.api, 'anthropic-messages');
+  });
+
+  test('an unknown named provider without a URL stays unroutable rather than guessing', () => {
+    const resolved = resolveDshProviderSettings({ provider: 'some-gateway' });
+    assert.strictEqual(resolved.baseUrl, '');
+    assert.strictEqual(isDshProviderUsable(resolved), false);
   });
 });

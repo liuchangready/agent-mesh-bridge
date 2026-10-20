@@ -101,6 +101,79 @@ export function isDshProviderUsable(provider?: Partial<DshProviderConfig> | null
   );
 }
 
+/**
+ * Provider endpoints that earlier releases shipped as their defaults.
+ *
+ * A profile that names one of these providers but carries no URL of its own used
+ * to run against the shipped endpoint. Resolving that endpoint again keeps the
+ * route working instead of silently dropping the run onto the official one.
+ */
+const LEGACY_PROVIDER_DEFAULTS: Record<
+  string,
+  { baseUrl: string; model: string; apiKeyEnv: string }
+> = {
+  commandcode: {
+    baseUrl: 'https://api.commandcode.ai/provider/v1',
+    model: 'deepseek/deepseek-v4.1-flash',
+    apiKeyEnv: 'COMMANDCODE_API_KEY',
+  },
+};
+
+/** Raw `agentMeshBridge.deepseekHarness.*` values, before any derivation. */
+export interface DshProviderSettingsInput {
+  provider?: string;
+  api?: string;
+  baseUrl?: string;
+  model?: string;
+  apiKeyEnv?: string;
+}
+
+/**
+ * Resolve the configured DeepSeek Harness model route from user settings.
+ *
+ * Every field is optional: a blank `baseUrl` keeps DSH's shipped
+ * `deepseek-official` route, a URL without a provider id derives one from the
+ * host, and a provider id without a URL falls back to that provider's shipped
+ * endpoint. An explicit value always wins over a derived one.
+ */
+export function resolveDshProviderSettings(raw: DshProviderSettingsInput): DshProviderConfig {
+  let provider = (raw.provider || '').trim();
+  let baseUrl = (raw.baseUrl || '').trim();
+  let model = (raw.model || '').trim();
+  let apiKeyEnv = (raw.apiKeyEnv || '').trim();
+  const api = (raw.api || '').trim() || 'openai-completions';
+
+  const legacy = provider ? LEGACY_PROVIDER_DEFAULTS[provider.toLowerCase()] : undefined;
+  if (!baseUrl && legacy) {
+    baseUrl = legacy.baseUrl;
+    if (!apiKeyEnv) apiKeyEnv = legacy.apiKeyEnv;
+  }
+
+  if (baseUrl) {
+    if (!provider) {
+      if (/commandcode/i.test(baseUrl)) {
+        provider = 'commandcode';
+      } else if (/deepseek/i.test(baseUrl)) {
+        provider = 'deepseek';
+      } else {
+        provider = 'custom';
+      }
+    }
+    // The model a provider ships with is paired by provider id, whether the URL
+    // came from the profile or was written out explicitly.
+    const routeLegacy = LEGACY_PROVIDER_DEFAULTS[provider.toLowerCase()];
+    if (!apiKeyEnv) {
+      apiKeyEnv =
+        provider.toLowerCase() === 'commandcode' ? 'COMMANDCODE_API_KEY' : 'DEEPSEEK_API_KEY';
+    }
+    if (!model) model = routeLegacy?.model || 'deepseek-chat';
+  } else if (!apiKeyEnv) {
+    apiKeyEnv = 'DEEPSEEK_API_KEY';
+  }
+
+  return { provider, api, baseUrl, model, apiKeyEnv: apiKeyEnv || 'DEEPSEEK_API_KEY' };
+}
+
 /** Relative path from an install root to the profile launcher. */
 const LAUNCHER_RELATIVE = path.join('resources', 'runtime', 'cli', 'bin');
 
@@ -494,13 +567,6 @@ export function readDshConfiguredProvider(): DshProviderConfig | undefined {
  *     reads the env var that declaration names.
  */
 export function checkDshAuth(): { authenticated: boolean; details: string } {
-  if (process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY.trim()) {
-    return { authenticated: true, details: '已登录 (DEEPSEEK_API_KEY 环境变量)' };
-  }
-  if (process.env.DSH_API_KEY && process.env.DSH_API_KEY.trim()) {
-    return { authenticated: true, details: '已登录 (DSH_API_KEY 环境变量)' };
-  }
-
   // Disk is authoritative; the env hints only cover a not-yet-synced host.
   const configured = readDshConfiguredProvider();
   const providerEnv = (configured?.apiKeyEnv || process.env[DSH_PROVIDER_ENV_HINT] || '').trim();
@@ -518,8 +584,15 @@ export function checkDshAuth(): { authenticated: boolean; details: string } {
       authenticated: false,
       details:
         `已配置 provider ${providerId}，但当前进程缺少密钥（请设置环境变量 ${providerEnv}，` +
-        `或在插件中填写 API Key 后完全重启 VS Code）`,
+        `或在插件中配置 API Key）`,
     };
+  }
+
+  if (process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY.trim()) {
+    return { authenticated: true, details: '已登录 (DEEPSEEK_API_KEY 环境变量)' };
+  }
+  if (process.env.DSH_API_KEY && process.env.DSH_API_KEY.trim()) {
+    return { authenticated: true, details: '已登录 (DSH_API_KEY 环境变量)' };
   }
 
   const credentialsPath = path.join(getDshHome(), '.credentials.yaml');

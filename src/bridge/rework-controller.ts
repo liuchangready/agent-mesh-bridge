@@ -22,7 +22,6 @@ import { findScopeConflicts, describeScopeConflict, ScopeConflict } from './file
 import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
 import { ExecutionGate, ExecutionOwner } from './execution-gate';
 import { QueueDrainer, QueuedExecution } from './queue-drainer';
-import { CancellationRegistry } from './cancellation-registry';
 import { TaskRoleLock } from './task-role-lock';
 
 export class ReworkController {
@@ -279,7 +278,11 @@ export class ReworkController {
     }
 
     // A stale pause/delete request must not immediately kill the resumed run.
-    new CancellationRegistry().clear(threadId);
+    // The runner owns both channels — the cancellation file it polls and the
+    // pause it remembers in memory — so clearing through it is the only way to
+    // cover a pause that landed before any child existed and was therefore never
+    // consumed by a settling round.
+    this.runner.clearPendingCancellation(threadId);
 
     const isRework = shouldResumeNativeSession(thread, pausedRound);
     const nowIso = new Date().toISOString();

@@ -203,6 +203,36 @@ export class TaskSupervisor extends EventEmitter {
     this.taskStore.loadFromDisk();
     const allTasks = this.taskStore.getAllTasks();
 
+    // If an active task was deleted from disk while executing, proactively abort its runner.
+    // If it was marked paused, stop the child process to preserve the round.
+    for (const activeThreadId of Array.from(this.activeTasks.keys())) {
+      const live = this.taskStore.getTask(activeThreadId);
+      if (!live) {
+        console.warn(
+          `[TaskSupervisor] Active task ${activeThreadId} was deleted from store; aborting runner.`,
+        );
+        this.runner.cancelThread(activeThreadId, 'delete', 'Task was deleted from store', 'supervisor');
+      } else if (live.status === 'paused') {
+        this.runner.cancelThread(
+          activeThreadId,
+          'pause',
+          live.interruption?.reason || 'Task was paused in store',
+          'supervisor',
+        );
+      }
+    }
+
+    const lockOwner = this.executionGate.getOwner();
+    if (lockOwner && !this.taskStore.getTask(lockOwner.threadId)) {
+      console.warn(
+        `[TaskSupervisor] Lock owner task ${lockOwner.threadId} no longer exists in store; clearing orphaned gate.`,
+      );
+      this.executionGate.killOrphanChild(lockOwner.threadId, true);
+      if (lockOwner.pid === process.pid && !this.activeTasks.has(lockOwner.threadId)) {
+        this.executionGate.release();
+      }
+    }
+
     // Task-level queue head: the oldest unfinished task owns the single global
     // slot. A waiting_review/paused head blocks every younger task until it is
     // completed (or deleted/retried).

@@ -174,28 +174,33 @@ export class ExecutionGate {
   }
 
   /**
-   * Kill the agent child recorded for `threadId` when its host is gone.
+   * Kill the agent child recorded for `threadId`.
    *
-   * A live host owns its child and reacts to the cross-process cancellation file
-   * on its own, so this only acts on genuine orphans (host process dead). It
-   * makes `pause_task` / `delete_task` effective even after a host restart.
+   * By default (`force = false`), this acts only on genuine orphans (host process dead)
+   * so a live host can handle cancellation on its own. When `force = true` (e.g. from
+   * `pauseTask` or `deleteTask`), the agent child is forcefully killed immediately
+   * regardless of whether the host is alive, preventing retry loops or frozen agents
+   * from holding the global execution gate.
    *
-   * @returns whether an orphaned child was killed.
+   * @returns whether an agent child was killed.
    */
-  public killOrphanChild(threadId: string): boolean {
+  public killOrphanChild(threadId: string, force: boolean = false): boolean {
     const owner = this.readOwner();
     if (!owner || owner.threadId !== threadId) return false;
     if (!owner.childPid) return false;
-    // The owning host is still alive: leave the kill to its own runner, which
-    // also finalizes the round and records the interruption.
-    if (this.isPidAlive(owner.pid, true)) return false;
+    // When not forced, leave a live host to its own runner.
+    if (!force && this.isPidAlive(owner.pid, true)) return false;
     if (!this.isPidAlive(owner.childPid, false)) return false;
 
     console.warn(
-      `[ExecutionGate] Killing orphaned agent process ${owner.childPid} for ${threadId} ` +
-        `(round ${owner.round}): its host process ${owner.pid} is gone.`,
+      `[ExecutionGate] Killing ${force ? 'active' : 'orphaned'} agent process ${owner.childPid} for ${threadId} ` +
+        `(round ${owner.round})${force ? ' (force requested)' : `: its host process ${owner.pid} is gone.`}`,
     );
     this.killProcessTree(owner.childPid);
+    owner.childPid = undefined;
+    try {
+      fs.writeFileSync(this.lockFilePath, JSON.stringify(owner), 'utf8');
+    } catch {}
     return true;
   }
 

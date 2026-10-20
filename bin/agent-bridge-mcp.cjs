@@ -37,7 +37,7 @@ try {
   const taskStore = TaskStore.getInstance();
   const detector = new AgentDetector();
   const resolver = new ActiveAgentResolver(detector);
-  const runner = new AutonomousRunner(detector);
+  const runner = new AutonomousRunner(detector, undefined, undefined, taskStore);
   const callbackManager = new CallbackManager(detector);
   const dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector);
   const reworkController = new ReworkController(taskStore, runner, callbackManager, detector);

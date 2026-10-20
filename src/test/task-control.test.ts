@@ -172,4 +172,49 @@ describe('TaskControlService - pause/delete reasons', () => {
     assert.strictEqual(thread.interruption, undefined, 'current interruption cleared');
     assert.strictEqual(thread.interruptions?.[0]?.reason, 'pause for inspection', 'history kept');
   });
+
+  test('resuming clears the pause the runner remembered while nothing was running', async () => {
+    taskStore.upsertTask(makeThread({ status: 'queued' }));
+    // Use the real runner: pausing a task that never spawned a child leaves the
+    // pause remembered in memory, where no settling round will consume it.
+    runner.cancelThread = AutonomousRunner.prototype.cancelThread;
+
+    const control = new TaskControlService(
+      taskStore,
+      runner,
+      new CancellationRegistry(tempDir),
+      tempDir,
+    );
+    control.pauseTask('thread_control_1', 'pause before start', 'user');
+    assert.ok(
+      runner.checkPendingCancellation('thread_control_1'),
+      'the pause stays pending for a task that never spawned a child',
+    );
+
+    const callbackManager = new CallbackManager(new AgentDetector());
+    callbackManager.notifyCaller = async () => true;
+    callbackManager.notifyCallerOfFailure = async () => false;
+    const reworkController = new ReworkController(
+      taskStore,
+      runner,
+      callbackManager,
+      new AgentDetector(),
+      new ExecutionGate(tempDir),
+    );
+    runner.execute = async (): Promise<RunResult> => ({
+      exitCode: 0,
+      stdout: 'resumed',
+      stderr: '',
+      extractedOutput: 'resumed',
+      durationMs: 5,
+    });
+
+    await reworkController.resumePausedTask('thread_control_1');
+
+    assert.strictEqual(
+      runner.checkPendingCancellation('thread_control_1'),
+      undefined,
+      'a resumed task must not be cancelled on sight by the pause it was resumed from',
+    );
+  });
 });
