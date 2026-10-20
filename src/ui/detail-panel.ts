@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 import { TaskStore } from '../bridge/task-store';
 import { ReworkController } from '../bridge/rework-controller';
 import { DelegationThread } from '../bridge/types';
+import { TaskSupervisor } from '../bridge/task-supervisor';
+import { AgentDetector } from '../bridge/agent-detector';
 
 export class TaskDetailPanel {
   public static currentPanel: TaskDetailPanel | undefined;
@@ -53,6 +55,17 @@ export class TaskDetailPanel {
           case 'resumeTask':
             await this.handleResumeTask(message.feedback);
             break;
+          case 'pauseTask':
+            await vscode.commands.executeCommand('agent-mesh-bridge.pauseTask', this.currentThreadId);
+            this.update();
+            break;
+          case 'deleteTask':
+            await vscode.commands.executeCommand(
+              'agent-mesh-bridge.deleteTask',
+              this.currentThreadId,
+            );
+            this.update();
+            break;
           case 'retryFailedRound':
             await this.handleRetryFailedRound();
             break;
@@ -65,6 +78,15 @@ export class TaskDetailPanel {
             break;
           case 'openTerminal':
             this.handleOpenTerminal();
+            break;
+          case 'printRecentLogs':
+            await vscode.commands.executeCommand(
+              'agent-mesh-bridge.printRecentLogs',
+              this.currentThreadId,
+            );
+            break;
+          case 'copiedNotice':
+            vscode.window.showInformationMessage('已复制最近 1,000 行日志到剪贴板。');
             break;
           case 'refresh':
             this.update();
@@ -148,6 +170,12 @@ export class TaskDetailPanel {
   private async handleResumeTask(feedback?: string) {
     const thread = this.taskStore.getTask(this.currentThreadId);
     if (!thread) return;
+
+    if (thread.status === 'paused' || (thread.rounds || []).some((r) => r.status === 'paused')) {
+      await vscode.commands.executeCommand('agent-mesh-bridge.resumeTask', this.currentThreadId);
+      this.update();
+      return;
+    }
 
     if (thread.status === 'running' || thread.status === 'reworking') {
       vscode.window.showInformationMessage(
@@ -233,6 +261,10 @@ export class TaskDetailPanel {
       cmd = `claude -p "" --resume ${thread.receiverSessionId} --permission-mode bypassPermissions`;
     } else if (thread.targetAgent === 'antigravity') {
       cmd = `agy --conversation ${thread.receiverSessionId}`;
+    } else if (thread.targetAgent === 'deepseek_harness') {
+      // DSH resumes an existing native Session through the `tui` app.
+      const launcher = new AgentDetector().resolveExecutable('deepseek_harness') || 'dsh';
+      cmd = `"${launcher}" tui --resume ${thread.receiverSessionId}`;
     }
 
     if (cmd) {
@@ -262,21 +294,30 @@ export class TaskDetailPanel {
         .replace(/'/g, '&#039;');
     };
 
+    const safeMrUrl =
+      thread.mergeRequest?.url && /^https?:\/\//i.test(thread.mergeRequest.url)
+        ? thread.mergeRequest.url
+        : undefined;
+
     const statusBadgeColors: Record<string, string> = {
+      queued: '#a855f7',
       running: '#f59e0b',
       reworking: '#f59e0b',
       waiting_review: '#3b82f6',
+      paused: '#f97316',
       completed: '#10b981',
       failed: '#ef4444',
     };
 
     const badgeColor = statusBadgeColors[thread.status] || '#6b7280';
+    const recentLogs = TaskSupervisor.getRecentLogs(thread.threadId, 1000, this.taskStore);
 
     const roundsHtml = thread.rounds
       .map((r) => {
         const durationSec = Math.round((r.durationMs || 0) / 1000);
         const isFailed = r.status === 'failed';
-        const roundBorderColor = isFailed ? '#ef4444' : '#334155';
+        const isPaused = r.status === 'paused';
+        const roundBorderColor = isFailed ? '#ef4444' : isPaused ? '#f97316' : '#334155';
 
         return `
         <div class="round-card" style="border-left: 4px solid ${roundBorderColor};">
@@ -284,7 +325,19 @@ export class TaskDetailPanel {
             <span class="round-badge">Round ${r.round} (${r.type.toUpperCase()})</span>
             <span class="round-meta">${new Date(r.timestamp).toLocaleTimeString()} · ${durationSec}s · Status: <strong>${r.status}</strong></span>
           </div>
-          
+
+          ${
+            r.assessment
+              ? `
+          <div class="section-title" style="color: ${r.assessment.success ? '#34d399' : '#fca5a5'};">
+            Response Health: ${escapeHtml(r.assessment.errorCode)} · exit=${r.assessment.exitCode}
+          </div>
+          <pre class="code-block" style="color:${r.assessment.success ? '#a7f3d0' : '#fecaca'}; max-height:120px;">chunks=${r.assessment.stream.chunkCount} (stdout ${r.assessment.stream.stdoutBytes}B / stderr ${r.assessment.stream.stderrBytes}B)
+actualOutput=${r.assessment.stream.hasActualOutput} · continuous=${r.assessment.stream.continuous} · maxGap=${r.assessment.stream.maxGapMs}ms / threshold=${r.assessment.stream.gapThresholdMs}ms
+${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}</pre>`
+              : ''
+          }
+
           <div class="prompt-section">
             <div class="section-title">Caller Instructions / Feedback:</div>
             <pre class="code-block">${escapeHtml(r.prompt)}</pre>
@@ -294,7 +347,10 @@ export class TaskDetailPanel {
             r.output
               ? `
           <div class="output-section">
-            <div class="section-title">Receiver Output:</div>
+            <div class="section-title" style="display: flex; align-items: center; gap: 8px;">
+              ${r.status === 'running' ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;"></span>` : ''}
+              Receiver Output ${r.status === 'running' ? '(实时流式更新中 · 每30s自动刷新):' : ':'}
+            </div>
             <pre class="code-block output-text">${escapeHtml(r.output)}</pre>
           </div>`
               : ''
@@ -306,6 +362,16 @@ export class TaskDetailPanel {
           <div class="error-section">
             <div class="section-title" style="color: #ef4444;">Execution Error:</div>
             <pre class="code-block error-text">${escapeHtml(r.error)}</pre>
+          </div>`
+              : ''
+          }
+
+          ${
+            r.interruption
+              ? `
+          <div class="error-section">
+            <div class="section-title" style="color: #f97316;">Interruption (${escapeHtml(r.interruption.kind)}):</div>
+            <pre class="code-block" style="color:#fdba74;">${escapeHtml(r.interruption.reason)}${r.interruption.by ? `\n— by ${escapeHtml(r.interruption.by)} at ${new Date(r.interruption.at).toLocaleString()}` : ''}</pre>
           </div>`
               : ''
           }
@@ -522,6 +588,39 @@ export class TaskDetailPanel {
         <div class="meta-label">Created At</div>
         <div class="meta-val">${new Date(thread.createdAt).toLocaleString()}</div>
       </div>
+      ${
+        thread.expectedFiles && thread.expectedFiles.length > 0
+          ? `
+      <div class="meta-item" style="grid-column: 1 / -1;">
+        <div class="meta-label">Expected File Scope (冲突排队保护)</div>
+        <div class="meta-val" style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px;">
+          ${thread.expectedFiles
+            .map(
+              (f) =>
+                `<span style="background: rgba(168, 85, 247, 0.2); border: 1px solid rgba(168, 85, 247, 0.4); padding: 2px 8px; border-radius: 4px; font-size: 12px; color: #e9d5ff;">${escapeHtml(f)}</span>`,
+            )
+            .join('')}
+        </div>
+      </div>`
+          : ''
+      }
+      ${
+        thread.mergeRequest
+          ? `
+      <div class="meta-item" style="grid-column: 1 / -1;">
+        <div class="meta-label">Merge Request (调用者收口)</div>
+        <div class="meta-val" style="margin-top: 6px; line-height: 1.7;">
+          <strong>${escapeHtml(thread.mergeRequest.status.toUpperCase())}</strong>
+          ${thread.mergeRequest.url ? (safeMrUrl ? ` · <a href="${escapeHtml(safeMrUrl)}" style="color:#60a5fa;">${escapeHtml(safeMrUrl)}</a>` : ` · ${escapeHtml(thread.mergeRequest.url)}`) : ''}
+          ${thread.mergeRequest.branch ? `<br/>branch: ${escapeHtml(thread.mergeRequest.branch)}` : ''}
+          ${thread.mergeRequest.commit ? ` · commit: ${escapeHtml(thread.mergeRequest.commit)}` : ''}
+          ${thread.mergeRequest.remote ? `<br/>remote: ${escapeHtml(thread.mergeRequest.remote)}` : ''}
+          ${thread.mergeRequest.baseBranch ? ` · base: ${escapeHtml(thread.mergeRequest.baseBranch)}` : ''}
+          ${thread.mergeRequest.summary ? `<br/>${escapeHtml(thread.mergeRequest.summary)}` : ''}
+        </div>
+      </div>`
+          : ''
+      }
     </div>
   </div>
 
@@ -535,6 +634,16 @@ export class TaskDetailPanel {
       <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">由 <strong>${escapeHtml(thread.initiatorAgent)}</strong> 独立运行全部测试套件完成验证，既有测试与回归测试全绿通过。</div>
     </div>
   </div>`
+      : thread.status === 'queued'
+      ? `
+  <div style="background: rgba(168, 85, 247, 0.15); border: 1px solid #a855f7; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
+    <div style="font-size: 28px;">⏳</div>
+    <div>
+      <div style="font-weight: 700; font-size: 16px; color: #c084fc;">排队等待中 · 检测到文件修改范围冲突 (Task Queued)</div>
+      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">${escapeHtml(thread.summary.lastOutputSnippet)}</div>
+      <div style="font-size: 12px; opacity: 0.75; margin-top: 2px;">当前任务正在等待冲突任务释放文件锁定，释放后网格将自动唤醒开始执行，无需人工干预。</div>
+    </div>
+  </div>`
       : thread.status === 'waiting_review'
       ? `
   <div style="background: rgba(59, 130, 246, 0.15); border: 1px solid #3b82f6; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
@@ -544,13 +653,23 @@ export class TaskDetailPanel {
       <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">已主动唤醒 <strong>${escapeHtml(thread.initiatorAgent)}</strong>，正在后台独立执行全量构建与回归跑测（通常耗时 30~60 秒）。任务正常流转中，请等待审查结论。</div>
     </div>
   </div>`
+      : thread.status === 'paused'
+      ? `
+  <div style="background: rgba(249, 115, 22, 0.15); border: 1px solid #f97316; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
+    <div style="font-size: 28px;">⏸️</div>
+    <div>
+      <div style="font-weight: 700; font-size: 16px; color: #fb923c;">任务已暂停 · 第 ${thread.currentRound || 1} 轮已中断</div>
+      <div style="font-size: 13px; opacity: 0.95; margin-top: 4px;"><strong>中断原因：</strong>${escapeHtml(thread.interruption?.reason || '未记录')}${thread.interruption?.by ? `（by ${escapeHtml(thread.interruption.by)}）` : ''}</div>
+      <div style="font-size: 12px; opacity: 0.75; margin-top: 4px;">Agent 进程已停止，当前轮次与原生会话已保留。点击下方“恢复执行”可从原轮次继续。</div>
+    </div>
+  </div>`
       : (thread.status === 'running' || thread.status === 'reworking')
       ? `
   <div style="background: rgba(245, 158, 11, 0.15); border: 1px solid #f59e0b; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
     <div style="font-size: 28px;">⏳</div>
     <div>
       <div style="font-weight: 700; font-size: 16px; color: #fbbf24;">第 ${thread.currentRound || 1} 轮正在自主执行中 (${escapeHtml(thread.targetAgent)})</div>
-      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;"><strong>${escapeHtml(thread.targetAgent)}</strong> 正在原生会话中修改代码与编写测试，后台进程正常运转中，无需人工干预。</div>
+      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;"><strong>${escapeHtml(thread.targetAgent)}</strong> 正在原生会话中修改代码与编写测试，后台每 30 秒流式同步一次最新输出，无需人工干预。</div>
     </div>
   </div>`
       : thread.status === 'failed'
@@ -559,7 +678,7 @@ export class TaskDetailPanel {
     <div style="font-size: 28px;">⚠️</div>
     <div>
       <div style="font-weight: 700; font-size: 16px; color: #f87171;">第 ${thread.currentRound || 1} 轮执行异常中断</div>
-      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">进程非零退出或执行超时。可点击下方“重试失败轮次”按钮重新执行该轮次。</div>
+      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">${thread.interruption?.reason ? `<strong>中断原因：</strong>${escapeHtml(thread.interruption.reason)}<br/>` : ''}进程非零退出、看门狗或执行超时。可点击下方“重试失败轮次”按钮重新执行该轮次。</div>
     </div>
   </div>`
       : ''
@@ -568,10 +687,29 @@ export class TaskDetailPanel {
   <div class="action-bar">
     ${(thread.status === 'failed' || thread.rounds.some((r) => r.status === 'failed')) ? `<button class="retry-btn" style="background: #dc2626; color: white;" onclick="retryFailedRound()">🔄 重试失败轮次 (Retry Failed)</button>` : ''}
     ${thread.status === 'waiting_review' ? `<button class="notify-btn" onclick="wakeUpCaller()">🔔 再次唤醒下发者检视</button>` : ''}
+    ${(thread.status === 'running' || thread.status === 'reworking' || thread.status === 'queued') ? `<button style="background:#ea580c;color:white;" onclick="pauseTask()">⏸ 暂停任务 (Pause)</button>` : ''}
+    ${thread.status === 'paused' ? `<button class="resume-btn" onclick="resumeTask()">▶ 恢复执行 (Resume)</button>` : ''}
     ${(thread.status === 'failed' || thread.status === 'waiting_review') ? `<button class="resume-btn" onclick="resumeTask()">▶ 下发返修要求 / 重新执行</button>` : ''}
     ${thread.status !== 'completed' ? `<button onclick="approveTask()">✓ 手动验收通过 (Approve Task)</button>` : ''}
+    <button style="background:#7f1d1d;color:white;" onclick="deleteTask()">🗑 删除任务 (Delete)</button>
+    <button class="secondary" onclick="printRecentLogs()">📄 打印最近1000行日志 (Print 1,000 Lines)</button>
     <button class="secondary" onclick="openTerminal()">💻 Open Terminal in Session</button>
     <button class="secondary" onclick="refresh()">⟳ Refresh</button>
+  </div>
+
+  <div class="live-logs-box" style="margin-top: 16px; margin-bottom: 24px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; padding: 16px;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px; flex-wrap:wrap; gap:8px;">
+      <div style="font-weight:600; font-size:14px; display:flex; align-items:center; gap:8px;">
+        ${thread.status === 'running' || thread.status === 'reworking' ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;"></span>` : ''}
+        <span>最近 1,000 行实时日志 (Live Logs)</span>
+        <span style="font-size:12px;opacity:0.6;font-weight:normal;">(${recentLogs.returnedLines} / ${recentLogs.totalLines} 行${recentLogs.isRunning ? ' · 实时运行中' : ''})</span>
+      </div>
+      <div style="display:flex; gap:8px;">
+        <button class="secondary" style="padding:4px 10px;font-size:12px;" onclick="printRecentLogs()">在 VS Code 输出面板打印</button>
+        <button class="secondary" style="padding:4px 10px;font-size:12px;" onclick="copyLogs()">复制日志</button>
+      </div>
+    </div>
+    <pre id="recentLogViewer" class="code-block output-text" style="max-height: 380px; overflow-y: auto; background: #0b0f19; border: 1px solid #1e293b; padding: 12px; border-radius: 6px; font-family: Consolas, monospace; font-size: 12px; line-height: 1.5; color: #e2e8f0; white-space: pre-wrap; word-break: break-all;">${escapeHtml(recentLogs.logs || '(暂无输出日志)')}</pre>
   </div>
 
   <div class="timeline">
@@ -602,6 +740,14 @@ export class TaskDetailPanel {
       vscode.postMessage({ command: 'resumeTask' });
     }
 
+    function pauseTask() {
+      vscode.postMessage({ command: 'pauseTask' });
+    }
+
+    function deleteTask() {
+      vscode.postMessage({ command: 'deleteTask' });
+    }
+
     function wakeUpCaller() {
       vscode.postMessage({ command: 'wakeUpCaller' });
     }
@@ -614,8 +760,27 @@ export class TaskDetailPanel {
       vscode.postMessage({ command: 'openTerminal' });
     }
 
+    function printRecentLogs() {
+      vscode.postMessage({ command: 'printRecentLogs' });
+    }
+
+    function copyLogs() {
+      const el = document.getElementById('recentLogViewer');
+      if (el) {
+        navigator.clipboard.writeText(el.innerText).then(() => {
+          vscode.postMessage({ command: 'copiedNotice' });
+        });
+      }
+    }
+
     function refresh() {
       vscode.postMessage({ command: 'refresh' });
+    }
+
+    // Auto-scroll log viewer to bottom on load
+    const logViewer = document.getElementById('recentLogViewer');
+    if (logViewer) {
+      logViewer.scrollTop = logViewer.scrollHeight;
     }
 
     function submitRework() {

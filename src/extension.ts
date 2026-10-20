@@ -15,6 +15,13 @@ import { AgentNodesProvider, AgentNodeItem } from './ui/agent-nodes-provider';
 import { TaskDetailPanel } from './ui/detail-panel';
 import { AgentId } from './bridge/types';
 import { TaskSupervisor } from './bridge/task-supervisor';
+import { TaskControlService } from './bridge/task-control';
+import {
+  DSH_PROVIDER_ENV_HINT,
+  DSH_PROVIDER_ID_HINT,
+  DshProviderConfig,
+  isDshProviderUsable,
+} from './bridge/deepseek-harness';
 
 export function activate(context: vscode.ExtensionContext) {
   console.log('[Agent Mesh Bridge] Activating extension...');
@@ -25,9 +32,55 @@ export function activate(context: vscode.ExtensionContext) {
   const agyPath = config.get<string>('antigravityPath');
   const claudePath = config.get<string>('claudeCodePath');
   const codexPath = config.get<string>('codexPath');
+  const dshPath = config.get<string>('deepseekHarnessPath');
   if (agyPath) customPaths.antigravity = agyPath;
   if (claudePath) customPaths.claude_code = claudePath;
   if (codexPath) customPaths.codex = codexPath;
+  if (dshPath) customPaths.deepseek_harness = dshPath;
+
+  /**
+   * Resolve the DeepSeek Harness model route used by bridge-launched
+   * (`dsh headless`) runs.
+   *
+   * DSH's headless profile disables the account/credentials plugins, so an
+   * endpoint other than the shipped one must be declared in the profile and its
+   * key must reach the DSH process. The key is exported into this host's
+   * environment *and* handed to every agent's bridge MCP process as an explicit
+   * `env` entry (see ConfigSyncService.setAgentMcpEnv) — an agent spawns that
+   * process itself, so ambient environment inheritance is not reliable.
+   */
+  let dshApiKey = '';
+  const applyDshProviderSettings = (): DshProviderConfig | null => {
+    const dshCfg = vscode.workspace.getConfiguration('agentMeshBridge.deepseekHarness');
+    const candidate: DshProviderConfig = {
+      provider: (dshCfg.get<string>('provider') || '').trim(),
+      api: (dshCfg.get<string>('api') || '').trim() || 'openai-completions',
+      baseUrl: (dshCfg.get<string>('baseUrl') || '').trim(),
+      model: (dshCfg.get<string>('model') || '').trim(),
+      apiKeyEnv: (dshCfg.get<string>('apiKeyEnv') || '').trim() || 'COMMANDCODE_API_KEY',
+    };
+    const apiKey = (dshCfg.get<string>('apiKey') || '').trim();
+    dshApiKey = apiKey;
+
+    if (!isDshProviderUsable(candidate)) {
+      delete process.env[DSH_PROVIDER_ENV_HINT];
+      delete process.env[DSH_PROVIDER_ID_HINT];
+      return null;
+    }
+
+    if (apiKey) {
+      process.env[candidate.apiKeyEnv] = apiKey;
+    }
+    process.env[DSH_PROVIDER_ENV_HINT] = candidate.apiKeyEnv;
+    process.env[DSH_PROVIDER_ID_HINT] = candidate.provider;
+    return candidate;
+  };
+
+  /** Variables every registered bridge MCP process receives. */
+  const agentMcpEnvFor = (provider: DshProviderConfig | null): Record<string, string> =>
+    provider && dshApiKey ? { [provider.apiKeyEnv]: dshApiKey } : {};
+
+  const dshProvider = applyDshProviderSettings();
 
   // 2. Initialize Core Services
   const taskStore = TaskStore.getInstance();
@@ -38,7 +91,9 @@ export function activate(context: vscode.ExtensionContext) {
   const callbackManager = new CallbackManager(detector);
   const _dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector);
   const reworkController = new ReworkController(taskStore, runner, callbackManager, detector);
-  const configSync = new ConfigSyncService();
+  const taskControl = new TaskControlService(taskStore, runner);
+  const configSync = new ConfigSyncService(undefined, dshProvider);
+  configSync.setAgentMcpEnv(agentMcpEnvFor(dshProvider));
   const supervisor = new TaskSupervisor(taskStore, runner, callbackManager, detector);
   context.subscriptions.push({ dispose: () => supervisor.dispose() });
 
@@ -186,9 +241,12 @@ export function activate(context: vscode.ExtensionContext) {
           await statusBar.update();
           vscode.window.showInformationMessage(`已清除 ${item.info.name} 的耗尽状态标记。`);
         } else {
-          const pick = await vscode.window.showQuickPick(['antigravity', 'codex', 'claude_code'], {
-            placeHolder: '选择要清除耗尽状态的 Agent',
-          });
+          const pick = await vscode.window.showQuickPick(
+            ['antigravity', 'codex', 'claude_code', 'deepseek_harness'],
+            {
+              placeHolder: '选择要清除耗尽状态的 Agent',
+            },
+          );
           if (pick) {
             detector.getRateLimitTracker().clearExhaustion(pick as AgentId);
             await agentNodesProvider.refresh(true);
@@ -222,6 +280,157 @@ export function activate(context: vscode.ExtensionContext) {
           TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
         } else {
           vscode.window.showErrorMessage('No task selected to view.');
+        }
+      },
+    ),
+
+    vscode.commands.registerCommand(
+      'agent-mesh-bridge.printRecentLogs',
+      async (itemOrThreadId?: TaskTreeItem | string) => {
+        let threadId =
+          typeof itemOrThreadId === 'string' ? itemOrThreadId : itemOrThreadId?.thread?.threadId;
+
+        if (!threadId) {
+          taskStore.loadFromDisk();
+          const tasks = taskStore.getAllTasks();
+          if (tasks.length === 0) {
+            vscode.window.showInformationMessage('当前暂无任何任务。');
+            return;
+          }
+
+          const picks = tasks.map((t) => {
+            const isRunning = supervisor.isExecuting(t.threadId);
+            const prefix = isRunning ? '⚡ [运行中] ' : t.status === 'queued' ? '⏳ [排队中] ' : '';
+            return {
+              label: `${prefix}${t.title}`,
+              description: `[${t.initiatorAgent} ➔ ${t.targetAgent}] · ${t.status}`,
+              detail: `Thread ID: ${t.threadId}`,
+              threadId: t.threadId,
+            };
+          });
+
+          const selected = await vscode.window.showQuickPick(picks, {
+            placeHolder: '选择要查看/打印最近1000行实时日志的任务:',
+          });
+          if (!selected) return;
+          threadId = selected.threadId;
+        }
+
+        taskStore.loadFromDisk();
+        const thread = taskStore.getTask(threadId);
+        const title = thread ? thread.title : threadId;
+
+        const logInfo = TaskSupervisor.getRecentLogs(threadId, 1000, taskStore);
+
+        const channel = vscode.window.createOutputChannel(`Agent Bridge: ${title.slice(0, 20)} Logs`);
+        context.subscriptions.push(channel);
+
+        channel.clear();
+        channel.appendLine('='.repeat(80));
+        channel.appendLine(`[Agent Mesh Bridge] 最近 1,000 行实时日志 (Thread: ${threadId})`);
+        channel.appendLine(`任务标题: ${title}`);
+        channel.appendLine(
+          `运行状态: ${logInfo.isRunning ? '⚡ 正在运行中 (Running)' : `已停止 (${thread?.status || 'unknown'})`}`,
+        );
+        channel.appendLine(
+          `总输出行数: ${logInfo.totalLines} 行 | 本次打印: 最近 ${logInfo.returnedLines} 行`,
+        );
+        if (logInfo.logFilePath) {
+          channel.appendLine(`本地日志源文件: ${logInfo.logFilePath}`);
+        }
+        channel.appendLine('='.repeat(80));
+        channel.appendLine('');
+
+        if (logInfo.logs && logInfo.logs.trim()) {
+          channel.appendLine(logInfo.logs);
+        } else {
+          channel.appendLine('(当前暂无实时输出日志)');
+        }
+
+        channel.show(true);
+
+        vscode.window.showInformationMessage(
+          `已在输出面板展示【${title}】最近 1000 行实时日志（共 ${logInfo.returnedLines} 行）。`,
+        );
+      },
+    ),
+
+    vscode.commands.registerCommand(
+      'agent-mesh-bridge.pauseTask',
+      async (itemOrThreadId?: TaskTreeItem | string) => {
+        let threadId =
+          typeof itemOrThreadId === 'string' ? itemOrThreadId : itemOrThreadId?.thread?.threadId;
+
+        if (!threadId) {
+          const input = await vscode.window.showInputBox({
+            prompt: '输入要暂停的 Thread ID:',
+          });
+          if (!input) return;
+          threadId = input.trim();
+        }
+
+        const reason = await vscode.window.showInputBox({
+          prompt: `请输入暂停【${threadId}】的中断原因:`,
+          value: '用户手动暂停',
+          placeHolder: '例如：需要先处理更高优先级任务',
+        });
+        if (reason === undefined) return;
+
+        try {
+          const result = taskControl.pauseTask(threadId, reason, 'user');
+          vscode.window.showInformationMessage(result.message);
+          taskStore.loadFromDisk();
+          activeTreeProvider.refresh();
+          recentTreeProvider.refresh();
+          statusBar.update();
+          TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`暂停任务失败: ${e.message}`);
+        }
+      },
+    ),
+
+    vscode.commands.registerCommand(
+      'agent-mesh-bridge.deleteTask',
+      async (itemOrThreadId?: TaskTreeItem | string) => {
+        let threadId =
+          typeof itemOrThreadId === 'string' ? itemOrThreadId : itemOrThreadId?.thread?.threadId;
+
+        if (!threadId) {
+          const input = await vscode.window.showInputBox({
+            prompt: '输入要删除的 Thread ID:',
+          });
+          if (!input) return;
+          threadId = input.trim();
+        }
+
+        taskStore.loadFromDisk();
+        const thread = taskStore.getTask(threadId);
+        const title = thread ? thread.title : threadId;
+        const confirm = await vscode.window.showWarningMessage(
+          `确定要永久删除任务【${title}】吗？如果它正在运行，会先终止 Agent 进程；删除后不可恢复。`,
+          { modal: true },
+          '删除',
+          '取消',
+        );
+        if (confirm !== '删除') return;
+
+        const reason = await vscode.window.showInputBox({
+          prompt: `请输入删除【${title}】的原因（会写入删除墓碑日志）:`,
+          value: '用户手动删除',
+          placeHolder: '例如：任务重复 / 需求取消',
+        });
+        if (reason === undefined) return;
+
+        try {
+          const result = taskControl.deleteTask(threadId, reason, 'user');
+          vscode.window.showInformationMessage(result.message);
+          taskStore.loadFromDisk();
+          activeTreeProvider.refresh();
+          recentTreeProvider.refresh();
+          statusBar.update();
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`删除任务失败: ${e.message}`);
         }
       },
     ),
@@ -294,6 +503,19 @@ export function activate(context: vscode.ExtensionContext) {
         const thread = taskStore.getTask(threadId);
         if (!thread) {
           vscode.window.showErrorMessage(`未找到任务: ${threadId}`);
+          return;
+        }
+
+        if (thread.status === 'paused' || (thread.rounds || []).some((r) => r.status === 'paused')) {
+          try {
+            const round = await reworkController.resumePausedTask(threadId);
+            vscode.window.showInformationMessage(
+              `已恢复暂停任务 ${threadId} 第 ${round.round} 轮，正在同一原生会话中继续执行。`,
+            );
+            TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
+          } catch (e: any) {
+            vscode.window.showErrorMessage(`恢复暂停任务失败: ${e.message}`);
+          }
           return;
         }
 
@@ -462,6 +684,32 @@ export function activate(context: vscode.ExtensionContext) {
           `Agent Mesh Bridge: Synced with warnings. Synced: ${result.synced.join(', ') || 'None'}. Errors: ${result.errors.join('; ')}`,
         );
       }
+    }),
+
+    vscode.commands.registerCommand('agent-mesh-bridge.configureDeepSeekHarness', async () => {
+      await vscode.commands.executeCommand(
+        'workbench.action.openSettings',
+        'agentMeshBridge.deepseekHarness',
+      );
+    }),
+  );
+
+  // Re-apply the DeepSeek Harness model route whenever its settings change, so
+  // the profile patch and the reported login state follow the configuration.
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration(async (e) => {
+      if (!e.affectsConfiguration('agentMeshBridge.deepseekHarness')) return;
+      const provider = applyDshProviderSettings();
+      configSync.setDshProvider(provider);
+      configSync.setAgentMcpEnv(agentMcpEnvFor(provider));
+      await configSync.syncAll();
+      await agentNodesProvider.refresh(true);
+      await statusBar.update();
+      vscode.window.showInformationMessage(
+        provider
+          ? `Agent Mesh Bridge: DeepSeek Harness 模型路由已更新 (provider: ${provider.provider})。`
+          : 'Agent Mesh Bridge: DeepSeek Harness 已恢复为官方 provider 路由。',
+      );
     }),
   );
 

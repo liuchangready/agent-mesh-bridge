@@ -5,7 +5,31 @@ import { TaskStore } from './task-store';
 import { AgentDetector } from './agent-detector';
 import { ActiveAgentResolver } from './active-agent-resolver';
 import { AutonomousRunner } from './autonomous-runner';
-import { AgentId } from './types';
+import { TaskSupervisor } from './task-supervisor';
+import { TaskControlService } from './task-control';
+import { TaskRoleLock } from './task-role-lock';
+import { AgentId, MESH_TASK_THREAD_ENV, isTaskReceiverProcess } from './types';
+
+/**
+ * Tools that create new outbound work. A delegated task's receiver must never
+ * use these: fanning work out again would make the mesh recursive and would
+ * break the strict one-task-at-a-time guarantee.
+ */
+const FORWARDING_TOOLS = new Set([
+  'dispatch_task',
+  'invoke_agent',
+  'invoke_antigravity',
+  'invoke_claude_code',
+  'invoke_codex',
+]);
+
+/** Control-plane tools a receiver must not apply to its own executing task. */
+const CONTROL_TOOLS = new Set([
+  'pause_task',
+  'resume_task',
+  'delete_task',
+  'record_merge_request',
+]);
 
 export class MCPServer {
   private dispatcher: AsyncDispatcher;
@@ -14,6 +38,7 @@ export class MCPServer {
   private detector: AgentDetector;
   private resolver: ActiveAgentResolver;
   private runner: AutonomousRunner;
+  private taskControl: TaskControlService;
 
   constructor(
     dispatcher: AsyncDispatcher,
@@ -29,31 +54,32 @@ export class MCPServer {
     this.detector = detector;
     this.resolver = resolver;
     this.runner = runner;
+    this.taskControl = new TaskControlService(taskStore, runner);
   }
 
   /**
    * Returns list of tools for MCP tools/list.
    */
   public getToolDefinitions() {
-    return [
+    const tools = [
       {
         name: 'dispatch_task',
         description:
-          'Asynchronously delegate a new task to another agent (Codex, Claude Code, Antigravity) without blocking the current turn. Returns immediately with threadId.',
+          'Asynchronously delegate a new task to another agent (Codex, Claude Code, Antigravity, DeepSeek Harness) without blocking the current turn. Returns immediately with threadId. This tool is unavailable while this agent is itself executing a delegated task (receivers must not forward work).',
         inputSchema: {
           type: 'object',
           properties: {
             targetAgent: {
               type: 'string',
-              enum: ['default', 'codex', 'claude_code', 'antigravity'],
+              enum: ['default', 'codex', 'claude_code', 'antigravity', 'deepseek_harness'],
               description:
                 'Target agent to execute the task. Defaults to "default" (auto-detected).',
             },
             initiatorAgent: {
               type: 'string',
-              enum: ['default', 'codex', 'claude_code', 'antigravity'],
+              enum: ['default', 'codex', 'claude_code', 'antigravity', 'deepseek_harness'],
               description:
-                'Your agent identity (codex, claude_code, antigravity). Defaults to auto-detected caller.',
+                'Your agent identity (codex, claude_code, antigravity, deepseek_harness). Defaults to auto-detected caller.',
             },
             title: {
               type: 'string',
@@ -72,6 +98,12 @@ export class MCPServer {
             workspacePath: {
               type: 'string',
               description: 'Workspace root path (defaults to current working directory).',
+            },
+            expectedFiles: {
+              type: 'array',
+              items: { type: 'string' },
+              description:
+                'Concrete code file paths expected to be modified (e.g. ["src/service/Foo.ts", "lib/parser.ts"]). Do NOT pass folders, trailing slashes, or glob patterns: they are rejected because they would lock unrelated files. Tasks execute strictly one at a time; exact same-file conflicts are additionally tracked.',
             },
           },
           required: ['title', 'prompt'],
@@ -121,6 +153,86 @@ export class MCPServer {
         },
       },
       {
+        name: 'pause_task',
+        description:
+          'Pause a queued/running/reworking task. The current agent process is stopped, the round is preserved as paused, and the interruption reason is recorded.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            threadId: {
+              type: 'string',
+              description: 'Task thread ID to pause.',
+            },
+            reason: {
+              type: 'string',
+              description: 'Why the task is being paused (recorded as the interruption reason).',
+            },
+          },
+          required: ['threadId', 'reason'],
+        },
+      },
+      {
+        name: 'resume_task',
+        description:
+          'Resume a paused task, preserving its original prompt and native session (or starting fresh when no native session was captured).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            threadId: {
+              type: 'string',
+              description: 'Task thread ID to resume.',
+            },
+          },
+          required: ['threadId'],
+        },
+      },
+      {
+        name: 'delete_task',
+        description:
+          'Permanently delete a task. A running agent process is stopped first; the deletion reason is written to the tombstone log.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            threadId: {
+              type: 'string',
+              description: 'Task thread ID to delete.',
+            },
+            reason: {
+              type: 'string',
+              description: 'Why the task is being deleted (recorded in the tombstone log).',
+            },
+          },
+          required: ['threadId', 'reason'],
+        },
+      },
+      {
+        name: 'record_merge_request',
+        description:
+          'Caller/reviewer only: record the merge-request handoff after a task or batch is accepted. The caller agent creates the MR and pushes to the remote; the bridge persists url/branch/commit/status for audit. The developer/receiver must not call this.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            threadId: {
+              type: 'string',
+              description: 'Task thread ID whose changes are included in the MR.',
+            },
+            url: { type: 'string', description: 'Merge-request URL.' },
+            branch: { type: 'string', description: 'Source branch pushed to the remote.' },
+            commit: { type: 'string', description: 'Commit SHA included in the MR.' },
+            remote: { type: 'string', description: 'Git remote name (default: origin).' },
+            baseBranch: { type: 'string', description: 'Target/base branch.' },
+            title: { type: 'string', description: 'MR title.' },
+            status: {
+              type: 'string',
+              enum: ['created', 'pushed', 'synced', 'failed'],
+              description: 'MR lifecycle status (default: synced).',
+            },
+            summary: { type: 'string', description: 'Short MR summary or failure reason.' },
+          },
+          required: ['threadId'],
+        },
+      },
+      {
         name: 'list_recent_tasks',
         description: 'Query recent delegation tasks from the 1,000 tasks persistent ledger.',
         inputSchema: {
@@ -138,6 +250,7 @@ export class MCPServer {
                 'running',
                 'waiting_review',
                 'reworking',
+                'paused',
                 'completed',
                 'failed',
               ],
@@ -162,6 +275,25 @@ export class MCPServer {
         },
       },
       {
+        name: 'get_recent_logs',
+        description:
+          'Get the most recent log output (default 1,000 lines) of a running or completed task thread in real-time.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            threadId: {
+              type: 'string',
+              description: 'Task thread ID to inspect.',
+            },
+            maxLines: {
+              type: 'number',
+              description: 'Maximum number of recent lines to return (defaults to 1000).',
+            },
+          },
+          required: ['threadId'],
+        },
+      },
+      {
         name: 'invoke_agent',
         description:
           'Synchronously invoke an agent for lightweight queries or code snippet reviews (blocks up to 30s).',
@@ -170,7 +302,7 @@ export class MCPServer {
           properties: {
             targetAgent: {
               type: 'string',
-              enum: ['default', 'codex', 'claude_code', 'antigravity'],
+              enum: ['default', 'codex', 'claude_code', 'antigravity', 'deepseek_harness'],
               description: 'Target agent to query.',
             },
             prompt: {
@@ -188,19 +320,92 @@ export class MCPServer {
       {
         name: 'query_agent_mesh_status',
         description:
-          'Query status, paths, versions and connectivity of Antigravity, Claude Code, and Codex in the mesh.',
+          'Query status, paths, versions and connectivity of Antigravity, Claude Code, Codex, and DeepSeek Harness in the mesh.',
         inputSchema: {
           type: 'object',
           properties: {},
         },
       },
     ];
+
+    // A receiver is executing one delegated task; hide new-work tools so the
+    // model cannot even attempt recursive delegation. The runtime guard in
+    // handleToolCall stays as the authoritative enforcement.
+    if (isTaskReceiverProcess()) {
+      return tools.filter((tool) => !FORWARDING_TOOLS.has(tool.name));
+    }
+    return tools;
+  }
+
+  /**
+   * A review decision is only valid while the task is in its reviewer role.
+   * This blocks a stale reviewer process (one that already handed off) from
+   * approving or reopening the task later.
+   */
+  private assertActiveReviewerRole(threadId: string): void {
+    const owner = new TaskRoleLock().getOwner(threadId);
+    if (!owner || owner.role !== 'reviewer') {
+      throw new Error(
+        `[Agent Mesh Bridge] Refusing review action for thread ${threadId}: ` +
+          `no active reviewer role is held. A task accepts review decisions only from its current reviewer turn; ` +
+          `finish or re-wake the same task instead of acting from a stale reviewer process.`,
+      );
+    }
+  }
+
+  /**
+   * Enforce the receiver rule at call time (defense in depth: a client may have
+   * cached the tool list from before the marker was applied, or call a tool
+   * directly over JSON-RPC).
+   */
+  private assertReceiverMayCall(name: string, args: any): void {
+    if (!isTaskReceiverProcess()) return;
+
+    const currentThreadId = process.env[MESH_TASK_THREAD_ENV];
+    if (FORWARDING_TOOLS.has(name)) {
+      const target = args?.targetAgent ? ` to ${args.targetAgent}` : '';
+      throw new Error(
+        `[Agent Mesh Bridge] Refusing "${name}"${target}: this agent is the receiver of delegated task ` +
+          `${currentThreadId || '(unknown thread)'}. Task receivers must execute the current task and report ` +
+          `back, not forward work to other agents.`,
+      );
+    }
+
+    // Pause/resume/delete are control-plane actions. A receiver may manage a
+    // different thread it initiated, but never the task it is executing.
+    if (CONTROL_TOOLS.has(name)) {
+      if (!currentThreadId || args?.threadId === currentThreadId) {
+        throw new Error(
+          `[Agent Mesh Bridge] Refusing "${name}" for thread ${args?.threadId || currentThreadId}: ` +
+            `a task receiver cannot perform caller/reviewer control actions on its own executing task.`,
+        );
+      }
+    }
+
+    // A receiver also must not drive its own task's review loop; only the
+    // initiator (caller) decides whether to rework or approve.
+    if (name === 'request_rework' || name === 'approve_task') {
+      if (!currentThreadId) {
+        throw new Error(
+          `[Agent Mesh Bridge] Refusing "${name}": this process was launched as a receiver for a one-shot ` +
+            `invocation and is not the initiator of any thread.`,
+        );
+      }
+      if (args?.threadId === currentThreadId) {
+        throw new Error(
+          `[Agent Mesh Bridge] Refusing "${name}" for thread ${currentThreadId}: this agent is its receiver, ` +
+            `not its initiator. Finish the current round and let the caller review it.`,
+        );
+      }
+    }
   }
 
   /**
    * Execute a tool call and return result object.
    */
   public async handleToolCall(name: string, args: any): Promise<any> {
+    this.assertReceiverMayCall(name, args);
+
     switch (name) {
       case 'dispatch_task': {
         const callerFromEnv = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
@@ -216,22 +421,72 @@ export class MCPServer {
           prompt: args.prompt,
           callerSessionId: args.callerSessionId,
           workspacePath: args.workspacePath,
+          expectedFiles: args.expectedFiles,
         });
       }
 
       case 'request_rework': {
-        return await this.reworkController.requestRework({
+        this.assertActiveReviewerRole(args.threadId);
+        const result = await this.reworkController.requestRework({
           threadId: args.threadId,
           feedback: args.feedback,
           callerSessionId: args.callerSessionId,
         });
+        // Reviewer decision submitted: hand the task role over to the
+        // developer. The reviewer CLI process may still be printing its final
+        // message; that is not an active review decision anymore.
+        new TaskRoleLock().releaseIfRole(args.threadId, 'reviewer');
+        return result;
       }
 
       case 'approve_task': {
-        return this.reworkController.approveTask({
+        this.assertActiveReviewerRole(args.threadId);
+        const result = this.reworkController.approveTask({
           threadId: args.threadId,
           remarks: args.remarks,
         });
+        new TaskRoleLock().releaseIfRole(args.threadId, 'reviewer');
+        return result;
+      }
+
+      case 'pause_task': {
+        return this.taskControl.pauseTask(args.threadId, args.reason, 'agent');
+      }
+
+      case 'resume_task': {
+        return this.reworkController.resumePausedTask(args.threadId);
+      }
+
+      case 'delete_task': {
+        return this.taskControl.deleteTask(args.threadId, args.reason, 'agent');
+      }
+
+      case 'record_merge_request': {
+        if (!args.url && !args.branch && !args.commit) {
+          throw new Error(
+            'record_merge_request requires at least one of url, branch, or commit.',
+          );
+        }
+        const updated = this.taskStore.recordMergeRequest(args.threadId, {
+          url: args.url,
+          branch: args.branch,
+          commit: args.commit,
+          remote: args.remote || 'origin',
+          baseBranch: args.baseBranch,
+          title: args.title,
+          status: args.status || 'synced',
+          summary: args.summary,
+          updatedAt: new Date().toISOString(),
+          by: (process.env.MESH_CALLER_AGENT as string) || 'caller',
+        });
+        if (!updated) {
+          throw new Error(`Task thread not found: ${args.threadId}`);
+        }
+        return {
+          threadId: args.threadId,
+          status: 'MR_RECORDED',
+          mergeRequest: updated.mergeRequest,
+        };
       }
 
       case 'list_recent_tasks': {
@@ -245,7 +500,17 @@ export class MCPServer {
         if (!task) {
           throw new Error(`Thread not found: ${args.threadId}`);
         }
-        return task;
+        const recentLogsInfo = TaskSupervisor.getRecentLogs(args.threadId, 1000, this.taskStore);
+        return {
+          ...task,
+          recentLogs: recentLogsInfo.logs,
+          totalLogLines: recentLogsInfo.totalLines,
+        };
+      }
+
+      case 'get_recent_logs': {
+        const maxLines = typeof args.maxLines === 'number' ? args.maxLines : 1000;
+        return TaskSupervisor.getRecentLogs(args.threadId, maxLines, this.taskStore);
       }
 
       case 'invoke_agent': {
@@ -275,10 +540,11 @@ export class MCPServer {
       }
 
       case 'query_agent_mesh_status': {
-        const [anti, claude, codex, active] = await Promise.all([
+        const [anti, claude, codex, dsh, active] = await Promise.all([
           this.detector.probeAgent('antigravity'),
           this.detector.probeAgent('claude_code'),
           this.detector.probeAgent('codex'),
+          this.detector.probeAgent('deepseek_harness'),
           this.resolver.resolveActiveAgent(),
         ]);
 
@@ -291,6 +557,7 @@ export class MCPServer {
             antigravity: anti,
             claude_code: claude,
             codex: codex,
+            deepseek_harness: dsh,
           },
         };
       }

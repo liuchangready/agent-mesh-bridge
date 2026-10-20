@@ -2,7 +2,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { EventEmitter } from 'events';
-import { DelegationThread, DelegationRound, ThreadStatus } from './types';
+import {
+  DelegationThread,
+  DelegationRound,
+  ThreadStatus,
+  TaskInterruption,
+  MergeRequestInfo,
+  appendInterruption,
+} from './types';
 
 export const MAX_STORED_TASKS = 1000;
 
@@ -215,6 +222,7 @@ export class TaskStore extends EventEmitter {
     newThreadStatus?: ThreadStatus,
     receiverSessionId?: string,
     callerSessionId?: string,
+    interruption?: TaskInterruption,
   ): DelegationThread | undefined {
     this.ensureUpToDate();
     const thread = this.tasks.get(threadId);
@@ -227,14 +235,42 @@ export class TaskStore extends EventEmitter {
       thread.callerSessionId = callerSessionId;
     }
 
-    const roundIndex = thread.rounds.findIndex((r) => r.round === roundNumber);
+    // Target the NEWEST entry for this round number: a ledger written before the
+    // one-round-in-flight invariant may hold duplicate numbers, and the live,
+    // most recently appended entry is the one that must be updated.
+    let roundIndex = -1;
+    for (let i = thread.rounds.length - 1; i >= 0; i--) {
+      if (thread.rounds[i].round === roundNumber) {
+        roundIndex = i;
+        break;
+      }
+    }
     if (roundIndex >= 0) {
+      // Live-progress syncs must never revive a round that the control plane
+      // just paused. Resume explicitly mutates the round and upserts instead.
+      if (
+        thread.rounds[roundIndex].status === 'paused' &&
+        roundUpdate.status === 'running'
+      ) {
+        return thread;
+      }
       thread.rounds[roundIndex] = {
         ...thread.rounds[roundIndex],
         ...roundUpdate,
+        ...(interruption ? { interruption } : {}),
       };
     } else if (roundUpdate.prompt) {
-      // Append if not found
+      // Append if not found. Refuse to append a NEW running round while another
+      // round is already in flight: that would break the one-round-in-flight
+      // invariant and let two agent processes drive one workspace at once.
+      const wouldAddRunningRound = (roundUpdate.status || 'running') === 'running';
+      if (wouldAddRunningRound && thread.rounds.some((r) => r.status === 'running')) {
+        console.warn(
+          `[TaskStore] Refusing to append running round ${roundNumber} to ${threadId}: ` +
+            `a round is already in flight.`,
+        );
+        return undefined;
+      }
       thread.rounds.push({
         round: roundNumber,
         type: roundUpdate.type || 'rework',
@@ -244,7 +280,12 @@ export class TaskStore extends EventEmitter {
         durationMs: roundUpdate.durationMs || 0,
         status: roundUpdate.status || 'running',
         timestamp: roundUpdate.timestamp || new Date().toISOString(),
+        interruption,
       });
+    }
+
+    if (interruption) {
+      appendInterruption(thread, interruption);
     }
 
     if (newThreadStatus) {
@@ -292,7 +333,11 @@ export class TaskStore extends EventEmitter {
       if (statusFilter === 'active') {
         all = all.filter(
           (t) =>
-            t.status === 'running' || t.status === 'waiting_review' || t.status === 'reworking',
+            t.status === 'running' ||
+            t.status === 'waiting_review' ||
+            t.status === 'reworking' ||
+            t.status === 'queued' ||
+            t.status === 'paused',
         );
       } else {
         all = all.filter((t) => t.status === statusFilter);
@@ -300,6 +345,49 @@ export class TaskStore extends EventEmitter {
     }
 
     return all.slice(0, safeLimit);
+  }
+
+  /**
+   * Record the caller's merge-request handoff for a task/batch.
+   *
+   * The caller agent performs the actual git/MR operations; this method only
+   * persists the result so the UI and ledger can audit it.
+   */
+  public recordMergeRequest(
+    threadId: string,
+    mergeRequest: MergeRequestInfo,
+  ): DelegationThread | undefined {
+    this.ensureUpToDate();
+    const thread = this.tasks.get(threadId);
+    if (!thread) return undefined;
+
+    thread.mergeRequest = {
+      ...thread.mergeRequest,
+      ...mergeRequest,
+      updatedAt: mergeRequest.updatedAt || new Date().toISOString(),
+    };
+    thread.updatedAt = new Date().toISOString();
+    thread.summary.lastOutputSnippet = mergeRequest.url
+      ? `MR: ${mergeRequest.url}`
+      : mergeRequest.commit
+        ? `MR commit: ${mergeRequest.commit}`
+        : `MR: ${mergeRequest.status}`;
+    this.saveToDisk();
+    return thread;
+  }
+
+  /**
+   * Permanently remove a task from the ledger.
+   *
+   * @returns true when an entry existed and was removed.
+   */
+  public deleteTask(threadId: string): boolean {
+    this.ensureUpToDate();
+    const existed = this.tasks.delete(threadId);
+    if (existed) {
+      this.saveToDisk();
+    }
+    return existed;
   }
 
   /**

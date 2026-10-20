@@ -30,6 +30,7 @@ export class StatusBarController {
       antigravity: 'Antigravity',
       claude_code: 'Claude Code',
       codex: 'Codex',
+      deepseek_harness: 'DeepSeek Harness',
       vscode_chat: 'VSCode Chat',
     };
 
@@ -50,7 +51,7 @@ export class StatusBarController {
     md.appendMarkdown(`### Agent Mesh Bridge 节点状态\n\n`);
     md.appendMarkdown(`**当前选路**: \`${label}\` (${resolved.reason})\n\n---\n\n`);
 
-    const agentList: AgentId[] = ['antigravity', 'codex', 'claude_code'];
+    const agentList: AgentId[] = ['antigravity', 'codex', 'claude_code', 'deepseek_harness'];
     for (const id of agentList) {
       const info = allAgents[id];
       if (!info) continue;
@@ -110,6 +111,11 @@ export class StatusBarController {
         detail: `状态: ${agents.claude_code?.statusDetails || ''}`,
       },
       {
+        label: '$(symbol-event) DeepSeek Harness (dsh)',
+        description: formatAgentStatus('deepseek_harness'),
+        detail: `状态: ${agents.deepseek_harness?.statusDetails || ''}`,
+      },
+      {
         label: '$(refresh) 刷新所有 Agent 节点状态 (Refresh Status)',
         description: '重新探测各 Agent 可执行文件、登录态与限流恢复时间',
       },
@@ -141,6 +147,11 @@ export class StatusBarController {
       this.resolver.setManualOverride('claude_code');
       vscode.window.showInformationMessage(
         'Agent Mesh Bridge: 目标已锁定为 Anthropic Claude Code。',
+      );
+    } else if (pick.label.includes('DeepSeek Harness')) {
+      this.resolver.setManualOverride('deepseek_harness');
+      vscode.window.showInformationMessage(
+        'Agent Mesh Bridge: 目标已锁定为 DeepSeek Harness。',
       );
     }
 

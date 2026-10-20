@@ -1,7 +1,7 @@
 {
   "name": "agent-mesh-bridge",
   "displayName": "Agent Mesh Bridge",
-  "description": "Peer-to-Peer Multi-Agent Bridge connecting Google Antigravity, OpenAI Codex, and Anthropic Claude Code in VSCode",
+  "description": "Peer-to-Peer Multi-Agent Bridge connecting Google Antigravity, OpenAI Codex, Anthropic Claude Code, and DeepSeek Harness in VSCode",
   "version": "1.0.0",
   "publisher": "agent-mesh",
   "author": "Antigravity Team",
@@ -24,6 +24,8 @@
     "antigravity",
     "codex",
     "claude",
+    "deepseek",
+    "dsh",
     "mcp",
     "multi-agent"
   ],
@@ -97,6 +99,16 @@
         "icon": "$(play)"
       },
       {
+        "command": "agent-mesh-bridge.pauseTask",
+        "title": "Pause Task / 暂停任务",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "agent-mesh-bridge.deleteTask",
+        "title": "Delete Task / 删除任务",
+        "icon": "$(trash)"
+      },
+      {
         "command": "agent-mesh-bridge.wakeUpCaller",
         "title": "Wake Up Initiator / 唤醒下发者检视",
         "icon": "$(bell)"
@@ -104,6 +116,15 @@
       {
         "command": "agent-mesh-bridge.syncMcpConfig",
         "title": "Sync MCP Configuration to Agents"
+      },
+      {
+        "command": "agent-mesh-bridge.configureDeepSeekHarness",
+        "title": "Configure DeepSeek Harness Model Route"
+      },
+      {
+        "command": "agent-mesh-bridge.printRecentLogs",
+        "title": "Print Recent 1,000 Lines / 打印最近1000行日志",
+        "icon": "$(output)"
       }
     ],
     "menus": {
@@ -136,6 +157,11 @@
           "group": "inline"
         },
         {
+          "command": "agent-mesh-bridge.printRecentLogs",
+          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "group": "inline"
+        },
+        {
           "command": "agent-mesh-bridge.approveTask",
           "when": "view == agent-mesh-bridge.active-tasks",
           "group": "1_actions"
@@ -147,6 +173,16 @@
         },
         {
           "command": "agent-mesh-bridge.resumeTask",
+          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "group": "1_actions"
+        },
+        {
+          "command": "agent-mesh-bridge.pauseTask",
+          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "group": "1_actions"
+        },
+        {
+          "command": "agent-mesh-bridge.deleteTask",
           "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
           "group": "1_actions"
         },
@@ -166,7 +202,8 @@
             "auto",
             "codex",
             "claude_code",
-            "antigravity"
+            "antigravity",
+            "deepseek_harness"
           ],
           "default": "auto",
           "description": "Default target agent for task delegation when not explicitly specified."
@@ -196,10 +233,50 @@
           "default": "",
           "description": "Custom executable path for OpenAI Codex (codex)."
         },
+        "agentMeshBridge.deepseekHarnessPath": {
+          "type": "string",
+          "default": "",
+          "description": "Custom path to the DeepSeek Harness CLI launcher (dsh.cmd / dsh). Leave empty to auto-detect the installation."
+        },
+        "agentMeshBridge.deepseekHarness.provider": {
+          "type": "string",
+          "default": "",
+          "description": "Model provider written into the DeepSeek Harness 'headless' profile for bridge-launched runs (e.g. \"commandcode\"). Leave empty to keep DSH's shipped deepseek-official route."
+        },
+        "agentMeshBridge.deepseekHarness.api": {
+          "type": "string",
+          "default": "openai-completions",
+          "enum": [
+            "openai-completions",
+            "anthropic-messages"
+          ],
+          "description": "Wire protocol used by the configured DeepSeek Harness provider."
+        },
+        "agentMeshBridge.deepseekHarness.baseUrl": {
+          "type": "string",
+          "default": "https://api.commandcode.ai/provider/v1",
+          "description": "Base URL of the configured DeepSeek Harness provider."
+        },
+        "agentMeshBridge.deepseekHarness.model": {
+          "type": "string",
+          "default": "deepseek/deepseek-v4.1-flash",
+          "description": "Model id made the default for bridge-launched DeepSeek Harness runs."
+        },
+        "agentMeshBridge.deepseekHarness.apiKeyEnv": {
+          "type": "string",
+          "default": "COMMANDCODE_API_KEY",
+          "description": "Environment variable the DeepSeek Harness provider reads its API key from. The extension exports this variable to the DSH process it launches."
+        },
+        "agentMeshBridge.deepseekHarness.apiKey": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "API key for the configured DeepSeek Harness provider. Exported to the launched DSH process through `#agentMeshBridge.deepseekHarness.apiKeyEnv#`. Kept in machine-scope settings so it is never synced; leave empty to supply the key through the environment variable instead."
+        },
         "agentMeshBridge.autoSyncMcp": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically sync MCP configuration to Antigravity, Claude, and Codex profiles on activation."
+          "description": "Automatically sync MCP configuration to Antigravity, Claude, Codex, and DeepSeek Harness profiles on activation."
         }
       }
     }

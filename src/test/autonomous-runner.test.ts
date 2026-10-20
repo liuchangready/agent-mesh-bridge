@@ -1,11 +1,22 @@
 import { test, describe } from 'node:test';
 import * as assert from 'node:assert';
-import { AutonomousRunner } from '../bridge/autonomous-runner';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import {
+  AutonomousRunner,
+  DEFAULT_SILENCE_TIMEOUT_MS,
+} from '../bridge/autonomous-runner';
 import { AgentDetector } from '../bridge/agent-detector';
+import { CancellationRegistry } from '../bridge/cancellation-registry';
 
 describe('AutonomousRunner Tests', () => {
   const detector = new AgentDetector();
   const runner = new AutonomousRunner(detector);
+
+  test('should use a 10-minute silence watchdog by default', () => {
+    assert.strictEqual(DEFAULT_SILENCE_TIMEOUT_MS, 600_000);
+  });
 
   test('should generate compliant skip-danger command for Codex initial run', () => {
     const cmdInfo = runner.buildCommand({
@@ -24,6 +35,13 @@ describe('AutonomousRunner Tests', () => {
     assert.ok(cmdInfo.args.includes('--ask-for-approval'));
     assert.ok(cmdInfo.args.includes('never'));
     assert.ok(cmdInfo.args.includes('--json'));
+    // `--ask-for-approval` is a GLOBAL Codex option. If it lands after `exec`,
+    // Codex rejects the entire invocation and every delegated task is blocked
+    // before it starts.
+    assert.ok(
+      cmdInfo.args.indexOf('--ask-for-approval') < cmdInfo.args.indexOf('exec'),
+      `--ask-for-approval must precede exec: ${cmdInfo.args.join(' ')}`,
+    );
   });
 
   test('should generate compliant rework resume command for Codex reusing exact session ID', () => {
@@ -40,7 +58,13 @@ describe('AutonomousRunner Tests', () => {
     assert.ok(cmdInfo.args.includes(sessionId));
     assert.ok(cmdInfo.args.includes('Fix 2 failing test assertions'));
     assert.ok(cmdInfo.args.includes('--dangerously-bypass-approvals-and-sandbox'));
+    assert.ok(cmdInfo.args.includes('--dangerously-bypass-hook-trust'));
+    assert.ok(cmdInfo.args.includes('--skip-git-repo-check'));
     assert.ok(cmdInfo.args.includes('--json'));
+    assert.ok(
+      cmdInfo.args.indexOf('--ask-for-approval') < cmdInfo.args.indexOf('exec'),
+      `--ask-for-approval must precede exec: ${cmdInfo.args.join(' ')}`,
+    );
   });
 
   test('should generate compliant skip-danger command for Claude Code initial run', () => {
@@ -113,6 +137,104 @@ describe('AutonomousRunner Tests', () => {
     assert.ok(reworkCmd.args.includes('stream-json'));
   });
 
+  test('should assess success by error code AND continuous actual output (Codex JSON)', () => {
+    const codexStream = [
+      '{"type":"thread.started","thread_id":"01a1549a-0034-7843-8af8-846a650058eb"}',
+      '{"type":"turn.started"}',
+      '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"PONG"}}',
+      '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":1}}',
+    ].join('\n');
+
+    const success = runner.evaluateResponse({
+      exitCode: 0,
+      stdout: codexStream,
+      stderr: '',
+      chunkCount: 4,
+      stdoutBytes: codexStream.length,
+      stderrBytes: 0,
+      firstOutputAtMs: 20,
+      lastOutputAtMs: 900,
+      maxGapMs: 400,
+      gapThresholdMs: 180_000,
+    });
+    assert.strictEqual(success.success, true);
+    assert.strictEqual(success.errorCode, 'OK');
+    assert.strictEqual(success.stream.hasActualOutput, true);
+    assert.strictEqual(success.stream.continuous, true);
+    assert.strictEqual(
+      runner.extractSessionId(codexStream),
+      '01a1549a-0034-7843-8af8-846a650058eb',
+    );
+
+    const statusOnly = [
+      '{"type":"thread.started","thread_id":"01a1549a-0034-7843-8af8-846a650058eb"}',
+      '{"type":"turn.started"}',
+      '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":0}}',
+    ].join('\n');
+    const empty = runner.evaluateResponse({
+      exitCode: 0,
+      stdout: statusOnly,
+      stderr: '',
+      chunkCount: 3,
+      stdoutBytes: statusOnly.length,
+      stderrBytes: 0,
+      firstOutputAtMs: 20,
+      lastOutputAtMs: 500,
+      maxGapMs: 200,
+      gapThresholdMs: 180_000,
+    });
+    assert.strictEqual(empty.success, false);
+    assert.strictEqual(empty.errorCode, 'EMPTY_OUTPUT');
+
+    const stalled = runner.evaluateResponse({
+      exitCode: 0,
+      stdout: 'PONG',
+      stderr: '',
+      chunkCount: 2,
+      stdoutBytes: 4,
+      stderrBytes: 0,
+      firstOutputAtMs: 10,
+      lastOutputAtMs: 200_000,
+      maxGapMs: 199_990,
+      gapThresholdMs: 180_000,
+    });
+    assert.strictEqual(stalled.success, false);
+    assert.strictEqual(stalled.errorCode, 'STREAM_STALLED');
+
+    const nonzero = runner.evaluateResponse({
+      exitCode: 1,
+      stdout: 'PONG',
+      stderr: 'boom',
+      chunkCount: 1,
+      stdoutBytes: 4,
+      stderrBytes: 4,
+      firstOutputAtMs: 10,
+      lastOutputAtMs: 10,
+      maxGapMs: 10,
+      gapThresholdMs: 180_000,
+    });
+    assert.strictEqual(nonzero.success, false);
+    assert.strictEqual(nonzero.errorCode, 'NONZERO_EXIT');
+
+    // Claude's `--output-format json` emits one final object after a long run.
+    // A single substantive chunk is still a valid response for non-streaming CLIs.
+    const singleFinal = runner.evaluateResponse({
+      exitCode: 0,
+      stdout: '{"type":"result","result":"DONE"}',
+      stderr: '',
+      chunkCount: 1,
+      stdoutBytes: 32,
+      stderrBytes: 0,
+      firstOutputAtMs: 600_000,
+      lastOutputAtMs: 600_000,
+      maxGapMs: 600_000,
+      gapThresholdMs: 180_000,
+      expectStreaming: false,
+    });
+    assert.strictEqual(singleFinal.success, true);
+    assert.strictEqual(singleFinal.errorCode, 'OK');
+  });
+
   test('should accurately extract session ID and output from stream-json stream', () => {
     const streamSample = [
       '{"event":"init","conversation_id":"conv-test-999","init":{"cwd":"/repo"}}',
@@ -125,6 +247,67 @@ describe('AutonomousRunner Tests', () => {
 
     const output = runner.extractCleanOutput(streamSample);
     assert.strictEqual(output, 'Done with refactor');
+  });
+
+  test('cancelThread kills the child and reports a paused interruption', async () => {
+    const runner = new AutonomousRunner(detector);
+    runner.buildCommand = () => ({
+      command: process.execPath,
+      args: ['-e', 'setInterval(() => {}, 1000)'],
+      useShell: false,
+    });
+
+    const execution = runner.execute({
+      agent: 'antigravity',
+      prompt: 'long running',
+      isRework: false,
+      receiverSessionId: 'session-cancel-local',
+      taskThreadId: 'thread_cancel_local',
+      taskRound: 1,
+    });
+
+    await new Promise((r) => setTimeout(r, 350));
+    const canceled = runner.cancelThread('thread_cancel_local', 'pause', 'pause from test', 'test');
+    assert.strictEqual(canceled, true);
+
+    const result = await execution;
+    assert.strictEqual(result.interruption?.kind, 'paused');
+    assert.match(result.error || '', /pause from test/);
+    assert.notStrictEqual(result.exitCode, 0);
+  });
+
+  test('a cancellation file from another process stops the child', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-cancel-'));
+    const registry = new CancellationRegistry(tempDir);
+    const runner = new AutonomousRunner(detector, undefined, registry);
+    runner.buildCommand = () => ({
+      command: process.execPath,
+      args: ['-e', 'setInterval(() => {}, 1000)'],
+      useShell: false,
+    });
+
+    try {
+      const execution = runner.execute({
+        agent: 'antigravity',
+        prompt: 'long running',
+        isRework: false,
+        receiverSessionId: 'session-cancel-external',
+        taskThreadId: 'thread_cancel_external',
+        taskRound: 1,
+      });
+
+      await new Promise((r) => setTimeout(r, 300));
+      registry.request('thread_cancel_external', 'pause', 'external pause', 'other-process');
+
+      const result = await execution;
+      assert.strictEqual(result.interruption?.kind, 'paused');
+      assert.match(result.error || '', /external pause/);
+    } finally {
+      runner.cancelThread('thread_cancel_external', 'stop', 'test cleanup', 'test');
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch {}
+    }
   });
 
   test('should detect active sessions for claude_code and antigravity', () => {

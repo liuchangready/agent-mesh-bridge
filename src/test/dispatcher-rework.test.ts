@@ -3,6 +3,14 @@ import * as assert from 'node:assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+
+// Isolate the supervisor heartbeat and execution lock from concurrently running
+// test files. `TaskSupervisor.isSupervisorActive()` and `ExecutionGate` both read
+// the home directory.
+const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-dispatch-home-'));
+process.env.USERPROFILE = isolatedHome;
+process.env.HOME = isolatedHome;
+
 import { TaskStore } from '../bridge/task-store';
 import { AgentDetector } from '../bridge/agent-detector';
 import { ActiveAgentResolver } from '../bridge/active-agent-resolver';
@@ -10,6 +18,7 @@ import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
 import { AsyncDispatcher } from '../bridge/async-dispatcher';
 import { ReworkController } from '../bridge/rework-controller';
+import { ExecutionGate } from '../bridge/execution-gate';
 
 describe('AsyncDispatcher and ReworkController Tests', () => {
   let tempDir: string;
@@ -39,8 +48,9 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     };
     callbackManager = new CallbackManager(detector);
     callbackManager.notifyCaller = async () => true;
-    dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager);
-    reworkController = new ReworkController(taskStore, runner, callbackManager);
+    const gate = new ExecutionGate(tempDir);
+    dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector, gate);
+    reworkController = new ReworkController(taskStore, runner, callbackManager, detector, gate);
   });
 
   afterEach(() => {
@@ -49,6 +59,24 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       fs.rmSync(tempDir, { recursive: true, force: true });
     } catch {}
   });
+
+  /**
+   * Wait until the mock receiver process has actually released its developer
+   * role. Role enforcement (new) intentionally blocks the next role while the
+   * previous round is still executing.
+   */
+  const waitForStatus = async (threadId: string, status: string, timeoutMs = 2000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (taskStore.getTask(threadId)?.status === status) return;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error(
+      `Timed out waiting for ${threadId} to reach ${status}; current=${
+        taskStore.getTask(threadId)?.status
+      }`,
+    );
+  };
 
   test('should dispatch task asynchronously and create thread with round 1', async () => {
     const res = await dispatcher.dispatchTask({
@@ -73,6 +101,48 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.strictEqual(stored.rounds[0].type, 'initial');
   });
 
+  test('should treat exit 0 with no actual output as a failed response', async () => {
+    runner.execute = async () => ({
+      exitCode: 0,
+      stdout: '{"type":"turn.started"}\n{"type":"turn.completed"}',
+      stderr: '',
+      extractedOutput: '',
+      durationMs: 10,
+      error:
+        'Process exited with code 0 but the stream contained no actual final answer (only status/metadata or no output).',
+      assessment: {
+        success: false,
+        errorCode: 'EMPTY_OUTPUT',
+        exitCode: 0,
+        stream: {
+          chunkCount: 2,
+          stdoutBytes: 48,
+          stderrBytes: 0,
+          firstOutputAtMs: 5,
+          lastOutputAtMs: 8,
+          maxGapMs: 3,
+          gapThresholdMs: 180_000,
+          hasActualOutput: false,
+          continuous: true,
+        },
+        reason: 'no actual output',
+      },
+    });
+
+    const res = await dispatcher.dispatchTask({
+      targetAgent: 'antigravity',
+      title: 'Empty output probe',
+      prompt: 'return nothing',
+    });
+    await waitForStatus(res.threadId, 'failed');
+
+    const thread = taskStore.getTask(res.threadId)!;
+    assert.strictEqual(thread.status, 'failed');
+    assert.strictEqual(thread.rounds[0].status, 'failed');
+    assert.strictEqual(thread.rounds[0].assessment?.errorCode, 'EMPTY_OUTPUT');
+    assert.match(thread.rounds[0].error || '', /no actual|actual final answer/i);
+  });
+
   test('should request rework strictly reusing same receiverSessionId and incrementing round', async () => {
     const dispatchRes = await dispatcher.dispatchTask({
       targetAgent: 'claude_code',
@@ -82,6 +152,8 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
 
     const originalSessionId = dispatchRes.receiverSessionId;
     assert.ok(originalSessionId);
+
+    await waitForStatus(dispatchRes.threadId, 'waiting_review');
 
     const reworkRes = await reworkController.requestRework({
       threadId: dispatchRes.threadId,
@@ -113,6 +185,9 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       prompt: 'Run prettier and eslint',
     });
 
+    // A thread may only be approved once nothing is in flight.
+    await waitForStatus(dispatchRes.threadId, 'waiting_review');
+
     const approveRes = reworkController.approveTask({
       threadId: dispatchRes.threadId,
       remarks: 'All lint checks passed.',
@@ -139,6 +214,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.notStrictEqual(thread1.callerSessionId, 'claude_code');
 
     // 2. Requesting rework with invalid callerSessionId "antigravity"
+    await waitForStatus(dispatchRes.threadId, 'waiting_review');
     await reworkController.requestRework({
       threadId: dispatchRes.threadId,
       feedback: 'Fix something',
@@ -150,6 +226,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.notStrictEqual(thread2.callerSessionId, 'antigravity');
 
     // 3. Requesting rework with a valid UUID
+    await waitForStatus(dispatchRes.threadId, 'waiting_review');
     const validUuid = '12345678-abcd-ef01-2345-6789abcdef01';
     await reworkController.requestRework({
       threadId: dispatchRes.threadId,
@@ -169,11 +246,13 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       prompt: 'Handle trailing comma in JSON',
     });
 
-    // Request rework
+    // Request rework (round 1 must be finished first)
+    await waitForStatus(dispatchRes.threadId, 'waiting_review');
     await reworkController.requestRework({
       threadId: dispatchRes.threadId,
       feedback: 'Handle comments in JSON',
     });
+    await waitForStatus(dispatchRes.threadId, 'waiting_review');
 
     const thread = taskStore.getTask(dispatchRes.threadId);
     assert.ok(thread);

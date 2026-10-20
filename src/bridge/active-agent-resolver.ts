@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { AgentId } from './types';
 import { AgentDetector } from './agent-detector';
+import { getDshSessionsDir } from './deepseek-harness';
 
 export class ActiveAgentResolver {
   private manualOverride: AgentId | null = null;
@@ -65,6 +66,7 @@ export class ActiveAgentResolver {
     const agyAvail = !!this.detector.resolveExecutable('antigravity');
     const codexAvail = !!this.detector.resolveExecutable('codex');
     const claudeAvail = !!this.detector.resolveExecutable('claude_code');
+    const dshAvail = !!this.detector.resolveExecutable('deepseek_harness');
 
     if (codexAvail) {
       return { agent: 'codex', mode: 'auto', reason: 'Detected OpenAI Codex executable' };
@@ -78,6 +80,13 @@ export class ActiveAgentResolver {
     }
     if (claudeAvail) {
       return { agent: 'claude_code', mode: 'auto', reason: 'Detected Claude Code CLI executable' };
+    }
+    if (dshAvail) {
+      return {
+        agent: 'deepseek_harness',
+        mode: 'auto',
+        reason: 'Detected DeepSeek Harness executable',
+      };
     }
 
     return { agent: 'codex', mode: 'auto', reason: 'Default fallback agent' };
@@ -112,6 +121,12 @@ export class ActiveAgentResolver {
       candidates.push({ agent: 'codex', latestTime: codexTime });
     }
 
+    // DeepSeek Harness sessions (nested: <sessions>/--<slug>--/session-<uuid>/)
+    const dshTime = this.getLatestDshSessionMtime();
+    if (dshTime > 0) {
+      candidates.push({ agent: 'deepseek_harness', latestTime: dshTime });
+    }
+
     if (candidates.length === 0) return null;
 
     candidates.sort((a, b) => b.latestTime - a.latestTime);
@@ -124,6 +139,38 @@ export class ActiveAgentResolver {
     }
 
     return null;
+  }
+
+  /**
+   * DeepSeek Harness stores sessions two levels deep
+   * (`<sessions>/--<workspace-slug>--/session-<uuid>/`), so it needs its own scan.
+   */
+  private getLatestDshSessionMtime(): number {
+    const root = getDshSessionsDir();
+    if (!fs.existsSync(root)) return 0;
+    let maxTime = 0;
+    try {
+      for (const workspace of fs.readdirSync(root, { withFileTypes: true })) {
+        if (!workspace.isDirectory()) continue;
+        const workspaceDir = path.join(root, workspace.name);
+        let sessions: fs.Dirent[];
+        try {
+          sessions = fs.readdirSync(workspaceDir, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const session of sessions) {
+          if (!session.isDirectory() || !session.name.startsWith('session-')) continue;
+          try {
+            const s = fs.statSync(path.join(workspaceDir, session.name));
+            if (s.mtimeMs > maxTime) maxTime = s.mtimeMs;
+          } catch {}
+        }
+      }
+    } catch {
+      return 0;
+    }
+    return maxTime;
   }
 
   private getLatestMtimeInDir(dirPath: string): number {

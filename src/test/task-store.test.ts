@@ -124,6 +124,48 @@ describe('TaskStore Tests', () => {
     assert.strictEqual(updated.summary.totalDurationMs, 4200);
   });
 
+  test('should persist the caller merge-request handoff', () => {
+    const thread: DelegationThread = {
+      threadId: 'thread_mr_test',
+      title: 'MR handoff',
+      initiatorAgent: 'codex',
+      targetAgent: 'deepseek_harness',
+      status: 'completed',
+      currentRound: 1,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      receiverSessionId: 'sess-mr',
+      workspacePath: tempDir,
+      summary: {
+        lastPromptSnippet: 'do work',
+        lastOutputSnippet: 'approved',
+        totalDurationMs: 10,
+      },
+      rounds: [],
+    };
+    taskStore.upsertTask(thread);
+
+    const updated = taskStore.recordMergeRequest('thread_mr_test', {
+      url: 'https://example.com/mr/7',
+      branch: 'feat/mr',
+      commit: 'abc123',
+      remote: 'origin',
+      status: 'synced',
+      updatedAt: new Date().toISOString(),
+    });
+    assert.ok(updated);
+    assert.strictEqual(updated!.mergeRequest?.url, 'https://example.com/mr/7');
+    assert.strictEqual(taskStore.getTask('thread_mr_test')?.mergeRequest?.commit, 'abc123');
+
+    const secondStore = new TaskStore(tempDir);
+    assert.strictEqual(
+      secondStore.getTask('thread_mr_test')?.mergeRequest?.branch,
+      'feat/mr',
+      'MR info must survive persistence',
+    );
+    secondStore.dispose();
+  });
+
   test('should enforce strict 1,000 tasks cap with LRU truncation', () => {
     // Generate 1050 tasks
     const baseTime = Date.now();

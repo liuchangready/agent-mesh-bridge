@@ -1,13 +1,56 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import {
+  DshProviderConfig,
+  resolveNodeCommand,
+  syncDshMcpConfigs,
+} from '../bridge/deepseek-harness';
 
 export class ConfigSyncService {
   private mcpScriptPath: string;
+  private dshProvider: DshProviderConfig | null;
+  private homeDir: string;
+  /** Extra variables handed to every registered bridge MCP process. */
+  private agentMcpEnv: Record<string, string> = {};
 
-  constructor(customMcpScriptPath?: string) {
+  constructor(
+    customMcpScriptPath?: string,
+    dshProvider?: DshProviderConfig | null,
+    homeDir?: string,
+  ) {
     this.mcpScriptPath =
       customMcpScriptPath || path.resolve(__dirname, '..', '..', 'bin', 'agent-bridge-mcp.cjs');
+    this.dshProvider = dshProvider ?? null;
+    this.homeDir = homeDir || os.homedir();
+  }
+
+  /**
+   * Update the model route written into the DSH `headless` profile.
+   * Pass `null` to fall back to DSH's shipped `deepseek-official` route.
+   */
+  public setDshProvider(provider: DshProviderConfig | null): void {
+    this.dshProvider = provider;
+  }
+
+  /**
+   * Variables passed explicitly to each agent's bridge MCP process.
+   *
+   * An agent spawns that process itself, so relying on the ambient environment
+   * is unreliable (a Windows `setx` does not reach programs launched from an
+   * already-running Explorer). Declaring the provider key here makes the
+   * registration self-contained and independent of process inheritance.
+   */
+  public setAgentMcpEnv(env: Record<string, string>): void {
+    this.agentMcpEnv = { ...env };
+  }
+
+  /** TOML inline table for the Codex MCP `env` key, with escaped values. */
+  private buildTomlEnv(entries: Record<string, string>): string {
+    const pairs = Object.entries(entries).map(
+      ([key, value]) => `${key} = "${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`,
+    );
+    return `{ ${pairs.join(', ')} }`;
   }
 
   /**
@@ -41,6 +84,15 @@ export class ConfigSyncService {
       errors.push(`Google Antigravity: ${e.message}`);
     }
 
+    // 4. Sync DeepSeek Harness (profile patch layers)
+    try {
+      const dsh = this.syncDeepSeekHarnessConfig();
+      synced.push(...dsh.synced);
+      errors.push(...dsh.errors);
+    } catch (e: any) {
+      errors.push(`DeepSeek Harness: ${e.message}`);
+    }
+
     return {
       success: errors.length === 0,
       synced,
@@ -48,8 +100,24 @@ export class ConfigSyncService {
     };
   }
 
+  /**
+   * Register the bridge MCP server with every DeepSeek Harness profile.
+   *
+   * DSH has no `mcpServers` JSON file: each `dsh-mcp-client` plugin instance
+   * connects to exactly one server and is declared in the profile's
+   * `cordis.patch.yml` patch layer, so the registration is a YAML insert.
+   */
+  private syncDeepSeekHarnessConfig(): { synced: string[]; errors: string[] } {
+    return syncDshMcpConfigs(
+      this.mcpScriptPath,
+      resolveNodeCommand(),
+      this.dshProvider,
+      this.agentMcpEnv,
+    );
+  }
+
   private syncClaudeConfig(): boolean {
-    const home = os.homedir();
+    const home = this.homeDir;
     const configPaths = [
       path.join(home, '.claude', 'claude_desktop_config.json'),
       path.join(home, '.claude.json'),
@@ -82,6 +150,7 @@ export class ConfigSyncService {
         args: [this.mcpScriptPath, '--caller', 'claude_code'],
         env: {
           MESH_CALLER_AGENT: 'claude_code',
+          ...this.agentMcpEnv,
         },
       };
 
@@ -133,7 +202,7 @@ export class ConfigSyncService {
   }
 
   private syncCodexConfig(): boolean {
-    const home = os.homedir();
+    const home = this.homeDir;
     const tomlPath = path.join(home, '.codex', 'config.toml');
     const dir = path.dirname(tomlPath);
 
@@ -155,13 +224,20 @@ export class ConfigSyncService {
 
     const normalizedScriptPath = this.mcpScriptPath.replace(/\\/g, '/');
 
-    // Remove old/stale [mcp_servers.agent-mesh-bridge] and [mcp_servers.cross-agent-bridge] blocks
+    // Remove stale blocks, then register exactly ONE server. Codex surfaces one
+    // MCP namespace per registered server, so a duplicate registration shows up
+    // to the model as a second, identical copy of every tool (and spawns a
+    // second server process).
     const cleanToml = tomlContent
       .replace(/\[mcp_servers\.agent-mesh-bridge\][\s\S]*?(?=(\n\[|$))/g, '')
       .replace(/\[mcp_servers\.cross-agent-bridge\][\s\S]*?(?=(\n\[|$))/g, '')
       .trim();
 
-    const mcpBlock = `\n\n[mcp_servers.agent-mesh-bridge]\ncommand = "node"\nargs = ["${normalizedScriptPath}", "--caller", "codex"]\nenv = { MESH_CALLER_AGENT = "codex" }\n\n[mcp_servers.cross-agent-bridge]\ncommand = "node"\nargs = ["${normalizedScriptPath}", "--caller", "codex"]\nenv = { MESH_CALLER_AGENT = "codex" }\n`;
+    const codexEnv = this.buildTomlEnv({
+      MESH_CALLER_AGENT: 'codex',
+      ...this.agentMcpEnv,
+    });
+    const mcpBlock = `\n\n[mcp_servers.agent-mesh-bridge]\ncommand = "node"\nargs = ["${normalizedScriptPath}", "--caller", "codex"]\nenv = ${codexEnv}\n`;
 
     fs.writeFileSync(tomlPath, cleanToml + mcpBlock, 'utf8');
 
@@ -180,13 +256,10 @@ export class ConfigSyncService {
       config.mcpServers['agent-mesh-bridge'] = {
         command: 'node',
         args: [this.mcpScriptPath, '--caller', 'codex'],
-        env: { MESH_CALLER_AGENT: 'codex' },
+        env: { MESH_CALLER_AGENT: 'codex', ...this.agentMcpEnv },
       };
-      config.mcpServers['cross-agent-bridge'] = {
-        command: 'node',
-        args: [this.mcpScriptPath, '--caller', 'codex'],
-        env: { MESH_CALLER_AGENT: 'codex' },
-      };
+      // Drop the legacy duplicate so upgrades clean themselves up.
+      delete config.mcpServers['cross-agent-bridge'];
       fs.writeFileSync(jsonPath, JSON.stringify(config, null, 2), 'utf8');
     } catch {}
 
@@ -194,7 +267,7 @@ export class ConfigSyncService {
   }
 
   private syncAntigravityConfig(): boolean {
-    const home = os.homedir();
+    const home = this.homeDir;
     const mcpConfigPath = path.join(home, '.gemini', 'antigravity', 'mcp_config.json');
     const dir = path.dirname(mcpConfigPath);
 
@@ -222,6 +295,7 @@ export class ConfigSyncService {
       args: [this.mcpScriptPath, '--caller', 'antigravity'],
       env: {
         MESH_CALLER_AGENT: 'antigravity',
+        ...this.agentMcpEnv,
       },
     };
 

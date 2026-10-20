@@ -53,6 +53,10 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     let statusLabel = thread.status.toUpperCase();
 
     switch (thread.status) {
+      case 'queued':
+        iconName = 'clock';
+        statusLabel = `Queued (排队中)`;
+        break;
       case 'running':
       case 'reworking':
         iconName = 'sync~spin';
@@ -62,6 +66,10 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
       case 'waiting_review':
         iconName = 'eye';
         statusLabel = `In-Review (${roundText})`;
+        break;
+      case 'paused':
+        iconName = 'debug-pause';
+        statusLabel = `Paused (已暂停)`;
         break;
       case 'completed':
         iconName = 'check';
@@ -82,7 +90,12 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     const item = new TaskTreeItem(label, vscode.TreeItemCollapsibleState.Collapsed, thread);
     item.description = description;
     item.iconPath = new vscode.ThemeIcon(iconName);
-    item.contextValue = thread.status === 'waiting_review' ? 'waiting_review' : 'task_item';
+    item.contextValue =
+      thread.status === 'waiting_review'
+        ? 'waiting_review'
+        : thread.status === 'paused'
+          ? 'paused_task'
+          : 'task_item';
 
     // Click command
     item.command = {
@@ -104,6 +117,26 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     const outputSnippet = thread.summary.lastOutputSnippet
       ? `B: "${thread.summary.lastOutputSnippet.replace(/[\r\n]+/g, ' ')}"`
       : 'No output snippet';
+    if (thread.interruption?.reason) {
+      subItems.push(
+        new TaskTreeItem(
+          `Interrupted: ${thread.interruption.reason}`,
+          vscode.TreeItemCollapsibleState.None,
+        ),
+      );
+      const interruptionItem = subItems[subItems.length - 1];
+      interruptionItem.iconPath = new vscode.ThemeIcon('stop-circle');
+    }
+    if (thread.mergeRequest) {
+      const label = thread.mergeRequest.url
+        ? `MR: ${thread.mergeRequest.url}`
+        : thread.mergeRequest.commit
+          ? `MR commit: ${thread.mergeRequest.commit}`
+          : `MR: ${thread.mergeRequest.status}`;
+      subItems.push(new TaskTreeItem(label, vscode.TreeItemCollapsibleState.None));
+      const mrItem = subItems[subItems.length - 1];
+      mrItem.iconPath = new vscode.ThemeIcon('git-pull-request');
+    }
     const outputItem = new TaskTreeItem(outputSnippet, vscode.TreeItemCollapsibleState.None);
     outputItem.iconPath = new vscode.ThemeIcon('output');
     subItems.push(outputItem);
@@ -120,6 +153,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
         return 'Claude';
       case 'codex':
         return 'Codex';
+      case 'deepseek_harness':
+        return 'DSH';
       case 'vscode_chat':
         return 'VSCode';
       default:

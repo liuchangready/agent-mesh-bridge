@@ -39,7 +39,12 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     }
 
     const activeResolution = await this.resolver.resolveActiveAgent();
-    const agentsList: AgentId[] = ['antigravity', 'codex', 'claude_code'];
+    const agentsList: AgentId[] = [
+      'antigravity',
+      'codex',
+      'claude_code',
+      'deepseek_harness',
+    ];
 
     const items: AgentNodeItem[] = [];
     for (const agentId of agentsList) {

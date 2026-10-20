@@ -4,6 +4,12 @@ import * as os from 'os';
 import { execFile } from 'child_process';
 import { AgentId, AgentInfo, AgentStatusType } from './types';
 import { RateLimitTracker } from './rate-limit-tracker';
+import {
+  checkDshAuth,
+  detectDshActiveSession,
+  getDshCandidatePaths,
+  queryDshVersion,
+} from './deepseek-harness';
 
 export class AgentDetector {
   private customPaths: Partial<Record<AgentId, string>> = {};
@@ -133,6 +139,14 @@ export class AgentDetector {
   }
 
   /**
+   * Find candidate paths for DeepSeek Harness (`dsh`), an Electron desktop app
+   * whose CLI is exposed through a profile launcher.
+   */
+  public getDeepSeekHarnessCandidatePaths(): string[] {
+    return getDshCandidatePaths(this.customPaths.deepseek_harness);
+  }
+
+  /**
    * Resolve best executable path for given agent.
    */
   public resolveExecutable(agent: AgentId): string | null {
@@ -146,6 +160,9 @@ export class AgentDetector {
         break;
       case 'codex':
         candidates = this.getCodexCandidatePaths();
+        break;
+      case 'deepseek_harness':
+        candidates = this.getDeepSeekHarnessCandidatePaths();
         break;
       case 'vscode_chat':
         return 'vscode_internal';
@@ -174,6 +191,7 @@ export class AgentDetector {
       antigravity: 'Google Antigravity',
       claude_code: 'Anthropic Claude Code',
       codex: 'OpenAI Codex',
+      deepseek_harness: 'DeepSeek Harness',
       vscode_chat: 'VSCode Copilot/Chat',
     };
 
@@ -211,7 +229,10 @@ export class AgentDetector {
     }
 
     // 2. Check version
-    const version = await this.queryVersion(execPath);
+    const version =
+      agent === 'deepseek_harness'
+        ? await queryDshVersion(execPath)
+        : await this.queryVersion(execPath);
 
     // 3. Check Authentication
     const auth = this.checkAuthentication(agent);
@@ -250,7 +271,7 @@ export class AgentDetector {
    * Probe all agents concurrently.
    */
   public async probeAll(forceRefresh: boolean = false): Promise<Record<AgentId, AgentInfo>> {
-    const agents: AgentId[] = ['antigravity', 'codex', 'claude_code'];
+    const agents: AgentId[] = ['antigravity', 'codex', 'claude_code', 'deepseek_harness'];
     const results = await Promise.all(agents.map((a) => this.probeAgent(a, forceRefresh)));
     const map: Partial<Record<AgentId, AgentInfo>> = {};
     for (const r of results) {
@@ -330,13 +351,25 @@ export class AgentDetector {
       return { authenticated: false, details: '未配置 Anthropic 访问令牌' };
     }
 
+    if (agent === 'deepseek_harness') {
+      return checkDshAuth();
+    }
+
     return { authenticated: true, details: 'Default' };
   }
 
   private queryVersion(execPath: string): Promise<string | undefined> {
     return new Promise((resolve) => {
       try {
-        const proc = execFile(execPath, ['--version'], { timeout: 3000 }, (error, stdout) => {
+        // `.cmd` / `.bat` launchers (Claude Code, DeepSeek Harness) are shell
+        // scripts and must be executed through cmd.exe on Windows.
+        const lower = execPath.toLowerCase();
+        const needsShellWrapper =
+          process.platform === 'win32' && (lower.endsWith('.cmd') || lower.endsWith('.bat'));
+        const command = needsShellWrapper ? 'cmd.exe' : execPath;
+        const args = needsShellWrapper ? ['/c', execPath, '--version'] : ['--version'];
+
+        const proc = execFile(command, args, { timeout: 8000 }, (error, stdout) => {
           if (error) {
             resolve(undefined);
           } else {
@@ -465,6 +498,10 @@ export class AgentDetector {
             }
           }
         }
+      }
+
+      if (agent === 'deepseek_harness') {
+        return detectDshActiveSession(workspacePath, excludeSessionIds);
       }
     } catch (e) {
       console.warn(`[AgentDetector] Error detecting active session for ${agent}:`, e);
