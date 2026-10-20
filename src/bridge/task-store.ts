@@ -281,6 +281,7 @@ export class TaskStore extends EventEmitter {
         status: roundUpdate.status || 'running',
         timestamp: roundUpdate.timestamp || new Date().toISOString(),
         interruption,
+        ...(roundUpdate.touchedFiles ? { touchedFiles: roundUpdate.touchedFiles } : {}),
       });
     }
 

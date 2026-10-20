@@ -32,6 +32,21 @@ export type ThreadStatus =
  */
 export type InterruptionKind = 'paused' | 'stopped' | 'deleted' | 'timeout' | 'watchdog' | 'error';
 
+/**
+ * True when a human stopped the round on purpose.
+ *
+ * A pause/stop/delete is a decision, not a failure: waking the caller to tell it
+ * "your task failed" would be misleading. Timeouts, watchdogs and process errors
+ * are system-caused and do deserve a failure wake-up.
+ */
+export function isUserInterruption(interruption?: TaskInterruption): boolean {
+  return (
+    interruption?.kind === 'paused' ||
+    interruption?.kind === 'stopped' ||
+    interruption?.kind === 'deleted'
+  );
+}
+
 export interface TaskInterruption {
   kind: InterruptionKind;
   reason: string;
@@ -119,6 +134,22 @@ export interface DelegationRound {
   interruption?: TaskInterruption;
   /** Two-part response health: error code + stream continuity/output. */
   assessment?: ResponseAssessment;
+  /**
+   * Files this round actually changed (workspace-relative), measured with a git
+   * status probe bracketing the run. Complements the caller's declared
+   * `expectedFiles`, which may be missing or incomplete.
+   */
+  touchedFiles?: string[];
+  /**
+   * Set when this round's instruction is byte-identical to an earlier round's.
+   *
+   * A caller that wants "run the same task again" has no retry lever in the MCP
+   * surface, so it historically re-sent the original prompt through
+   * `request_rework`; the ledger then showed two rounds that looked like two
+   * identical tasks. Recording the origin makes the repeat explicit instead of
+   * making it look like a duplicate dispatch.
+   */
+  repeatOfRound?: number;
 }
 
 export interface ThreadSummary {
@@ -171,12 +202,28 @@ export interface DelegationThread {
   interruption?: TaskInterruption;
   /** Full interruption history, newest last. */
   interruptions?: TaskInterruption[];
+  /**
+   * Round numbers whose failure already woke the caller.
+   *
+   * Keeps one failure from spawning two callbacks (the supervisor, the
+   * dispatcher and the rework controller can all finalize the same round), and
+   * caps the wake-up loop so a task that keeps failing cannot ping-pong forever.
+   */
+  failureNotifications?: number[];
 
   /** MR handoff recorded by the caller after the task/batch is accepted. */
   mergeRequest?: MergeRequestInfo;
 
   // File scope for conflict detection and queueing
   expectedFiles?: string[]; // Concrete code files (directories/globs are rejected at dispatch)
+
+  /**
+   * Caller explicitly allowed this task to touch files another open task already
+   * changed. Without it, a scope overlap keeps the task queued.
+   */
+  scopeOverride?: boolean;
+  /** Why this task is parked by the scope gate (cleared once it can start). */
+  scopeBlockedBy?: { threadId: string; title?: string; files: string[] };
 
   // Summary for fast sidebar rendering
   summary: ThreadSummary;
@@ -206,8 +253,22 @@ export interface DispatchTaskParams {
   /**
    * Concrete code file paths expected to be modified. Directories and glob
    * patterns are rejected so the lock scope stays per-file.
+   *
+   * Required by `dispatch_task` unless the caller passes `allowNoScope`: the
+   * scope is what lets the bridge refuse to start a task on a file another open
+   * task already changed.
    */
   expectedFiles?: string[];
+  /** Caller confirms this task touches no workspace file (or refuses to declare). */
+  allowNoScope?: boolean;
+  /** Caller accepts running on top of files another open task already changed. */
+  allowScopeOverlap?: boolean;
+  /**
+   * Reject the dispatch when `expectedFiles` is empty and `allowNoScope` is not
+   * set. Enabled by the MCP layer (agent callers must declare a scope); internal
+   * callers and tests keep the lenient behaviour.
+   */
+  requireScope?: boolean;
 }
 
 export type DispatchStatus = 'DISPATCHED' | 'QUEUED';

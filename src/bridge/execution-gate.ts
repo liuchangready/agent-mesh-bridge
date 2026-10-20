@@ -1,3 +1,4 @@
+import * as child_process from 'child_process';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -15,11 +16,22 @@ import * as path from 'path';
  * The lock is refreshed every few seconds. A lock whose heartbeat stopped (or
  * whose owner PID is gone) is stale and may be reclaimed, so a crashed agent
  * cannot block the queue forever.
+ *
+ * The lock also records the real agent child PID. On Windows a crashed host does
+ * not kill its children, so judging liveness by the host PID alone would let a
+ * surviving `dsh headless` (or codex/claude) keep editing the workspace while a
+ * new round starts on top of it. An orphaned child therefore keeps the gate busy
+ * until it exits — or, after a grace period, is killed before takeover.
  */
 
 export interface ExecutionOwner {
   token: string;
   pid: number;
+  /**
+   * Real agent process spawned by `pid`. It survives a crashed host on Windows,
+   * so it must be probed independently before another round may start.
+   */
+  childPid?: number;
   threadId: string;
   round: number;
   acquiredAt: number;
@@ -32,21 +44,36 @@ export interface ExecutionLease {
   round: number;
 }
 
+export interface ExecutionGateOptions {
+  /** Heartbeat age after which the owner stops being trusted (default 30s). */
+  staleAfterMs?: number;
+  /**
+   * How long an orphaned child (host dead, agent still alive) may keep running
+   * before it is killed and the gate is taken over (default 2 minutes).
+   */
+  orphanGraceMs?: number;
+}
+
 const LOCK_FILE_NAME = 'execution.lock';
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const STALE_AFTER_MS = 30_000;
+const ORPHAN_GRACE_MS = 120_000;
 
 export class ExecutionGate {
   private readonly lockFilePath: string;
+  private readonly staleAfterMs: number;
+  private readonly orphanGraceMs: number;
   private activeLease: ExecutionLease | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
 
-  constructor(storageDir?: string) {
+  constructor(storageDir?: string, options?: ExecutionGateOptions) {
     const dir = storageDir || path.join(os.homedir(), '.agent-mesh-bridge');
     try {
       fs.mkdirSync(dir, { recursive: true });
     } catch {}
     this.lockFilePath = path.join(dir, LOCK_FILE_NAME);
+    this.staleAfterMs = options?.staleAfterMs ?? STALE_AFTER_MS;
+    this.orphanGraceMs = options?.orphanGraceMs ?? ORPHAN_GRACE_MS;
   }
 
   public getLockFilePath(): string {
@@ -57,7 +84,8 @@ export class ExecutionGate {
    * Attempt to become the one globally executing task.
    *
    * @returns a lease when acquired, `null` when another live process/round owns
-   *   the gate.
+   *   the gate. An orphaned agent child left behind by a crashed host is killed
+   *   before the gate is taken over, so it cannot edit files concurrently.
    */
   public tryAcquire(threadId: string, round: number): ExecutionLease | null {
     if (this.activeLease) return null;
@@ -94,7 +122,15 @@ export class ExecutionGate {
           this.removeStaleLock(undefined);
           continue;
         }
-        if (this.isOwnerLive(owner)) return null;
+
+        const verdict = this.evaluateOwner(owner);
+        if (verdict.live) return null;
+        // The host is gone but its agent child is still running (or hung): kill
+        // it before taking the slot, otherwise two agents would edit the same
+        // workspace at once.
+        if (verdict.orphanChildPid) {
+          this.killProcessTree(verdict.orphanChildPid);
+        }
         this.removeStaleLock(owner);
       }
     }
@@ -109,11 +145,58 @@ export class ExecutionGate {
   public getOwner(): ExecutionOwner | undefined {
     const owner = this.readOwner();
     if (!owner) return undefined;
-    return this.isOwnerLive(owner) ? owner : undefined;
+    return this.evaluateOwner(owner).live ? owner : undefined;
+  }
+
+  /** Raw owner record, including one whose host died (needed for orphan cleanup). */
+  public getRawOwner(): ExecutionOwner | undefined {
+    return this.readOwner();
   }
 
   public isBusy(): boolean {
     return this.getOwner() !== undefined;
+  }
+
+  /**
+   * Record (or clear) the real agent child of this lease.
+   *
+   * Called by every execution path right after spawn and again when the child
+   * exits, so a surviving orphan can be detected and killed after a host crash.
+   */
+  public attachChildPid(childPid?: number): void {
+    if (!this.activeLease) return;
+    const owner = this.readOwner();
+    if (!owner || owner.token !== this.activeLease.token) return;
+    owner.childPid = childPid && childPid > 0 ? childPid : undefined;
+    try {
+      fs.writeFileSync(this.lockFilePath, JSON.stringify(owner), 'utf8');
+    } catch {}
+  }
+
+  /**
+   * Kill the agent child recorded for `threadId` when its host is gone.
+   *
+   * A live host owns its child and reacts to the cross-process cancellation file
+   * on its own, so this only acts on genuine orphans (host process dead). It
+   * makes `pause_task` / `delete_task` effective even after a host restart.
+   *
+   * @returns whether an orphaned child was killed.
+   */
+  public killOrphanChild(threadId: string): boolean {
+    const owner = this.readOwner();
+    if (!owner || owner.threadId !== threadId) return false;
+    if (!owner.childPid) return false;
+    // The owning host is still alive: leave the kill to its own runner, which
+    // also finalizes the round and records the interruption.
+    if (this.isPidAlive(owner.pid, true)) return false;
+    if (!this.isPidAlive(owner.childPid, false)) return false;
+
+    console.warn(
+      `[ExecutionGate] Killing orphaned agent process ${owner.childPid} for ${threadId} ` +
+        `(round ${owner.round}): its host process ${owner.pid} is gone.`,
+    );
+    this.killProcessTree(owner.childPid);
+    return true;
   }
 
   /** Release a lease. Only the process holding that exact token may delete it. */
@@ -152,17 +235,39 @@ export class ExecutionGate {
     return undefined;
   }
 
-  private isOwnerLive(owner: ExecutionOwner): boolean {
+  /**
+   * Decides whether the recorded owner still represents work in flight.
+   *
+   * Priority: a fresh heartbeat wins; then a live host PID; then — for a bounded
+   * grace period — a live agent child. Past that grace the child is orphaned and
+   * the caller is expected to kill it before taking over.
+   */
+  private evaluateOwner(owner: ExecutionOwner): {
+    live: boolean;
+    orphanChildPid?: number;
+  } {
     const heartbeatAt = owner.updatedAt || owner.acquiredAt || 0;
-    if (!heartbeatAt || Date.now() - heartbeatAt > STALE_AFTER_MS) return false;
-    if (!owner.pid) return false;
+    const age = heartbeatAt ? Date.now() - heartbeatAt : Number.POSITIVE_INFINITY;
 
-    // A lock written by this PID is ours or a sibling gate in this process. Its
-    // freshness is the only signal available (we must not delete a live lease).
-    if (owner.pid === process.pid) return true;
+    if (heartbeatAt && age <= this.staleAfterMs) return { live: true };
+
+    if (this.isPidAlive(owner.pid, true)) return { live: true };
+
+    const childAlive = owner.childPid ? this.isPidAlive(owner.childPid, false) : false;
+    if (childAlive && age <= this.orphanGraceMs) return { live: true };
+    if (childAlive) return { live: false, orphanChildPid: owner.childPid };
+
+    return { live: false };
+  }
+
+  private isPidAlive(pid: number, isHostPid: boolean): boolean {
+    if (!pid || pid <= 0) return false;
+    // A lock written by this PID is ours: freshness was already evaluated by the
+    // caller, and we must never delete a lease we are actively holding.
+    if (isHostPid && pid === process.pid) return true;
 
     try {
-      process.kill(owner.pid, 0);
+      process.kill(pid, 0);
       return true;
     } catch (err: any) {
       // EPERM means the process exists but we may not signal it.
@@ -170,10 +275,24 @@ export class ExecutionGate {
     }
   }
 
+  private killProcessTree(pid: number): void {
+    if (!pid || !this.isPidAlive(pid, false)) return;
+    try {
+      if (process.platform === 'win32') {
+        child_process.execFileSync('taskkill', ['/pid', String(pid), '/T', '/F'], {
+          stdio: 'ignore',
+          windowsHide: true,
+        });
+        return;
+      }
+      process.kill(pid, 'SIGKILL');
+    } catch {}
+  }
+
   private isLockFileStale(): boolean {
     try {
       const stat = fs.statSync(this.lockFilePath);
-      return Date.now() - stat.mtimeMs > STALE_AFTER_MS;
+      return Date.now() - stat.mtimeMs > this.staleAfterMs;
     } catch {
       return false;
     }

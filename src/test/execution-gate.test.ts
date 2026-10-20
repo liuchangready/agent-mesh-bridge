@@ -1,5 +1,6 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
+import * as child_process from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -72,6 +73,109 @@ describe('ExecutionGate - cross-process single flight', () => {
     assert.strictEqual(gate.getOwner()?.threadId, 'thread_live');
     gate.release(lease!);
   });
+
+  test('records and clears the real agent child on the live lease', () => {
+    const gate = new ExecutionGate(tempDir);
+    const lease = gate.tryAcquire('thread_child', 1);
+    assert.ok(lease);
+
+    gate.attachChildPid(4242);
+    const withChild = JSON.parse(fs.readFileSync(gate.getLockFilePath(), 'utf8'));
+    assert.strictEqual(withChild.childPid, 4242);
+
+    gate.attachChildPid(undefined);
+    const cleared = JSON.parse(fs.readFileSync(gate.getLockFilePath(), 'utf8'));
+    assert.strictEqual(cleared.childPid, undefined);
+
+    gate.release(lease!);
+  });
+
+  test('killOrphanChild leaves a live host and other tasks alone', () => {
+    const gate = new ExecutionGate(tempDir, { staleAfterMs: 100, orphanGraceMs: 500 });
+    const child = child_process.spawn(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1000)'],
+      { stdio: 'ignore', windowsHide: true },
+    );
+
+    try {
+      fs.writeFileSync(
+        gate.getLockFilePath(),
+        JSON.stringify({
+          token: 'live-token',
+          pid: process.pid, // this test process is the live host
+          childPid: child.pid,
+          threadId: 'thread_live_host',
+          round: 1,
+          acquiredAt: Date.now(),
+          updatedAt: Date.now(),
+        }),
+        'utf8',
+      );
+
+      assert.strictEqual(
+        gate.killOrphanChild('thread_live_host'),
+        false,
+        'a live host handles its own child through the cancellation file',
+      );
+      assert.strictEqual(gate.killOrphanChild('thread_other'), false);
+    } finally {
+      try {
+        child.kill('SIGKILL');
+      } catch {}
+    }
+  });
+
+  test('an orphaned agent child keeps the gate busy and is killed before takeover', async () => {
+    const child = child_process.spawn(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1000)'],
+      { stdio: 'ignore', windowsHide: true },
+    );
+    let childExited = false;
+    child.once('exit', () => {
+      childExited = true;
+    });
+
+    try {
+      assert.ok(child.pid);
+      const gate = new ExecutionGate(tempDir, { staleAfterMs: 100, orphanGraceMs: 500 });
+      const now = Date.now();
+      fs.writeFileSync(
+        gate.getLockFilePath(),
+        JSON.stringify({
+          token: 'orphan-token',
+          pid: 999_999, // the host that spawned the agent is gone
+          childPid: child.pid, // the agent itself is still alive
+          threadId: 'thread_orphan',
+          round: 1,
+          acquiredAt: now - 200,
+          updatedAt: now - 200, // stale heartbeat, still inside the orphan grace
+        }),
+        'utf8',
+      );
+
+      // Inside the grace window a surviving agent still owns the slot: starting
+      // the next round now would put two agents on the same workspace.
+      assert.strictEqual(gate.tryAcquire('thread_next', 1), null);
+      assert.strictEqual(gate.getOwner()?.threadId, 'thread_orphan');
+
+      // Past the grace window the orphan is killed, then the slot is taken over.
+      await new Promise((resolve) => setTimeout(resolve, 550));
+      const lease = gate.tryAcquire('thread_next', 1);
+      assert.ok(lease, 'the gate must be reclaimable once the orphan is past its grace');
+
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      assert.strictEqual(childExited, true, 'the orphaned agent process must be killed');
+      gate.release(lease!);
+    } finally {
+      if (!childExited) {
+        try {
+          child.kill('SIGKILL');
+        } catch {}
+      }
+    }
+  });
 });
 
 describe('Global serialization - dispatcher fallback queue', () => {
@@ -89,6 +193,7 @@ describe('Global serialization - dispatcher fallback queue', () => {
     runner = new AutonomousRunner(detector);
     callbackManager = new CallbackManager(detector);
     callbackManager.notifyCaller = async () => true;
+    callbackManager.notifyCallerOfFailure = async () => false;
     dispatcher = new AsyncDispatcher(
       taskStore,
       resolver,

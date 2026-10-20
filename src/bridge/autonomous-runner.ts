@@ -20,6 +20,37 @@ import {
 /** Default silence watchdog: 10 minutes (long model reasoning is not a hang). */
 export const DEFAULT_SILENCE_TIMEOUT_MS = 10 * 60 * 1000;
 
+/**
+ * Network/transport level failures that are worth one more attempt with the
+ * very same prompt. Kept to explicit phrases and errno spellings so normal build
+ * output (a diff mentioning "connection", a test name, `eof` handling code)
+ * cannot trigger a spurious replay.
+ */
+const TRANSPORT_ERROR_PATTERNS: string[] = [
+  // DSH reports dropped transports as `dsh: TRANSPORT: Connection error.`
+  'transport: connection error',
+  'connection error',
+  'network error',
+  'network is unreachable',
+  'connection reset by peer',
+  'connection refused',
+  'socket hang up',
+  'socket closed',
+  'other side closed',
+  'premature close',
+  'tls handshake timeout',
+  'temporary failure in name resolution',
+  'fetch failed',
+  'econnreset',
+  'econnrefused',
+  'etimedout',
+  'enotfound',
+  'eai_again',
+  'enetunreach',
+  'und_err_connect_timeout',
+  'und_err_socket',
+];
+
 export interface RunCommand {
   command: string;
   args: string[];
@@ -38,6 +69,8 @@ export interface RunOptions {
   timeoutMs?: number; // Overall process timeout, default 2 hours (120 mins)
   silenceTimeoutMs?: number; // Silence watchdog timeout, default 10 minutes
   maxRetries?: number; // Max retries for transient startup/network errors, default 3
+  /** Base delay for the exponential retry backoff; tests shorten it. */
+  retryBackoffMs?: number;
   /** Thread being executed, so the child can be marked as a task receiver. */
   taskThreadId?: string;
   /** Round being executed (used for diagnostics and receiver guard). */
@@ -56,6 +89,13 @@ export interface RunOptions {
   markAsReceiver?: boolean;
   onStdoutChunk?: (chunk: string) => void;
   onStderrChunk?: (chunk: string) => void;
+  /**
+   * Reports the real agent child PID on spawn and `undefined` once it exits.
+   *
+   * The global execution lease records it so that a leaked child (host killed,
+   * agent still running) can be detected and killed before another round starts.
+   */
+  onChildPid?: (pid: number | undefined) => void;
 }
 
 export interface RunResult {
@@ -340,28 +380,79 @@ export class AutonomousRunner {
 
   /**
    * Executes the agent command with retry on transient startup/network errors.
+   *
+   * A network hiccup (e.g. DSH's `TRANSPORT: Connection error`) must not burn a
+   * whole task round: the same prompt is replayed with exponential backoff.
+   * A run that was paused/stopped/timed out is never retried — replaying it
+   * would silently resurrect a process the user asked to kill.
    */
   public async execute(options: RunOptions): Promise<RunResult> {
     const maxRetries = options.maxRetries ?? 3;
+    const baseBackoffMs = options.retryBackoffMs ?? 2000;
+    let attemptOptions = options;
     let attempt = 0;
     while (true) {
       attempt++;
-      const result = await this.executeOnce(options);
-      if (result.exitCode === 0) {
+      const result = await this.executeOnce(attemptOptions);
+      const succeeded =
+        result.exitCode === 0 && (!result.assessment || result.assessment.success);
+      if (succeeded) {
         return result;
       }
 
-      if (attempt <= maxRetries && this.isTransientError(result)) {
-        const backoffMs = Math.min(2000 * Math.pow(2, attempt - 1), 10000);
+      if (result.interruption) {
+        return result;
+      }
+
+      if (attempt <= maxRetries && this.isRetryableFailure(result)) {
+        const backoffMs = Math.min(baseBackoffMs * Math.pow(2, attempt - 1), 10_000);
         console.warn(
-          `[AutonomousRunner] Transient startup/network error on attempt ${attempt}/${maxRetries} for ${options.agent}: "${result.error}". Retrying in ${backoffMs / 1000}s...`,
+          `[AutonomousRunner] Transient startup/network error on attempt ${attempt}/${maxRetries} for ${options.agent}: "${result.error || result.assessment?.reason || result.stderr.trim()}". Retrying in ${backoffMs / 1000}s...`,
         );
         await new Promise((r) => setTimeout(r, backoffMs));
+        // A dead attempt may already have opened a native session. Continuing
+        // that session keeps the work the receiver already did; starting a
+        // second fresh session would redo the whole task in a new context.
+        if (!attemptOptions.isRework && result.actualSessionId) {
+          attemptOptions = {
+            ...attemptOptions,
+            isRework: true,
+            receiverSessionId: result.actualSessionId,
+          };
+          console.log(
+            `[AutonomousRunner] Retry for ${options.agent} resumes native session ${result.actualSessionId} instead of starting a fresh one.`,
+          );
+        }
         continue;
       }
 
       return result;
     }
+  }
+
+  /**
+   * Decides whether a failed attempt deserves another try.
+   *
+   * Two shapes exist in the wild:
+   *   1. the CLI dies with a non-zero code after a network error;
+   *   2. the CLI swallows the network error, exits 0 and emits no final answer
+   *      (DSH's `dsh: TRANSPORT: Connection error.` behaves this way).
+   * Both are retried; a genuine empty answer or a stalled stream without any
+   * transport evidence is not.
+   */
+  public isRetryableFailure(result: RunResult): boolean {
+    // A paused/stopped/timed-out run was killed on purpose: replaying it would
+    // resurrect work the user asked to abandon.
+    if (result.interruption) return false;
+    if (result.exitCode !== 0) return this.isTransientError(result);
+    if (!result.assessment || result.assessment.success) return false;
+    return this.isTransportFailure(result);
+  }
+
+  /** True when the captured output mentions a network/transport level failure. */
+  public isTransportFailure(result: RunResult): boolean {
+    const combined = `${result.stdout}\n${result.stderr}\n${result.error || ''}`.toLowerCase();
+    return TRANSPORT_ERROR_PATTERNS.some((pattern) => combined.includes(pattern));
   }
 
   /**
@@ -371,16 +462,9 @@ export class AutonomousRunner {
     if (result.exitCode === 0) return false;
     const combined = `${result.stdout}\n${result.stderr}\n${result.error || ''}`.toLowerCase();
     const transientPatterns = [
+      ...TRANSPORT_ERROR_PATTERNS,
       'eligibility check failed',
       'eof',
-      'econnreset',
-      'etimedout',
-      'socket hang up',
-      'network is unreachable',
-      'connection reset by peer',
-      'tls handshake timeout',
-      'temporary failure in name resolution',
-      'fetch failed',
       '502 bad gateway',
       '503 service unavailable',
       '504 gateway timeout',
@@ -657,6 +741,19 @@ export class AutonomousRunner {
         try {
           child.stdin.end();
         } catch {}
+      }
+
+      // Publish the real agent PID to the execution lease: it outlives a crashed
+      // host on Windows, and the next round must not start on top of it.
+      if (child.pid) {
+        try {
+          options.onChildPid?.(child.pid);
+        } catch {}
+        child.once('exit', () => {
+          try {
+            options.onChildPid?.(undefined);
+          } catch {}
+        });
       }
 
       // Cross-process pause/delete: a control plane running elsewhere writes a

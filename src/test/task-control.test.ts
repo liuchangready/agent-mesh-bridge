@@ -136,6 +136,7 @@ describe('TaskControlService - pause/delete reasons', () => {
 
     const callbackManager = new CallbackManager(new AgentDetector());
     callbackManager.notifyCaller = async () => true;
+    callbackManager.notifyCallerOfFailure = async () => false;
     const reworkController = new ReworkController(
       taskStore,
       runner,

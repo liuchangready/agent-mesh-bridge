@@ -323,6 +323,11 @@ export class TaskDetailPanel {
         <div class="round-card" style="border-left: 4px solid ${roundBorderColor};">
           <div class="round-header">
             <span class="round-badge">Round ${r.round} (${r.type.toUpperCase()})</span>
+            ${
+              r.repeatOfRound !== undefined
+                ? `<span class="round-badge" style="background:#4c1d95;border:1px solid #7c3aed;color:#ddd6fe;margin-left:6px;" title="本轮指令与第 ${r.repeatOfRound} 轮完全相同；建议改用 retry_task 重跑失败轮">↻ 重复第 ${r.repeatOfRound} 轮指令</span>`
+                : ''
+            }
             <span class="round-meta">${new Date(r.timestamp).toLocaleTimeString()} · ${durationSec}s · Status: <strong>${r.status}</strong></span>
           </div>
 
@@ -342,6 +347,21 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}</pre>
             <div class="section-title">Caller Instructions / Feedback:</div>
             <pre class="code-block">${escapeHtml(r.prompt)}</pre>
           </div>
+
+          ${
+            r.touchedFiles && r.touchedFiles.length > 0
+              ? `
+          <div class="section-title" style="color: #93c5fd;">Files Touched This Round (git probe):</div>
+          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;">
+            ${r.touchedFiles
+              .map(
+                (f) =>
+                  `<span style="background: rgba(59, 130, 246, 0.18); border: 1px solid rgba(59, 130, 246, 0.45); padding: 2px 8px; border-radius: 4px; font-size: 12px; color: #bfdbfe;">${escapeHtml(f)}</span>`,
+              )
+              .join('')}
+          </div>`
+              : ''
+          }
 
           ${
             r.output
@@ -599,10 +619,31 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}</pre>
         <div class="meta-val">${new Date(thread.createdAt).toLocaleString()}</div>
       </div>
       ${
+        thread.scopeBlockedBy
+          ? `
+      <div class="meta-item" style="grid-column: 1 / -1;">
+        <div class="meta-label" style="color: #fbbf24;">Scope Block（文件归属互斥）</div>
+        <div class="meta-val" style="color: #fde68a;">
+          以下文件已被任务 <strong>${escapeHtml(thread.scopeBlockedBy.threadId)}</strong>${
+            thread.scopeBlockedBy.title ? `「${escapeHtml(thread.scopeBlockedBy.title)}」` : ''
+          } 声明或实际修改，本任务不会启动，直到该任务收口（approve + record_merge_request）或调用 allow_scope_overlap 放行：
+          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px;">
+            ${thread.scopeBlockedBy.files
+              .map(
+                (f) =>
+                  `<span style="background: rgba(251, 191, 36, 0.18); border: 1px solid rgba(251, 191, 36, 0.45); padding: 2px 8px; border-radius: 4px; font-size: 12px; color: #fde68a;">${escapeHtml(f)}</span>`,
+              )
+              .join('')}
+          </div>
+        </div>
+      </div>`
+          : ''
+      }
+      ${
         thread.expectedFiles && thread.expectedFiles.length > 0
           ? `
       <div class="meta-item" style="grid-column: 1 / -1;">
-        <div class="meta-label">Expected File Scope (冲突排队保护)</div>
+        <div class="meta-label">Expected File Scope (文件归属互斥)</div>
         <div class="meta-val" style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px;">
           ${thread.expectedFiles
             .map(
@@ -612,7 +653,13 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}</pre>
             .join('')}
         </div>
       </div>`
-          : ''
+          : `
+      <div class="meta-item" style="grid-column: 1 / -1;">
+        <div class="meta-label">Expected File Scope (文件归属互斥)</div>
+        <div class="meta-val" style="color: #94a3b8;">
+          未声明（早期派发或 allowNoScope）。文件归属互斥对它不生效；但本轮实际改动的文件仍会由 git probe 记录，用于保护后续任务。
+        </div>
+      </div>`
       }
       ${
         thread.mergeRequest

@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { AutonomousRunner } from './autonomous-runner';
 import { CancellationRegistry } from './cancellation-registry';
+import { ExecutionGate } from './execution-gate';
 import { TaskStore } from './task-store';
 import {
   DelegationRound,
@@ -31,6 +32,7 @@ export class TaskControlService {
   private readonly taskStore: TaskStore;
   private readonly runner?: AutonomousRunner;
   private readonly cancellationRegistry: CancellationRegistry;
+  private readonly executionGate: ExecutionGate;
   private readonly storageDir: string;
 
   constructor(
@@ -43,6 +45,7 @@ export class TaskControlService {
     this.runner = runner;
     this.cancellationRegistry = cancellationRegistry || new CancellationRegistry(storageDir);
     this.storageDir = storageDir || path.join(os.homedir(), '.agent-mesh-bridge');
+    this.executionGate = new ExecutionGate(this.storageDir);
   }
 
   /**
@@ -82,6 +85,9 @@ export class TaskControlService {
       // Idempotent, but still publish cancellation in case a stale child lives.
       this.cancellationRegistry.request(threadId, 'pause', normalizedReason, by);
       this.runner?.cancelThread(threadId, 'pause', normalizedReason, by);
+      // A host restart drops the in-memory child handle; the execution lease is
+      // the only place the real agent PID survives.
+      this.executionGate.killOrphanChild(threadId);
       return {
         threadId,
         status: 'PAUSED',
@@ -104,6 +110,7 @@ export class TaskControlService {
     // Publish the stop signal for whichever process owns the child.
     this.cancellationRegistry.request(threadId, 'pause', normalizedReason, by);
     this.runner?.cancelThread(threadId, 'pause', normalizedReason, by);
+    this.executionGate.killOrphanChild(threadId);
 
     return {
       threadId,
@@ -138,6 +145,7 @@ export class TaskControlService {
     if (active) {
       this.cancellationRegistry.request(threadId, 'delete', normalizedReason, by);
       this.runner?.cancelThread(threadId, 'delete', normalizedReason, by);
+      this.executionGate.killOrphanChild(threadId);
     }
 
     this.taskStore.deleteTask(threadId);

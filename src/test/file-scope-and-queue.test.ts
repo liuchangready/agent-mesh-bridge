@@ -182,6 +182,7 @@ describe('File Scope and Conflict Queueing Tests', () => {
 
       callbackManager = new CallbackManager(detector);
       callbackManager.notifyCaller = async () => true;
+      callbackManager.notifyCallerOfFailure = async () => false;
 
       // Both components share the same lock file, which is scoped to this
       // test's temp directory instead of the real home directory.
@@ -324,8 +325,28 @@ describe('File Scope and Conflict Queueing Tests', () => {
       assert.strictEqual(taskStore.getTask(resC.threadId)?.status, 'queued');
       assert.deepStrictEqual(startOrder, ['Task A (MenuScreen)']);
 
-      // 5. Complete A -> B may start. B then blocks C until B is completed.
+      // 5. Complete A and收口 its MR -> B may start. A's uncommitted edits on
+      // MenuScreen.kt keep owning that file until the merge request is recorded,
+      // so approval alone must NOT release B onto the same file.
       taskStore.updateRound(resA.threadId, 1, { status: 'completed' }, 'completed');
+      supervisor.checkPendingTasks();
+      await new Promise((r) => setTimeout(r, 120));
+      assert.strictEqual(
+        taskStore.getTask(resB.threadId)?.status,
+        'queued',
+        'an accepted but unmerged task keeps owning its files',
+      );
+
+      taskStore.recordMergeRequest(resA.threadId, {
+        url: 'https://example.com/mr/1',
+        branch: 'feature/menu',
+        commit: 'abc1234',
+        remote: 'origin',
+        status: 'synced',
+        summary: 'MenuScreen refactor merged',
+        updatedAt: new Date().toISOString(),
+        by: 'codex',
+      });
       supervisor.checkPendingTasks();
       await waitFor(resB.threadId, 'waiting_review');
       assert.strictEqual(taskStore.getTask(resB.threadId)?.status, 'waiting_review');
