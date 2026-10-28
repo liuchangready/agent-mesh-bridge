@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { TaskStore } from '../bridge/task-store';
 import { DelegationThread, describeModelRouting, getModelRouting } from '../bridge/types';
+import { aggregateThreadTokenUsage, formatTokenCount } from '../bridge/token-usage-collector';
 
 export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
   private _onDidChangeTreeData: vscode.EventEmitter<TaskTreeItem | undefined | void> =
@@ -99,15 +100,49 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     const scopeBadge = thread.scopeBlockedBy
       ? ` · ⛔scope 等 ${thread.scopeBlockedBy.threadId}`
       : '';
+    // A stalled review is actionable: the caller was woken but never reviewed
+    // (429 / expired session), and nothing else can move this task. The record is
+    // per-round, so a rework that is still being reviewed shows nothing.
+    const reviewWake =
+      thread.status === 'waiting_review' &&
+      thread.reviewWake &&
+      thread.reviewWake.round === (thread.currentRound || 1)
+        ? thread.reviewWake
+        : undefined;
+    const reviewBadge = reviewWake
+      ? reviewWake.gaveUp
+        ? ' · ⚠️检视唤醒失败(需手动)'
+        : reviewWake.quotaExhausted
+          ? ` · ⚠️配额不足${
+              reviewWake.autoRetryAt
+                ? `(自动重试 ${new Date(reviewWake.autoRetryAt).toLocaleTimeString()})`
+                : ''
+            }`
+          : reviewWake.kind === 'timeout'
+            ? ' · ⚠️检视卡住'
+            : ' · ⚠️检视唤醒失败'
+      : '';
 
-    const description = `${statusLabel} · ${durationText}${modelBadge}${repeatBadge}${scopeBadge}`;
+    // Derived from the rounds (never a stored aggregate): cheap, and cannot go
+    // stale after another process finalizes a round.
+    const tokenSummary = aggregateThreadTokenUsage(thread.rounds || []);
+    const tokenBadge =
+      tokenSummary.measuredRounds > 0
+        ? ` · ${tokenSummary.isPartialOrEstimated ? '~' : ''}${formatTokenCount(tokenSummary.totalTokens)} tok`
+        : '';
+
+    const description = `${statusLabel} · ${durationText}${modelBadge}${tokenBadge}${repeatBadge}${scopeBadge}${reviewBadge}`;
 
     const item = new TaskTreeItem(label, vscode.TreeItemCollapsibleState.Collapsed, thread);
     item.description = description;
     item.iconPath = new vscode.ThemeIcon(iconName);
     item.contextValue =
       thread.status === 'waiting_review'
-        ? 'waiting_review'
+        ? // A healthy review needs no manual wake: only a recorded wake failure
+          // exposes the "re-review" action (see the menu `when` clause).
+          reviewWake
+          ? 'waiting_review_stalled'
+          : 'waiting_review'
         : thread.status === 'paused'
           ? 'paused_task'
           : 'task_item';

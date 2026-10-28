@@ -7,3 +7,11 @@ tsconfig.json
 **/*.map
 out/test/**
 
+# Development-only material: never needed at runtime, would only bloat the .vsix.
+AGENTS.md
+DESIGN.md
+docs/**
+eslint.config.mjs
+.prettierrc
+.prettierignore
+*.vsix

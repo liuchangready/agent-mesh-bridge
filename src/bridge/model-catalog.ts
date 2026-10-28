@@ -71,6 +71,35 @@ export type ModelDefaults = Partial<Record<AgentId, string>>;
 interface ModelConfigFile {
   updatedAt?: string;
   models?: ModelDefaults;
+  /**
+   * Whether pinning a receiver model other than the configured default requires
+   * the user's click consent in VS Code. Absent/false-y means "not configured";
+   * only an explicit `false` turns the gate off.
+   */
+  requireModelApproval?: boolean;
+}
+
+/** Raw snapshot reader; missing/corrupt file -> undefined. */
+function readModelConfigFile(dir: string): ModelConfigFile | undefined {
+  try {
+    const file = path.join(dir, MODEL_CONFIG_FILENAME);
+    if (!fs.existsSync(file)) return undefined;
+    return JSON.parse(fs.readFileSync(file, 'utf8')) as ModelConfigFile;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether a non-default receiver model must be confirmed by the user.
+ *
+ * Defaults to `true`: switching an agent away from the model the user configured
+ * is an explicit decision the user makes, not one a caller agent may make on
+ * their behalf.
+ */
+export function loadModelApprovalRequired(dir: string = getBridgeHome()): boolean {
+  const parsed = readModelConfigFile(dir);
+  return parsed?.requireModelApproval !== false;
 }
 
 /** Trim a model id and treat an empty value as "not configured". */
@@ -98,7 +127,11 @@ export function loadModelDefaults(dir: string = getBridgeHome()): ModelDefaults 
 }
 
 /** Persist the per-agent defaults for every MCP process to read. */
-export function saveModelDefaults(models: ModelDefaults, dir: string = getBridgeHome()): void {
+export function saveModelDefaults(
+  models: ModelDefaults,
+  dir: string = getBridgeHome(),
+  options: { requireModelApproval?: boolean } = {},
+): void {
   const file = path.join(dir, MODEL_CONFIG_FILENAME);
   const clean: ModelDefaults = {};
   for (const [agent, model] of Object.entries(models)) {
@@ -108,10 +141,42 @@ export function saveModelDefaults(models: ModelDefaults, dir: string = getBridge
   try {
     fs.mkdirSync(dir, { recursive: true });
     const payload: ModelConfigFile = { updatedAt: new Date().toISOString(), models: clean };
+    // Keep the approval policy sticky: callers that only mirror the model
+    // settings must not silently reset it.
+    const nextPolicy =
+      options.requireModelApproval !== undefined
+        ? options.requireModelApproval
+        : readModelConfigFile(dir)?.requireModelApproval;
+    if (nextPolicy !== undefined) payload.requireModelApproval = nextPolicy;
     fs.writeFileSync(file, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
   } catch (e: any) {
     console.warn(`[ModelCatalog] Could not persist model defaults: ${e?.message || e}`);
   }
+}
+
+/**
+ * Put the configured default model first and tag it in place.
+ *
+ * `list_agent_models` used to bury `configuredModel` after the whole probe list,
+ * so a caller skimming the (provider-ordered) catalogue saw whichever id came
+ * first — `deepseek/deepseek-v4-pro` before the configured Flash route — and
+ * pinned it. Marking the default in the list itself removes that trap.
+ */
+export function annotateConfiguredModel(
+  models: ModelOption[],
+  configured?: string | null,
+): ModelOption[] {
+  const target = normalizeModelId(configured);
+  if (!target) return models.map((m) => ({ ...m }));
+
+  const tagged = 'configured default';
+  const found = models.find((m) => m.id === target);
+  const head: ModelOption = found
+    ? { ...found, hint: found.hint ? `${found.hint} · ${tagged}` : tagged }
+    : { id: target, hint: `${tagged} (not returned by the probe)` };
+
+  const rest = models.filter((m) => m.id !== target).map((m) => ({ ...m }));
+  return [head, ...rest];
 }
 
 const configuredCache = new Map<string, { value?: string; at: number }>();

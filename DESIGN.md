@@ -135,6 +135,9 @@ Agent 响应成功不再只看退出码，而是两段式判定：
    - stdout 必须能提取到**实际最终答案**（不能只是 JSON status/元数据）；
    - 至少收到一个输出 chunk；
    - 相邻 chunk（含启动到首个 chunk）的最长间隔不超过 `silenceTimeoutMs`。
+   - **间隔按「活跃时间」计算**：用单调时钟（`performance.now()`）度量，并由 `HostSuspensionGuard` 每秒心跳识别主机挂起窗口（`sleep` / `hibernate` / Windows Modern Standby / 扩展宿主被冻结 / 调试器暂停）。这些窗口从间隔中扣除，机器睡多久都不算 agent 的静默；原始墙钟间隔留在 `rawMaxGapMs`，扣除量留在 `excludedSuspensionMs`。看门狗与总超时同样按扣除后的活跃时间判定（睡眠不消耗任务预算）。
+
+**长间隔默认降级为 warning**：当 `exitCode === 0` 且已提取到实际输出时，扣除挂起后仍超阈值的间隔记 `STREAM_GAP_EXCEEDED` 警告（`success` 仍为 `true`），不得据此外抛失败、丢弃已完成的工作或整轮重跑；`STREAM_STALLED` 只在显式 `streamGapPolicy: 'fail'` 时使用。
 
 结果写入 `RunResult.assessment` 并持久化到 `round.assessment`：
 
@@ -149,12 +152,17 @@ interface ResponseAssessment {
     stderrBytes: number;
     firstOutputAtMs?: number;
     lastOutputAtMs?: number;
-    maxGapMs: number;
+    maxGapMs: number;          // 扣除主机挂起后的最长间隔（判定依据）
+    rawMaxGapMs?: number;      // 原始墙钟间隔（诊断用）
+    excludedSuspensionMs?: number;
+    suspensionCount?: number;
     gapThresholdMs: number;
     hasActualOutput: boolean;
     continuous: boolean;
+    gapExceeded?: boolean;
   };
   reason?: string;
+  warnings?: { code: string; message: string }[];
 }
 ```
 
@@ -196,7 +204,7 @@ interface ResponseAssessment {
 
 - **暂停**：`TaskControlService.pauseTask()` 先把线程与当前轮次标记为 `paused`，写入 `TaskInterruption { kind: 'paused', reason, at, by }`，然后通过 `CancellationRegistry` 发布跨进程取消请求；真正持有子进程的 `AutonomousRunner` 轮询到请求后终止进程树，并在 `RunResult.interruption` 中回传同一原因。暂停轮次保留原 prompt 与原生会话。
 - **恢复**：`ReworkController.resumePausedTask()` 清除当前 `interruption`（历史保留在 `interruptions[]`），将轮次恢复为 `running`；`shouldResumeNativeSession()` 决定是续聊（已捕获原生会话/返修轮）还是以初始轮重新执行。
-- **删除**：`TaskControlService.deleteTask()` 先发布 `delete` 取消请求并终止进程，再 `TaskStore.deleteTask()` 移除账本条目，并把 `{ threadId, title, statusAtDeletion, reason, by, at }` 追加到 `~/.agent-mesh-bridge/deleted_tasks.log` 墓碑日志。
+- **删除**：`TaskControlService.deleteTask()` 先发布 `delete` 取消请求并终止进程，再 `TaskStore.deleteTask()` 移除账本条目，并把 `{ threadId, title, statusAtDeletion, reason, by, at }` 追加到 `~/.agent-mesh-bridge/deleted_tasks.log` 墓碑日志。随后调用 `cleanupThreadNativeSessions()` 清理该任务在接收方留下的原生对话（`thread.receiverSessionId`，以及改派历史中 `retargets[].previousReceiverSessionId` 对应的旧会话）：Claude `~/.claude/projects/*/<sessionId>.jsonl`（含子代理目录、`session-env`、`file-history`、todos）、Codex `~/.codex/sessions/**/rollout-*-<sessionId>.jsonl` + `session_index.jsonl` 条目 + `thread-writer-locks`、Antigravity `conversations/<id>.db` + `brain/` + `annotations/` + `implicit/` + `cache` 元数据（`antigravity-cli` 与 `antigravity` 两套存储都探测）、DSH `sessions/<slug>/<sessionId>/` + `session_projcache` + `storages/workspace.json` 中的 sessionIds/pinned/archived 引用。清理是 **best-effort**：找不到对话不是错误，单个路径失败只记录在墓碑 `nativeSessions[].error`，不回滚删除、不阻断队列；`callerSessionId` 是用户自己的会话，永不清理。应用自有的 SQLite 索引（如 `conversation_summaries.db`、Codex `state_*.sqlite`）不做改写，避免与运行中的应用抢写导致损坏。
 - **自动中断**：看门狗与总超时由 runner 直接写入 `interruption.kind = 'watchdog' | 'timeout'`；所有执行器通过 `TaskStore.updateRound(..., interruption)` 统一落盘，UI 在任务详情与轮次卡片中展示原因。
 
 ### 2.7 模型发现与发送/接收模型路由
@@ -363,8 +371,8 @@ export interface DelegationRound {
 - **`child.stdin.end()`**：进程启动后立即关闭标准输入流，若 CLI 尝试等待用户交互键盘输入将立即退回或报错，防止永久假死。
 - **环境变量注入**：
   `CI=1`, `NON_INTERACTIVE=true`, `FORCE_COLOR=0`, `TERM=dumb`, `DEBIAN_FRONTEND=noninteractive`。
-- **静默看门狗**：若子进程连续 **10 分钟**无任何 stdout/stderr 输出且仍在运行，触发告警或强制 kill，避免死循环；可通过 `RunOptions.silenceTimeoutMs` 按任务覆盖。
-- **单轮总超时**：默认放宽至 2 小时（120 分钟 / 7,200 秒），支持配置项 `agentMeshBridge.taskTimeoutMinutes` 自定义，充分满足超大型代码重构与多文件自动化开发需求。
+- **静默看门狗**：若子进程连续 **10 分钟**无任何 stdout/stderr 输出且仍在运行，触发告警或强制 kill，避免死循环；可通过 `RunOptions.silenceTimeoutMs` 按任务覆盖。静默时长按「扣除主机挂起后的活跃时间」计算（`HostSuspensionGuard`），机器休眠/合盖苏醒后不会立刻误杀仍在正常工作的子进程。
+- **单轮总超时**：默认放宽至 2 小时（120 分钟 / 7,200 秒）的**活跃运行时间**，支持配置项 `agentMeshBridge.taskTimeoutMinutes` 自定义，充分满足超大型代码重构与多文件自动化开发需求；主机挂起时间不计入预算。
 
 ---
 
@@ -405,7 +413,7 @@ export interface DelegationRound {
 - **`pause_task(threadId, reason)`**：终止运行中的 Agent 进程，轮次标记 `paused`，记录中断原因；排队中的任务只标记暂停。
 - **`resume_task(threadId)`**：恢复暂停轮次；已捕获原生会话时续聊，否则以初始轮重新执行。
 - **`retry_task(threadId)`**：原地重跑失败轮——复用同一轮号、同一 prompt、同一原生会话，不追加新轮次。调用者想「把原任务再做一遍」时用它；把原始 prompt 原样传给 `request_rework` 会在账本里留下两条指令完全相同的轮次（`repeatOfRound` 会标记这种重复）。
-- **`delete_task(threadId, reason)`**：先终止进程，再移除账本条目；原因写入 `deleted_tasks.log` 墓碑日志。
+- **`delete_task(threadId, reason)`**：先终止进程，再移除账本条目；原因写入 `deleted_tasks.log` 墓碑日志。随后尽力清理接收方原生对话（Claude/Codex/Antigravity/DSH），找不到对话不报错，失败只记录在墓碑的 `nativeSessions` 字段；调用方会话不清理。
 - 失败回调：轮次进入 `failed` 时，`CallbackManager.notifyCallerOfFailure()` 会唤醒调用方并给出上述处置选项；同一轮只通知一次（`thread.failureNotifications`），每个任务最多 3 次，`paused`/`stopped` 等用户主动中断不通知。
 - 四者均为控制面操作，接收方进程不能对自己正在执行的任务调用。
 - 失败轮若仍持有已捕获的原生会话，`AutonomousRunner` 的进程内重试（网络抖动）会**续聊该会话**，而不是另开一个新会话重做整件事。
@@ -492,6 +500,7 @@ D:\agent_bridge\
 │   │   ├── cancellation-registry.ts# 跨进程暂停/删除信号
 │   │   ├── task-role-lock.ts      # 单任务 reviewer/developer 角色锁
 │   │   ├── task-control.ts        # 暂停/删除控制面与删除墓碑
+│   │   ├── native-session-cleanup.ts# 删除任务时尽力清理接收方原生对话
 │   │   ├── queue-drainer.ts       # 无 supervisor 时的 FIFO 队列泵
 │   │   ├── async-dispatcher.ts    # 异步非阻塞任务派发器
 │   │   ├── rework-controller.ts   # 同会话多轮返修控制器

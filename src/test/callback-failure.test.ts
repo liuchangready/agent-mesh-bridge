@@ -69,8 +69,11 @@ describe('CallbackManager failure wake-ups', () => {
       sessionId: string,
       prompt: string,
       round: DelegationRound,
+      release: () => void,
     ) => {
       captured = { sessionId, prompt, round };
+      // A real wake releases its per-caller slot when the child exits.
+      release();
       return true;
     };
 
@@ -96,8 +99,15 @@ describe('CallbackManager failure wake-ups', () => {
   test('does not wake the caller twice for the same failed round', async () => {
     const manager = new CallbackManager(new AgentDetector());
     let launches = 0;
-    (manager as any).launchCaller = () => {
+    (manager as any).launchCaller = (
+      _t: any,
+      _s: any,
+      _p: any,
+      _r: any,
+      release: () => void,
+    ) => {
       launches++;
+      release();
       return true;
     };
 
@@ -110,8 +120,15 @@ describe('CallbackManager failure wake-ups', () => {
   test('stays silent for paused tasks and after three failure wake-ups', async () => {
     const manager = new CallbackManager(new AgentDetector());
     let launches = 0;
-    (manager as any).launchCaller = () => {
+    (manager as any).launchCaller = (
+      _t: any,
+      _s: any,
+      _p: any,
+      _r: any,
+      release: () => void,
+    ) => {
       launches++;
+      release();
       return true;
     };
 
@@ -128,8 +145,15 @@ describe('CallbackManager failure wake-ups', () => {
   test('tells the caller when the round merely repeats an earlier instruction', async () => {
     const manager = new CallbackManager(new AgentDetector());
     let prompt = '';
-    (manager as any).launchCaller = (_t: DelegationThread, _s: string, p: string) => {
+    (manager as any).launchCaller = (
+      _t: DelegationThread,
+      _s: string,
+      p: string,
+      _r: any,
+      release: () => void,
+    ) => {
       prompt = p;
+      release();
       return true;
     };
 

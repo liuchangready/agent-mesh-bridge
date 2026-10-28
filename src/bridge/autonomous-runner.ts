@@ -1,16 +1,24 @@
 import * as child_process from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import {
   AgentId,
+  DEFAULT_STREAM_GAP_POLICY,
   MESH_TASK_RECEIVER_ENV,
   MESH_TASK_ROUND_ENV,
   MESH_TASK_THREAD_ENV,
   ResponseAssessment,
   StreamAssessment,
+  StreamGapPolicy,
   TaskInterruption,
+  TokenUsageMetrics,
 } from './types';
 import { AgentDetector } from './agent-detector';
 import { buildDshHeadlessCommand } from './deepseek-harness';
+import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
 import { normalizeModelId, resolveConfiguredModel, writeDshModelOverlay } from './model-catalog';
+import { accumulateTokenUsage, collectTokenUsage } from './token-usage-collector';
 import {
   CancellationAction,
   CancellationRegistry,
@@ -52,12 +60,194 @@ const TRANSPORT_ERROR_PATTERNS: string[] = [
   'und_err_socket',
 ];
 
+/**
+ * Structured "provider refused us" signals.
+ *
+ * The agent CLIs retry these internally (Claude Code: 10 attempts with 30–40s
+ * backoff), so a delegated round keeps burning the remaining quota for minutes
+ * after the provider already said no. The runner aborts on the first signal
+ * instead, and reports RATE_LIMITED so the caller can back off or switch
+ * executors.
+ *
+ * Only structured error envelopes and stderr text are matched: assistant output
+ * can legitimately quote source files that mention rate limits.
+ */
+const RATE_LIMIT_SIGNALS: RegExp[] = [
+  /"error_status"\s*:\s*429/i,
+  /"error"\s*:\s*"rate_limit"/i,
+  /"status"\s*:\s*429\b/i,
+  /\bhttp\s*429\b/i,
+  /\b429\s+too\s+many\s+requests\b/i,
+  /\btoo\s+many\s+requests\b/i,
+  /\brate[-_\s]?limit(?:ed|_error|_exceeded)?\b/i,
+];
+
+/** The first rate-limit signal in a chunk of provider output, if any. */
+export function detectRateLimitSignal(text: string): string | undefined {
+  if (!text) return undefined;
+  for (const pattern of RATE_LIMIT_SIGNALS) {
+    const match = pattern.exec(text);
+    if (match) return match[0];
+  }
+  return undefined;
+}
+
+/**
+ * Transcript envelopes carry the agent's own words: tool results quote whole
+ * source files and test logs, so they routinely contain phrases like
+ * `"RATE_LIMITED"` (a real application error code), `"HTTP 429"` in a test
+ * assertion, or the words "rate limit" in a comment. They are never a provider
+ * refusal and must not abort the run.
+ */
+const TRANSCRIPT_ENVELOPE_TYPES = new Set([
+  'assistant',
+  'user',
+  'stream_event',
+  'tool_use',
+  'tool_result',
+  'thinking',
+  'text',
+  'final',
+  'message',
+]);
+
+/**
+ * Detects a provider rate limit in one stdout line of a streaming agent CLI.
+ *
+ * Only structured error envelopes count: the envelope must be JSON, must not be
+ * a transcript message, and must actually look like a provider error (an error
+ * type/subtype, `is_error`, a 429 status, or an `error` field). Free-text
+ * mentions of rate limiting are ignored on purpose — see
+ * {@link TRANSCRIPT_ENVELOPE_TYPES}.
+ *
+ * @returns the matched signal, or `undefined` when the line is not a structured
+ * provider error (including partial/non-JSON lines, which the caller buffers).
+ */
+export function detectStructuredRateLimitSignal(line: string): string | undefined {
+  const text = line.trim();
+  if (!text.startsWith('{')) return undefined;
+
+  let envelope: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+    envelope = parsed as Record<string, unknown>;
+  } catch {
+    // A JSON line split across chunks: keep buffering, never guess.
+    return undefined;
+  }
+
+  const type = typeof envelope.type === 'string' ? envelope.type : '';
+  if (TRANSCRIPT_ENVELOPE_TYPES.has(type)) return undefined;
+
+  const subtype = typeof envelope.subtype === 'string' ? envelope.subtype : '';
+  const looksLikeProviderError =
+    type === 'error' ||
+    subtype === 'api_retry' ||
+    subtype === 'api_error' ||
+    subtype === 'rate_limit' ||
+    envelope.is_error === true ||
+    Number(envelope.error_status) === 429 ||
+    Number(envelope.status) === 429 ||
+    envelope.error !== undefined;
+
+  if (!looksLikeProviderError) return undefined;
+  return detectRateLimitSignal(text);
+}
+
+/**
+ * Claude Code keeps a per-process ownership record under `~/.claude/sessions/`
+ * ("pid owns sessionId") so that two processes cannot resume the same native
+ * session at once. A hard kill (`taskkill /F` on a rate-limit abort, a pause or
+ * a window reload) gives the CLI no chance to unregister, and every later
+ * `--resume` then fails with `Session ID <id> is already in use.` even though
+ * the owning process is long gone. These helpers clean such stale records up.
+ */
+export function claudeSessionRegistryDir(homeDir: string = os.homedir()): string {
+  return path.join(homeDir, '.claude', 'sessions');
+}
+
+/** True when `pid` is still running (EPERM means it exists but is not ours). */
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+export interface StaleClaudeSessionLock {
+  file: string;
+  pid: number;
+  sessionId: string;
+}
+
+/**
+ * Deletes Claude Code session-ownership records whose owning process is dead.
+ *
+ * Records of live processes are never touched, so a genuinely concurrent run
+ * keeps its lock. Select by `pid` (the child this runner launched) and/or by
+ * `sessionId` (the session we are about to resume).
+ */
+export function clearStaleClaudeSessionLocks(
+  selector: { pid?: number; sessionId?: string },
+  homeDir: string = os.homedir(),
+): StaleClaudeSessionLock[] {
+  const dir = claudeSessionRegistryDir(homeDir);
+  let files: string[];
+  try {
+    files = fs.readdirSync(dir).filter((name) => name.toLowerCase().endsWith('.json'));
+  } catch {
+    return [];
+  }
+
+  const removed: StaleClaudeSessionLock[] = [];
+  for (const name of files) {
+    const file = path.join(dir, name);
+    let record: { pid?: unknown; sessionId?: unknown };
+    try {
+      record = JSON.parse(fs.readFileSync(file, 'utf8')) as { pid?: unknown; sessionId?: unknown };
+    } catch {
+      continue;
+    }
+    const pid = Number(record.pid);
+    const sessionId = typeof record.sessionId === 'string' ? record.sessionId : '';
+    if (selector.pid !== undefined && pid !== selector.pid) continue;
+    if (selector.sessionId !== undefined && sessionId !== selector.sessionId) continue;
+    if (isProcessAlive(pid)) continue;
+    try {
+      fs.unlinkSync(file);
+      removed.push({ file, pid, sessionId });
+    } catch {
+      // Best effort: the retry path re-checks the record anyway.
+    }
+  }
+  return removed;
+}
+
+/** Extracts the session id from Claude's `Session ID <id> is already in use.` */
+export function parseInUseSessionId(text: string): string | undefined {
+  const match = /Session ID\s+([0-9a-fA-F][0-9a-fA-F-]{7,})\s+is already in use/i.exec(text || '');
+  return match ? match[1] : undefined;
+}
+
 export interface RunCommand {
   command: string;
   args: string[];
   useShell: boolean;
   /** Extra environment entries required by the specific agent launch strategy. */
   env?: Record<string, string>;
+  /**
+   * Prompt written to the child's stdin before it is closed.
+   *
+   * Some CLIs must not receive the prompt as an argument: on Windows the npm
+   * shims (`claude.cmd`) are launched through cmd.exe, which treats a newline
+   * inside an argument as a command separator and silently drops everything
+   * after the first line.
+   */
+  stdinPayload?: string;
 }
 
 export interface RunOptions {
@@ -69,6 +259,13 @@ export interface RunOptions {
   cwd?: string;
   timeoutMs?: number; // Overall process timeout, default 2 hours (120 mins)
   silenceTimeoutMs?: number; // Silence watchdog timeout, default 10 minutes
+  /**
+   * How to treat an output gap that exceeds the threshold while the process
+   * still exited 0 with a real final answer. Default `warn`: keep the round
+   * successful and record a `STREAM_GAP_EXCEEDED` warning. `fail` restores the
+   * strict `STREAM_STALLED` verdict for that round.
+   */
+  streamGapPolicy?: StreamGapPolicy;
   maxRetries?: number; // Max retries for transient startup/network errors, default 3
   /** Base delay for the exponential retry backoff; tests shorten it. */
   retryBackoffMs?: number;
@@ -82,6 +279,16 @@ export interface RunOptions {
    * then to whatever default the CLI itself ships with.
    */
   model?: string;
+  /**
+   * Token usage already recorded for this round.
+   *
+   * `retry_task` and `resume_task` reuse the SAME round number, so a second
+   * execution must ADD to what the first one spent. The executor seeds the
+   * runner with the round's stored measurement, so the returned figure is
+   * always the round's running total — and stays idempotent when two
+   * processes finalize the same round.
+   */
+  previousTokenUsage?: TokenUsageMetrics;
   /**
    * Mark the launched agent as a delegated-task receiver. Defaults to `true`:
    * any process this runner starts is executing work on somebody else's behalf
@@ -111,6 +318,10 @@ export interface RunResult {
   interruption?: TaskInterruption;
   /** Two-part response health: process error code + stream continuity. */
   assessment?: ResponseAssessment;
+  /** Normalized token accounting for this attempt (see token-usage-collector). */
+  tokenUsage?: TokenUsageMetrics;
+  /** The model this attempt actually ran with. */
+  model?: string;
 }
 
 export class AutonomousRunner {
@@ -124,6 +335,8 @@ export class AutonomousRunner {
   /** Where an unspecified model comes from; replaceable for tests. */
   private modelResolver: (agent: AgentId) => string | undefined = (agent) =>
     resolveConfiguredModel(agent);
+  /** Home directory holding the agent CLIs' state; replaceable for tests. */
+  public homeDir: string = os.homedir();
 
   constructor(
     detector: AgentDetector,
@@ -274,6 +487,9 @@ export class AutonomousRunner {
       durationMs: baseResult?.durationMs || 0,
       error,
       interruption,
+      // Whatever the killed process already billed is still real spend.
+      tokenUsage: baseResult?.tokenUsage,
+      model: baseResult?.model,
       assessment: {
         success: false,
         errorCode: kind.toUpperCase(),
@@ -387,70 +603,38 @@ export class AutonomousRunner {
 
     if (agent === 'claude_code') {
       const exec = resolvedPath || (isWindows ? 'claude.cmd' : 'claude');
-      if (isRework) {
-        // claude -p "<feedback>" --resume <receiverSessionId> --dangerously-skip-permissions --output-format json
-        return {
-          command: isWindows ? 'cmd.exe' : exec,
-          args: isWindows
-            ? [
-                '/c',
-                exec,
-                '-p',
-                prompt,
-                '--resume',
-                receiverSessionId,
-                '--dangerously-skip-permissions',
-                '--output-format',
-                'json',
-                ...modelFlagArgs,
-              ]
-            : [
-                '-p',
-                prompt,
-                '--resume',
-                receiverSessionId,
-                '--dangerously-skip-permissions',
-                '--output-format',
-                'json',
-                ...modelFlagArgs,
-              ],
-          useShell: false,
-        };
-      } else {
-        // claude -p "<prompt>" --session-id <uuid> -n "<title>" --dangerously-skip-permissions --output-format json
-        const taskTitle = title || 'Task';
-        return {
-          command: isWindows ? 'cmd.exe' : exec,
-          args: isWindows
-            ? [
-                '/c',
-                exec,
-                '-p',
-                prompt,
-                '--session-id',
-                receiverSessionId,
-                '-n',
-                taskTitle,
-                '--dangerously-skip-permissions',
-                '--output-format',
-                'json',
-                ...modelFlagArgs,
-              ]
-            : [
-                '-p',
-                prompt,
-                '--session-id',
-                receiverSessionId,
-                '-n',
-                taskTitle,
-                '--dangerously-skip-permissions',
-                '--output-format',
-                'json',
-                ...modelFlagArgs,
-              ],
-          useShell: false,
-        };
-      }
+      // Two CLI realities shape this branch:
+      //   1. The npm shim is a `.cmd`, so on Windows it is launched through
+      //      cmd.exe. A multi-line prompt passed as an argument is cut at the
+      //      first newline (cmd.exe treats it as a command separator): the
+      //      agent silently receives only the first line. `-p` is a boolean
+      //      flag, so the prompt travels on stdin instead.
+      //   2. `--output-format json` prints one object when the process ends, so
+      //      stdout stays empty for the entire run and the 10-minute silence
+      //      watchdog used to kill healthy long tasks before their first byte.
+      //      `stream-json` emits `system/init` immediately and keeps streaming
+      //      assistant/tool events, which keeps the watchdog fed. Print mode
+      //      requires `--verbose` for that format.
+      const sharedArgs = [
+        '-p',
+        '--output-format',
+        'stream-json',
+        '--verbose',
+        '--dangerously-skip-permissions',
+        ...modelFlagArgs,
+      ];
+      // claude -p --output-format stream-json --verbose --resume <session>
+      // claude -p --output-format stream-json --verbose --session-id <uuid> -n "<title>"
+      const sessionArgs = isRework
+        ? ['--resume', receiverSessionId]
+        : ['--session-id', receiverSessionId, '-n', title || 'Task'];
+      const tailArgs = [...sessionArgs, ...sharedArgs];
+      return {
+        command: isWindows ? 'cmd.exe' : exec,
+        args: isWindows ? ['/c', exec, ...tailArgs] : tailArgs,
+        useShell: false,
+        stdinPayload: prompt,
+      };
     }
 
     if (agent === 'antigravity') {
@@ -542,6 +726,13 @@ export class AutonomousRunner {
     try {
       let attemptOptions = options;
       let attempt = 0;
+      // Every attempt is billed, so the round's token usage is the SUM of all
+      // attempts, not just the last one (transient-error replays cost real
+      // money even when they fail). A retried or resumed round also carries
+      // the spend of its previous execution, which the executor seeds here.
+      let accumulatedUsage: TokenUsageMetrics | undefined = options.previousTokenUsage
+        ? { ...options.previousTokenUsage }
+        : undefined;
       while (true) {
         attempt++;
 
@@ -549,18 +740,62 @@ export class AutonomousRunner {
         const preCancel = this.checkPendingCancellation(taskThreadId, initialTaskExisted);
         if (preCancel) {
           this.consumeCancellation(taskThreadId);
-          return this.buildInterruptedResult(preCancel);
+          const interrupted = this.buildInterruptedResult(preCancel);
+          interrupted.tokenUsage = accumulatedUsage;
+          return interrupted;
         }
 
         const result = await this.executeOnce(attemptOptions);
+        accumulatedUsage = accumulateTokenUsage(accumulatedUsage, result.tokenUsage);
         const succeeded =
           result.exitCode === 0 && (!result.assessment || result.assessment.success);
         if (succeeded) {
+          result.tokenUsage = accumulatedUsage;
           return result;
         }
 
         if (result.interruption) {
+          result.tokenUsage = accumulatedUsage;
           return result;
+        }
+
+        // A hard-killed Claude run leaves its "this pid owns this session"
+        // record behind, and the next `--resume` then dies in one second with
+        // "Session ID <id> is already in use." Nothing is actually running, so
+        // drop the stale record and replay the same session instead of failing
+        // the whole round.
+        const staleSessionId =
+          options.agent === 'claude_code'
+            ? parseInUseSessionId(`${result.stderr}\n${result.stdout}\n${result.error || ''}`)
+            : undefined;
+        if (attempt <= maxRetries && staleSessionId) {
+          if (!attemptOptions.isRework) {
+            // The id already has a transcript: reserving it again is what the CLI
+            // rejects. Resume it instead — this is the shape of a round that was
+            // dispatched as "fresh" after an executor switch but whose session had
+            // in fact already been opened (and captured) by the previous attempt.
+            attemptOptions = {
+              ...attemptOptions,
+              isRework: true,
+              receiverSessionId: staleSessionId,
+            };
+            console.warn(
+              `[AutonomousRunner] ${options.agent} reported session ${staleSessionId} as already in use; ` +
+                `resuming that session instead of reserving it again.`,
+            );
+            continue;
+          }
+          // A rework already resumes, so the holder must be a dead process's
+          // leftover ownership record.
+          const removed = clearStaleClaudeSessionLocks(
+            { sessionId: staleSessionId },
+            this.homeDir,
+          );
+          console.warn(
+            `[AutonomousRunner] ${options.agent} reported session ${staleSessionId} as already in use; ` +
+              `cleared ${removed.length} stale ownership record(s).`,
+          );
+          if (removed.length > 0) continue;
         }
 
         if (attempt <= maxRetries && this.isRetryableFailure(result)) {
@@ -573,21 +808,27 @@ export class AutonomousRunner {
           const earlyCancel = this.checkPendingCancellation(taskThreadId, initialTaskExisted);
           if (earlyCancel) {
             this.consumeCancellation(taskThreadId);
-            return this.buildInterruptedResult(earlyCancel, result);
+            const interrupted = this.buildInterruptedResult(earlyCancel, result);
+            interrupted.tokenUsage = accumulatedUsage;
+            return interrupted;
           }
 
           // Cancellable sleep: checks cancellation every 100ms
           const sleepCancel = await this.cancellableSleep(backoffMs, taskThreadId, initialTaskExisted);
           if (sleepCancel) {
             this.consumeCancellation(taskThreadId);
-            return this.buildInterruptedResult(sleepCancel, result);
+            const interrupted = this.buildInterruptedResult(sleepCancel, result);
+            interrupted.tokenUsage = accumulatedUsage;
+            return interrupted;
           }
 
           // Check cancellation after sleeping before continuing
           const postCancel = this.checkPendingCancellation(taskThreadId, initialTaskExisted);
           if (postCancel) {
             this.consumeCancellation(taskThreadId);
-            return this.buildInterruptedResult(postCancel, result);
+            const interrupted = this.buildInterruptedResult(postCancel, result);
+            interrupted.tokenUsage = accumulatedUsage;
+            return interrupted;
           }
 
           // A dead attempt may already have opened a native session. Continuing
@@ -606,6 +847,7 @@ export class AutonomousRunner {
           continue;
         }
 
+        result.tokenUsage = accumulatedUsage;
         return result;
       }
     } finally {
@@ -629,6 +871,9 @@ export class AutonomousRunner {
     // A paused/stopped/timed-out run was killed on purpose: replaying it would
     // resurrect work the user asked to abandon.
     if (result.interruption) return false;
+    // Rate limits do not clear in seconds: retrying immediately just burns the
+    // remaining quota. The caller decides when (and on which executor) to retry.
+    if (result.assessment?.errorCode === 'RATE_LIMITED') return false;
     if (result.exitCode !== 0) return this.isTransientError(result);
     if (!result.assessment || result.assessment.success) return false;
     return this.isTransportFailure(result);
@@ -720,6 +965,12 @@ export class AutonomousRunner {
    * Two-part success assessment:
    *   1. process error code must be 0;
    *   2. the stream must contain actual output and must not have stalled.
+   *
+   * Stream continuity is measured on a suspension-adjusted gap: time the HOST
+   * was asleep/frozen is not the agent's silence (see `HostSuspensionGuard`).
+   * A remaining long gap is still not enough to throw a finished round away —
+   * with exit 0 and a real final answer it is downgraded to a
+   * `STREAM_GAP_EXCEEDED` warning unless the caller asks for strict `fail`.
    */
   public evaluateResponse(input: {
     exitCode: number;
@@ -730,7 +981,12 @@ export class AutonomousRunner {
     stderrBytes: number;
     firstOutputAtMs?: number;
     lastOutputAtMs?: number;
+    /** Longest gap the agent is accountable for (host suspension excluded). */
     maxGapMs: number;
+    /** Longest wall-clock gap, before host suspension was excluded. */
+    rawMaxGapMs?: number;
+    excludedSuspensionMs?: number;
+    suspensionCount?: number;
     gapThresholdMs: number;
     interruption?: TaskInterruption;
     /**
@@ -739,12 +995,18 @@ export class AutonomousRunner {
      * substantive chunk counts as continuous.
      */
     expectStreaming?: boolean;
+    /** Default `warn` (see `DEFAULT_STREAM_GAP_POLICY`). */
+    streamGapPolicy?: StreamGapPolicy;
   }): ResponseAssessment {
     const finalOutput = this.extractAnswerOnly(input.stdout);
     const hasActualOutput = finalOutput.trim().length > 0;
     const expectStreaming = input.expectStreaming !== false;
-    const continuous =
-      input.chunkCount > 0 && (!expectStreaming || input.maxGapMs <= input.gapThresholdMs);
+    const gapExceeded =
+      input.chunkCount > 0 && expectStreaming && input.maxGapMs > input.gapThresholdMs;
+    const continuous = input.chunkCount > 0 && !gapExceeded;
+    const gapPolicy = input.streamGapPolicy ?? DEFAULT_STREAM_GAP_POLICY;
+    const excludedSuspensionMs = Math.max(0, input.excludedSuspensionMs ?? 0);
+    const rawMaxGapMs = Math.max(input.rawMaxGapMs ?? input.maxGapMs, input.maxGapMs);
 
     const stream: StreamAssessment = {
       chunkCount: input.chunkCount,
@@ -753,9 +1015,13 @@ export class AutonomousRunner {
       firstOutputAtMs: input.firstOutputAtMs,
       lastOutputAtMs: input.lastOutputAtMs,
       maxGapMs: input.maxGapMs,
+      rawMaxGapMs,
+      excludedSuspensionMs,
+      suspensionCount: input.suspensionCount ?? 0,
       gapThresholdMs: input.gapThresholdMs,
       hasActualOutput,
       continuous,
+      gapExceeded,
     };
 
     if (input.interruption) {
@@ -792,15 +1058,41 @@ export class AutonomousRunner {
       };
     }
 
-    if (!continuous) {
+    if (gapExceeded) {
+      const gapDetail =
+        `longest output gap ${Math.round(input.maxGapMs)}ms exceeded the ` +
+        `${input.gapThresholdMs}ms threshold` +
+        (excludedSuspensionMs > 0
+          ? ` (raw ${Math.round(rawMaxGapMs)}ms, ` +
+            `${Math.round(excludedSuspensionMs)}ms of host suspension excluded)`
+          : '');
+
+      if (gapPolicy === 'warn') {
+        // The process exited 0 AND produced a real answer: the round's work is
+        // there, so the long gap is a warning for the reviewer, not a reason to
+        // discard the round and re-run it.
+        return {
+          success: true,
+          errorCode: 'OK',
+          exitCode: input.exitCode,
+          stream,
+          warnings: [
+            {
+              code: 'STREAM_GAP_EXCEEDED',
+              message:
+                `Stream gap exceeded but the round still exited 0 with a real final ` +
+                `answer: ${gapDetail}.`,
+            },
+          ],
+        };
+      }
+
       return {
         success: false,
         errorCode: 'STREAM_STALLED',
         exitCode: input.exitCode,
         stream,
-        reason:
-          `Stream stalled: longest output gap ${input.maxGapMs}ms exceeded ` +
-          `the ${input.gapThresholdMs}ms threshold.`,
+        reason: `Stream stalled: ${gapDetail}.`,
       };
     }
 
@@ -832,7 +1124,31 @@ export class AutonomousRunner {
       }
 
       const startTime = Date.now();
-      const { command, args, useShell, env: commandEnv } = this.buildCommand(options);
+      // Durations are measured on the monotonic clock: a wall-clock correction
+      // (NTP / manual change) must not look like a multi-minute output gap.
+      const startMono = monotonicNowMs();
+      // Host sleep/hibernate/Modern Standby freezes this process together with
+      // the agent child. Remember those windows so they are never charged to
+      // the agent as silence (see HostSuspensionGuard).
+      const suspension = new HostSuspensionGuard();
+      suspension.start();
+      const settle = (result: RunResult) => {
+        try {
+          suspension.stop();
+        } catch {}
+        resolve(result);
+      };
+
+      const { command, args, useShell, env: commandEnv, stdinPayload } = (() => {
+        try {
+          return this.buildCommand(options);
+        } catch (err) {
+          // A synchronous build failure rejects the promise: release the
+          // heartbeat so it cannot outlive this attempt.
+          suspension.stop();
+          throw err;
+        }
+      })();
 
       const cwd = options.cwd || process.cwd();
       const timeoutMs = options.timeoutMs || this.defaultTimeoutMs; // 2 hours default
@@ -874,7 +1190,7 @@ export class AutonomousRunner {
       let stdoutData = '';
       let stderrData = '';
       let isSettled = false;
-      let lastActivityTime = Date.now();
+      let lastActivityMono = startMono;
       let watchdogTriggered = false;
       let maxTimerTriggered = false;
 
@@ -884,19 +1200,30 @@ export class AutonomousRunner {
       let stderrBytes = 0;
       let firstOutputAtMs: number | undefined;
       let lastOutputAtMs: number | undefined;
+      /** Longest gap the agent is accountable for (host suspension excluded). */
       let maxGapMs = 0;
+      /** Longest wall-clock gap, kept for diagnostics. */
+      let rawMaxGapMs = 0;
+      /** Host-suspension time that was removed from the gap measurements. */
+      let excludedSuspensionMs = 0;
+      let lastChunkMono: number | undefined;
 
       const noteStreamChunk = (byteLength: number) => {
-        const now = Date.now();
-        const elapsed = now - startTime;
+        // Sync first: after a resume the overdue heartbeat may not have been
+        // processed yet, and the window would otherwise be missed.
+        suspension.sync();
+        const nowMono = monotonicNowMs();
+        const elapsed = Math.max(0, nowMono - startMono);
+        const previousMono = lastChunkMono ?? startMono;
+        const rawGap = Math.max(0, nowMono - previousMono);
+        const excluded = suspension.suspendedWithin(previousMono, nowMono);
         chunkCount++;
-        if (firstOutputAtMs === undefined) {
-          firstOutputAtMs = elapsed;
-          maxGapMs = Math.max(maxGapMs, elapsed);
-        } else if (lastOutputAtMs !== undefined) {
-          maxGapMs = Math.max(maxGapMs, elapsed - lastOutputAtMs);
-        }
+        rawMaxGapMs = Math.max(rawMaxGapMs, rawGap);
+        excludedSuspensionMs += excluded;
+        maxGapMs = Math.max(maxGapMs, Math.max(0, rawGap - excluded));
+        if (firstOutputAtMs === undefined) firstOutputAtMs = elapsed;
         lastOutputAtMs = elapsed;
+        lastChunkMono = nowMono;
         return byteLength;
       };
 
@@ -906,7 +1233,7 @@ export class AutonomousRunner {
       const preCancel = this.checkPendingCancellation(taskThreadId, initialTaskExisted);
       if (preCancel) {
         this.consumeCancellation(taskThreadId);
-        return resolve(this.buildInterruptedResult(preCancel));
+        return settle(this.buildInterruptedResult(preCancel));
       }
 
       let child: child_process.ChildProcess;
@@ -920,7 +1247,7 @@ export class AutonomousRunner {
         });
       } catch (err: any) {
         const durationMs = Date.now() - startTime;
-        return resolve({
+        return settle({
           exitCode: -1,
           stdout: '',
           stderr: String(err),
@@ -930,8 +1257,16 @@ export class AutonomousRunner {
         });
       }
 
-      // CRITICAL: Close stdin immediately to prevent CLI waiting on user input
+      // CRITICAL: Close stdin so no CLI waits on interactive input. Agents that
+      // take their prompt on stdin (Claude Code) get the payload written first;
+      // the error handler swallows EPIPE when the child exits early.
       if (child.stdin) {
+        child.stdin.on('error', () => {});
+        if (stdinPayload !== undefined) {
+          try {
+            child.stdin.write(stdinPayload, 'utf8');
+          } catch {}
+        }
         try {
           child.stdin.end();
         } catch {}
@@ -1003,13 +1338,20 @@ export class AutonomousRunner {
         cancellationPoll.unref?.();
       }
 
-      // Silence Watchdog
+      // Silence Watchdog. Silence is measured on the suspension-adjusted clock:
+      // a host that slept for an hour was never going to produce output, so the
+      // round must not be killed the moment the machine wakes up.
       const silenceInterval = setInterval(() => {
         if (isSettled) {
           clearInterval(silenceInterval);
           return;
         }
-        const silentDuration = Date.now() - lastActivityTime;
+        suspension.sync();
+        const nowMono = monotonicNowMs();
+        const silentDuration = Math.max(
+          0,
+          nowMono - lastActivityMono - suspension.suspendedWithin(lastActivityMono, nowMono),
+        );
         if (silentDuration > silenceTimeoutMs) {
           clearInterval(silenceInterval);
           watchdogTriggered = true;
@@ -1022,36 +1364,93 @@ export class AutonomousRunner {
         }
       }, 5000);
 
-      // Overall Timeout Timer
-      const maxTimer = setTimeout(() => {
-        if (!isSettled) {
+      // Overall timeout, counted in ACTIVE runtime: time the host spent asleep
+      // does not consume the task's execution budget.
+      const timeoutCheckMs = Math.min(5_000, Math.max(250, Math.floor(timeoutMs / 10)));
+      const maxTimer = setInterval(() => {
+        if (isSettled) {
+          clearInterval(maxTimer);
+          return;
+        }
+        suspension.sync();
+        const nowMono = monotonicNowMs();
+        const activeElapsedMs =
+          nowMono - startMono - suspension.suspendedWithin(startMono, nowMono);
+        if (activeElapsedMs >= timeoutMs) {
+          clearInterval(maxTimer);
           maxTimerTriggered = true;
           console.warn(
-            `[AutonomousRunner] Overall timeout (${Math.round(timeoutMs / 1000)}s) reached for ${options.agent}. Terminating.`,
+            `[AutonomousRunner] Overall timeout (${Math.round(timeoutMs / 1000)}s of active ` +
+              `runtime, host suspension excluded) reached for ${options.agent}. Terminating.`,
           );
           try {
             this.killProcess(child);
           } catch {}
         }
-      }, timeoutMs);
+      }, timeoutCheckMs);
+
+      // Fail fast on a provider rate limit: the CLI would otherwise retry for
+      // minutes with 30-40s backoff while the quota is already exhausted.
+      //
+      // stdout is line-buffered and only STRUCTURED provider errors are matched:
+      // an agent transcript quotes source files and test logs, and a task that
+      // implements rate limiting prints its own "RATE_LIMITED" error code —
+      // scanning raw stdout killed those rounds as if the provider had refused.
+      // stderr stays free-text: that is where the CLI reports its own failures.
+      let rateLimitSignal: string | undefined;
+      let stdoutPartialLine = '';
+      let stderrPartialLine = '';
+      const MAX_PARTIAL_LINE = 1 << 20; // 1 MiB guard against a newline-less stream
+      const abortOnRateLimit = (hit: string) => {
+        if (rateLimitSignal || isSettled) return;
+        rateLimitSignal = hit;
+        console.warn(
+          `[AutonomousRunner] Provider rate limit detected (${hit}) for ${options.agent}; ` +
+            `aborting instead of waiting out its internal retries.`,
+        );
+        try {
+          this.killProcess(child);
+        } catch {}
+      };
+      const scanLines = (
+        chunk: string,
+        previous: string,
+        onLine: (line: string) => string | undefined,
+      ): string => {
+        if (rateLimitSignal || isSettled) return previous;
+        const lines = (previous + chunk).split(/\r?\n/);
+        let rest = lines.pop() ?? '';
+        if (rest.length > MAX_PARTIAL_LINE) rest = rest.slice(-MAX_PARTIAL_LINE);
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const hit = onLine(line);
+          if (hit) {
+            abortOnRateLimit(hit);
+            break;
+          }
+        }
+        return rest;
+      };
 
       child.stdout?.on('data', (data) => {
-        lastActivityTime = Date.now();
+        lastActivityMono = monotonicNowMs();
         stdoutBytes += data.length;
         noteStreamChunk(data.length);
         const str = data.toString();
         stdoutData += str;
+        stdoutPartialLine = scanLines(str, stdoutPartialLine, detectStructuredRateLimitSignal);
         if (options.onStdoutChunk) {
           options.onStdoutChunk(str);
         }
       });
 
       child.stderr?.on('data', (data) => {
-        lastActivityTime = Date.now();
+        lastActivityMono = monotonicNowMs();
         stderrBytes += data.length;
         noteStreamChunk(data.length);
         const str = data.toString();
         stderrData += str;
+        stderrPartialLine = scanLines(str, stderrPartialLine, detectRateLimitSignal);
         if (options.onStderrChunk) {
           options.onStderrChunk(str);
         }
@@ -1061,7 +1460,7 @@ export class AutonomousRunner {
         if (isSettled) return;
         isSettled = true;
         clearInterval(silenceInterval);
-        clearTimeout(maxTimer);
+        clearInterval(maxTimer);
         const cancellation = takeCancellation();
         const durationMs = Date.now() - startTime;
         const interruption: TaskInterruption | undefined = cancellation
@@ -1077,7 +1476,7 @@ export class AutonomousRunner {
               by: cancellation.by,
             }
           : undefined;
-        resolve({
+        settle({
           exitCode: -1,
           stdout: stdoutData,
           stderr: stderrData ? `${stderrData}\n${err.message}` : err.message,
@@ -1093,12 +1492,29 @@ export class AutonomousRunner {
       child.on('close', (code) => {
         if (isSettled) return;
         isSettled = true;
+        // Pick up a suspension window that ended right at exit time (e.g. the
+        // machine was asleep when the child's last output arrived).
+        suspension.sync();
         clearInterval(silenceInterval);
-        clearTimeout(maxTimer);
+        clearInterval(maxTimer);
+        // A provider error printed without a trailing newline still has to be
+        // recognised; the process is gone, so record it instead of aborting.
+        if (!rateLimitSignal && stdoutPartialLine) {
+          rateLimitSignal = detectStructuredRateLimitSignal(stdoutPartialLine) ?? rateLimitSignal;
+        }
         const cancellation = takeCancellation();
         const durationMs = Date.now() - startTime;
         const extracted = this.extractCleanOutput(stdoutData);
         const actualSessionId = this.extractSessionId(stdoutData);
+        // A killed CLI never unregisters itself: clean its ownership record so
+        // the next resume is not rejected as "already in use". Live processes
+        // are never touched by the helper.
+        if (options.agent === 'claude_code') {
+          clearStaleClaudeSessionLocks({ pid: child.pid }, this.homeDir);
+          if (actualSessionId) {
+            clearStaleClaudeSessionLocks({ sessionId: actualSessionId }, this.homeDir);
+          }
+        }
         let error: string | undefined = undefined;
         let interruption: TaskInterruption | undefined = undefined;
 
@@ -1140,7 +1556,7 @@ export class AutonomousRunner {
 
         const exitCode = cancellation ? -1 : (code ?? 0);
 
-        const assessment = this.evaluateResponse({
+        let assessment = this.evaluateResponse({
           exitCode,
           stdout: stdoutData,
           stderr: stderrData,
@@ -1150,11 +1566,29 @@ export class AutonomousRunner {
           firstOutputAtMs,
           lastOutputAtMs,
           maxGapMs,
+          rawMaxGapMs,
+          excludedSuspensionMs,
+          suspensionCount: suspension.suspensionCount,
           gapThresholdMs: silenceTimeoutMs,
           interruption,
-          // Claude's JSON output is a single final object, not a live stream.
-          expectStreaming: options.agent !== 'claude_code',
+          // Every agent now emits a live event stream (Claude Code runs with
+          // `--output-format stream-json`), so a silent gap means a real stall.
+          expectStreaming: true,
+          streamGapPolicy: options.streamGapPolicy,
         });
+        if (rateLimitSignal) {
+          // We killed the process on purpose: report the real cause instead of
+          // the exit code the kill produced.
+          assessment = {
+            ...assessment,
+            success: false,
+            errorCode: 'RATE_LIMITED',
+            reason:
+              `Provider rate limit hit (${rateLimitSignal}); run aborted after ` +
+              `${Math.round(durationMs / 1000)}s instead of exhausting the CLI's internal retries.`,
+          };
+          error = assessment.reason;
+        }
         if (!assessment.success && !error) {
           error = assessment.reason;
         }
@@ -1175,7 +1609,21 @@ export class AutonomousRunner {
           }
         }
 
-        resolve({
+        // Token accounting: parse the buffered stdout once, at exit. Streaming
+        // parsing would only add half-line JSON handling and double counting
+        // risk — the whole stream is already in memory, even for a round that
+        // was killed.
+        const effectiveModel = this.resolveModel(options.agent, options.model);
+        const tokenUsage = collectTokenUsage({
+          agent: options.agent,
+          stdout: stdoutData,
+          finalOutput: extracted,
+          effectiveModel,
+          requestedModel: options.model,
+          interrupted: !!interruption,
+        });
+
+        settle({
           exitCode,
           stdout: stdoutData,
           stderr: stderrData,
@@ -1185,6 +1633,8 @@ export class AutonomousRunner {
           error,
           interruption,
           assessment,
+          tokenUsage,
+          model: effectiveModel,
         });
       });
     });
@@ -1247,6 +1697,24 @@ export class AutonomousRunner {
       if (line.startsWith('{') && line.endsWith('}')) {
         try {
           const parsed = JSON.parse(line);
+          // Claude Code (`--output-format stream-json --verbose`): the answer is
+          // the terminal `result` event. Assistant events repeat the same text
+          // inside `message.content[]`, which is the only text available when a
+          // run is killed before the result event arrives.
+          if (
+            parsed.type === 'result' &&
+            typeof parsed.result === 'string' &&
+            parsed.result.trim()
+          ) {
+            return parsed.result;
+          }
+          if (parsed.type === 'assistant' && Array.isArray(parsed.message?.content)) {
+            const text = (parsed.message.content as any[])
+              .filter((block) => block && block.type === 'text' && typeof block.text === 'string')
+              .map((block) => block.text as string)
+              .join('');
+            if (text.trim()) return text;
+          }
           if (parsed.event === 'result' && parsed.result) {
             if (parsed.result.response) return String(parsed.result.response);
             if (typeof parsed.result === 'string') return parsed.result;
@@ -1260,7 +1728,7 @@ export class AutonomousRunner {
           // DeepSeek Harness terminates its run-event stream with the answer.
           if (parsed.type === 'final' && typeof parsed.text === 'string') return parsed.text;
           if (parsed.response) return String(parsed.response);
-          if (parsed.message) return String(parsed.message);
+          if (typeof parsed.message === 'string') return parsed.message;
           if (parsed.content) return String(parsed.content);
           if (parsed.output) return String(parsed.output);
           if (parsed.text) return String(parsed.text);
@@ -1283,7 +1751,7 @@ export class AutonomousRunner {
         if (parsed.event === 'result' && parsed.result?.response)
           return String(parsed.result.response);
         if (parsed.response) return String(parsed.response);
-        if (parsed.message) return String(parsed.message);
+        if (typeof parsed.message === 'string') return parsed.message;
         if (parsed.content) return String(parsed.content);
         if (parsed.output) return String(parsed.output);
         if (parsed.text) return String(parsed.text);

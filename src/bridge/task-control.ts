@@ -4,6 +4,11 @@ import * as path from 'path';
 import { AutonomousRunner } from './autonomous-runner';
 import { CancellationRegistry } from './cancellation-registry';
 import { ExecutionGate } from './execution-gate';
+import {
+  NativeSessionCleanupResult,
+  cleanupThreadNativeSessions,
+  describeNativeSessionCleanup,
+} from './native-session-cleanup';
 import { TaskStore } from './task-store';
 import {
   DelegationRound,
@@ -18,6 +23,11 @@ export interface TaskControlResult {
   status: 'PAUSED' | 'DELETED';
   reason: string;
   message: string;
+  /**
+   * Receiver-side native conversations removed along with a deleted ledger
+   * entry. Absent when the task had no resolvable native session.
+   */
+  nativeSessions?: NativeSessionCleanupResult;
 }
 
 /**
@@ -34,18 +44,21 @@ export class TaskControlService {
   private readonly cancellationRegistry: CancellationRegistry;
   private readonly executionGate: ExecutionGate;
   private readonly storageDir: string;
+  private readonly sessionCleanup: (thread: DelegationThread) => NativeSessionCleanupResult;
 
   constructor(
     taskStore: TaskStore,
     runner?: AutonomousRunner,
     cancellationRegistry?: CancellationRegistry,
     storageDir?: string,
+    sessionCleanup?: (thread: DelegationThread) => NativeSessionCleanupResult,
   ) {
     this.taskStore = taskStore;
     this.runner = runner;
     this.cancellationRegistry = cancellationRegistry || new CancellationRegistry(storageDir);
     this.storageDir = storageDir || path.join(os.homedir(), '.agent-mesh-bridge');
     this.executionGate = new ExecutionGate(this.storageDir);
+    this.sessionCleanup = sessionCleanup || ((thread) => cleanupThreadNativeSessions(thread));
   }
 
   /**
@@ -63,7 +76,9 @@ export class TaskControlService {
       throw new Error(`Cannot pause task ${threadId}: it is already completed.`);
     }
     if (thread.status === 'failed') {
-      throw new Error(`Cannot pause task ${threadId}: it already failed. Use resume/retry instead.`);
+      throw new Error(
+        `Cannot pause task ${threadId}: it already failed. Use resume/retry instead.`,
+      );
     }
     if (thread.status === 'waiting_review') {
       throw new Error(
@@ -126,12 +141,35 @@ export class TaskControlService {
    * Permanently delete a task. Active children are stopped first; the ledger
    * entry is removed and a tombstone (with the reason) is appended to
    * `deleted_tasks.log` so the stop reason is not silently lost.
+   *
+   * The receiver's native conversations are removed as well (best effort: a
+   * conversation that no longer exists is not an error). The caller's own
+   * session is never touched — it is shared with later tasks.
+   *
+   * Merge gate: a task that ran in a temporary worktree and was completed
+   * without a recorded merge request is refused by default — deleting it would
+   * throw away work that only exists in the throwaway worktree. The caller must
+   * record the MR first (the normal path) or pass `force: true` deliberately.
    */
-  public deleteTask(threadId: string, reason: string, by: string = 'user'): TaskControlResult {
+  public deleteTask(
+    threadId: string,
+    reason: string,
+    by: string = 'user',
+    force: boolean = false,
+  ): TaskControlResult {
     this.taskStore.loadFromDisk();
     const thread = this.taskStore.getTask(threadId);
     if (!thread) {
       throw new Error(`Task thread not found: ${threadId}`);
+    }
+
+    if (thread.worktree && !thread.mergeRequest && !force) {
+      throw new Error(
+        `Refusing to delete task ${threadId}: its worktree ${thread.worktree.path} ` +
+          `has not been merged back to ${thread.worktree.mainPath} yet. ` +
+          `Record the merge request first (record_merge_request with url/branch/commit), ` +
+          `or pass force: true to delete anyway — the worktree output would be lost.`,
+      );
     }
 
     const normalizedReason = (reason || '').trim() || 'Deleted by user';
@@ -149,16 +187,34 @@ export class TaskControlService {
     }
 
     this.taskStore.deleteTask(threadId);
-    // Logs are intentionally kept for audit; the tombstone records why the
-    // ledger entry disappeared.
-    this.appendTombstone(thread, normalizedReason, by);
 
+    // Clean up the receiver's native conversation(s) only after the ledger entry
+    // is gone: a cleanup failure must never leave a "deleted but still listed"
+    // task behind. The cleaner itself never throws, but guard the call site too.
+    const nativeSessions = this.cleanupNativeSessions(thread);
+    this.appendTombstone(thread, normalizedReason, by, nativeSessions);
+
+    const cleanupNote = describeNativeSessionCleanup(nativeSessions);
     return {
       threadId,
       status: 'DELETED',
       reason: normalizedReason,
-      message: `Task ${threadId} deleted. Reason: ${normalizedReason}.`,
+      message:
+        `Task ${threadId} deleted. Reason: ${normalizedReason}.` +
+        (cleanupNote ? ` Cleaned: ${cleanupNote}.` : ''),
+      nativeSessions,
     };
+  }
+
+  /** Run the injected cleaner, swallowing anything it might still throw. */
+  private cleanupNativeSessions(thread: DelegationThread): NativeSessionCleanupResult | undefined {
+    try {
+      const result = this.sessionCleanup(thread);
+      return result.entries.length > 0 ? result : undefined;
+    } catch (e: any) {
+      console.warn('[TaskControlService] Native session cleanup failed:', e?.message || e);
+      return undefined;
+    }
   }
 
   private resolveCurrentRound(thread: DelegationThread): DelegationRound | undefined {
@@ -169,7 +225,12 @@ export class TaskControlService {
       : undefined;
   }
 
-  private appendTombstone(thread: DelegationThread, reason: string, by: string): void {
+  private appendTombstone(
+    thread: DelegationThread,
+    reason: string,
+    by: string,
+    nativeSessions?: NativeSessionCleanupResult,
+  ): void {
     try {
       fs.mkdirSync(this.storageDir, { recursive: true });
       const record = {
@@ -181,6 +242,19 @@ export class TaskControlService {
         reason,
         by,
         at: new Date().toISOString(),
+        nativeSessions: nativeSessions
+          ? {
+              removedFiles: nativeSessions.removedCount,
+              sessions: nativeSessions.entries.map((entry) => ({
+                agent: entry.agent,
+                sessionId: entry.sessionId,
+                found: entry.found,
+                removed: entry.removed,
+                pruned: entry.pruned,
+                ...(entry.error ? { error: entry.error } : {}),
+              })),
+            }
+          : undefined,
       };
       fs.appendFileSync(
         path.join(this.storageDir, 'deleted_tasks.log'),

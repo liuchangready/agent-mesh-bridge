@@ -20,9 +20,32 @@ export interface TaskRoleOwner {
   token: string;
   threadId: string;
   role: TaskRole;
+  /** Process that acquired (and heartbeats) the lock. */
   pid: number;
+  /**
+   * The detached caller/reviewer child this role was handed to.
+   *
+   * The wake spawns the reviewer detached and unref'd so it outlives the bridge
+   * process that launched it. That makes the launcher a bad liveness signal: when
+   * the extension host restarts mid-review, the launcher's heartbeat stops while
+   * the reviewer is still running, and every review decision would be refused.
+   * The child pid keeps the role valid for exactly as long as the reviewer runs.
+   */
+  childPid?: number;
   acquiredAt: number;
   updatedAt: number;
+}
+
+/** Liveness probe that never throws: EPERM means the pid exists. */
+function isPidAlive(pid?: number): boolean {
+  if (!pid || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: any) {
+    return err?.code === 'EPERM';
+  }
 }
 
 export interface TaskRoleLease {
@@ -122,8 +145,32 @@ export class TaskRoleLock {
     }
   }
 
+  /**
+   * Hand a freshly spawned detached caller child to the role lock.
+   *
+   * Called by the wake path right after the reviewer process starts: from then on
+   * the role is alive while EITHER the launcher heartbeats OR the child runs, so
+   * a bridge restart cannot invalidate a review that is still in progress.
+   */
+  public attachChild(lease: TaskRoleLease | null, childPid: number | undefined): boolean {
+    if (!lease || !childPid) return false;
+    const owner = this.readOwner(lease.threadId);
+    if (!owner || owner.token !== lease.token) return false;
+    try {
+      owner.childPid = childPid;
+      owner.updatedAt = Date.now();
+      fs.writeFileSync(this.filePath(lease.threadId), JSON.stringify(owner), 'utf8');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   public describe(owner?: TaskRoleOwner): string {
-    return owner ? `${owner.role} (pid ${owner.pid})` : 'another role';
+    if (!owner) return 'another role';
+    return owner.childPid
+      ? `${owner.role} (pid ${owner.pid}, reviewer child ${owner.childPid})`
+      : `${owner.role} (pid ${owner.pid})`;
   }
 
   public getLockFilePath(threadId: string): string {
@@ -152,7 +199,13 @@ export class TaskRoleLock {
 
   private isOwnerLive(owner: TaskRoleOwner): boolean {
     const heartbeatAt = owner.updatedAt || owner.acquiredAt || 0;
-    if (!heartbeatAt || Date.now() - heartbeatAt > STALE_AFTER_MS) return false;
+    const heartbeatFresh = !!heartbeatAt && Date.now() - heartbeatAt <= STALE_AFTER_MS;
+    // A running detached reviewer outranks a silent heartbeat: the launcher may
+    // have exited (VS Code restart, crashed bridge process) while the caller CLI
+    // keeps reviewing. Without this the review's own approve/rework calls are
+    // rejected as "stale reviewer".
+    if (isPidAlive(owner.childPid)) return true;
+    if (!heartbeatFresh) return false;
     if (!owner.pid) return false;
     if (owner.pid === process.pid) return true;
     try {

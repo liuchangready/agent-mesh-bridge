@@ -293,7 +293,9 @@ describe('File Scope and Conflict Queueing Tests', () => {
       assert.strictEqual(threadB?.status, 'queued');
       assert.match(
         threadB?.summary.lastOutputSnippet || '',
-        /one at a time|Waiting for (conflicting )?task/,
+        // Either wording is accurate: the task is queued behind Task A, and the
+        // scope gate names the same owner plus the overlapping file.
+        /one at a time|Waiting for (conflicting )?task|Queued \(scope\)/,
       );
 
       // 3. Task C touches disjoint files, but it must STILL be queued: the rule

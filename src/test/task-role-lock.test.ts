@@ -78,6 +78,60 @@ describe('TaskRoleLock - one role per task', () => {
     second.release(developer!);
   });
 
+  test('a detached reviewer child keeps the role alive after its launcher stops', () => {
+    const lock = new TaskRoleLock(tempDir);
+    const file = lock.getLockFilePath('thread_child');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const write = (owner: Record<string, unknown>) =>
+      fs.writeFileSync(file, JSON.stringify(owner), 'utf8');
+
+    // The wake launches the reviewer detached: the launcher exits (dead pid,
+    // heartbeat long gone) while the caller CLI keeps reviewing. The role must
+    // stay valid, otherwise the review's own approve/rework calls are refused.
+    write({
+      token: 'child-token',
+      threadId: 'thread_child',
+      role: 'reviewer',
+      pid: 999_999,
+      childPid: process.pid,
+      acquiredAt: Date.now() - 10 * 60_000,
+      updatedAt: Date.now() - 10 * 60_000,
+    });
+
+    const observer = new TaskRoleLock(tempDir);
+    const owner = observer.getOwner('thread_child');
+    assert.strictEqual(owner?.role, 'reviewer');
+    assert.ok(observer.describe(owner).includes('reviewer child'));
+
+    // Both processes gone: the role is dead again and can be reclaimed.
+    write({
+      token: 'child-token',
+      threadId: 'thread_child',
+      role: 'reviewer',
+      pid: 999_999,
+      childPid: 999_998,
+      acquiredAt: Date.now() - 10 * 60_000,
+      updatedAt: Date.now() - 10 * 60_000,
+    });
+    assert.strictEqual(observer.getOwner('thread_child'), undefined);
+  });
+
+  test('attachChild binds the role to the spawned caller process', () => {
+    const lock = new TaskRoleLock(tempDir);
+    const lease = lock.tryAcquire('thread_attach', 'reviewer');
+    assert.ok(lease);
+
+    assert.strictEqual(lock.attachChild(lease, process.pid), true);
+    assert.strictEqual(lock.getOwner('thread_attach')?.childPid, process.pid);
+
+    // A foreign lease token must not be able to rebind someone else's role.
+    assert.strictEqual(
+      lock.attachChild({ token: 'not-the-owner', threadId: 'thread_attach', role: 'reviewer' }, 4242),
+      false,
+    );
+    lock.release(lease!);
+  });
+
   test('a stale role lock is reclaimed', () => {
     const lock = new TaskRoleLock(tempDir);
     const file = lock.getLockFilePath('thread_stale');

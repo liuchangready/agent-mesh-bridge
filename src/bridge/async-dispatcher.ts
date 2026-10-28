@@ -9,6 +9,8 @@ import {
   DispatchTaskParams,
   DispatchResult,
   DispatchStatus,
+  DispatchWorktreeSpec,
+  WorktreeInfo,
   getModelRouting,
   isTaskUnfinished,
   isValidSessionId,
@@ -29,14 +31,17 @@ import {
   ScopeConflict,
 } from './file-scope';
 import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
-import { ExecutionGate, ExecutionOwner } from './execution-gate';
+import { ExecutionGate, ExecutionOwner, normalizeWorkspaceKey } from './execution-gate';
 import { QueueDrainer, QueuedExecution } from './queue-drainer';
 import { TaskRoleLock } from './task-role-lock';
+import { resolveInitiatorModel } from './model-catalog';
+import { appendCompactionProtocol, compactRoundBestEffort } from './context-compactor';
+import { readStoredRoundUsage } from './token-usage-collector';
+import { concurrencyPolicy } from './bridge-policy';
 import {
-  normalizeModelId,
-  resolveConfiguredModel,
-  resolveInitiatorModel,
-} from './model-catalog';
+  ModelApprovalHandler,
+  resolveDispatchModel,
+} from './model-approval';
 
 export class AsyncDispatcher {
   private taskStore: TaskStore;
@@ -47,6 +52,8 @@ export class AsyncDispatcher {
   private streamSyncIntervalMs: number = 30000;
   private executionGate: ExecutionGate;
   private queueDrainer: QueueDrainer;
+  /** Answers model-switch confirmations; the file channel unless overridden. */
+  private modelApprovalHandler?: ModelApprovalHandler;
 
   constructor(
     taskStore: TaskStore,
@@ -82,8 +89,53 @@ export class AsyncDispatcher {
   }
 
   /**
+   * Replace how a non-default receiver model is confirmed. Production uses the
+   * cross-process file channel (the VS Code extension host answers it); tests
+   * inject a decision directly.
+   */
+  public setModelApprovalHandler(handler: ModelApprovalHandler | undefined): void {
+    this.modelApprovalHandler = handler;
+  }
+
+  /**
    * Dispatches a new task asynchronously and non-blockingly.
    */
+  /**
+   * Validate the caller's "this workspace is a temporary worktree" declaration.
+   *
+   * Without `mainPath` the bridge cannot tell a throwaway checkout from a real
+   * workspace, and the merge gate would silently never fire — the exact failure
+   * mode this parameter exists to prevent. `path` is the task's workspacePath, so
+   * passing the same directory twice is a caller mistake, not a valid worktree.
+   */
+  private resolveWorktreeSpec(
+    spec: DispatchWorktreeSpec | undefined,
+    workspacePath: string,
+  ): WorktreeInfo | undefined {
+    if (!spec) return undefined;
+    if (!spec.mainPath || !String(spec.mainPath).trim()) {
+      throw new Error(
+        'worktree.mainPath is required when worktree is set: name the main checkout ' +
+          'this temporary worktree has to merge back into.',
+      );
+    }
+    const worktreePath = path.resolve(workspacePath);
+    const mainPath = path.resolve(spec.mainPath);
+    if (worktreePath.toLowerCase() === mainPath.toLowerCase()) {
+      throw new Error(
+        `worktree.mainPath must differ from workspacePath (both resolve to ${worktreePath}). ` +
+          'Pass the temporary worktree as workspacePath and the main checkout as worktree.mainPath.',
+      );
+    }
+    return {
+      path: worktreePath,
+      mainPath,
+      ...(spec.branch ? { branch: spec.branch } : {}),
+      ...(spec.baseCommit ? { baseCommit: spec.baseCommit } : {}),
+      mergePending: false,
+    };
+  }
+
   public async dispatchTask(params: DispatchTaskParams): Promise<DispatchResult> {
     let targetAgent: AgentId;
 
@@ -101,6 +153,9 @@ export class AsyncDispatcher {
     const receiverSessionId = crypto.randomUUID();
     const nowIso = now.toISOString();
     const workspacePath = params.workspacePath || process.cwd();
+    // Throws before anything is persisted when the declaration is unusable, so a
+    // bad worktree spec can never create a task whose output cannot be merged.
+    const worktree = this.resolveWorktreeSpec(params.worktree, workspacePath);
 
     // expectedFiles is a lock scope, so it must be narrow: concrete code files
     // only. Folders/globs would block unrelated sibling work.
@@ -150,15 +205,24 @@ export class AsyncDispatcher {
       timestamp: nowIso,
     };
 
-    // Load active tasks to detect both file-scope conflicts and the global
-    // single-flight rule. A thread with an in-flight round counts even if its
-    // lifecycle status was not refreshed yet.
+    // Load active tasks to detect both file-scope conflicts and the execution
+    // slot rule. A thread with an in-flight round counts even if its lifecycle
+    // status was not refreshed yet.
+    //
+    // Concurrency is opt-in and, when enabled, partitioned by workspace: only an
+    // unfinished task in the SAME workspace competes for this task's slot. With
+    // concurrency off (the default) every unfinished task blocks, exactly as the
+    // historical global single-flight rule requires.
+    const policy = concurrencyPolicy();
+    const workspaceKey = policy.enabled ? normalizeWorkspaceKey(workspacePath) : undefined;
     this.taskStore.loadFromDisk();
     // Task-level queue: one unfinished task (including waiting_review/paused)
-    // blocks every younger task, regardless of whether a round is in flight.
+    // blocks every younger task in its workspace, regardless of whether a round
+    // is in flight.
     const allKnownTasks = this.taskStore.getAllTasks();
     const activeTasks = allKnownTasks
       .filter((t) => t.threadId !== threadId && isTaskUnfinished(t))
+      .filter((t) => !policy.enabled || normalizeWorkspaceKey(t.workspacePath) === workspaceKey)
       .sort(
         (a, b) =>
           new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
@@ -171,8 +235,20 @@ export class AsyncDispatcher {
     // effort) and the model the receiver will execute with. Pinning the receiver
     // model here keeps rework/retry rounds on one model and makes the task list
     // show exactly what will run.
+    //
+    // The configured default wins unless the caller declares an explicit user
+    // request AND the user confirms the switch in VS Code (see model-approval).
     const initiatorModel = resolveInitiatorModel(initiatorAgent, params.initiatorModel);
-    const targetModel = normalizeModelId(params.model) || resolveConfiguredModel(targetAgent);
+    const modelResolution = await resolveDispatchModel({
+      targetAgent,
+      requestedModel: params.model,
+      requestedByUser: params.modelRequestedByUser === true,
+      initiatorAgent,
+      title: params.title,
+      handler: this.modelApprovalHandler,
+    });
+    const targetModel = modelResolution.model;
+    const modelNotice = modelResolution.notice;
 
     const tempCandidate: DelegationThread = {
       threadId,
@@ -186,9 +262,12 @@ export class AsyncDispatcher {
       receiverSessionId,
       callerSessionId,
       workspacePath,
+      ...(worktree ? { worktree } : {}),
       initiatorModel: initiatorModel.model,
       initiatorModelSource: initiatorModel.source,
       targetModel,
+      modelNotice,
+      modelApproval: modelResolution.approval,
       expectedFiles:
         expectedFilesValidation.files.length > 0 ? expectedFilesValidation.files : undefined,
       scopeOverride: params.allowScopeOverlap ? true : undefined,
@@ -204,10 +283,18 @@ export class AsyncDispatcher {
     // Batch-level scope gate: refuse to schedule a task whose declared files are
     // still owned by another open task (declared or actually touched).
     const scopeConflict = findScopeConflicts(tempCandidate, scopePeers);
-    const gateOwner = this.executionGate.getOwner();
+    // With concurrency on, an owner in ANOTHER workspace is a different slot and
+    // must not queue this task; with it off, any live owner does (legacy).
+    const gateOwner = this.executionGate.getOwner(workspaceKey);
     const globalOwner = gateOwner && gateOwner.threadId !== threadId ? gateOwner : undefined;
     const blockingTask = activeTasks[0];
-    const globallyBusy = !!globalOwner || !!blockingTask;
+    const activeSlots = policy.enabled ? this.executionGate.countActive() : 0;
+    const globalSlotFull = policy.enabled && activeSlots >= policy.maxConcurrentTasks;
+    const agentSlots = policy.enabled
+      ? this.executionGate.listOwners().filter((owner) => owner.agent === targetAgent).length
+      : 0;
+    const agentSlotFull = policy.enabled && agentSlots >= policy.maxConcurrentPerAgent;
+    const globallyBusy = !!globalOwner || !!blockingTask || globalSlotFull || agentSlotFull;
     const isQueued = conflict.hasConflict || !!scopeConflict || globallyBusy;
 
     let queueDetail = '';
@@ -221,7 +308,10 @@ export class AsyncDispatcher {
     } else if (conflict.hasConflict && conflict.conflictingThread) {
       queueDetail = `Queued: Waiting for task ${conflict.conflictingThread.threadId} to release the same file(s) [${(conflict.conflictingFiles || []).join(', ')}]`;
     } else if (globalOwner) {
-      queueDetail = `Queued: Waiting for task ${globalOwner.threadId} (round ${globalOwner.round}) to finish; tasks execute strictly one at a time.`;
+      queueDetail = policy.enabled
+        ? `Queued: workspace ${workspaceKey} already has task ${globalOwner.threadId} (round ${globalOwner.round}) running; ` +
+          `only one task per workspace may run at a time.`
+        : `Queued: Waiting for task ${globalOwner.threadId} (round ${globalOwner.round}) to finish; tasks execute strictly one at a time.`;
     } else if (blockingTask) {
       const phase =
         blockingTask.status === 'waiting_review'
@@ -229,9 +319,19 @@ export class AsyncDispatcher {
           : blockingTask.status === 'paused'
             ? 'to be resumed or deleted'
             : `to finish (${blockingTask.status})`;
+      queueDetail = policy.enabled
+        ? `Queued: Waiting for task ${blockingTask.threadId} ${phase} in workspace ${workspaceKey} ` +
+          `before another task runs there; only one task per workspace may run at a time.`
+        : `Queued: Waiting for task ${blockingTask.threadId} ${phase} before another task runs; ` +
+          `tasks execute one whole task at a time.`;
+    } else if (agentSlotFull) {
       queueDetail =
-        `Queued: Waiting for task ${blockingTask.threadId} ${phase} before another task runs; ` +
-        `tasks execute one whole task at a time.`;
+        `Queued: agent ${targetAgent} already occupies ${agentSlots}/${policy.maxConcurrentPerAgent} ` +
+        `of its concurrent slots; waiting for one of its running tasks to finish.`;
+    } else if (globalSlotFull) {
+      queueDetail =
+        `Queued: global concurrency limit reached (${activeSlots}/${policy.maxConcurrentTasks}); ` +
+        `waiting for a free execution slot.`;
     }
 
     if (isQueued) {
@@ -267,10 +367,20 @@ export class AsyncDispatcher {
 
     const dispatchStatus: DispatchStatus = isQueued ? 'QUEUED' : 'DISPATCHED';
     const routing = getModelRouting(thread);
-    const modelLine = `Model routing: ${routing.text}.`;
+    const noticeLine = modelNotice ? ` ${modelNotice}` : '';
+    const modelLine = `Model routing: ${routing.text}.${noticeLine}`;
+    // The caller's turn must end here. Agents that keep the turn open spend the
+    // user's tokens polling for information the callback will deliver anyway, so
+    // the directive is machine-readable AND leads the prose.
+    const stopInstruction =
+      'STOP NOW — the dispatch is asynchronous. End your turn immediately and do not call ' +
+      'get_thread_details / get_recent_logs / list_recent_tasks to watch this task; the bridge ' +
+      'wakes your native session when the round finishes (success and failure both wake you). ' +
+      (isQueued ? 'A QUEUED result is normal: it starts on its own.' : '');
+    const stopLine = `nextAction=END_TURN_AND_WAIT_FOR_CALLBACK. ${stopInstruction}`;
     const message = isQueued
-      ? `Task queued (Thread: ${threadId}). ${modelLine} ${queueDetail} It will execute when the workspace is free.`
-      : `Task successfully dispatched to ${targetAgent} (Thread: ${threadId}). ${modelLine} Conclude your current turn and await callback.`;
+      ? `${stopLine} Task queued (Thread: ${threadId}). ${modelLine} ${queueDetail} It will execute when the workspace is free.`
+      : `${stopLine} Task successfully dispatched to ${targetAgent} (Thread: ${threadId}). ${modelLine} Conclude your current turn and await callback.`;
 
     return {
       threadId,
@@ -279,6 +389,10 @@ export class AsyncDispatcher {
       status: dispatchStatus,
       message,
       modelRouting: routing,
+      modelNotice,
+      modelApproval: modelResolution.approval,
+      nextAction: 'END_TURN_AND_WAIT_FOR_CALLBACK',
+      stopInstruction,
     };
   }
 
@@ -325,14 +439,33 @@ export class AsyncDispatcher {
       return;
     }
 
-    // The gate is the cross-process authority: a task may only start when no
-    // other round (from any agent, any MCP server, any workspace) is in flight.
-    const lease = this.executionGate.tryAcquire(thread.threadId, roundNumber);
+    // The gate is the cross-process authority. With concurrency off it is the one
+    // mesh-wide slot; with it on, the slot belongs to this task's workspace (and
+    // the global/per-agent caps are enforced by the callers below).
+    const policy = concurrencyPolicy();
+    const workspaceKey = policy.enabled ? normalizeWorkspaceKey(thread.workspacePath) : undefined;
+    const lease = this.executionGate.tryAcquire(
+      thread.threadId,
+      roundNumber,
+      workspaceKey,
+      thread.targetAgent,
+    );
     if (!lease) {
       roleLock.release(roleLease);
-      const owner = this.executionGate.getOwner();
+      const owner = this.executionGate.getOwner(workspaceKey);
       if (owner?.threadId !== thread.threadId) {
-        this.markThreadQueued(thread, owner);
+        this.markThreadQueued(
+          thread,
+          owner,
+          owner
+            ? policy.enabled
+              ? `Queued: workspace ${workspaceKey} already has task ${owner.threadId} (round ${owner.round}) running; ` +
+                `only one task per workspace may run at a time.`
+              : `Queued: Waiting for task ${owner.threadId} (round ${owner.round}) to finish; tasks execute strictly one at a time.`
+            : policy.enabled
+              ? this.describeConcurrencyBlocked(thread.targetAgent)
+              : undefined,
+        );
       }
       this.queueDrainer.schedule(1_500);
       return;
@@ -399,7 +532,7 @@ export class AsyncDispatcher {
       try {
         result = await this.runner.execute({
           agent: thread.targetAgent,
-          prompt,
+          prompt: isRework ? appendCompactionProtocol(prompt, roundNumber) : prompt,
           isRework,
           receiverSessionId: thread.receiverSessionId,
           title: thread.title,
@@ -407,7 +540,8 @@ export class AsyncDispatcher {
           taskThreadId: thread.threadId,
           taskRound: roundNumber,
           model: thread.targetModel,
-          onChildPid: (pid) => this.executionGate.attachChildPid(pid),
+          previousTokenUsage: readStoredRoundUsage(this.taskStore, thread.threadId, roundNumber),
+          onChildPid: (pid) => this.executionGate.attachChildPid(pid, lease),
           onStdoutChunk: (chunk: string) => {
             streamedOutput += chunk;
             try {
@@ -486,6 +620,11 @@ export class AsyncDispatcher {
           status: finalRoundStatus,
           assessment: result.assessment,
           touchedFiles: touchedFiles.length > 0 ? touchedFiles : undefined,
+          // Execution metadata: who ran this round, on which model, and what
+          // it cost. It must survive the lagged compaction.
+          executorAgent: thread.targetAgent,
+          executorModel: result.model || thread.targetModel,
+          tokenUsage: result.tokenUsage,
         },
         finalThreadStatus,
         nativeSessionId,
@@ -496,6 +635,16 @@ export class AsyncDispatcher {
       if (updatedThread && this.taskStore.getTask(updatedThread.threadId)) {
         const completedRound = updatedThread.rounds.find((r) => r.round === roundNumber);
         if (completedRound) {
+          // Lagged compaction: only after this round actually succeeded, and
+          // before the role handoff. Best-effort — the compactor never throws,
+          // because a failure here must not strand the reviewer wake-up.
+          if (isSuccess) {
+            compactRoundBestEffort(this.taskStore, {
+              threadId: updatedThread.threadId,
+              currentRoundNumber: roundNumber,
+              currentOutput: result.extractedOutput || result.stdout,
+            });
+          }
           // Hand the task from developer to reviewer.
           roleLock.release(roleLease);
           if (!interruption && isSuccess) {
@@ -527,6 +676,29 @@ export class AsyncDispatcher {
       target.round.prompt,
       shouldResumeNativeSession(target.thread, target.round),
     );
+  }
+
+  /**
+   * Why no slot could be taken when no same-workspace owner explains it: either
+   * the mesh-wide cap or this agent's own cap is saturated.
+   */
+  private describeConcurrencyBlocked(targetAgent: string): string {
+    const policy = concurrencyPolicy();
+    const owners = this.executionGate.listOwners();
+    if (owners.length >= policy.maxConcurrentTasks) {
+      return (
+        `Queued: global concurrency limit reached (${owners.length}/${policy.maxConcurrentTasks}); ` +
+        `waiting for a free execution slot.`
+      );
+    }
+    const sameAgent = owners.filter((owner) => owner.agent === targetAgent).length;
+    if (sameAgent >= policy.maxConcurrentPerAgent) {
+      return (
+        `Queued: agent ${targetAgent} already occupies ${sameAgent}/${policy.maxConcurrentPerAgent} ` +
+        `of its concurrent slots; waiting for one of its running tasks to finish.`
+      );
+    }
+    return 'Queued: waiting for a free execution slot.';
   }
 
   private markThreadQueued(

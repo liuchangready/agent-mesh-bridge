@@ -124,6 +124,70 @@ describe('TaskControlService - pause/delete reasons', () => {
     assert.strictEqual(record.reason, 'duplicate request');
   });
 
+  test('deleting a task also records the receiver conversation cleanup', () => {
+    taskStore.upsertTask(makeThread());
+    const cleanedThreads: string[] = [];
+    const control = new TaskControlService(
+      taskStore,
+      runner,
+      new CancellationRegistry(tempDir),
+      tempDir,
+      (thread) => {
+        cleanedThreads.push(thread.threadId);
+        return {
+          entries: [
+            {
+              agent: 'claude_code',
+              sessionId: 'receiver-session-0001',
+              found: true,
+              removed: ['/home/u/.claude/projects/x/receiver-session-0001.jsonl'],
+              pruned: [],
+            },
+          ],
+          removedCount: 1,
+        };
+      },
+    );
+
+    const result = control.deleteTask('thread_control_1', 'duplicate request', 'user');
+
+    assert.deepStrictEqual(cleanedThreads, ['thread_control_1']);
+    assert.ok(result.nativeSessions, 'the cleanup outcome is returned to the caller');
+    assert.strictEqual(result.nativeSessions?.removedCount, 1);
+    assert.match(result.message, /native conversations: 1 cleaned/);
+
+    const record = JSON.parse(
+      fs.readFileSync(path.join(tempDir, 'deleted_tasks.log'), 'utf8').trim(),
+    );
+    assert.strictEqual(record.nativeSessions.removedFiles, 1);
+    assert.strictEqual(record.nativeSessions.sessions[0].agent, 'claude_code');
+    assert.strictEqual(record.nativeSessions.sessions[0].sessionId, 'receiver-session-0001');
+    assert.strictEqual(record.nativeSessions.sessions[0].found, true);
+  });
+
+  test('a failing native conversation cleanup never blocks the deletion', () => {
+    taskStore.upsertTask(makeThread());
+    const control = new TaskControlService(
+      taskStore,
+      runner,
+      new CancellationRegistry(tempDir),
+      tempDir,
+      () => {
+        throw new Error('session store is locked');
+      },
+    );
+
+    const result = control.deleteTask('thread_control_1', 'cleanup failed on purpose', 'user');
+
+    assert.strictEqual(result.status, 'DELETED');
+    assert.strictEqual(taskStore.getTask('thread_control_1'), undefined);
+    assert.strictEqual(result.nativeSessions, undefined);
+    const record = JSON.parse(
+      fs.readFileSync(path.join(tempDir, 'deleted_tasks.log'), 'utf8').trim(),
+    );
+    assert.strictEqual(record.reason, 'cleanup failed on purpose');
+  });
+
   test('resuming a paused task keeps history and clears the current interruption', async () => {
     taskStore.upsertTask(makeThread());
     const control = new TaskControlService(

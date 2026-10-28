@@ -1,6 +1,7 @@
 import {
   DelegationThread,
   DelegationRound,
+  ExecutorOverride,
   RequestReworkParams,
   RequestReworkResult,
   ApproveTaskParams,
@@ -12,7 +13,11 @@ import {
   isUserInterruption,
   nextRoundNumber,
   shouldResumeNativeSession,
+  ThreadStatus,
 } from './types';
+import * as fs from 'fs';
+import * as path from 'path';
+import { roundExecutionLogPath } from './round-log';
 import { TaskStore } from './task-store';
 import { AgentDetector } from './agent-detector';
 import { AutonomousRunner } from './autonomous-runner';
@@ -20,9 +25,14 @@ import { CallbackManager } from './callback-manager';
 import { TaskSupervisor } from './task-supervisor';
 import { findScopeConflicts, describeScopeConflict, ScopeConflict } from './file-scope';
 import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
-import { ExecutionGate, ExecutionOwner } from './execution-gate';
+import { ExecutionGate, ExecutionOwner, normalizeWorkspaceKey } from './execution-gate';
 import { QueueDrainer, QueuedExecution } from './queue-drainer';
+import { concurrencyPolicy } from './bridge-policy';
 import { TaskRoleLock } from './task-role-lock';
+import { ModelApprovalHandler } from './model-approval';
+import { TaskRetargetService, latestRetarget } from './task-retarget';
+import { appendCompactionProtocol, compactRoundBestEffort } from './context-compactor';
+import { readStoredRoundUsage } from './token-usage-collector';
 
 export class ReworkController {
   private taskStore: TaskStore;
@@ -31,6 +41,8 @@ export class ReworkController {
   private detector?: AgentDetector;
   private executionGate: ExecutionGate;
   private queueDrainer: QueueDrainer;
+  /** Moves a task to another agent/model when rework/retry/resume asks for it. */
+  private readonly retargetService: TaskRetargetService;
 
   constructor(
     taskStore: TaskStore,
@@ -44,6 +56,7 @@ export class ReworkController {
     this.callbackManager = callbackManager;
     this.detector = detector;
     this.executionGate = executionGate || new ExecutionGate();
+    this.retargetService = new TaskRetargetService(taskStore);
     this.queueDrainer = new QueueDrainer(
       this.taskStore,
       this.executionGate,
@@ -52,14 +65,73 @@ export class ReworkController {
     );
   }
 
+  /** Answer model-switch confirmations raised by an executor switch. */
+  public setModelApprovalHandler(handler: ModelApprovalHandler | undefined): void {
+    this.retargetService.setModelApprovalHandler(handler);
+  }
+
+  /**
+   * Apply a rework/retry/resume executor override, if the caller asked for one.
+   * A model-only request against the same agent keeps the native session; a new
+   * agent always starts a fresh one (see `TaskRetargetService`).
+   */
+  private async applyExecutorOverride(
+    threadId: string,
+    overrides: ExecutorOverride,
+    reason: string,
+  ): Promise<void> {
+    if (!this.retargetService.hasOverride(overrides)) return;
+    await this.retargetService.retargetTask({
+      threadId,
+      targetAgent: overrides.targetAgent,
+      model: overrides.model,
+      modelRequestedByUser: overrides.modelRequestedByUser,
+      reason,
+      by: 'caller',
+    });
+  }
+
   /**
    * Dispatches a rework round to the target agent within the EXACT SAME native session.
-   * STRICT RULE: Never regenerate receiverSessionId!
+   * STRICT RULE: never regenerate receiverSessionId — unless the caller explicitly
+   * moves the task to another agent/model, in which case the session cannot
+   * follow (see `TaskRetargetService`).
    */
   public async requestRework(params: RequestReworkParams): Promise<RequestReworkResult> {
-    const thread = this.taskStore.getTask(params.threadId);
+    let thread = this.taskStore.getTask(params.threadId);
     if (!thread) {
       throw new Error(`Task thread not found: ${params.threadId}`);
+    }
+    // `completed` is terminal: a stale reviewer must not resurrect an archived
+    // task by submitting a late rework.
+    if (thread.status === 'completed') {
+      throw new Error(
+        `Cannot request rework: thread ${params.threadId} is already approved and archived. ` +
+          `Dispatch a new task if the work has to continue.`,
+      );
+    }
+
+    // Optional executor switch: applied before the round is created, so a
+    // declined model switch aborts the rework without touching the ledger.
+    let retarget = latestRetarget(thread);
+    let modelNotice: string | undefined;
+    if (this.retargetService.hasOverride(params)) {
+      const outcome = await this.retargetService.retargetTask({
+        threadId: params.threadId,
+        targetAgent: params.targetAgent,
+        model: params.model,
+        modelRequestedByUser: params.modelRequestedByUser,
+        reason: 'request_rework: executor switch',
+        by: 'caller',
+      });
+      modelNotice = outcome.modelNotice;
+      this.taskStore.loadFromDisk();
+      const reloaded = this.taskStore.getTask(params.threadId);
+      if (!reloaded) {
+        throw new Error(`Task thread not found after retarget: ${params.threadId}`);
+      }
+      thread = reloaded;
+      retarget = outcome.status === 'RETARGETED' ? latestRetarget(thread) : retarget;
     }
 
     if (!thread.receiverSessionId) {
@@ -75,6 +147,11 @@ export class ReworkController {
     if (inFlight) {
       throw new Error(`Cannot request rework: ${describeRoundInFlight(thread, inFlight)}`);
     }
+
+    // A rework that repeats the previous instruction after a round that changed
+    // no file cannot produce anything new. That is how a reviewer "waits" for a
+    // sibling task, and it was turning into an endless loop of empty rounds.
+    assertNotNoopRework(thread, params.feedback);
 
     // Monotonic numbering: never reuse a round number even if currentRound was
     // rewound by a retry.
@@ -107,8 +184,12 @@ export class ReworkController {
       );
     }
 
+    // A resumed session keeps its continuity; a task that was just moved to
+    // another agent has no resumable session and starts a fresh one.
+    const resumesNativeSession = shouldResumeNativeSession(thread, reworkRound);
+
     thread.currentRound = nextRound;
-    thread.status = 'reworking';
+    thread.status = resumesNativeSession ? 'reworking' : 'running';
     thread.interruption = undefined;
     thread.updatedAt = nowIso;
     if (params.callerSessionId && isValidSessionId(params.callerSessionId)) {
@@ -131,7 +212,9 @@ export class ReworkController {
     }
     thread.rounds.push(reworkRound);
     thread.summary.lastPromptSnippet = (params.feedback || '').slice(0, 100);
-    thread.summary.lastOutputSnippet = `Reworking in same session (Round ${nextRound})...`;
+    thread.summary.lastOutputSnippet = retarget && retarget.toAgent !== retarget.fromAgent
+      ? `Reworking on ${thread.targetAgent} with a fresh session (Round ${nextRound})...`
+      : `Reworking in same session (Round ${nextRound})...`;
 
     // Persist immediately
     this.taskStore.upsertTask(thread);
@@ -142,11 +225,16 @@ export class ReworkController {
       console.log(
         `[ReworkController] Active TaskSupervisor detected. Delegating Round ${nextRound} execution to supervisor.`,
       );
-    } else if (this.isGloballyBusy(thread.threadId)) {
-      this.markQueued(thread, this.executionGate.getOwner());
+    } else if (this.isGloballyBusy(thread.threadId, thread.workspacePath)) {
+      this.markQueued(thread, this.workspaceOwner(thread));
       this.queueDrainer.schedule(1_500);
     } else {
-      this.executeReworkBackground(thread, nextRound, params.feedback).catch((err) => {
+      this.executeReworkBackground(
+        thread,
+        nextRound,
+        params.feedback,
+        resumesNativeSession,
+      ).catch((err) => {
         console.error(
           `[ReworkController] Error executing rework round ${nextRound} for ${thread.threadId}:`,
           err,
@@ -154,21 +242,35 @@ export class ReworkController {
       });
     }
 
+    const switched = !!retarget && retarget.toAgent !== retarget.fromAgent;
     return {
       threadId: thread.threadId,
       round: nextRound,
       receiverSessionId: thread.receiverSessionId,
       targetAgent: thread.targetAgent,
       status: 'REWORK_DISPATCHED',
-      message: `Rework Round ${nextRound} dispatched to ${thread.targetAgent} in original session (${thread.receiverSessionId}). Conclude your turn and await callback.`,
+      retarget,
+      modelNotice,
+      message: switched
+        ? `Rework Round ${nextRound} switched to ${thread.targetAgent}` +
+          `${thread.targetModel ? ` (${thread.targetModel})` : ''} with a fresh native session ` +
+          `(${thread.receiverSessionId}); the previous agent's session cannot be resumed. Conclude your turn and await callback.`
+        : `Rework Round ${nextRound} dispatched to ${thread.targetAgent} in original session (${thread.receiverSessionId}). Conclude your turn and await callback.`,
     };
   }
 
   /**
    * Retries the failed round in-place within the EXACT SAME native session,
    * preserving the original prompt and avoiding creating duplicate or generic rounds.
+   *
+   * `overrides` may move the retry to another agent/model first (fresh session).
    */
-  public async retryFailedRound(threadId: string): Promise<DelegationRound> {
+  public async retryFailedRound(
+    threadId: string,
+    overrides: ExecutorOverride = {},
+  ): Promise<DelegationRound> {
+    await this.applyExecutorOverride(threadId, overrides, 'retry_task: executor switch');
+    this.taskStore.loadFromDisk();
     const thread = this.taskStore.getTask(threadId);
     if (!thread) {
       throw new Error(`Task thread not found: ${threadId}`);
@@ -215,8 +317,8 @@ export class ReworkController {
       console.log(
         `[ReworkController] Active TaskSupervisor detected. Delegating Round ${failedRound.round} retry to supervisor.`,
       );
-    } else if (this.isGloballyBusy(thread.threadId)) {
-      this.markQueued(thread, this.executionGate.getOwner());
+    } else if (this.isGloballyBusy(thread.threadId, thread.workspacePath)) {
+      this.markQueued(thread, this.workspaceOwner(thread));
       this.queueDrainer.schedule(1_500);
     } else {
       this.executeReworkBackground(
@@ -239,8 +341,15 @@ export class ReworkController {
    * Resume a paused round in place. The original prompt and native session are
    * preserved; the interruption reason stays in history, and the current
    * interruption marker is cleared.
+   *
+   * `overrides` may resume the task on another agent/model (fresh session) — e.g.
+   * pause a task whose model is rate-limited, switch, then resume.
    */
-  public async resumePausedTask(threadId: string): Promise<DelegationRound> {
+  public async resumePausedTask(
+    threadId: string,
+    overrides: ExecutorOverride = {},
+  ): Promise<DelegationRound> {
+    await this.applyExecutorOverride(threadId, overrides, 'resume_task: executor switch');
     this.taskStore.loadFromDisk();
     const thread = this.taskStore.getTask(threadId);
     if (!thread) {
@@ -260,16 +369,16 @@ export class ReworkController {
     }
 
     // A pause kills the child asynchronously. Resuming before the old round has
-    // actually released the global execution gate would clear its cancellation
-    // request and let the old process keep running. Wait for the gate first.
-    const owner = this.executionGate.getOwner();
+    // actually released its execution slot would clear its cancellation request
+    // and let the old process keep running. Wait for the slot first.
+    const owner = this.workspaceOwner(thread);
     if (owner && owner.threadId === threadId) {
       for (let i = 0; i < 50; i++) {
-        const current = this.executionGate.getOwner();
+        const current = this.workspaceOwner(thread);
         if (!current || current.threadId !== threadId) break;
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
-      const stillOwned = this.executionGate.getOwner();
+      const stillOwned = this.workspaceOwner(thread);
       if (stillOwned && stillOwned.threadId === threadId) {
         throw new Error(
           `Task ${threadId} is still stopping; wait for the pause to finish before resuming.`,
@@ -302,8 +411,8 @@ export class ReworkController {
       console.log(
         `[ReworkController] Active TaskSupervisor detected. Delegating resumed Round ${pausedRound.round} to supervisor.`,
       );
-    } else if (this.isGloballyBusy(thread.threadId)) {
-      this.markQueued(thread, this.executionGate.getOwner());
+    } else if (this.isGloballyBusy(thread.threadId, thread.workspacePath)) {
+      this.markQueued(thread, this.workspaceOwner(thread));
       this.queueDrainer.schedule(1_500);
     } else {
       this.executeReworkBackground(
@@ -320,6 +429,65 @@ export class ReworkController {
     }
 
     return pausedRound;
+  }
+
+  /**
+   * Park a review on a dependency instead of spending a rework round.
+   *
+   * The reviewer has exactly two moves — approve or rework — so "this task is
+   * fine, but the batch is waiting for another task" had no expression and was
+   * encoded as an empty rework round that returned in 15 seconds and burned a
+   * full execution slot, over and over. Blocking keeps the task `waiting_review`
+   * (queue invariants unchanged), silences the stall watchdog and the wake path,
+   * and wakes the reviewer as soon as the dependency reaches a terminal state.
+   *
+   * Unlike `pause_task` this is not a user interruption: it records no
+   * `interruption`, keeps the review round intact, and needs no manual resume.
+   */
+  public blockReview(params: {
+    threadId: string;
+    reason?: string;
+    waitingForThreadId?: string;
+    by?: string;
+  }): { threadId: string; status: ThreadStatus; waitingForThreadId?: string; message: string } {
+    const thread = this.taskStore.getTask(params.threadId);
+    if (!thread) {
+      throw new Error(`Task thread not found: ${params.threadId}`);
+    }
+    if (thread.status !== 'waiting_review') {
+      throw new Error(
+        `Cannot block review: thread ${params.threadId} is "${thread.status}", not "waiting_review".`,
+      );
+    }
+    const inFlight = findInFlightRound(thread);
+    if (inFlight) {
+      throw new Error(`Cannot block review: ${describeRoundInFlight(thread, inFlight)}`);
+    }
+
+    const nowIso = new Date().toISOString();
+    thread.reviewBlocked = {
+      waitingForThreadId: params.waitingForThreadId,
+      reason: params.reason?.slice(0, 500),
+      at: nowIso,
+      by: params.by || 'caller',
+    };
+    // The review is not stalled — it is deliberately parked. Clearing the wake
+    // plan keeps the watchdog and the retry timer out of the way.
+    thread.reviewWake = undefined;
+    thread.updatedAt = nowIso;
+    thread.summary.lastOutputSnippet = params.waitingForThreadId
+      ? `Blocked: waiting for ${params.waitingForThreadId}`
+      : 'Blocked: waiting for an external dependency';
+    this.taskStore.upsertTask(thread);
+
+    return {
+      threadId: thread.threadId,
+      status: thread.status,
+      waitingForThreadId: params.waitingForThreadId,
+      message: params.waitingForThreadId
+        ? `Review parked. The task will be woken automatically when ${params.waitingForThreadId} reaches a terminal state; no rework round was created.`
+        : `Review parked. Clear the block (or approve/rework) once the external dependency is resolved; no rework round was created.`,
+    };
   }
 
   /**
@@ -415,10 +583,21 @@ export class ReworkController {
       return;
     }
 
-    const lease = this.executionGate.tryAcquire(thread.threadId, roundNumber);
+    // Cross-process execution slot: the workspace-scoped lease when concurrency
+    // is enabled, the historical mesh-wide one otherwise.
+    const gatePolicy = concurrencyPolicy();
+    const workspaceKey = gatePolicy.enabled
+      ? normalizeWorkspaceKey(thread.workspacePath)
+      : undefined;
+    const lease = this.executionGate.tryAcquire(
+      thread.threadId,
+      roundNumber,
+      workspaceKey,
+      thread.targetAgent,
+    );
     if (!lease) {
       roleLock.release(roleLease);
-      const owner = this.executionGate.getOwner();
+      const owner = this.executionGate.getOwner(workspaceKey);
       if (owner?.threadId !== thread.threadId) {
         this.markQueued(thread, owner);
       }
@@ -453,10 +632,22 @@ export class ReworkController {
 
       let result;
       const scopeBefore = captureWorkspaceSnapshot(thread.workspacePath);
+      // Rework rounds used to run without a per-round stdio log, so the "raw
+      // execution log" existed only for dispatch/supervisor rounds. Capture it
+      // here too: `get_round_raw_log` must not silently return "not captured".
+      const roundLogPath = roundExecutionLogPath(
+        thread.threadId,
+        roundNumber,
+        path.dirname(this.taskStore.getStoragePath()),
+      );
+      try {
+        fs.mkdirSync(path.dirname(roundLogPath), { recursive: true });
+        fs.writeFileSync(roundLogPath, '', 'utf8');
+      } catch {}
       try {
         result = await this.runner.execute({
           agent: thread.targetAgent,
-          prompt: feedback,
+          prompt: isRework ? appendCompactionProtocol(feedback, roundNumber) : feedback,
           isRework,
           receiverSessionId: thread.receiverSessionId,
           title: thread.title,
@@ -464,9 +655,20 @@ export class ReworkController {
           taskThreadId: thread.threadId,
           taskRound: roundNumber,
           model: thread.targetModel,
+          previousTokenUsage: readStoredRoundUsage(this.taskStore, thread.threadId, roundNumber),
           // Record the real agent child so a crashed host cannot leave an orphan
           // editing the workspace while the next task starts.
-          onChildPid: (pid) => this.executionGate.attachChildPid(pid),
+          onChildPid: (pid) => this.executionGate.attachChildPid(pid, lease),
+          onStdoutChunk: (chunk: string) => {
+            try {
+              fs.appendFileSync(roundLogPath, chunk, 'utf8');
+            } catch {}
+          },
+          onStderrChunk: (chunk: string) => {
+            try {
+              fs.appendFileSync(roundLogPath, chunk, 'utf8');
+            } catch {}
+          },
         });
       } catch (err: any) {
         result = {
@@ -526,6 +728,11 @@ export class ReworkController {
           status: finalRoundStatus,
           assessment: result.assessment,
           touchedFiles: touchedFiles.length > 0 ? touchedFiles : undefined,
+          // Execution metadata: who ran this round, on which model, and what
+          // it cost. It must survive the lagged compaction.
+          executorAgent: thread.targetAgent,
+          executorModel: result.model || thread.targetModel,
+          tokenUsage: result.tokenUsage,
         },
         finalThreadStatus,
         nativeSessionId,
@@ -536,6 +743,15 @@ export class ReworkController {
       if (updatedThread && this.taskStore.getTask(updatedThread.threadId)) {
         const completedRound = updatedThread.rounds.find((r) => r.round === roundNumber);
         if (completedRound) {
+          // Lagged compaction of the superseded round, before the handoff and
+          // never allowed to block it.
+          if (isSuccess) {
+            compactRoundBestEffort(this.taskStore, {
+              threadId: updatedThread.threadId,
+              currentRoundNumber: roundNumber,
+              currentOutput: result.extractedOutput || result.stdout,
+            });
+          }
           // Hand the task from developer to reviewer.
           roleLock.release(roleLease);
           if (!interruption && isSuccess) {
@@ -569,13 +785,33 @@ export class ReworkController {
   }
 
   /** True when another thread (or another process) is executing a round. */
-  private isGloballyBusy(excludeThreadId: string): boolean {
-    const owner = this.executionGate.getOwner();
+  private isGloballyBusy(excludeThreadId: string, workspacePath?: string): boolean {
+    const policy = concurrencyPolicy();
+    const workspaceKey = policy.enabled ? normalizeWorkspaceKey(workspacePath) : undefined;
+    const owner = this.executionGate.getOwner(workspaceKey);
     if (owner && owner.threadId !== excludeThreadId) return true;
+    if (policy.enabled && this.executionGate.countActive() >= policy.maxConcurrentTasks) {
+      return true;
+    }
 
     return this.taskStore
       .getAllTasks()
-      .some((thread) => thread.threadId !== excludeThreadId && isTaskUnfinished(thread));
+      .some(
+        (thread) =>
+          thread.threadId !== excludeThreadId &&
+          isTaskUnfinished(thread) &&
+          // Concurrency is partitioned by workspace: a task in another workspace
+          // holds a different slot and must not queue this rework round.
+          (!policy.enabled || normalizeWorkspaceKey(thread.workspacePath) === workspaceKey),
+      );
+  }
+
+  /** The live lease owner relevant to this task's slot (workspace-scoped when on). */
+  private workspaceOwner(thread: DelegationThread): ExecutionOwner | undefined {
+    const policy = concurrencyPolicy();
+    return this.executionGate.getOwner(
+      policy.enabled ? normalizeWorkspaceKey(thread.workspacePath) : undefined,
+    );
   }
 
   private markQueued(
@@ -603,4 +839,66 @@ export class ReworkController {
     thread.summary.lastOutputSnippet = message;
     this.taskStore.upsertTask(thread);
   }
+}
+
+/**
+ * Bigram Jaccard similarity on normalized text, used to spot a rework that says
+ * exactly what the previous round already said.
+ *
+ * Digits are folded (`第9轮` vs `第10轮` are the same instruction) and everything
+ * but letters/digits is stripped, so formatting churn does not hide a repeat.
+ */
+export function promptSimilarity(a: string, b: string): number {
+  const normalize = (value: string): string =>
+    (value || '')
+      .toLowerCase()
+      .replace(/\d+/g, '#')
+      .replace(/[^\p{L}\p{N}#]+/gu, '');
+  const left = normalize(a);
+  const right = normalize(b);
+  if (!left || !right) return 0;
+  if (left === right) return 1;
+
+  const grams = (text: string): Set<string> => {
+    const set = new Set<string>();
+    for (let i = 0; i < text.length - 1; i++) set.add(text.slice(i, i + 2));
+    return set;
+  };
+  const a2 = grams(left);
+  const b2 = grams(right);
+  if (a2.size === 0 || b2.size === 0) return 0;
+
+  let shared = 0;
+  for (const gram of a2) if (b2.has(gram)) shared++;
+  return shared / (a2.size + b2.size - shared);
+}
+
+/** Similarity above which two rework prompts count as "the same instruction". */
+export const NOOP_REWORK_SIMILARITY = 0.85;
+
+/**
+ * Refuse a rework that cannot change anything.
+ *
+ * A reviewer that is waiting on a sibling task ("BLOCKED, dependency not
+ * delivered") used to answer with a rework round whose text repeated the last
+ * one; the developer then returned "no changes" and the cycle repeated every
+ * couple of minutes, each cycle burning an execution slot and a ledger round.
+ * Such a wait must be expressed with `blockReview` (or `approve_task`) instead.
+ */
+export function assertNotNoopRework(thread: DelegationThread, feedback: string): void {
+  const previous = (thread.rounds || [])[thread.rounds.length - 1];
+  if (!previous || previous.type !== 'rework') return;
+  // Legacy ledgers never recorded touchedFiles: absence is not evidence of a no-op.
+  if (!Array.isArray(previous.touchedFiles) || previous.touchedFiles.length > 0) return;
+
+  const similarity = promptSimilarity(feedback || '', previous.prompt || '');
+  if (similarity < NOOP_REWORK_SIMILARITY) return;
+
+  throw new Error(
+    `REWORK_NOOP_LOOP: 上一轮（Round ${previous.round}）没有任何文件改动，本次返修指令与它 ` +
+      `${(similarity * 100).toFixed(0)}% 相同，不可能产生新交付。请二选一：` +
+      `本任务范围已通过就调用 approve_task；` +
+      `被同批其他任务阻塞就调用 request_rework(threadId="${thread.threadId}", feedback="...", blocked=true, waitingForThreadId="<依赖的 threadId>") 挂起——` +
+      `桥接会在依赖完成时自动唤醒，不占轮次、不烧 token。`,
+  );
 }

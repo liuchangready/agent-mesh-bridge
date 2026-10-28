@@ -6,6 +6,10 @@ import * as path from 'path';
 import {
   AutonomousRunner,
   DEFAULT_SILENCE_TIMEOUT_MS,
+  clearStaleClaudeSessionLocks,
+  detectRateLimitSignal,
+  detectStructuredRateLimitSignal,
+  parseInUseSessionId,
 } from '../bridge/autonomous-runner';
 import { AgentDetector } from '../bridge/agent-detector';
 import { CancellationRegistry } from '../bridge/cancellation-registry';
@@ -18,6 +22,264 @@ describe('AutonomousRunner Tests', () => {
 
   test('should use a 10-minute silence watchdog by default', () => {
     assert.strictEqual(DEFAULT_SILENCE_TIMEOUT_MS, 600_000);
+  });
+
+  test('detects provider rate-limit signals in structured output and stderr text', () => {
+    // Claude Code stream-json retry event — the exact shape that kept a round
+    // burning quota for minutes.
+    assert.ok(
+      detectRateLimitSignal(
+        '{"type":"system","subtype":"api_retry","attempt":9,"error_status":429,"error":"rate_limit"}',
+      ),
+    );
+    assert.ok(detectRateLimitSignal('HTTP 429 Too Many Requests'));
+    assert.ok(detectRateLimitSignal('{"status":429,"message":"slow down"}'));
+    assert.ok(detectRateLimitSignal('rate_limit_error: quota temporarily exhausted'));
+    // Ordinary failures and code that merely mentions the words must not trip it.
+    assert.strictEqual(detectRateLimitSignal('Process exited with code 1'), undefined);
+    assert.strictEqual(detectRateLimitSignal('{"status":500,"error":"boom"}'), undefined);
+    assert.strictEqual(detectRateLimitSignal(''), undefined);
+  });
+
+  test('ignores rate-limit words quoted from source, tool output and final answers', () => {
+    // Regression: a delegated round that implements rate limiting prints its own
+    // "RATE_LIMITED" error code. Scanning raw stdout treated that as a provider
+    // refusal and killed the round before it could commit anything.
+    const transcript = [
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"EnqueueError(ServerBusy, \\"connection\\", \\"RATE_LIMITED\\")"}]}}',
+      '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"retryAfterMs: 250, code RATE_LIMITED, HTTP 429 too many requests"}]}}',
+      '{"type":"result","subtype":"success","is_error":false,"result":"fixed the RATE_LIMITED path"}',
+      '{"type":"system","subtype":"thinking_tokens","estimated_tokens":42}',
+      '{"type":"status","phase":"step_end","usage":{"inputTokens":1}}',
+      '{"type":"tool_use","name":"Read","input":{"file_path":"TableSessionHandler.cs"}}',
+    ];
+    for (const line of transcript) {
+      assert.strictEqual(
+        detectStructuredRateLimitSignal(line),
+        undefined,
+        `transcript line must not abort the run: ${line}`,
+      );
+    }
+    // Partial JSON (streamed in pieces) is never guessed at.
+    assert.strictEqual(detectStructuredRateLimitSignal('{"type":"error","message":"429 Too'), undefined);
+  });
+
+  test('still detects structured provider errors', () => {
+    assert.ok(
+      detectStructuredRateLimitSignal(
+        '{"type":"system","subtype":"api_retry","attempt":3,"error_status":429,"error":"rate_limit"}',
+      ),
+    );
+    assert.ok(detectStructuredRateLimitSignal('{"type":"error","message":"429 Too Many Requests"}'));
+    assert.ok(
+      detectStructuredRateLimitSignal('{"type":"result","is_error":true,"result":"API Error: 429 rate_limit"}'),
+    );
+    // A 429 status is structured evidence even without an error type.
+    assert.ok(detectStructuredRateLimitSignal('{"status":429,"message":"slow down"}'));
+    assert.strictEqual(detectStructuredRateLimitSignal('{"status":500,"error":"boom"}'), undefined);
+  });
+
+  test('a transcript quoting RATE_LIMITED does not abort the run', async () => {
+    const runner = new AutonomousRunner(detector);
+    const transcript = [
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"reading TableSessionHandler.cs"}]}}',
+      '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"EnqueueError(ProtocolErrorCode.ServerBusy, \\"connection\\", \\"RATE_LIMITED\\", retryable: true, retryAfterMs: 250);"}]}}',
+      '{"type":"result","subtype":"success","is_error":false,"result":"implemented the RATE_LIMITED branch"}',
+    ]
+      .map((line) => `console.log(${JSON.stringify(line)});`)
+      .join('');
+    runner.buildCommand = () => ({
+      command: process.execPath,
+      args: ['-e', `${transcript}process.exit(0)`],
+      useShell: false,
+    });
+
+    const started = Date.now();
+    const result = await runner.executeOnce({
+      agent: 'claude_code',
+      prompt: 'x',
+      isRework: false,
+      receiverSessionId: 'sess-2',
+      timeoutMs: 60_000,
+      silenceTimeoutMs: 60_000,
+    });
+    const elapsed = Date.now() - started;
+
+    assert.ok(elapsed < 15_000, `should not be killed as a rate limit, took ${elapsed}ms`);
+    assert.strictEqual(result.exitCode, 0);
+    assert.notStrictEqual(
+      result.assessment?.errorCode,
+      'RATE_LIMITED',
+      'the transcript must not be mistaken for a provider refusal',
+    );
+  });
+
+  test('clears only dead-owner Claude session records', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-claude-reg-'));
+    const dir = path.join(home, '.claude', 'sessions');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, '999999.json'),
+      JSON.stringify({ pid: 999999, sessionId: 'dead-session' }),
+    );
+    fs.writeFileSync(
+      path.join(dir, `${process.pid}.json`),
+      JSON.stringify({ pid: process.pid, sessionId: 'live-session' }),
+    );
+
+    const removed = clearStaleClaudeSessionLocks({}, home);
+    assert.strictEqual(removed.length, 1);
+    assert.strictEqual(removed[0].sessionId, 'dead-session');
+    assert.strictEqual(fs.existsSync(path.join(dir, '999999.json')), false);
+    assert.strictEqual(
+      fs.existsSync(path.join(dir, `${process.pid}.json`)),
+      true,
+      'a live process keeps its lock',
+    );
+
+    // A live record must never be deleted even when it is selected by session id.
+    assert.strictEqual(clearStaleClaudeSessionLocks({ sessionId: 'live-session' }, home).length, 0);
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  test('parses the session id out of the in-use error', () => {
+    assert.strictEqual(
+      parseInUseSessionId(
+        'Error: Session ID e327178b-f398-4c25-a7c3-9f5c8f60e0e0 is already in use.',
+      ),
+      'e327178b-f398-4c25-a7c3-9f5c8f60e0e0',
+    );
+    assert.strictEqual(parseInUseSessionId('some other failure'), undefined);
+  });
+
+  test('a fresh start that hits an existing session resumes it instead of failing', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const runner = new AutonomousRunner(detector);
+    runner.homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-claude-resume-'));
+    let spawns = 0;
+    const isReworkCalls: boolean[] = [];
+    runner.buildCommand = (opts) => {
+      spawns += 1;
+      isReworkCalls.push(Boolean(opts.isRework));
+      if (spawns === 1) {
+        return {
+          command: process.execPath,
+          args: [
+            '-e',
+            `console.error('Error: Session ID ${sessionId} is already in use.');process.exit(1)`,
+          ],
+          useShell: false,
+        };
+      }
+      return {
+        command: process.execPath,
+        args: [
+          '-e',
+          "console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,result:'resumed ok'}))",
+        ],
+        useShell: false,
+      };
+    };
+
+    const result = await runner.execute({
+      agent: 'claude_code',
+      prompt: 'x',
+      isRework: false,
+      receiverSessionId: sessionId,
+      timeoutMs: 60_000,
+      silenceTimeoutMs: 60_000,
+      retryBackoffMs: 10,
+    });
+
+    assert.deepStrictEqual(
+      isReworkCalls,
+      [false, true],
+      'the replay must resume the existing session instead of reserving it again',
+    );
+    assert.strictEqual(result.exitCode, 0);
+  });
+
+  test('clears a stale Claude session lock and retries instead of failing in one second', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-claude-lock-'));
+    const sessions = path.join(home, '.claude', 'sessions');
+    fs.mkdirSync(sessions, { recursive: true });
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const lockFile = path.join(sessions, '999999.json');
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: 999999, sessionId }));
+
+    const runner = new AutonomousRunner(detector);
+    runner.homeDir = home;
+    let spawns = 0;
+    runner.buildCommand = () => {
+      spawns += 1;
+      if (spawns === 1) {
+        return {
+          command: process.execPath,
+          args: [
+            '-e',
+            `console.error('Error: Session ID ${sessionId} is already in use.');process.exit(1)`,
+          ],
+          useShell: false,
+        };
+      }
+      return {
+        command: process.execPath,
+        args: [
+          '-e',
+          "console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,result:'resumed ok',usage:{input_tokens:1,output_tokens:1}}))",
+        ],
+        useShell: false,
+      };
+    };
+
+    const result = await runner.execute({
+      agent: 'claude_code',
+      prompt: 'x',
+      isRework: true,
+      receiverSessionId: sessionId,
+      timeoutMs: 60_000,
+      silenceTimeoutMs: 60_000,
+      retryBackoffMs: 10,
+    });
+
+    assert.strictEqual(spawns, 2, 'the runner must replay the session after clearing the lock');
+    assert.strictEqual(result.exitCode, 0);
+    assert.strictEqual(fs.existsSync(lockFile), false, 'the stale record is gone');
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  test('aborts immediately on a provider 429 instead of waiting out CLI retries', async () => {
+    const runner = new AutonomousRunner(detector);
+    runner.buildCommand = () => ({
+      command: process.execPath,
+      args: [
+        '-e',
+        "console.log(JSON.stringify({type:'system',subtype:'api_retry',attempt:1,max_retries:10,error_status:429,error:'rate_limit'}));setInterval(()=>{},1000)",
+      ],
+      useShell: false,
+    });
+
+    const started = Date.now();
+    const result = await runner.executeOnce({
+      agent: 'antigravity',
+      prompt: 'x',
+      isRework: false,
+      receiverSessionId: 'sess-1',
+      timeoutMs: 60_000,
+      // A silent run would only be killed after 10 minutes; the 429 must win.
+      silenceTimeoutMs: 60_000,
+    });
+    const elapsed = Date.now() - started;
+
+    assert.ok(elapsed < 15_000, `should abort fast, took ${elapsed}ms`);
+    assert.strictEqual(result.assessment?.errorCode, 'RATE_LIMITED');
+    assert.strictEqual(result.assessment?.success, false);
+    assert.match(result.error || '', /rate limit/i);
+    assert.strictEqual(
+      runner.isRetryableFailure(result),
+      false,
+      'a rate limit must not be replayed immediately',
+    );
   });
 
   test('should generate compliant skip-danger command for Codex initial run', () => {
@@ -71,37 +333,49 @@ describe('AutonomousRunner Tests', () => {
 
   test('should generate compliant skip-danger command for Claude Code initial run', () => {
     const sessionId = 'claude-session-123';
+    const prompt = 'Refactor logger interface\n\nThis second line must survive too';
     const cmdInfo = runner.buildCommand({
       agent: 'claude_code',
-      prompt: 'Refactor logger interface',
+      prompt,
       isRework: false,
       receiverSessionId: sessionId,
       title: 'Logger Task',
     });
 
     assert.ok(cmdInfo.args.includes('-p'));
-    assert.ok(cmdInfo.args.includes('Refactor logger interface'));
+    // The prompt travels on stdin: a multi-line argv element is truncated by
+    // cmd.exe on Windows (the npm shim is a .cmd), so the agent would silently
+    // lose everything after the first line.
+    assert.strictEqual(cmdInfo.stdinPayload, prompt);
+    assert.ok(!cmdInfo.args.includes(prompt), cmdInfo.args.join(' '));
     assert.ok(cmdInfo.args.includes('--session-id'));
     assert.ok(cmdInfo.args.includes(sessionId));
+    assert.ok(cmdInfo.args.includes('-n'));
+    assert.ok(cmdInfo.args.includes('Logger Task'));
     assert.ok(cmdInfo.args.includes('--dangerously-skip-permissions'));
     assert.ok(cmdInfo.args.includes('--output-format'));
-    assert.ok(cmdInfo.args.includes('json'));
+    assert.ok(cmdInfo.args.includes('stream-json'));
+    assert.ok(cmdInfo.args.includes('--verbose'));
   });
 
   test('should generate compliant rework resume command for Claude Code reusing exact session ID', () => {
     const sessionId = 'claude-resume-target-777';
+    const prompt = 'Update documentation and types\n- keep the same session';
     const cmdInfo = runner.buildCommand({
       agent: 'claude_code',
-      prompt: 'Update documentation and types',
+      prompt,
       isRework: true,
       receiverSessionId: sessionId,
     });
 
     assert.ok(cmdInfo.args.includes('-p'));
-    assert.ok(cmdInfo.args.includes('Update documentation and types'));
+    assert.strictEqual(cmdInfo.stdinPayload, prompt);
+    assert.ok(!cmdInfo.args.includes(prompt), cmdInfo.args.join(' '));
     assert.ok(cmdInfo.args.includes('--resume'));
     assert.ok(cmdInfo.args.includes(sessionId));
+    assert.ok(!cmdInfo.args.includes('--session-id'));
     assert.ok(cmdInfo.args.includes('--dangerously-skip-permissions'));
+    assert.ok(cmdInfo.args.includes('stream-json'));
   });
 
   test('should generate compliant skip-danger command for Antigravity initial and rework', () => {
@@ -199,9 +473,60 @@ describe('AutonomousRunner Tests', () => {
       lastOutputAtMs: 200_000,
       maxGapMs: 199_990,
       gapThresholdMs: 180_000,
+      streamGapPolicy: 'fail',
     });
     assert.strictEqual(stalled.success, false);
     assert.strictEqual(stalled.errorCode, 'STREAM_STALLED');
+    assert.match(stalled.reason || '', /longest output gap 199990ms/);
+
+    // Default policy: exit 0 + a real answer means the round keeps its work and
+    // the long gap becomes a warning instead of a failure.
+    const warned = runner.evaluateResponse({
+      exitCode: 0,
+      stdout: 'PONG',
+      stderr: '',
+      chunkCount: 2,
+      stdoutBytes: 4,
+      stderrBytes: 0,
+      firstOutputAtMs: 10,
+      lastOutputAtMs: 4_990_859,
+      maxGapMs: 4_990_859,
+      gapThresholdMs: 600_000,
+    });
+    assert.strictEqual(warned.success, true);
+    assert.strictEqual(warned.errorCode, 'OK');
+    assert.strictEqual(warned.stream.continuous, false);
+    assert.strictEqual(warned.stream.gapExceeded, true);
+    assert.strictEqual(warned.warnings?.length, 1);
+    assert.strictEqual(warned.warnings?.[0].code, 'STREAM_GAP_EXCEEDED');
+    assert.match(warned.warnings?.[0].message || '', /4990859ms/);
+
+    // Host sleep is not agent silence: an 83-minute wall-clock gap whose whole
+    // duration is a suspension window leaves an effective gap of ~0.
+    const slept = runner.evaluateResponse({
+      exitCode: 0,
+      stdout: 'PONG',
+      stderr: '',
+      chunkCount: 2,
+      stdoutBytes: 4,
+      stderrBytes: 0,
+      firstOutputAtMs: 10,
+      lastOutputAtMs: 4_990_859,
+      maxGapMs: 0,
+      rawMaxGapMs: 4_990_859,
+      excludedSuspensionMs: 4_990_859,
+      suspensionCount: 1,
+      gapThresholdMs: 600_000,
+    });
+    assert.strictEqual(slept.success, true);
+    assert.strictEqual(slept.errorCode, 'OK');
+    assert.strictEqual(slept.stream.continuous, true);
+    assert.strictEqual(slept.stream.gapExceeded, false);
+    assert.strictEqual(slept.stream.maxGapMs, 0);
+    assert.strictEqual(slept.stream.rawMaxGapMs, 4_990_859);
+    assert.strictEqual(slept.stream.excludedSuspensionMs, 4_990_859);
+    assert.strictEqual(slept.stream.suspensionCount, 1);
+    assert.strictEqual(slept.warnings, undefined);
 
     const nonzero = runner.evaluateResponse({
       exitCode: 1,
@@ -218,8 +543,9 @@ describe('AutonomousRunner Tests', () => {
     assert.strictEqual(nonzero.success, false);
     assert.strictEqual(nonzero.errorCode, 'NONZERO_EXIT');
 
-    // Claude's `--output-format json` emits one final object after a long run.
-    // A single substantive chunk is still a valid response for non-streaming CLIs.
+    // Legacy non-streaming CLIs emit one final object after a long run; a
+    // single substantive chunk is still a valid response when streaming is
+    // explicitly not expected. Claude Code no longer takes this path.
     const singleFinal = runner.evaluateResponse({
       exitCode: 0,
       stdout: '{"type":"result","result":"DONE"}',
@@ -249,6 +575,46 @@ describe('AutonomousRunner Tests', () => {
 
     const output = runner.extractCleanOutput(streamSample);
     assert.strictEqual(output, 'Done with refactor');
+  });
+
+  test('Claude Code stream-json keeps the silence watchdog fed and yields the final answer', () => {
+    const claudeStream = [
+      '{"type":"system","subtype":"init","session_id":"sess-1","tools":[]}',
+      '{"type":"system","subtype":"thinking_tokens","estimated_tokens":7}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"plan"}]}}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"PONG"}]}}',
+      '{"type":"result","subtype":"success","is_error":false,"result":"PONG","usage":{"input_tokens":15,"output_tokens":3}}',
+    ].join('\n');
+
+    assert.strictEqual(runner.extractAnswerOnly(claudeStream), 'PONG');
+
+    const ok = runner.evaluateResponse({
+      exitCode: 0,
+      stdout: claudeStream,
+      stderr: '',
+      chunkCount: 5,
+      stdoutBytes: claudeStream.length,
+      stderrBytes: 0,
+      firstOutputAtMs: 900,
+      lastOutputAtMs: 58_000,
+      maxGapMs: 12_000,
+      gapThresholdMs: DEFAULT_SILENCE_TIMEOUT_MS,
+    });
+    assert.strictEqual(ok.success, true);
+    assert.strictEqual(ok.errorCode, 'OK');
+    assert.strictEqual(ok.stream.chunkCount, 5);
+    assert.strictEqual(ok.stream.hasActualOutput, true);
+  });
+
+  test('Claude Code stream killed before the result event still yields assistant text', () => {
+    const killed = [
+      '{"type":"system","subtype":"init","session_id":"sess-1"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"partial answer"}]}}',
+    ].join('\n');
+
+    // No result event (watchdog kill): the assistant text is the only real
+    // output, and the status/metadata events must never be mistaken for it.
+    assert.strictEqual(runner.extractAnswerOnly(killed), 'partial answer');
   });
 
   test('cancelThread kills the child and reports a paused interruption', async () => {
@@ -455,6 +821,30 @@ describe('AutonomousRunner Tests', () => {
         fs.rmSync(tempDir, { recursive: true, force: true });
       } catch {}
     }
+  });
+
+  test('execute records wall-clock and suspension-adjusted gap metrics separately', async () => {
+    const gapRunner = new AutonomousRunner(detector);
+    gapRunner.buildCommand = () => ({
+      command: process.execPath,
+      args: ['-e', 'process.stdout.write("done\\n")'],
+      useShell: false,
+    });
+
+    const result = await gapRunner.executeOnce({
+      agent: 'antigravity',
+      prompt: 'x',
+      isRework: false,
+      receiverSessionId: 'session-gap-metrics',
+    });
+
+    assert.strictEqual(result.assessment?.success, true);
+    const stream = result.assessment!.stream;
+    assert.strictEqual(typeof stream.rawMaxGapMs, 'number');
+    assert.ok((stream.rawMaxGapMs ?? 0) >= stream.maxGapMs);
+    assert.strictEqual(stream.excludedSuspensionMs, 0);
+    assert.strictEqual(stream.suspensionCount, 0);
+    assert.strictEqual(stream.gapExceeded, false);
   });
 
   test('execute resumes the native session opened by the failed attempt instead of starting a new one', async () => {

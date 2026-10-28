@@ -2,7 +2,7 @@
   "name": "agent-mesh-bridge",
   "displayName": "Agent Mesh Bridge",
   "description": "Peer-to-Peer Multi-Agent Bridge connecting Google Antigravity, OpenAI Codex, Anthropic Claude Code, and DeepSeek Harness in VSCode",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "agent-mesh",
   "author": "Antigravity Team",
   "license": "MIT",
@@ -109,14 +109,19 @@
         "icon": "$(debug-pause)"
       },
       {
+        "command": "agent-mesh-bridge.retargetTask",
+        "title": "Change Executor (Agent + Model) / 切换执行者",
+        "icon": "$(arrow-swap)"
+      },
+      {
         "command": "agent-mesh-bridge.deleteTask",
         "title": "Delete Task / 删除任务",
         "icon": "$(trash)"
       },
       {
         "command": "agent-mesh-bridge.wakeUpCaller",
-        "title": "Wake Up Initiator / 唤醒下发者检视",
-        "icon": "$(bell)"
+        "title": "Re-Review Initiator (after wake failure) / 唤醒失败后重新检视",
+        "icon": "$(refresh)"
       },
       {
         "command": "agent-mesh-bridge.syncMcpConfig",
@@ -203,13 +208,18 @@
           "group": "1_actions"
         },
         {
+          "command": "agent-mesh-bridge.retargetTask",
+          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "group": "1_actions"
+        },
+        {
           "command": "agent-mesh-bridge.deleteTask",
           "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.wakeUpCaller",
-          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "when": "viewItem == waiting_review_stalled && (view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks)",
           "group": "1_actions"
         }
       ]
@@ -249,15 +259,48 @@
           "default": "",
           "markdownDescription": "Default model for bridge-launched DeepSeek Harness runs. DSH has no `--model` flag, so each run receives a generated profile overlay; this requires a configured provider route (`#agentMeshBridge.deepseekHarness.provider#`). Leave empty to keep the route's own model."
         },
+        "agentMeshBridge.requireModelApproval": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Require an explicit user confirmation (a click in VS Code) before a delegated task runs on a model other than the agent's configured default. With this on, a caller may only switch models when it declares the user asked for that model (`modelRequestedByUser: true`), and the switch still needs your click; a guessed model is ignored and the configured default is used. Turn off only if you want callers to switch models without asking."
+        },
         "agentMeshBridge.maxTasks": {
           "type": "number",
           "default": 1000,
           "description": "Maximum number of tasks stored in the persistent delegation ledger."
         },
+        "agentMeshBridge.contextCompaction": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Condense the previous round's bulky output once a later round has completed (lagged compaction). The current round always stays verbatim for review; the exact original is archived under `~/.agent-mesh-bridge/logs/` and remains readable with `get_round_raw_log`. Turn this off to keep every round verbatim in the ledger."
+        },
+        "agentMeshBridge.concurrency.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Allow more than one delegated task round to run at the same time, one per workspace, up to `#agentMeshBridge.concurrency.maxConcurrentTasks#` mesh-wide. **OFF by default**: the mesh stays strictly single-flight (one round at a time). Even when ON, two tasks in the SAME workspace never overlap, and the file-scope gate, the single-task role lock and pause/delete cancellation are unchanged."
+        },
+        "agentMeshBridge.concurrency.maxConcurrentTasks": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "description": "Mesh-wide execution slots used when concurrency is enabled (each slot executes one task in one workspace). Ignored while concurrency is off."
+        },
+        "agentMeshBridge.concurrency.maxConcurrentPerAgent": {
+          "type": "number",
+          "default": 1,
+          "minimum": 1,
+          "description": "How many task rounds a single agent may execute at the same time when concurrency is enabled. Ignored while concurrency is off."
+        },
         "agentMeshBridge.taskTimeoutMinutes": {
           "type": "number",
           "default": 120,
           "description": "Maximum execution timeout in minutes for a single task round before terminating (default: 120 mins / 2 hours)."
+        },
+        "agentMeshBridge.reviewStallTimeoutMinutes": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "markdownDescription": "How long a task may stay in `waiting_review` with **no live reviewer process** before the bridge treats the review as stalled: it records the failure (so the task shows \"检视卡住\" and exposes **Re-Review**) and schedules an automatic re-wake. Raise this if your reviewer's test runs routinely take longer than 10 minutes."
         },
         "agentMeshBridge.antigravityPath": {
           "type": "string",

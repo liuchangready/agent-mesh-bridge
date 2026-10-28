@@ -119,18 +119,27 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
         durationMs: 20,
       };
     };
+    // The user confirmed the switch, so the non-default model is applied.
+    dispatcher.setModelApprovalHandler(async (request) => ({
+      id: request.id,
+      status: 'approved',
+      at: new Date().toISOString(),
+      by: 'user',
+    }));
 
     const res = await dispatcher.dispatchTask({
       targetAgent: 'codex',
       title: 'Pin a specific model',
       prompt: 'Implement the parser',
       model: '  gpt-6-sol  ',
+      modelRequestedByUser: true,
       initiatorModel: 'gpt-6.1-sol',
     });
     await waitForStatus(res.threadId, 'waiting_review');
 
     const stored = taskStore.getTask(res.threadId)!;
     assert.strictEqual(stored.targetModel, 'gpt-6-sol');
+    assert.strictEqual(stored.modelApproval?.status, 'approved');
     // Both ends of the routing are persisted, so the ledger can show them.
     assert.strictEqual(stored.initiatorModel, 'gpt-6.1-sol');
     assert.strictEqual(stored.initiatorModelSource, 'explicit');
@@ -138,6 +147,62 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.strictEqual(received.length, 1);
     assert.strictEqual(received[0].model, 'gpt-6-sol');
     assert.strictEqual(received[0].agent, 'codex');
+  });
+
+  test('ignores a non-default model the caller did not declare as a user request', async () => {
+    const received: any[] = [];
+    runner.execute = async (options: any) => {
+      received.push(options);
+      await new Promise((r) => setTimeout(r, 20));
+      return {
+        exitCode: 0,
+        stdout: 'Mock execution finished successfully',
+        stderr: '',
+        extractedOutput: 'Mock execution finished successfully',
+        durationMs: 20,
+      };
+    };
+    dispatcher.setModelApprovalHandler(async () => {
+      throw new Error('a guessed model must never reach the user');
+    });
+
+    const res = await dispatcher.dispatchTask({
+      targetAgent: 'codex',
+      title: 'Do not guess a model',
+      prompt: 'Implement the parser',
+      model: 'gpt-6-luna',
+    });
+    await waitForStatus(res.threadId, 'waiting_review');
+
+    const stored = taskStore.getTask(res.threadId)!;
+    // No configured default in this isolated home, so nothing is pinned.
+    assert.strictEqual(stored.targetModel, undefined);
+    assert.match(String(stored.modelNotice || ''), /ignored/);
+    assert.match(res.message, /ignored/);
+    assert.strictEqual(received[0].model, undefined);
+  });
+
+  test('a declined model switch aborts the dispatch before anything is queued', async () => {
+    dispatcher.setModelApprovalHandler(async (request) => ({
+      id: request.id,
+      status: 'cancelled',
+      at: new Date().toISOString(),
+      by: 'user',
+    }));
+
+    await assert.rejects(
+      () =>
+        dispatcher.dispatchTask({
+          targetAgent: 'codex',
+          title: 'Declined switch',
+          prompt: 'Implement the parser',
+          model: 'gpt-6-luna',
+          modelRequestedByUser: true,
+        }),
+      (err: any) => err?.code === 'MODEL_APPROVAL_DENIED',
+    );
+
+    assert.strictEqual(taskStore.count(), 0);
   });
 
   test('should treat exit 0 with no actual output as a failed response', async () => {
@@ -215,6 +280,50 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       thread.rounds[1].prompt,
       'Code verifier check is missing SHA256 hashing. Please fix.',
     );
+  });
+
+  test('request_rework can move the task to another agent on a fresh session', async () => {
+    const received: any[] = [];
+    runner.execute = async (options: any) => {
+      received.push(options);
+      await new Promise((r) => setTimeout(r, 20));
+      return {
+        exitCode: 0,
+        stdout: 'Mock execution finished successfully',
+        stderr: '',
+        extractedOutput: 'Mock execution finished successfully',
+        durationMs: 20,
+      };
+    };
+
+    const dispatchRes = await dispatcher.dispatchTask({
+      targetAgent: 'claude_code',
+      title: 'Cross-agent rework',
+      prompt: 'Implement the flow',
+    });
+    const originalSessionId = dispatchRes.receiverSessionId;
+    await waitForStatus(dispatchRes.threadId, 'waiting_review');
+
+    const reworkRes = await reworkController.requestRework({
+      threadId: dispatchRes.threadId,
+      feedback: 'Also cover the cancel path.',
+      targetAgent: 'codex',
+    });
+
+    assert.strictEqual(reworkRes.status, 'REWORK_DISPATCHED');
+    assert.strictEqual(reworkRes.targetAgent, 'codex');
+    // A different agent cannot resume the previous CLI session.
+    assert.notStrictEqual(reworkRes.receiverSessionId, originalSessionId);
+    assert.ok(reworkRes.retarget, 'the switch must be recorded on the rework result');
+
+    await waitForStatus(dispatchRes.threadId, 'waiting_review');
+
+    const thread = taskStore.getTask(dispatchRes.threadId)!;
+    assert.strictEqual(thread.targetAgent, 'codex');
+    assert.strictEqual(thread.retargets?.length, 1);
+    const switchedRun = received.find((options) => options.agent === 'codex');
+    assert.ok(switchedRun, 'the rework round must execute on the new agent');
+    assert.strictEqual(switchedRun.isRework, false);
   });
 
   test('should approve task and mark it completed', async () => {

@@ -18,6 +18,8 @@ import { ReworkController } from '../bridge/rework-controller';
 import { MCPServer } from '../bridge/mcp-server';
 import { ExecutionGate } from '../bridge/execution-gate';
 import { TaskRoleLock } from '../bridge/task-role-lock';
+import { roundOutputArchivePath } from '../bridge/round-log';
+import { DelegationRound } from '../bridge/types';
 
 describe('MCPServer Protocol Tests', () => {
   let tempDir: string;
@@ -89,7 +91,7 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(res.result.capabilities.tools);
   });
 
-  test('should handle tools/list and return all 15 specified tools', async () => {
+  test('should handle tools/list and return all 18 specified tools', async () => {
     const listReq = {
       jsonrpc: '2.0',
       id: 2,
@@ -109,6 +111,7 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(toolNames.includes('pause_task'));
     assert.ok(toolNames.includes('resume_task'));
     assert.ok(toolNames.includes('retry_task'));
+    assert.ok(toolNames.includes('retarget_task'));
     assert.ok(toolNames.includes('allow_scope_overlap'));
     assert.ok(toolNames.includes('delete_task'));
     assert.ok(toolNames.includes('record_merge_request'));
@@ -117,8 +120,246 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(toolNames.includes('invoke_agent'));
     assert.ok(toolNames.includes('query_agent_mesh_status'));
     assert.ok(toolNames.includes('get_recent_logs'));
+    assert.ok(toolNames.includes('get_round_raw_log'));
+    assert.ok(toolNames.includes('get_task_token_usage'));
     assert.ok(toolNames.includes('list_agent_models'));
-    assert.strictEqual(toolNames.length, 15);
+    assert.strictEqual(toolNames.length, 18);
+  });
+
+  test('tells the caller to stop and wait, and starves repeated polls', async () => {
+    const call = async (name: string, args: any) =>
+      mcpServer.handleRpcMessage({
+        jsonrpc: '2.0',
+        id: 60,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      });
+    const payload = (res: any) => JSON.parse(res.result.content[0].text);
+
+    const dispatched = payload(
+      await call('dispatch_task', {
+        targetAgent: 'codex',
+        title: 'Stop polling',
+        prompt: 'do the work',
+        allowNoScope: true,
+      }),
+    );
+    // The dispatch reply itself must carry the directive, before anything else.
+    assert.strictEqual(dispatched.nextAction, 'END_TURN_AND_WAIT_FOR_CALLBACK');
+    assert.match(dispatched.message, /^nextAction=END_TURN_AND_WAIT_FOR_CALLBACK/);
+    assert.match(dispatched.stopInstruction, /End your turn immediately/);
+
+    await waitForStatus(dispatched.threadId, 'waiting_review');
+
+    const first = payload(await call('get_thread_details', { threadId: dispatched.threadId }));
+    assert.strictEqual(first.repeatPoll, undefined);
+    assert.ok(first.rounds, 'the first read is a real payload');
+
+    const second = payload(await call('get_thread_details', { threadId: dispatched.threadId }));
+    assert.strictEqual(second.repeatPoll, true);
+    assert.strictEqual(second.nextAction, 'END_TURN_AND_WAIT_FOR_CALLBACK');
+    assert.match(second.stopInstruction, /STOP POLLING/);
+    assert.strictEqual(second.rounds, undefined, 'a repeated poll is starved of details');
+
+    // Log watching is the same loop wearing a different hat: the first read is
+    // still served (one inspection = details + logs), the second is starved.
+    assert.strictEqual(
+      payload(await call('get_recent_logs', { threadId: dispatched.threadId })).repeatPoll,
+      undefined,
+    );
+    assert.strictEqual(
+      payload(await call('get_recent_logs', { threadId: dispatched.threadId })).repeatPoll,
+      true,
+    );
+
+    // Real progress unblocks the full payload: the callback/resume path works.
+    const stored = taskStore.getTask(dispatched.threadId)!;
+    stored.currentRound = 2;
+    taskStore.upsertTask(stored);
+    const afterProgress = payload(await call('get_thread_details', { threadId: dispatched.threadId }));
+    assert.strictEqual(afterProgress.repeatPoll, undefined);
+    assert.strictEqual(afterProgress.threadId, dispatched.threadId);
+  });
+
+  test('get_thread_details condenses older rounds and get_round_raw_log pages the archive', async () => {
+    const call = async (name: string, args: any) =>
+      mcpServer.handleRpcMessage({
+        jsonrpc: '2.0',
+        id: 61,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      });
+    const payload = (res: any) => JSON.parse(res.result.content[0].text);
+
+    const threadId = 'thread_capsule_projection';
+    const longOutput = 'A'.repeat(9_000);
+    const now = new Date().toISOString();
+    const round = (
+      roundNumber: number,
+      type: 'initial' | 'rework',
+      output: string,
+    ): DelegationRound => ({
+      round: roundNumber,
+      type,
+      prompt: `prompt ${roundNumber}`,
+      output,
+      durationMs: 1,
+      status: 'completed',
+      timestamp: now,
+    });
+
+    taskStore.upsertTask({
+      threadId,
+      title: 'capsule projection',
+      initiatorAgent: 'codex',
+      targetAgent: 'claude_code',
+      status: 'waiting_review',
+      currentRound: 3,
+      createdAt: now,
+      updatedAt: now,
+      receiverSessionId: 'session-abcdef12',
+      workspacePath: tempDir,
+      summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 3 },
+      rounds: [
+        round(1, 'initial', longOutput),
+        round(2, 'rework', longOutput),
+        round(3, 'rework', 'latest output'),
+      ],
+    });
+
+    // Default view: latest verbatim, older oversized rounds excerpted, no logs.
+    const details = payload(await call('get_thread_details', { threadId }));
+    assert.strictEqual(details.rounds[2].output, 'latest output');
+    assert.strictEqual(details.rounds[0].outputTruncated, true);
+    assert.ok(details.rounds[0].output.length < longOutput.length);
+    assert.match(details.rounds[0].recallHint, /get_round_raw_log/);
+    assert.strictEqual(details.recentLogs, undefined, 'log dump is opt-in');
+    assert.ok(details.fullHistoryHint);
+
+    // Opting in still returns the unbounded history.
+    const full = payload(await call('get_thread_details', { threadId, includeRawLogs: true }));
+    assert.strictEqual(full.rounds[0].output.length, longOutput.length);
+    assert.ok(typeof full.recentLogs === 'string');
+
+    // Paged raw log: the archive is served in bounded windows.
+    const archive = roundOutputArchivePath(threadId, 1, tempDir);
+    fs.mkdirSync(path.dirname(archive), { recursive: true });
+    fs.writeFileSync(archive, longOutput, 'utf8');
+
+    const first = payload(
+      await call('get_round_raw_log', { threadId, round: 1, maxBytes: 100 }),
+    );
+    assert.strictEqual(first.available, true);
+    assert.strictEqual(first.content.length, 100);
+    assert.strictEqual(first.truncated, true);
+    assert.strictEqual(first.totalBytes, 9_000);
+
+    const second = payload(
+      await call('get_round_raw_log', {
+        threadId,
+        round: 1,
+        offsetBytes: first.nextOffset,
+        maxBytes: 100,
+      }),
+    );
+    assert.strictEqual(second.startOffset, 100);
+    assert.strictEqual(second.content.length, 100);
+
+    // `maxBytes` is clamped, never trusted as-is.
+    const clamped = payload(
+      await call('get_round_raw_log', { threadId, round: 1, maxBytes: 10_000_000 }),
+    );
+    assert.ok(clamped.content.length <= 200_000);
+  });
+
+  test('get_task_token_usage reports task rollup and single-round detail', async () => {
+    const call = async (name: string, args: any) =>
+      mcpServer.handleRpcMessage({
+        jsonrpc: '2.0',
+        id: 62,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      });
+    const payload = (res: any) => JSON.parse(res.result.content[0].text);
+
+    const threadId = 'thread_token_usage';
+    const now = new Date().toISOString();
+    const usage = (
+      total: number,
+      prompt: number,
+      output: number,
+    ): import('../bridge/types').TokenUsageMetrics => ({
+      uncachedInputTokens: prompt - 10,
+      cacheReadTokens: 10,
+      cacheWriteTokens: 0,
+      promptTokens: prompt,
+      outputTokens: output,
+      totalTokens: total,
+      agent: 'codex',
+      model: 'gpt-6-sol',
+      source: 'native_reported',
+      available: true,
+      attempts: 1,
+      collectedAt: now,
+    });
+
+    taskStore.upsertTask({
+      threadId,
+      title: 'token usage',
+      initiatorAgent: 'claude_code',
+      targetAgent: 'codex',
+      status: 'waiting_review',
+      currentRound: 2,
+      createdAt: now,
+      updatedAt: now,
+      receiverSessionId: 'session-token-01',
+      workspacePath: tempDir,
+      summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 2 },
+      rounds: [
+        {
+          round: 1,
+          type: 'initial',
+          prompt: 'p1',
+          output: 'o1',
+          durationMs: 1,
+          status: 'completed',
+          timestamp: now,
+          executorAgent: 'codex',
+          executorModel: 'gpt-6-sol',
+          tokenUsage: usage(1_200, 1_000, 200),
+        },
+        {
+          round: 2,
+          type: 'rework',
+          prompt: 'p2',
+          output: 'o2',
+          durationMs: 1,
+          status: 'completed',
+          timestamp: now,
+          executorAgent: 'codex',
+          executorModel: 'gpt-6-sol',
+          tokenUsage: usage(800, 600, 200),
+        },
+      ],
+    });
+
+    const whole = payload(await call('get_task_token_usage', { threadId }));
+    assert.strictEqual(whole.tokenUsage.totalTokens, 2_000);
+    assert.strictEqual(whole.tokenUsage.totalPromptTokens, 1_600);
+    assert.strictEqual(whole.tokenUsage.totalOutputTokens, 400);
+    assert.strictEqual(whole.tokenUsage.measuredRounds, 2);
+    assert.strictEqual(whole.tokenUsage.byAgent.codex, 2_000);
+    assert.strictEqual(whole.rounds.length, 2);
+    assert.strictEqual(whole.rounds[0].tokenUsage.totalTokens, 1_200);
+
+    const single = payload(await call('get_task_token_usage', { threadId, round: 1 }));
+    assert.strictEqual(single.round, 1);
+    assert.strictEqual(single.tokenUsage.totalTokens, 1_200);
+    assert.strictEqual(single.taskTotal.totalTokens, 2_000);
+
+    // The details payload also carries the derived rollup.
+    const details = payload(await call('get_thread_details', { threadId }));
+    assert.strictEqual(details.tokenUsage.totalTokens, 2_000);
   });
 
   test('should execute dispatch_task, get_thread_details, request_rework, and approve_task via tools/call', async () => {
@@ -347,6 +588,18 @@ describe('MCPServer Protocol Tests', () => {
         },
       });
       assert.match(deleteRes.error.message, /receiver/i);
+
+      // Nor move its own task to another agent/model.
+      const retargetRes = await mcpServer.handleRpcMessage({
+        jsonrpc: '2.0',
+        id: 36,
+        method: 'tools/call',
+        params: {
+          name: 'retarget_task',
+          arguments: { threadId: 'thread_receiver_1', targetAgent: 'codex' },
+        },
+      });
+      assert.match(retargetRes.error.message, /receiver/i);
 
       const mrRes = await mcpServer.handleRpcMessage({
         jsonrpc: '2.0',

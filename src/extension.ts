@@ -6,6 +6,7 @@ import { AgentDetector } from './bridge/agent-detector';
 import { ActiveAgentResolver } from './bridge/active-agent-resolver';
 import { AutonomousRunner } from './bridge/autonomous-runner';
 import { CallbackManager } from './bridge/callback-manager';
+import { ReviewWakeScheduler } from './bridge/review-wake-scheduler';
 import { AsyncDispatcher } from './bridge/async-dispatcher';
 import { ReworkController } from './bridge/rework-controller';
 import { ConfigSyncService } from './config/config-sync';
@@ -13,9 +14,13 @@ import { StatusBarController } from './ui/status-bar';
 import { TaskTreeProvider, TaskTreeItem } from './ui/task-tree-provider';
 import { AgentNodesProvider, AgentNodeItem } from './ui/agent-nodes-provider';
 import { TaskDetailPanel } from './ui/detail-panel';
+import { ModelApprovalService } from './ui/model-approval-service';
+import { TaskRetargetService } from './bridge/task-retarget';
+import { TaskRoleLock } from './bridge/task-role-lock';
 import { AgentId } from './bridge/types';
 import { TaskSupervisor } from './bridge/task-supervisor';
 import { TaskControlService } from './bridge/task-control';
+import { saveBridgePolicy } from './bridge/bridge-policy';
 import {
   DSH_PROVIDER_ENV_HINT,
   DSH_PROVIDER_ID_HINT,
@@ -162,15 +167,99 @@ export function activate(context: vscode.ExtensionContext) {
 
   const applyModelSettings = (): ModelDefaults => {
     const defaults = readModelSettings();
-    saveModelDefaults(defaults);
+    // The approval policy travels with the same snapshot, because the agents'
+    // MCP processes decide in their own process whether a model switch needs the
+    // user's click.
+    const requireModelApproval = vscode.workspace
+      .getConfiguration('agentMeshBridge')
+      .get<boolean>('requireModelApproval', true);
+    saveModelDefaults(defaults, undefined, { requireModelApproval });
     invalidateConfiguredModelCache();
     return defaults;
   };
 
   applyModelSettings();
+
+  /**
+   * Mirror the bridge-wide policy switches next to the ledger.
+   *
+   * `dispatch_task` and `request_rework` run inside the agents' MCP processes,
+   * which cannot read VS Code settings, so the switches must travel as a file.
+   */
+  const applyBridgePolicy = (): void => {
+    const bridgeCfg = vscode.workspace.getConfiguration('agentMeshBridge');
+    saveBridgePolicy({
+      contextCompaction: bridgeCfg.get<boolean>('contextCompaction', true),
+      concurrency: {
+        enabled: bridgeCfg.get<boolean>('concurrency.enabled', false),
+        maxConcurrentTasks: bridgeCfg.get<number>('concurrency.maxConcurrentTasks', 2),
+        maxConcurrentPerAgent: bridgeCfg.get<number>('concurrency.maxConcurrentPerAgent', 1),
+      },
+    });
+  };
+  applyBridgePolicy();
+
+  // Non-default receiver models are confirmed by the user through a modal
+  // dialog; this service answers the requests that agent MCP processes publish
+  // under ~/.agent-mesh-bridge/model-approvals/.
+  const modelApprovalService = new ModelApprovalService();
+  modelApprovalService.start();
+  context.subscriptions.push(modelApprovalService);
   const timeoutMinutes = config.get<number>('taskTimeoutMinutes', 120);
   const runner = new AutonomousRunner(detector, timeoutMinutes * 60 * 1000, undefined, taskStore);
   const callbackManager = new CallbackManager(detector);
+  // A deferred wake must re-read the thread when it is replayed.
+  callbackManager.setTaskStore(taskStore);
+
+  // A reviewer wake can die before it reviews anything (429 / exhausted quota).
+  // The thread then stays `waiting_review` and blocks its workspace queue, so the
+  // scheduling plan lives in the ledger (`thread.reviewWake`) and this scheduler
+  // re-wakes the SAME caller session once the provider's quota is back.
+  //
+  // The same scheduler also runs the stall watchdog: a review whose process died
+  // without an exit event (host crash) or exited cleanly without acting would
+  // otherwise never expose a failure.
+  const reviewStallMinutes = vscode.workspace
+    .getConfiguration('agentMeshBridge')
+    .get<number>('reviewStallTimeoutMinutes', 10);
+  const reviewWakeScheduler = new ReviewWakeScheduler(taskStore, callbackManager, {
+    stallTimeoutMs: Math.max(1, reviewStallMinutes) * 60_000,
+  });
+  reviewWakeScheduler.start();
+  context.subscriptions.push({ dispose: () => reviewWakeScheduler.dispose() });
+  // A restart kills whatever reviewer was mid-flight: the wake was launched by
+  // the previous host, so no exit event will ever arrive and no stall would be
+  // recorded until the next full timeout. One pass on activation surfaces those
+  // tasks immediately (it only flags reviews that are already past the stall
+  // threshold and have no live reviewer, so healthy ones are untouched).
+  void reviewWakeScheduler.runWatchdog();
+  reviewWakeScheduler.on('retryLaunched', ({ thread, round }) => {
+    vscode.window.showInformationMessage(
+      `🔁 [Agent Bridge] 已重新唤醒 ${thread.initiatorAgent} 检视任务【${thread.title}】(Round ${round.round})。`,
+    );
+  });
+  reviewWakeScheduler.on('reviewStalled', ({ threads }: { threads: any[] }) => {
+    if (!Array.isArray(threads) || threads.length === 0) return;
+    const names = threads
+      .slice(0, 5)
+      .map((t) => `【${t.title}】`)
+      .join('、');
+    const more = threads.length > 5 ? ` 等 ${threads.length} 个任务` : '';
+    vscode.window
+      .showWarningMessage(
+        `⚠️ [Agent Bridge] 检视卡住：${names}${more} 长时间处于等待检视且没有活跃的检视进程，已记录为检视失败并安排自动重新检视。`,
+        '查看首个任务 (Details)',
+      )
+      .then((choice) => {
+        if (choice !== '查看首个任务 (Details)') return;
+        TaskDetailPanel.render(
+          context.extensionUri,
+          taskStore,
+          reworkController,
+          threads[0].threadId,
+        );
+      });
+  });
   const _dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector);
   const reworkController = new ReworkController(taskStore, runner, callbackManager, detector);
   const taskControl = new TaskControlService(taskStore, runner);
@@ -239,6 +328,10 @@ export function activate(context: vscode.ExtensionContext) {
     statusBar.update();
     agentNodesProvider.refresh(false);
 
+    // Another process (an agent's MCP server) may have recorded a stalled
+    // review; re-arm the automatic retry so it is not left to a restart.
+    reviewWakeScheduler.reschedule();
+
     const taskList = Array.isArray(allTasks) ? allTasks : taskStore.getAllTasks();
     for (const t of taskList) {
       if (t.status === 'completed' && !knownCompletedThreadIds.has(t.threadId)) {
@@ -258,6 +351,33 @@ export function activate(context: vscode.ExtensionContext) {
           });
       }
     }
+
+    // A review parked with `blocked: true` is waiting on a sibling task, not on
+    // a timer: wake it the moment that dependency reaches a terminal state.
+    // Doing it here (instead of letting the reviewer poll with empty rework
+    // rounds) is what keeps a blocked batch from burning a slot every 15s.
+    const byThreadId = new Map<string, (typeof taskList)[number]>();
+    for (const t of taskList) byThreadId.set(t.threadId, t);
+    for (const t of taskList) {
+      const blocked = t.reviewBlocked;
+      if (!blocked?.waitingForThreadId) continue;
+      if (t.status !== 'waiting_review') continue;
+      const dependency = byThreadId.get(blocked.waitingForThreadId);
+      if (!dependency) continue;
+      if (dependency.status !== 'completed' && dependency.status !== 'failed') continue;
+
+      const reviewRound = [...(t.rounds || [])]
+        .reverse()
+        .find((r) => r.status === 'completed');
+      if (!reviewRound) continue;
+
+      const released = { ...t, reviewBlocked: undefined };
+      released.updatedAt = new Date().toISOString();
+      released.summary.lastOutputSnippet =
+        `Dependency ${blocked.waitingForThreadId} ${dependency.status}; review resumed.`;
+      taskStore.upsertTask(released);
+      void callbackManager.notifyCaller(released, reviewRound);
+    }
   });
 
   // 5. Notify in VSCode when tasks complete a round
@@ -268,8 +388,9 @@ export function activate(context: vscode.ExtensionContext) {
 
     const actions = ['查看详情 (View Details)'];
     if (isSuccess) {
+      // No manual re-review here: the reviewer was just woken and the review is
+      // in flight. The "re-review" action only exists once a wake has failed.
       actions.push('验收通过 (Approve)');
-      actions.push('唤醒下发者 (Wake Up Caller)');
     } else {
       actions.push('恢复继续 (Resume)');
     }
@@ -279,8 +400,6 @@ export function activate(context: vscode.ExtensionContext) {
         TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, thread.threadId);
       } else if (choice === '验收通过 (Approve)') {
         vscode.commands.executeCommand('agent-mesh-bridge.approveTask', { thread });
-      } else if (choice === '唤醒下发者 (Wake Up Caller)') {
-        vscode.commands.executeCommand('agent-mesh-bridge.wakeUpCaller', thread.threadId);
       } else if (choice === '恢复继续 (Resume)') {
         vscode.commands.executeCommand('agent-mesh-bridge.resumeTask', thread.threadId);
       }
@@ -290,24 +409,55 @@ export function activate(context: vscode.ExtensionContext) {
     agentNodesProvider.refresh(false);
   });
 
-  callbackManager.on('callbackFailed', async ({ thread, round, error }) => {
-    vscode.window
-      .showWarningMessage(
-        `⚠️ [Agent Bridge] 自动唤醒下发者 ${thread.initiatorAgent} 失败: ${error}。`,
-        '手动唤醒 (Wake Up)',
-        '查看日志 (View Log)',
-      )
-      .then((choice) => {
-        if (choice === '手动唤醒 (Wake Up)') {
-          vscode.commands.executeCommand('agent-mesh-bridge.wakeUpCaller', thread.threadId);
-        } else if (choice === '查看日志 (View Log)') {
-          const logPath = path.join(os.homedir(), '.agent-mesh-bridge', 'callbacks.log');
-          vscode.workspace
-            .openTextDocument(logPath)
-            .then((doc) => vscode.window.showTextDocument(doc));
-        }
-      });
-  });
+  callbackManager.on(
+    'callbackFailed',
+    async ({
+      thread,
+      error,
+      quotaExhausted,
+      quotaResetsAtFormatted,
+      autoRetryAt,
+      gaveUp,
+    }: {
+      thread: any;
+      error: string;
+      quotaExhausted?: boolean;
+      quotaResetsAtFormatted?: string;
+      autoRetryAt?: string;
+      gaveUp?: boolean;
+    }) => {
+      reviewWakeScheduler.reschedule();
+      const quotaLine = quotaExhausted
+        ? `\n原因：${thread.initiatorAgent} 配额/限流不足${
+            quotaResetsAtFormatted ? `（预计 ${quotaResetsAtFormatted} 恢复）` : ''
+          }。`
+        : '';
+      const retryLine = gaveUp
+        ? '\n自动重试已停止，请手动重新检视或直接验收/返修。'
+        : autoRetryAt
+          ? `\n已在 ${new Date(autoRetryAt).toLocaleTimeString()} 安排自动重新检视。`
+          : '';
+      vscode.window
+        .showWarningMessage(
+          `⚠️ [Agent Bridge] 检视唤醒失败：${error}。${quotaLine}${retryLine}`,
+          '重新检视 (Re-review)',
+          '查看日志 (View Log)',
+          '打开详情 (Details)',
+        )
+        .then((choice) => {
+          if (choice === '重新检视 (Re-review)') {
+            vscode.commands.executeCommand('agent-mesh-bridge.wakeUpCaller', thread.threadId);
+          } else if (choice === '查看日志 (View Log)') {
+            const logPath = path.join(os.homedir(), '.agent-mesh-bridge', 'callbacks.log');
+            vscode.workspace
+              .openTextDocument(logPath)
+              .then((doc) => vscode.window.showTextDocument(doc));
+          } else if (choice === '打开详情 (Details)') {
+            TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, thread.threadId);
+          }
+        });
+    },
+  );
 
   // 6. Register Commands
   context.subscriptions.push(
@@ -495,7 +645,9 @@ export function activate(context: vscode.ExtensionContext) {
         const thread = taskStore.getTask(threadId);
         const title = thread ? thread.title : threadId;
         const confirm = await vscode.window.showWarningMessage(
-          `确定要永久删除任务【${title}】吗？如果它正在运行，会先终止 Agent 进程；删除后不可恢复。`,
+          `确定要永久删除任务【${title}】吗？如果它正在运行，会先终止 Agent 进程；` +
+            `该任务对应的接收方原生对话（Claude Code / Codex / Antigravity / DeepSeek Harness）` +
+            `也会一并清理（找不到对话不算错误）。删除后不可恢复。`,
           { modal: true },
           '删除',
           '取消',
@@ -568,6 +720,146 @@ export function activate(context: vscode.ExtensionContext) {
           vscode.window.showInformationMessage(`Rework requested for ${threadId} in same session.`);
         } catch (e: any) {
           vscode.window.showErrorMessage(e.message);
+        }
+      },
+    ),
+
+    vscode.commands.registerCommand(
+      'agent-mesh-bridge.retargetTask',
+      async (itemOrThreadId?: TaskTreeItem | string) => {
+        let threadId =
+          typeof itemOrThreadId === 'string' ? itemOrThreadId : itemOrThreadId?.thread?.threadId;
+
+        if (!threadId) {
+          const input = await vscode.window.showInputBox({
+            prompt: '输入要切换执行者的 Thread ID:',
+          });
+          if (!input) return;
+          threadId = input.trim();
+        }
+
+        taskStore.loadFromDisk();
+        const thread = taskStore.getTask(threadId);
+        if (!thread) {
+          vscode.window.showErrorMessage(`未找到任务: ${threadId}`);
+          return;
+        }
+
+        // 1) Which agent should run it from now on.
+        const agentItems = (['antigravity', 'codex', 'claude_code', 'deepseek_harness'] as AgentId[]).map(
+          (agent) => ({
+            label: `${AGENT_LABELS[agent]}${agent === thread.targetAgent ? '（当前）' : ''}`,
+            description: agent,
+            agent,
+          }),
+        );
+        const agentPick = await vscode.window.showQuickPick(agentItems, {
+          placeHolder: `当前执行者：${AGENT_LABELS[thread.targetAgent]} · 选择新的接收 Agent`,
+          matchOnDescription: true,
+        });
+        if (!agentPick) return;
+        const targetAgent = agentPick.agent;
+        const agentChanged = targetAgent !== thread.targetAgent;
+
+        // 2) Which model of that agent (its configured default shown first).
+        let catalog;
+        try {
+          catalog = await vscode.window.withProgress(
+            {
+              location: vscode.ProgressLocation.Notification,
+              title: `Agent Bridge: 正在探测 ${AGENT_LABELS[targetAgent]} 可用模型...`,
+            },
+            () => modelCatalog.get(targetAgent, true),
+          );
+        } catch {
+          catalog = { models: [] as { id: string; hint?: string }[] };
+        }
+        const defaultModel = resolveConfiguredModel(targetAgent);
+
+        const modelItems: Array<{
+          label: string;
+          description?: string;
+          action: 'keep' | 'default' | 'model' | 'manual';
+          model?: string;
+        }> = [];
+        if (!agentChanged && thread.targetModel) {
+          modelItems.push({
+            label: `保持当前模型 ${thread.targetModel}`,
+            description: 'keep',
+            action: 'keep',
+          });
+        }
+        if (defaultModel) {
+          modelItems.push({
+            label: `${defaultModel}`,
+            description: '该 Agent 的配置默认',
+            action: 'default',
+            model: defaultModel,
+          });
+        }
+        for (const option of catalog.models) {
+          if (option.id === defaultModel) continue;
+          modelItems.push({ label: option.id, description: option.hint, action: 'model', model: option.id });
+        }
+        modelItems.push({ label: '$(edit) 手动输入模型 ID...', action: 'manual' });
+
+        const modelPick = await vscode.window.showQuickPick(modelItems, {
+          placeHolder: `为 ${AGENT_LABELS[targetAgent]} 选择模型（当前任务：${
+            thread.targetModel || 'Agent 默认'
+          }）`,
+          matchOnDescription: true,
+        });
+        if (!modelPick) return;
+
+        let model: string | undefined;
+        if (modelPick.action === 'keep') {
+          model = undefined;
+        } else if (modelPick.action === 'manual') {
+          const input = await vscode.window.showInputBox({
+            prompt: `输入 ${AGENT_LABELS[targetAgent]} 要使用的模型 ID`,
+            value: thread.targetModel || '',
+            placeHolder: '例如 gpt-6.1-sol / sonnet / deepseek/deepseek-v4.1-flash',
+          });
+          if (input === undefined) return;
+          model = normalizeModelId(input);
+          if (!model) {
+            vscode.window.showWarningMessage('模型 ID 不能为空。');
+            return;
+          }
+        } else if (modelPick.action === 'default') {
+          // Explicitly asking for the configured default: no model pin.
+          model = undefined;
+        } else {
+          model = modelPick.model;
+        }
+
+        // The user is picking here, so this click IS the model-switch consent:
+        // answer the approval gate inline instead of asking again.
+        const retargetService = new TaskRetargetService(taskStore);
+        retargetService.setModelApprovalHandler(async (request) => ({
+          id: request.id,
+          status: 'approved',
+          at: new Date().toISOString(),
+          by: 'user',
+          note: 'Confirmed from the VS Code task action',
+        }));
+
+        try {
+          const result = await retargetService.retargetTask({
+            threadId,
+            targetAgent,
+            model,
+            modelRequestedByUser: true,
+            reason: 'Switched from the VS Code executor picker',
+            by: 'user',
+          });
+          vscode.window.showInformationMessage(result.message);
+          activeTreeProvider.refresh();
+          recentTreeProvider.refresh();
+          statusBar.update();
+          TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`切换执行者失败: ${e.message}`);
         }
       },
     ),
@@ -647,7 +939,7 @@ export function activate(context: vscode.ExtensionContext) {
           if (choice.action === 'retry') {
             await reworkController.retryFailedRound(threadId);
             vscode.window.showInformationMessage(
-              `正在重新执行任务 ${threadId} 第 ${lastRound.round} 轮...`,
+              `正在重新执行任务 ${threadId} 第 ${lastRound.round} 轮..`,
             );
             TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
             return;
@@ -695,7 +987,7 @@ export function activate(context: vscode.ExtensionContext) {
         try {
           const retried = await reworkController.retryFailedRound(threadId);
           vscode.window.showInformationMessage(
-            `正在重新执行任务 ${threadId} 第 ${retried.round} 轮...`,
+            `正在重新执行任务 ${threadId} 第 ${retried.round} 轮..`,
           );
           TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
         } catch (e: any) {
@@ -722,6 +1014,29 @@ export function activate(context: vscode.ExtensionContext) {
         const thread = taskStore.getTask(threadId);
         if (!thread) {
           vscode.window.showErrorMessage(`未找到任务: ${threadId}`);
+          return;
+        }
+
+        // Re-review is allowed whenever nobody is actually reviewing. A second
+        // wake during a live review would fight it for the same native session,
+        // but a crashed host (or a role lock whose owner already exited) is
+        // exactly when the user must be able to recover. Requiring a recorded
+        // `reviewWake` first made that impossible: a lost wake could only be
+        // fixed by editing the ledger by hand.
+        if (thread.status !== 'waiting_review') {
+          vscode.window.showWarningMessage(
+            `任务【${thread.title}】当前状态为 ${thread.status}；只有处于“等待检视”的任务才能重新检视。`,
+          );
+          return;
+        }
+        const roleLock = new TaskRoleLock();
+        const liveReviewer = roleLock.getOwner(threadId);
+        if (liveReviewer?.role === 'reviewer') {
+          vscode.window.showInformationMessage(
+            `下发者 ${thread.initiatorAgent} 的检视仍在进行中（${roleLock.describe(
+              liveReviewer,
+            )}），无需重新唤醒。`,
+          );
           return;
         }
 
@@ -752,8 +1067,29 @@ export function activate(context: vscode.ExtensionContext) {
 
         const success = await callbackManager.notifyCaller(thread, lastRound);
         if (success) {
+          // Manual re-review accepted. Keep the stall visible until the caller's
+          // process ends cleanly, but do not let the scheduler fire a duplicate
+          // wake while this one is still running. A plan recorded for an OLDER
+          // round must not leak into this one.
+          const state = thread.reviewWake;
+          if (state && state.round !== (thread.currentRound || 1)) {
+            thread.reviewWake = undefined;
+            thread.updatedAt = new Date().toISOString();
+            taskStore.upsertTask(thread);
+          } else if (state) {
+            thread.reviewWake = {
+              ...state,
+              lastAttemptAt: new Date().toISOString(),
+              autoRetryAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+            };
+            taskStore.upsertTask(thread);
+          }
+          reviewWakeScheduler.reschedule();
+          activeTreeProvider.refresh();
+          recentTreeProvider.refresh();
+          TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
           vscode.window.showInformationMessage(
-            `已成功向下发者 ${thread.initiatorAgent} (会话: ${thread.callerSessionId}) 触发检视回调通知！`,
+            `已重新触发下发者 ${thread.initiatorAgent} 的检视回调 (会话: ${thread.callerSessionId})！`,
           );
         } else {
           vscode.window.showWarningMessage(
@@ -870,7 +1206,7 @@ export function activate(context: vscode.ExtensionContext) {
 
           if (targetAgent === 'deepseek_harness' && model && !readDshConfiguredProvider()) {
             vscode.window.showWarningMessage(
-              'DeepSeek Harness 需先配置 provider 路由（agentMeshBridge.deepseekHarness.provider / baseUrl / apiKey）才能按任务切换模型。',
+              'DeepSeek Harness 需先配置 provider 路由（agentMeshBridge.deepseekHarness.provider / baseUrl / apiKey）才能按任务切换模型',
             );
           }
 
@@ -988,8 +1324,25 @@ export function activate(context: vscode.ExtensionContext) {
   // writes the setting, which lands here; hand-edited settings land here too.
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (!e.affectsConfiguration('agentMeshBridge.models')) return;
+      if (
+        !e.affectsConfiguration('agentMeshBridge.models') &&
+        !e.affectsConfiguration('agentMeshBridge.requireModelApproval') &&
+        !e.affectsConfiguration('agentMeshBridge.contextCompaction') &&
+        !e.affectsConfiguration('agentMeshBridge.concurrency') &&
+        !e.affectsConfiguration('agentMeshBridge.reviewStallTimeoutMinutes')
+      ) {
+        return;
+      }
       applyModelSettings();
+      applyBridgePolicy();
+      reviewWakeScheduler.setStallTimeoutMs(
+        Math.max(
+          1,
+          vscode.workspace
+            .getConfiguration('agentMeshBridge')
+            .get<number>('reviewStallTimeoutMinutes', 10),
+        ) * 60_000,
+      );
       agentNodesProvider.refresh(false);
     }),
   );

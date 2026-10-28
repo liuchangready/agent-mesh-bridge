@@ -1,9 +1,16 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { TaskStore } from '../bridge/task-store';
 import { ReworkController } from '../bridge/rework-controller';
 import { DelegationThread } from '../bridge/types';
 import { TaskSupervisor } from '../bridge/task-supervisor';
 import { AgentDetector } from '../bridge/agent-detector';
+import {
+  resolveExistingArtifactPath,
+  roundExecutionLogPath,
+  roundOutputArchivePath,
+} from '../bridge/round-log';
+import { aggregateThreadTokenUsage, formatTokenCount } from '../bridge/token-usage-collector';
 
 export class TaskDetailPanel {
   public static currentPanel: TaskDetailPanel | undefined;
@@ -78,6 +85,9 @@ export class TaskDetailPanel {
             break;
           case 'openTerminal':
             this.handleOpenTerminal();
+            break;
+          case 'openRoundRawLog':
+            await this.handleOpenRoundRawLog(Number(message.round));
             break;
           case 'printRecentLogs':
             await vscode.commands.executeCommand(
@@ -284,6 +294,35 @@ export class TaskDetailPanel {
     this.panel.webview.html = this.getHtmlForWebview(thread);
   }
 
+  /**
+   * Open the archived pre-compaction output (falling back to the raw stdio log)
+   * for one round. The card in the webview is a summary; this is the whole truth.
+   */
+  private async handleOpenRoundRawLog(roundNumber: number): Promise<void> {
+    const thread = this.taskStore.getTask(this.currentThreadId);
+    const round = thread?.rounds.find((entry) => entry.round === roundNumber);
+    const root = path.dirname(this.taskStore.getStoragePath());
+    const file = resolveExistingArtifactPath([
+      round?.rawOutputFilePath,
+      roundOutputArchivePath(this.currentThreadId, roundNumber, root),
+      roundOutputArchivePath(this.currentThreadId, roundNumber),
+      roundExecutionLogPath(this.currentThreadId, roundNumber, root),
+      roundExecutionLogPath(this.currentThreadId, roundNumber),
+    ]);
+    if (!file) {
+      vscode.window.showWarningMessage(
+        `第 ${roundNumber} 轮没有可用的原始归档或执行日志（可能早于压缩功能）。`,
+      );
+      return;
+    }
+    try {
+      const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
+      await vscode.window.showTextDocument(document, { preview: true });
+    } catch (err) {
+      vscode.window.showErrorMessage(`无法打开原始日志：${String(err)}`);
+    }
+  }
+
   private getHtmlForWebview(thread: DelegationThread): string {
     const escapeHtml = (str: string) => {
       return (str || '')
@@ -311,6 +350,10 @@ export class TaskDetailPanel {
 
     const badgeColor = statusBadgeColors[thread.status] || '#6b7280';
     const recentLogs = TaskSupervisor.getRecentLogs(thread.threadId, 1000, this.taskStore);
+    // Derived on every render: a stored aggregate could be stale after a
+    // cross-process write.
+    const tokenSummary = aggregateThreadTokenUsage(thread.rounds || []);
+    const tokenTilde = tokenSummary.isPartialOrEstimated ? '~' : '';
 
     const roundsHtml = thread.rounds
       .map((r) => {
@@ -318,6 +361,7 @@ export class TaskDetailPanel {
         const isFailed = r.status === 'failed';
         const isPaused = r.status === 'paused';
         const roundBorderColor = isFailed ? '#ef4444' : isPaused ? '#f97316' : '#334155';
+        const capsule = r.isCompacted ? r.compactSummary : undefined;
 
         return `
         <div class="round-card" style="border-left: 4px solid ${roundBorderColor};">
@@ -329,17 +373,39 @@ export class TaskDetailPanel {
                 : ''
             }
             <span class="round-meta">${new Date(r.timestamp).toLocaleTimeString()} · ${durationSec}s · Status: <strong>${r.status}</strong></span>
+            ${
+              r.tokenUsage
+                ? `<span class="round-badge" style="margin-left:6px;background:#1e293b;border:1px solid #334155;color:#cbd5e1;" title="${escapeHtml(
+                    `输入 ${r.tokenUsage.promptTokens} · 输出 ${r.tokenUsage.outputTokens} · 缓存 ${r.tokenUsage.cacheReadTokens} · 来源 ${r.tokenUsage.source}`,
+                  )}">${
+                    r.tokenUsage.available
+                      ? `${r.tokenUsage.source === 'estimated' ? '~' : ''}⚡ ${formatTokenCount(r.tokenUsage.totalTokens)} tok (In ${formatTokenCount(r.tokenUsage.promptTokens)} · Out ${formatTokenCount(r.tokenUsage.outputTokens)})`
+                      : '⚡ Token 未知'
+                  }</span>`
+                : ''
+            }
           </div>
 
           ${
             r.assessment
               ? `
-          <div class="section-title" style="color: ${r.assessment.success ? '#34d399' : '#fca5a5'};">
-            Response Health: ${escapeHtml(r.assessment.errorCode)} · exit=${r.assessment.exitCode}
+          <div class="section-title" style="color: ${r.assessment.success ? ((r.assessment.warnings?.length ?? 0) > 0 ? '#fbbf24' : '#34d399') : '#fca5a5'};">
+            Response Health: ${escapeHtml(r.assessment.errorCode)} · exit=${r.assessment.exitCode}${
+              (r.assessment.warnings?.length ?? 0) > 0 ? ` · ${r.assessment.warnings!.length} warning(s)` : ''
+            }
           </div>
           <pre class="code-block" style="color:${r.assessment.success ? '#a7f3d0' : '#fecaca'}; max-height:120px;">chunks=${r.assessment.stream.chunkCount} (stdout ${r.assessment.stream.stdoutBytes}B / stderr ${r.assessment.stream.stderrBytes}B)
-actualOutput=${r.assessment.stream.hasActualOutput} · continuous=${r.assessment.stream.continuous} · maxGap=${r.assessment.stream.maxGapMs}ms / threshold=${r.assessment.stream.gapThresholdMs}ms
-${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}</pre>`
+actualOutput=${r.assessment.stream.hasActualOutput} · continuous=${r.assessment.stream.continuous} · maxGap=${r.assessment.stream.maxGapMs}ms / threshold=${r.assessment.stream.gapThresholdMs}ms${
+              r.assessment.stream.rawMaxGapMs !== undefined &&
+              r.assessment.stream.rawMaxGapMs > r.assessment.stream.maxGapMs
+                ? `\nrawGap=${r.assessment.stream.rawMaxGapMs}ms · hostSuspensionExcluded=${r.assessment.stream.excludedSuspensionMs ?? 0}ms (${r.assessment.stream.suspensionCount ?? 0} window(s))`
+                : ''
+            }
+${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
+              (r.assessment.warnings ?? [])
+                .map((warning) => `\nwarning(${warning.code}): ${escapeHtml(warning.message)}`)
+                .join('')
+            }</pre>`
               : ''
           }
 
@@ -365,7 +431,24 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}</pre>
 
           ${
             r.output
-              ? `
+              ? capsule
+                ? `
+          <div class="output-section" style="border:1px solid #4c1d95; border-radius:8px; padding:10px; background:rgba(76,29,149,0.12);">
+            <div class="section-title" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              🧠 Agent 上下文提纯胶囊
+              <span class="round-meta">原文 ${capsule.metrics.originalChars.toLocaleString()} 字符 → 摘要 ${capsule.metrics.compactedChars.toLocaleString()} 字符 · 保留 ${(capsule.metrics.compressionRatio * 100).toFixed(1)}% · 来源 ${escapeHtml(capsule.metrics.source)}</span>
+            </div>
+            <pre class="code-block output-text">${escapeHtml(r.output)}</pre>
+            <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
+              <button class="secondary" style="padding:4px 10px;font-size:12px;" onclick="openRoundRawLog(${r.round})">📄 查看原始全文</button>
+              ${
+                capsule.executionLogPath
+                  ? `<span class="round-meta" title="${escapeHtml(capsule.executionLogPath)}">执行日志: ${escapeHtml(capsule.executionLogPath)}</span>`
+                  : ''
+              }
+            </div>
+          </div>`
+                : `
           <div class="output-section">
             <div class="section-title" style="display: flex; align-items: center; gap: 8px;">
               ${r.status === 'running' ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;"></span>` : ''}
@@ -610,6 +693,73 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}</pre>
           <strong>接收 ${escapeHtml(thread.targetAgent)}</strong> [${escapeHtml(thread.targetModel || 'Agent 默认')}]
         </div>
       </div>
+      <div class="meta-item" style="grid-column: 1 / -1;">
+        <div class="meta-label">Callee Token / 被调用方 Token（仅接收方）</div>
+        <div class="meta-val">
+          ${
+            tokenSummary.measuredRounds === 0
+              ? `<span style="color:#94a3b8;">未采集到 Token 数据（历史轮次早于本功能，或 CLI 未上报）</span>`
+              : `🪙 累计 <strong>${tokenTilde}${formatTokenCount(tokenSummary.totalTokens)}</strong>
+                 · 输入 ${formatTokenCount(tokenSummary.totalPromptTokens)}（缓存命中 ${formatTokenCount(tokenSummary.totalCacheReadTokens)}）
+                 · 输出 ${formatTokenCount(tokenSummary.totalOutputTokens)}
+                 · ${tokenSummary.measuredRounds}/${tokenSummary.totalRounds} 轮已计量`
+          }
+          ${
+            tokenSummary.totalCostUsd !== undefined
+              ? ` · API 等价成本 $${tokenSummary.totalCostUsd.toFixed(4)}`
+              : ''
+          }
+          ${
+            tokenSummary.isPartialOrEstimated && tokenSummary.measuredRounds > 0
+              ? `<br/><span style="color:#fbbf24;">含估算或不完整数据（~ 标记）；输入 Token 无法从文本推算，缺失时不作估算。</span>`
+              : ''
+          }
+        </div>
+      </div>
+      ${
+        thread.modelNotice || thread.modelApproval
+          ? `
+      <div class="meta-item" style="grid-column: 1 / -1;">
+        <div class="meta-label">Model Decision / 模型切换裁决</div>
+        <div class="meta-val" style="color: #fde68a;">
+          ${
+            thread.modelApproval
+              ? `用户裁决：<strong>${escapeHtml(thread.modelApproval.status)}</strong>（请求 ${escapeHtml(
+                  thread.modelApproval.requestedModel,
+                )} · 默认 ${escapeHtml(thread.modelApproval.defaultModel || 'Agent 默认')}）<br/>`
+              : ''
+          }
+          ${thread.modelNotice ? escapeHtml(thread.modelNotice) : ''}
+        </div>
+      </div>`
+          : ''
+      }
+      ${
+        thread.retargets && thread.retargets.length > 0
+          ? (() => {
+              const last = thread.retargets[thread.retargets.length - 1];
+              const rows = thread.retargets
+                .map(
+                  (r) =>
+                    `· ${new Date(r.at).toLocaleTimeString()} ${escapeHtml(r.fromAgent)}${
+                      r.fromModel ? `(${escapeHtml(r.fromModel)})` : ''
+                    } ➔ ${escapeHtml(r.toAgent)}${r.toModel ? `(${escapeHtml(r.toModel)})` : ''}` +
+                    `${r.sessionReset ? ' · 已换新原生会话' : ''}${r.reason ? ` · ${escapeHtml(r.reason)}` : ''}`,
+                )
+                .join('<br/>');
+              return `
+      <div class="meta-item" style="grid-column: 1 / -1;">
+        <div class="meta-label">Executor Switch / 执行者切换（共 ${thread.retargets!.length} 次）</div>
+        <div class="meta-val" style="color: #bfdbfe;">
+          ${rows}<br/>
+          <span style="color:#93c5fd;">当前执行者：${escapeHtml(last.toAgent)}${
+            last.toModel ? ` (${escapeHtml(last.toModel)})` : ''
+          }</span>
+        </div>
+      </div>`;
+            })()
+          : ''
+      }
       <div class="meta-item">
         <div class="meta-label">Workspace</div>
         <div class="meta-val">${escapeHtml(thread.workspacePath)}</div>
@@ -702,7 +852,33 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}</pre>
     </div>
   </div>`
       : thread.status === 'waiting_review'
-      ? `
+      ? thread.reviewWake && thread.reviewWake.round === (thread.currentRound || 1)
+        ? `
+  <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
+    <div style="font-size: 28px;">⚠️</div>
+    <div>
+      <div style="font-weight: 700; font-size: 16px; color: #f87171;">${
+        thread.reviewWake.kind === 'timeout'
+          ? `检视卡住 · 第 ${thread.currentRound || 1} 轮等待 ${escapeHtml(thread.initiatorAgent)} 验收 (Reviewer Timeout)`
+          : `检视唤醒失败 · 第 ${thread.currentRound || 1} 轮等待 ${escapeHtml(thread.initiatorAgent)} 验收 (Review Wake Failed)`
+      }</div>
+      <div style="font-size: 13px; opacity: 0.95; margin-top: 6px;"><strong>失败原因：</strong>${escapeHtml(thread.reviewWake.lastError)}${thread.reviewWake.exitCode !== undefined ? `（退出码 ${thread.reviewWake.exitCode}）` : ''}</div>
+      ${
+        thread.reviewWake.quotaExhausted
+          ? `<div style="font-size: 13px; margin-top: 4px; color: #fca5a5;"><strong>配额/限流不足：</strong>${escapeHtml(thread.reviewWake.quotaReason || '429')}${thread.reviewWake.quotaResetsAtFormatted ? ` · 预计 ${escapeHtml(thread.reviewWake.quotaResetsAtFormatted)} 恢复` : ''}</div>`
+          : ''
+      }
+      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">已失败 ${thread.reviewWake.attempts} 次。${
+        thread.reviewWake.gaveUp
+          ? '自动重试已停止，请点击下方“🔁 重新检视下发者（唤醒失败）”手动重试。'
+          : thread.reviewWake.autoRetryAt
+            ? `桥接将在 ${new Date(thread.reviewWake.autoRetryAt).toLocaleString()} 自动重新唤醒（第 ${(thread.reviewWake.autoRetryAttempts || 0) + 1} 次自动尝试）。`
+            : ''
+      }</div>
+      <div style="font-size: 12px; opacity: 0.75; margin-top: 4px;">该任务仍占据其 workspace 的队列队头，后续任务会持续排队，直到重新检视成功、验收或删除。</div>
+    </div>
+  </div>`
+        : `
   <div style="background: rgba(59, 130, 246, 0.15); border: 1px solid #3b82f6; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
     <div style="font-size: 28px;">🔍</div>
     <div>
@@ -743,7 +919,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}</pre>
 
   <div class="action-bar">
     ${(thread.status === 'failed' || thread.rounds.some((r) => r.status === 'failed')) ? `<button class="retry-btn" style="background: #dc2626; color: white;" onclick="retryFailedRound()">🔄 重试失败轮次 (Retry Failed)</button>` : ''}
-    ${thread.status === 'waiting_review' ? `<button class="notify-btn" onclick="wakeUpCaller()">🔔 再次唤醒下发者检视</button>` : ''}
+    ${thread.status === 'waiting_review' && thread.reviewWake && thread.reviewWake.round === (thread.currentRound || 1) ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（唤醒失败）</button>` : ''}
     ${(thread.status === 'running' || thread.status === 'reworking' || thread.status === 'queued') ? `<button style="background:#ea580c;color:white;" onclick="pauseTask()">⏸ 暂停任务 (Pause)</button>` : ''}
     ${thread.status === 'paused' ? `<button class="resume-btn" onclick="resumeTask()">▶ 恢复执行 (Resume)</button>` : ''}
     ${(thread.status === 'failed' || thread.status === 'waiting_review') ? `<button class="resume-btn" onclick="resumeTask()">▶ 下发返修要求 / 重新执行</button>` : ''}
@@ -819,6 +995,10 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}</pre>
 
     function printRecentLogs() {
       vscode.postMessage({ command: 'printRecentLogs' });
+    }
+
+    function openRoundRawLog(round) {
+      vscode.postMessage({ command: 'openRoundRawLog', round: round });
     }
 
     function copyLogs() {

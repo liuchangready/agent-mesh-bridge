@@ -61,23 +61,61 @@ export interface StreamAssessment {
   stderrBytes: number;
   firstOutputAtMs?: number;
   lastOutputAtMs?: number;
-  /** Longest gap between two output chunks (or spawn -> first chunk). */
+  /**
+   * Longest gap between two output chunks (or spawn -> first chunk) that the
+   * agent is actually accountable for: host suspension windows (sleep,
+   * hibernate, Modern Standby, a frozen extension host) are subtracted.
+   */
   maxGapMs: number;
+  /**
+   * Longest wall-clock gap before host-suspension time was excluded. Kept for
+   * diagnostics so the ledger still shows that the clock jumped.
+   */
+  rawMaxGapMs?: number;
+  /** Host-suspension time subtracted from the gap measurements. */
+  excludedSuspensionMs?: number;
+  /** How many host suspension windows were detected during the run. */
+  suspensionCount?: number;
   gapThresholdMs: number;
   /** A non-empty final answer was extracted from stdout. */
   hasActualOutput: boolean;
-  /** Chunks arrived and no gap exceeded the threshold. */
+  /** The (suspension-adjusted) gap stayed within the threshold. */
   continuous: boolean;
+  /** The suspension-adjusted gap exceeded the threshold. */
+  gapExceeded?: boolean;
 }
 
+/** A non-fatal problem worth surfacing to the reviewer. */
+export interface AssessmentWarning {
+  /** Stable machine-readable code, e.g. STREAM_GAP_EXCEEDED. */
+  code: string;
+  message: string;
+}
+
+/**
+ * Severity of a long output gap once the process exited 0 with a real answer.
+ * `warn` keeps the round successful and records an assessment warning;
+ * `fail` restores the strict `STREAM_STALLED` verdict.
+ */
+export type StreamGapPolicy = 'warn' | 'fail';
+
+/**
+ * A gap is only proof of a stall when the round ALSO failed to deliver. If the
+ * process exited 0 and produced an actual final answer, its work must not be
+ * discarded because the host slept through the middle of the stream.
+ */
+export const DEFAULT_STREAM_GAP_POLICY: StreamGapPolicy = 'warn';
+
 export interface ResponseAssessment {
-  /** exitCode === 0 AND actual output existed AND the stream was continuous. */
+  /** exitCode === 0 AND actual output existed AND no unattributable stall. */
   success: boolean;
   /** Stable response status code, e.g. OK / NONZERO_EXIT / EMPTY_OUTPUT / STREAM_STALLED. */
   errorCode: string;
   exitCode: number;
   stream: StreamAssessment;
   reason?: string;
+  /** Non-fatal findings (e.g. a long gap that was downgraded to a warning). */
+  warnings?: AssessmentWarning[];
 }
 
 /**
@@ -121,6 +159,145 @@ export type RoundType = 'initial' | 'rework' | 'approval';
 
 export type RoundStatus = 'running' | 'paused' | 'completed' | 'failed';
 
+/**
+ * How an archived round's hot-storage summary was produced.
+ *
+ * `agent_protocol_envelope`: the receiver itself emitted a `<context_compaction>`
+ * block while finishing a later round (semantic, preferred).
+ * `deterministic_truncation`: the agent did not comply, so the bridge kept a
+ * bounded head/tail excerpt plus a pointer to the full archive (always works).
+ */
+export type CompactionSource = 'agent_protocol_envelope' | 'deterministic_truncation';
+
+/** Bounded summary that replaces a bulky historical round in the hot ledger. */
+export interface CompactedContextSummary {
+  /** 1-2 sentences describing what that round decided. */
+  headline: string;
+  /** Files the round actually changed (git-probe measured, not self-reported). */
+  touchedFiles: string[];
+  /** Problems that a later round already resolved. */
+  resolvedIssues: string[];
+  /** Long-lived constraints later rounds must respect. */
+  longTermConstraints: string[];
+  /** Absolute path of the exact pre-compaction output archive. */
+  rawOutputPath?: string;
+  /** Absolute path of the round's raw stdio execution log, when one exists. */
+  executionLogPath?: string;
+  metrics: {
+    originalChars: number;
+    compactedChars: number;
+    /** compactedChars / originalChars, 0..1 (0 when originalChars is 0). */
+    compressionRatio: number;
+    compactedAt: string;
+    source: CompactionSource;
+  };
+}
+
+/**
+ * Where a round's token numbers came from.
+ *
+ * `native_reported`: parsed from the receiver CLI's own usage payload.
+ * `estimated`: the CLI reported nothing usable, so only the output was guessed.
+ * `unavailable`: nothing at all could be measured (the numbers are 0, which
+ * does NOT mean "free").
+ */
+export type TokenMetricSource = 'native_reported' | 'estimated' | 'unavailable';
+
+/**
+ * Where a cost figure came from.
+ *
+ * Only `native` is trustworthy in v1: it is the CLI's own figure (for Claude
+ * that is an API-equivalent cost, not necessarily what the user paid). There is
+ * no price-table estimation yet, because a stale price table is worse than no
+ * number at all.
+ */
+export type TokenCostSource = 'native' | 'none';
+
+/**
+ * Normalized token accounting for one round.
+ *
+ * The four receivers report usage in incompatible shapes: Codex and Antigravity
+ * report an `input` that ALREADY INCLUDES cache reads, Claude and DSH report an
+ * `input` that EXCLUDES them. A single `input + output` formula therefore
+ * under-counts DSH by ~182x and over-counts Antigravity by ~8%. These fields
+ * remove the ambiguity:
+ *
+ *   promptTokens = uncachedInputTokens + cacheReadTokens + cacheWriteTokens
+ *   totalTokens  = promptTokens + outputTokens
+ *
+ * `reasoningTokens` is a SUBSET of `outputTokens` (the CLIs count thinking
+ * inside the output) and is only ever displayed, never added again.
+ */
+export interface TokenUsageMetrics {
+  /** Prompt tokens that missed the provider's cache. */
+  uncachedInputTokens: number;
+  /** Prompt tokens served from the provider's cache. */
+  cacheReadTokens: number;
+  /** Prompt tokens written into the provider's cache. */
+  cacheWriteTokens: number;
+  /** Full prompt = uncached + cacheRead + cacheWrite. */
+  promptTokens: number;
+  /** Generated tokens (thinking included when the CLI counts it there). */
+  outputTokens: number;
+  /** Reasoning/thinking tokens; a subset of `outputTokens`. */
+  reasoningTokens?: number;
+  /** promptTokens + outputTokens (this bridge's canonical number). */
+  totalTokens: number;
+  /** The CLI's own total, kept only for cross-checking. */
+  nativeTotalTokens?: number;
+  /** The agent that executed this round. */
+  agent: AgentId;
+  /** Effective model (CLI-reported first, otherwise the resolved model). */
+  model?: string;
+  /** Raw model string as reported by the CLI (may be an alias). */
+  reportedModel?: string;
+  /** Model the bridge asked for (`thread.targetModel`). */
+  requestedModel?: string;
+  /** Native cost in USD, when the CLI reports one. */
+  costUsd?: number;
+  costSource?: TokenCostSource;
+  source: TokenMetricSource;
+  /** False when nothing could be measured at all (the zeros are not "free"). */
+  available: boolean;
+  /** True when the numbers are incomplete (interrupted, estimated, missing). */
+  partial?: boolean;
+  /** How many process attempts this metric covers. */
+  attempts?: number;
+  /** Human-readable explanation of what is missing and why. */
+  notes?: string;
+  /** ISO8601 collection timestamp. */
+  collectedAt: string;
+}
+
+/**
+ * Task-level rollup, DERIVED from the rounds on every read.
+ *
+ * It is never persisted: a stored aggregate can be rolled back by a stale
+ * process writing an old copy of the task, which is exactly the failure mode
+ * that once resurrected compacted output.
+ */
+export interface ThreadTokenUsageSummary {
+  totalUncachedInputTokens: number;
+  totalCacheReadTokens: number;
+  totalCacheWriteTokens: number;
+  totalPromptTokens: number;
+  totalOutputTokens: number;
+  totalTokens: number;
+  /** Sum of natively reported costs, when any round had one. */
+  totalCostUsd?: number;
+  costSource?: TokenCostSource;
+  /** totalTokens per executing agent. */
+  byAgent: Partial<Record<AgentId, number>>;
+  /** totalTokens per model. */
+  byModel: Record<string, number>;
+  /** True when any round is estimated, partial or unmeasured. */
+  isPartialOrEstimated: boolean;
+  /** Rounds that actually produced a measurement. */
+  measuredRounds: number;
+  /** Rounds in the thread. */
+  totalRounds: number;
+}
+
 export interface DelegationRound {
   round: number; // Round number: 1, 2, 3...
   type: RoundType;
@@ -150,12 +327,131 @@ export interface DelegationRound {
    * making it look like a duplicate dispatch.
    */
   repeatOfRound?: number;
+  /**
+   * True once a later round archived this round's bulky output.
+   *
+   * The lagged policy is: the current round stays 100% raw for the reviewer,
+   * and only the previous round (whose exploration the current round has
+   * already consumed) is condensed. The exact original text survives in
+   * `rawOutputFilePath`, so compaction never destroys data.
+   */
+  isCompacted?: boolean;
+  /** Structured capsule backing the condensed `output` card. */
+  compactSummary?: CompactedContextSummary;
+  /** Absolute path of the archived pre-compaction output (cold storage). */
+  rawOutputFilePath?: string;
+  /** UTF-8 byte length of the output before compaction, for UI/metrics. */
+  outputBytes?: number;
+  /**
+   * The agent that actually executed this round.
+   *
+   * Recorded independently of the token metrics: after an executor switch the
+   * task only knows its CURRENT agent, so without this the ledger cannot say
+   * which round ran where. `retargets[]` only carries timestamps.
+   */
+  executorAgent?: AgentId;
+  /** The model that actually executed this round. */
+  executorModel?: string;
+  /**
+   * Token accounting for this round.
+   *
+   * Structured execution metadata: like `assessment` and `touchedFiles` it must
+   * survive the lagged context compaction (the compactor may only rewrite
+   * `output`).
+   */
+  tokenUsage?: TokenUsageMetrics;
 }
 
 export interface ThreadSummary {
   lastPromptSnippet: string; // Caller's latest prompt preview (first 100 chars)
   lastOutputSnippet: string; // Receiver's latest output preview (first 150 chars)
   totalDurationMs: number; // Cumulative duration in ms
+}
+
+/**
+ * Metadata for a task that ran in a temporary git worktree.
+ *
+ * `mergePending` means "this task produced work that is not on the main line
+ * yet": it is set once the task completes without a merge request and cleared
+ * when the caller records one. Nothing is auto-merged in this phase.
+ */
+export interface WorktreeInfo {
+  /** Absolute path of the temporary worktree the agent edited. */
+  path: string;
+  /** Absolute path of the main checkout the worktree belongs to. */
+  mainPath: string;
+  /** Branch the worktree was based on / will be merged from. */
+  branch?: string;
+  /** Commit the worktree was created from. */
+  baseCommit?: string;
+  /** True while the worktree's output has no recorded merge request. */
+  mergePending?: boolean;
+}
+
+/**
+ * Caller-supplied worktree declaration on `dispatch_task`.
+ *
+ * `path` is not repeated here: it is exactly the task's `workspacePath`, so the
+ * two can never disagree.
+ */
+export interface DispatchWorktreeSpec {
+  /** Main checkout the temporary worktree must eventually merge back into. */
+  mainPath: string;
+  /** Branch the worktree was created from (recorded for the merge audit). */
+  branch?: string;
+  /** Commit the worktree was created from (recorded for the merge audit). */
+  baseCommit?: string;
+}
+
+/**
+ * A failed attempt to wake the initiator (reviewer) for a finished round.
+ *
+ * The receiver round finishing does not imply the review happened: the wake
+ * spawns the caller's CLI, and that process can die (quota, expired session,
+ * provider outage) before it calls `approve_task` / `request_rework`. Without a
+ * record, the task would sit in `waiting_review` forever with no trace of why.
+ * This is that trace, plus the plan for the automatic retry.
+ */
+export interface ReviewWakeState {
+  /** How the stall was detected. */
+  kind?: 'wake_failed' | 'timeout';
+  /** Round the reviewer still has to inspect. */
+  round: number;
+  /** Failed wake attempts since the last successful one. */
+  attempts: number;
+  lastAttemptAt: string;
+  /** First line of the caller's output, or the spawn error. */
+  lastError: string;
+  /** Process exit code, when there was one. */
+  exitCode?: number;
+  /** The caller's agent (the one whose quota can be exhausted). */
+  agent?: AgentId;
+  /** True when the failure text looked like a 429 / quota signal. */
+  quotaExhausted?: boolean;
+  quotaResetsAt?: string;
+  quotaResetsAtFormatted?: string;
+  quotaReason?: string;
+  /** When the bridge will try again on its own (ISO8601). */
+  autoRetryAt?: string;
+  /** Automatic attempts already spent on this failure. */
+  autoRetryAttempts?: number;
+  /** True once automatic retries stopped; the user must act. */
+  gaveUp?: boolean;
+}
+
+/**
+ * A review parked on a dependency instead of a rework round.
+ *
+ * `waitingForThreadId` is the sibling task whose delivery unblocks this review;
+ * it may be absent when the dependency is external (a human, a remote system),
+ * in which case only an explicit unblock clears it.
+ */
+export interface ReviewBlockInfo {
+  waitingForThreadId?: string;
+  /** Why the review cannot conclude yet (reviewer's own words, bounded). */
+  reason?: string;
+  at: string;
+  by: string;
 }
 
 export interface DelegationThread {
@@ -198,6 +494,21 @@ export interface DelegationThread {
    */
   targetModel?: string;
 
+  /**
+   * Why the caller's requested model was not applied (guessed model ignored, or
+   * the user kept the default). Kept on the task so the decision stays auditable.
+   */
+  modelNotice?: string;
+
+  /** User decision recorded when switching away from the configured default. */
+  modelApproval?: ModelApprovalRecord;
+
+  /**
+   * Executor switches (agent and/or model) applied to this task after dispatch.
+   * Newest last; the detail panel shows the latest one.
+   */
+  retargets?: TaskRetargetRecord[];
+
   /** Latest pause/stop/interruption, if any. Cleared when execution resumes. */
   interruption?: TaskInterruption;
   /** Full interruption history, newest last. */
@@ -211,8 +522,44 @@ export interface DelegationThread {
    */
   failureNotifications?: number[];
 
+  /**
+   * Why the last reviewer wake-up failed, and when the bridge will retry.
+   *
+   * Cleared as soon as a wake ends cleanly (or the task leaves
+   * `waiting_review`), so its presence means "the review is stalled".
+   */
+  reviewWake?: ReviewWakeState;
+
+  /**
+   * Review parked on another task instead of burning rework rounds.
+   *
+   * The reviewer sometimes cannot approve yet — not because THIS task is wrong,
+   * but because a sibling task in the same batch has not been delivered (a
+   * PostgreSQL suite that is still skipped, for example). The bridge only has
+   * `approve_rework`, so that "waiting" used to be expressed as a rework round
+   * with no code change: a full execution slot and a new ledger round every few
+   * minutes, forever, until the sibling landed.
+   *
+   * With this flag the task stays `waiting_review` (so the queue invariants are
+   * unchanged) but the watchdog and the wake path leave it alone; it is woken
+   * again the moment `waitingForThreadId` reaches a terminal state.
+   */
+  reviewBlocked?: ReviewBlockInfo;
+
   /** MR handoff recorded by the caller after the task/batch is accepted. */
   mergeRequest?: MergeRequestInfo;
+
+  /**
+   * Temporary git worktree the task was executed in, when it was not run
+   * directly in `workspacePath`.
+   *
+   * The bridge never creates or removes a worktree in this phase: it only keeps
+   * the metadata and refuses to let the成果 die with the temporary directory.
+   * A completed task whose worktree has no recorded merge request stays
+   * `mergePending`, and `delete_task` refuses it until the caller records the MR
+   * (or explicitly forces the deletion).
+   */
+  worktree?: WorktreeInfo;
 
   // File scope for conflict detection and queueing
   expectedFiles?: string[]; // Concrete code files (directories/globs are rejected at dispatch)
@@ -242,8 +589,18 @@ export interface DispatchTaskParams {
   /**
    * Model the receiver should run this task with. Omitted = the model configured
    * for that agent in the bridge settings.
+   *
+   * A non-default value only takes effect when the caller also declares that the
+   * user named it (`modelRequestedByUser: true`) AND the user confirms the switch
+   * in VS Code. Otherwise the configured default is used.
    */
   model?: string;
+  /**
+   * Caller declares the user themselves specified `model`. Defaults to false, so
+   * a caller guessing a "better" model cannot silently switch away from the
+   * configured default; the bridge then asks the user before switching.
+   */
+  modelRequestedByUser?: boolean;
   /**
    * Model the caller itself is running on, recorded for the task's
    * "sender model -> receiver model" badge. Optional; detected from the
@@ -264,6 +621,13 @@ export interface DispatchTaskParams {
   /** Caller accepts running on top of files another open task already changed. */
   allowScopeOverlap?: boolean;
   /**
+   * Declare that `workspacePath` points at a TEMPORARY git worktree rather than
+   * the main checkout. The bridge then records the merge-back obligation: the
+   * task cannot be deleted until a merge request is recorded (unless forced),
+   * so work that only exists in the throwaway checkout cannot be lost.
+   */
+  worktree?: DispatchWorktreeSpec;
+  /**
    * Reject the dispatch when `expectedFiles` is empty and `allowNoScope` is not
    * set. Enabled by the MCP layer (agent callers must declare a scope); internal
    * callers and tests keep the lenient behaviour.
@@ -273,6 +637,58 @@ export interface DispatchTaskParams {
 
 export type DispatchStatus = 'DISPATCHED' | 'QUEUED';
 
+/** Outcome of a user confirmation for switching a receiver model. */
+export type ModelApprovalStatus = 'approved' | 'use_default' | 'cancelled' | 'timeout';
+
+/** Compact record of a model-switch confirmation, kept for audit and UI. */
+export interface ModelApprovalRecord {
+  id: string;
+  status: ModelApprovalStatus;
+  /** Model the caller asked for. */
+  requestedModel: string;
+  /** The agent's configured default (what runs unless approved). */
+  defaultModel?: string;
+  at: string;
+}
+
+/** Who executes a task: an agent plus (optionally) one of its models. */
+export interface ExecutorOverride {
+  targetAgent?: AgentId;
+  model?: string;
+  /** The user named this model (see the model-approval rule). */
+  modelRequestedByUser?: boolean;
+}
+
+/** Audit record of moving a task to another agent and/or another model. */
+export interface TaskRetargetRecord {
+  at: string;
+  by?: string;
+  reason?: string;
+  fromAgent: AgentId;
+  toAgent: AgentId;
+  fromModel?: string;
+  toModel?: string;
+  /** Native session dropped because a different agent cannot resume it. */
+  previousReceiverSessionId?: string;
+  sessionReset: boolean;
+}
+
+/** Result of switching a task's executor. */
+export interface RetargetTaskResult {
+  threadId: string;
+  status: 'RETARGETED' | 'UNCHANGED';
+  targetAgent: AgentId;
+  targetModel?: string;
+  previousAgent: AgentId;
+  previousModel?: string;
+  sessionReset: boolean;
+  /** Why the requested model was not applied, when it was not. */
+  modelNotice?: string;
+  modelApproval?: ModelApprovalRecord;
+  modelRouting?: ModelRoutingSummary;
+  message: string;
+}
+
 export interface DispatchResult {
   threadId: string;
   receiverSessionId: string;
@@ -281,6 +697,13 @@ export interface DispatchResult {
   message: string;
   /** Sender -> receiver model routing recorded on the task. */
   modelRouting?: ModelRoutingSummary;
+  /** Set when the requested model was replaced or confirmed by the user. */
+  modelNotice?: string;
+  modelApproval?: ModelApprovalRecord;
+  /** Machine-readable directive: the caller must end its turn now. */
+  nextAction?: 'END_TURN_AND_WAIT_FOR_CALLBACK';
+  /** Why it must end the turn (shown to the caller). */
+  stopInstruction?: string;
 }
 
 /** Compact "who sends with which model, who receives with which model" view. */
@@ -294,7 +717,7 @@ export interface ModelRoutingSummary {
   text: string;
 }
 
-export interface RequestReworkParams {
+export interface RequestReworkParams extends ExecutorOverride {
   threadId: string;
   feedback: string;
   callerSessionId?: string;
@@ -307,6 +730,9 @@ export interface RequestReworkResult {
   targetAgent: AgentId;
   status: 'REWORK_DISPATCHED';
   message: string;
+  /** Set when this rework also moved the task to another agent/model. */
+  retarget?: TaskRetargetRecord;
+  modelNotice?: string;
 }
 
 export interface ApproveTaskParams {
@@ -452,11 +878,29 @@ export function appendInterruption(
  * Rework rounds always resume. A paused/retried *initial* round resumes only
  * when the native session was already captured; otherwise it must be launched
  * as a fresh initial run (Codex/DSH cannot adopt an unknown id).
+ *
+ * The exception is an explicit executor switch: when the last `retarget` reset
+ * the session (different agent), there is nothing to resume — even for a rework
+ * round, because a native session belongs to the CLI that created it.
  */
 export function shouldResumeNativeSession(
   thread: DelegationThread,
   round: DelegationRound,
 ): boolean {
+  const retargets = thread.retargets || [];
+  const latestRetarget = retargets.length > 0 ? retargets[retargets.length - 1] : undefined;
+  if (latestRetarget?.sessionReset) {
+    // A reset only blocks resuming until the NEW executor has opened its own
+    // session. Once that first post-switch round captured the native id, every
+    // later round must resume it: reserving the id again (`--session-id`) makes
+    // Claude Code refuse with "Session ID <id> is already in use." and the round
+    // dies in one second, forever.
+    const openedAfterReset =
+      thread.receiverSessionCaptured === true &&
+      !!thread.receiverSessionId &&
+      thread.receiverSessionId !== latestRetarget.previousReceiverSessionId;
+    if (!openedAfterReset) return false;
+  }
   if (round.type !== 'initial') return true;
   return !!thread.receiverSessionCaptured;
 }
@@ -481,8 +925,29 @@ export function findQueueHead(tasks: DelegationThread[]): DelegationThread | und
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())[0];
 }
 
-/** Standard refusal text for every path that would start a second round. */
-export function describeRoundInFlight(thread: DelegationThread, inFlight: DelegationRound): string {
+/**
+ * The task ran in a temporary worktree whose output is not on the main line yet.
+ *
+ * This is the merge gate: as long as it holds, the worktree's changes exist only
+ * in a throwaway directory, so the task must not be deleted as if it were noise.
+ */
+export function isMergePending(thread: DelegationThread): boolean {
+  return !!thread?.worktree && thread.status === 'completed' && !thread.mergeRequest;
+}
+
+/**
+ * Tasks waiting to be merged back into the main checkout.
+ *
+ * Sorted by `createdAt` ascending: the merge ORDER is deterministic, so a batch
+ * of worktree tasks is merged oldest-first.
+ */
+export function pendingMerges(tasks: DelegationThread[]): DelegationThread[] {
+  return (tasks || [])
+    .filter((task) => !!task && isMergePending(task))
+    .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+}
+
+/** Standard refusal text for every path that would start a second round. */export function describeRoundInFlight(thread: DelegationThread, inFlight: DelegationRound): string {
   return (
     `Round ${inFlight.round} of task ${thread.threadId} is still running; ` +
     `a task may only have one round in flight at a time. ` +

@@ -8,7 +8,7 @@
 
 - **项目名称**：`agent-mesh-bridge` (VSCode 插件)
 - **核心目标**：在 VSCode 宿主内无缝打通 **Google Antigravity (`agy`)**、**OpenAI Codex (`codex`)**、**Anthropic Claude Code (`claude`)**、**DeepSeek Harness (`dsh`)**，构建对等多 Agent 协作网格。
-- **十五大核心设计铁律**：
+- **二十一大核心设计铁律**：
   1. **默认选路原则**：无显式指定 target 时，默认自动选路至 VSCode 当前使用的前台 Agent。
   2. **全向对等互派**：四端 Agent 均可作为发件人向其他 Agent 派发任务；但**接收方不得二次转发**（见第 9 条）。
   3. **接收方原生留痕**：执行必须携带原生会话参数（`--session-id` / `--conversation` / `--session-id <dsh>`），确保在接收方原生历史可查。
@@ -40,8 +40,10 @@
 
   15. **响应成功必须双条件（硬不变量）**：Agent 响应是否成功不能只看退出码，必须同时满足：
       - **错误码**：进程退出码为 `0`；非 0 记录 `NONZERO_EXIT`，暂停/超时/看门狗记录对应中断码。
-      - **流质量**：stdout 中必须提取到**实际最终输出**，且输出流连续（有 chunk，且最长间隔不超过 `silenceTimeoutMs`）；否则记录 `EMPTY_OUTPUT` / `STREAM_STALLED`。
-      - `RunResult.assessment` 必须持久化到 `round.assessment`，字段包括 `success`、`errorCode`、`exitCode`、`stream.{chunkCount, stdoutBytes, stderrBytes, firstOutputAtMs, lastOutputAtMs, maxGapMs, gapThresholdMs, hasActualOutput, continuous}`。
+      - **流质量**：stdout 中必须提取到**实际最终输出**，且输出流连续（有 chunk，且最长间隔不超过 `silenceTimeoutMs`）；没有实际输出记 `EMPTY_OUTPUT`。
+      - **间隔必须扣除主机挂起**：间隔用**单调时钟**测量（免疫 NTP/改表跳变），并由 `HostSuspensionGuard` 心跳识别 `sleep`/`hibernate`/Modern Standby/宿主被冻结的窗口，从 `maxGapMs` 中扣除；被扣除的原始墙钟间隔留在 `rawMaxGapMs`，扣除量留在 `excludedSuspensionMs`、窗口数留在 `suspensionCount`。静默看门狗与总超时同样按「扣除挂起后的活跃时间」判定，机器睡多久都不算 agent 的静默、也不消耗任务预算。
+      - **长间隔默认降级为 warning**：`exitCode === 0` 且提取到实际输出时，扣除挂起后仍超阈值的间隔记 `STREAM_GAP_EXCEEDED` 警告（`assessment.warnings[]`，`success` 仍为 `true`，`stream.continuous = false`、`stream.gapExceeded = true`），不得据此外抛失败、丢弃已完成的工作或重跑整轮；`STREAM_STALLED` 只在显式 `streamGapPolicy: 'fail'` 时使用。
+      - `RunResult.assessment` 必须持久化到 `round.assessment`，字段包括 `success`、`errorCode`、`exitCode`、`warnings[]`、`stream.{chunkCount, stdoutBytes, stderrBytes, firstOutputAtMs, lastOutputAtMs, maxGapMs, rawMaxGapMs, excludedSuspensionMs, suspensionCount, gapThresholdMs, hasActualOutput, continuous, gapExceeded}`。
       - 任何 `exitCode === 0` 但不能提取实际输出（例如只有 JSON status/metadata）的轮次必须判定为 `failed`，不得进入 `waiting_review`，更不得唤醒 reviewer。
 
   17. **文件归属互斥（scope gate，硬不变量）**：全局单飞只保证「不同时改」，**不保证「不重复改」**——同一文件被前后两个任务先后覆盖，锁管不到。因此：
@@ -50,6 +52,46 @@
       - 任何轮次启动前必须执行 `findScopeConflicts()`：候选任务的 `expectedFiles` 与其他**未收口任务**的 `expectedFiles ∪ touchedFiles` 有交集时**不得启动**，置 `queued` 并把冲突方与文件写入 `thread.scopeBlockedBy`。
       - 「未收口」= 未完成（`queued`/`running`/`reworking`/`waiting_review`/`paused`），或已完成但**没有** `mergeRequest` 且在 `SCOPE_BLOCK_WINDOW_MS`（24h）内；`failed` 不再阻塞。
       - 放行只能通过 `allow_scope_overlap(threadId)`（或派发时 `allowScopeOverlap: true`），任务树显示 `⛔scope`、详情面板显示冲突文件。
+
+  18. **模型默认优先、非默认必须用户点击同意（硬不变量）**：接收方模型的选择权属于用户，不属于 caller。
+      - 不传 `model` 一律使用该 Agent 的**配置默认模型**（`agentMeshBridge.models.*` → `~/.agent-mesh-bridge/model-config.json`），这是唯一无需确认的路径。
+      - caller **只有在用户明确点名型号时**才能传 `model`，且必须同时传 `modelRequestedByUser: true`；否则桥接**忽略**该型号、改用配置默认，并在 `DispatchResult.modelNotice` 与 `thread.modelNotice` 中说明。禁止 agent 自行「挑一个更强的模型」。
+      - `modelRequestedByUser: true` 且型号 ≠ 配置默认时，桥接在 `~/.agent-mesh-bridge/model-approvals/` 发布请求，VS Code 扩展宿主（`ModelApprovalService`）弹出模态确认框：同意 → 按请求型号执行；改用默认 → 回落默认并留痕；取消/超时（默认 180s）→ **派发失败**（`MODEL_APPROVAL_DENIED` / `MODEL_APPROVAL_TIMEOUT`），不得静默切换、不得排队绕过。
+      - 确认通道不可用（无扩展宿主、家目录不可写）时回落配置默认并提示 `modelNotice`，同样不得绕开确认直接使用非默认型号。
+      - 裁决必须落账：`thread.modelApproval{id,status,requestedModel,defaultModel,at}`，详情面板「模型切换裁决」展示；审计追加写入 `~/.agent-mesh-bridge/model-approvals.log`。
+      - `list_agent_models` 必须把 `configuredModel` 放在 payload **最前**，并把该型号在 `models` 数组内置顶并打 `configured default` 标签（`annotateConfiguredModel`），避免 caller 按 provider 顺序误选第一个条目。
+      - 策略开关 `agentMeshBridge.requireModelApproval`（默认 true）随 `model-config.json` 镜像给各 MCP 进程；置 false 只表示不弹确认框，仍**不允许**未声明的型号切换。
+      - **执行者改派（retarget）**：已派发任务可以换 Agent 和/或换模型，但必须走显式入口——`retarget_task`（专用工具）或 `request_rework` / `retry_task` / `resume_task` 的 `targetAgent` / `model` 参数；每次改派写入 `thread.retargets[]`（from/to Agent、from/to Model、sessionReset、previousReceiverSessionId、reason、at）。禁止静默漂移。
+      - 改派前置条件：**不得**存在在飞轮次（先 `pause_task`），`completed` 任务不得改派；`queued` / `paused` / `waiting_review` / `failed` 可改派且**状态保持不变**（改派只换执行者，不偷偷推进队列或状态）。模型解析沿用同一套规则：省略 `model` 时同 Agent 保持原模型、换 Agent 用新 Agent 的配置默认。
+      - **换 Agent 必须重置原生会话**：`receiverSessionId` 换成新的未捕获 id、`receiverSessionCaptured=false`，旧 id 只进 `retargets[].previousReceiverSessionId`；仅换模型（同 Agent）时保留会话。`shouldResumeNativeSession()` 必须优先尊重「最近一次改派是否重置了会话」，不得因 round.type 是 rework 就强行续聊。
+      - VS Code 任务右键命令 `agent-mesh-bridge.retargetTask`（切换执行者）里用户已亲手选定 Agent/模型，该点击即视为同意，可直接以 approved 应答确认闸门。
+
+  19. **派发即结束 Turn、禁止轮询（硬不变量）**：`dispatch_task` / `invoke_*` 返回后，发起方必须立刻结束当前 Turn，由桥接在轮次结束时唤醒其原生会话；**不得**用 `get_thread_details` / `get_recent_logs` / `list_recent_tasks` 轮询进度。
+      - 派发回包必须携带机器可读的 `nextAction: 'END_TURN_AND_WAIT_FOR_CALLBACK'` 与 `stopInstruction`，且 `message` 第一句就是停止指令；`QUEUED` 必须在 `stopInstruction` 里说明「排队是正常的，会自己开始」。
+      - MCP 进程用 `CallerPollGuard` 只守卫**本进程自己派发**的线程：同一线程同一进度（`progressSignature`，按 status / currentRound / rounds.length / 末轮 round+status+durationMs / 执行者 计算）首次读取给完整载荷，重复读取只返回 `repeatPoll` 短载荷（status、currentRound、lastRound、stopInstruction），**不得**抛错（用户主动查进度是合法操作）。
+      - 任何真实进度变化必须重置守卫，保证回调后或复检时能拿到完整数据；`approve_task` / `delete_task` 必须 `forget` 该线程。
+      - 只守卫本进程派发的任务；检视方读取他人任务、`list_recent_tasks` 概览不受影响。
+
+  20. **上下文滞后压缩（账本卫生，不碰原生会话）（硬不变量）**：多轮返修的账本体积与 reviewer 读取量必须受控，但**不得**靠改写 Agent 原生会话实现。
+      - 只压缩**严格早于当前轮**且已进入终态（`completed`/`failed`）的轮次；最新轮永远保留 100% 原始输出。`failed` 轮只压 `output`，`error`/`status`/`interruption` 保持原样；合成 `approval` 轮不参与。
+      - 只有 `assessment.success === true` 才允许触发；`NONZERO_EXIT` / `EMPTY_OUTPUT` / `STREAM_STALLED` / 暂停 / 超时 / 中断一律不压。
+      - 顺序不可颠倒：先写全文归档 `logs/<threadId>_round_N.output.md`，再改账本；归档失败即放弃压缩（宁可不压，不可丢数据）。卡片若不小于原文（小轮次 + 头部开销）则保留原样并返回 `no_size_benefit`，既不增大账本也不留下无用归档。
+      - 压缩必须 **best-effort**：`compactPrecedingRound()` 内部吞掉所有异常并返回 `CompactionOutcome`，调用点统一 `compactRoundBestEffort()`；绝不允许压缩失败阻断 reviewer 唤醒、角色交接或队列推进。
+      - Agent 协约（`<context_compaction>`）只在**执行期**追加到 `runner.execute` 的 prompt（且仅 `isRework && round >= 2`），**不得**写回 `round.prompt`；胶囊必须从 `extractAnswerOnly()` 的最终文本解析，不能对 JSONL 原始流正则。无胶囊时用确定性头尾摘录兜底。
+      - 胶囊是模型产出，只作展示/归档，**不得**驱动控制流或再次拼进 prompt；`touchedFiles` 只复用 git probe 的 `round.touchedFiles`。
+      - v1 **禁止**调用 `/compact` 或拉起任何额外压缩进程（会占全局串行槽、可能改工作区，且 headless 支持未证实）。如需启用，必须能力探测失败即跳过、只读权限、硬超时、默认关闭。
+      - 读取层必须收敛：`get_thread_details` 默认返回有界视图（最新轮全量、已压缩轮给卡片、其他超长历史轮截断并附 `recallHint`），不默认下发千行日志；`includeRawLogs: true` 才给全量。`get_round_raw_log` 必须分页（默认 20KB，上限 200KB），`source` 区分 `output` 归档与 `execution` stdio 日志。
+      - `TaskStore.upsertTask()` 合并时必须保护已压缩轮，旧的未压缩副本不得“复活”原文。
+      - 开关 `agentMeshBridge.contextCompaction` 经 `bridge-policy.json` 镜像给 MCP 进程；只有显式 false 才关闭。
+
+  21. **Token 计量必须归一化、只落轮级、不得造假（硬不变量）**：四端 CLI 的 `input` 语义不同，直接相加会得到错一个数量级的数字。
+      - **归一化口径唯一**：`promptTokens = uncachedInputTokens + cacheReadTokens + cacheWriteTokens`，`totalTokens = promptTokens + outputTokens`；`reasoningTokens` 是 `outputTokens` 的**子集**，只展示、绝不重复计入。CLI 自报的 total 只能放进 `nativeTotalTokens` 做交叉校验，**不得**参与聚合。
+      - **各端只认一个来源**：Codex 读 `turn.completed.usage`（`cached_input_tokens`/`cache_write_input_tokens` 是 `input_tokens` 子集）；Claude 读结果包 `usage` + `total_cost_usd`（cache 另计）；Antigravity 只读 `step_update.usage`（snake_case，`cache_read_tokens` 是 `input_tokens` 子集），**必须丢弃** `result` 的会话累计值；DSH 只读 `{"type":"status","phase":"step_end"}` 的 camelCase usage（`inputTokens` 不含 cache，`final` 不带 usage）。多源相加一律禁止。
+      - **只估输出**：输入是整段历史 + 工具结果，禁止用字符数估算；无 usage 时只估输出并标 `estimated/partial`，完全没有数据时标 `unavailable/available=false`，UI 显示「未知」而不是 0。
+      - **累加链**：`execute()` 内所有 attempt 累加（重试也是真实开销）；`retry_task` / `resume_task` 复用同一轮号，必须用执行器传入的 `previousTokenUsage` 做种子后累加，不得覆盖。`buildInterruptedResult()` 必须透传已采集量。
+      - **只持久化 `round.tokenUsage` 与 `round.executorAgent/executorModel`**；线程级汇总一律用 `aggregateThreadTokenUsage(rounds)` 读时派生，**禁止**落盘 `thread.tokenUsage` / `byRound` / `summary.totalTokens`（旧副本回写会让聚合回退）。
+      - **耐久性**：压缩只许改写 `round.output`；`TaskStore.upsertTask()` 合并时必须保留 `tokenUsage`/`executorAgent`/`executorModel`（旧副本不得抹掉），`updateRound()` 追加分支的白名单必须显式包含这些字段。
+      - **成本只报原生**：只有 CLI 自报的 `costUsd`（Claude 的 `total_cost_usd` 属 API 等价成本）可展示；价格表估算、代理/未知模型一律不显示成本，只报 token。
 
 详细架构设计见 [DESIGN.md](DESIGN.md)。
 
@@ -66,7 +108,7 @@
   - OpenAI Codex: `~/.vscode/extensions/openai.chatgpt-*/bin/windows-x86_64/codex.exe` 或 `PATH`
   - DeepSeek Harness: `<安装根>/resources/runtime/cli/bin/dsh.cmd`（自动扫描各盘符下含 `harness` 的目录）、`DSH_CLI_PATH` 环境变量，或 `agentMeshBridge.deepseekHarnessPath` 配置
 - **本地存储路径**：`~/.agent-mesh-bridge/delegation_threads.json`（上限 1,000 条）
-- **运行时协调文件**：`~/.agent-mesh-bridge/supervisor.json`（常驻 supervisor 心跳）、`~/.agent-mesh-bridge/execution.lock`（全局单飞租约）、`~/.agent-mesh-bridge/roles/<threadId>.json`（单任务 reviewer/developer 角色锁）、`~/.agent-mesh-bridge/cancellations/<threadId>.json`（跨进程暂停/删除信号）、`~/.agent-mesh-bridge/deleted_tasks.log`（删除墓碑与原因）、`~/.agent-mesh-bridge/logs/`（每轮日志）
+- **运行时协调文件**：`~/.agent-mesh-bridge/supervisor.json`（常驻 supervisor 心跳）、`~/.agent-mesh-bridge/execution.lock`（全局单飞租约）、`~/.agent-mesh-bridge/roles/<threadId>.json`（单任务 reviewer/developer 角色锁）、`~/.agent-mesh-bridge/cancellations/<threadId>.json`（跨进程暂停/删除信号）、`~/.agent-mesh-bridge/model-approvals/<id>.request.json|.decision.json`（非默认模型切换的跨进程确认握手）与 `~/.agent-mesh-bridge/model-approvals.log`（裁决审计）、`~/.agent-mesh-bridge/bridge-policy.json`（跨进程策略镜像，如 `contextCompaction`）、`~/.agent-mesh-bridge/deleted_tasks.log`（删除墓碑与原因）、`~/.agent-mesh-bridge/logs/`（每轮原始 stdio `<threadId>_round_<n>.log` 与压缩前输出归档 `<threadId>_round_<n>.output.md`）
 
 ### DeepSeek Harness (`dsh`) 接入要点
 
@@ -98,7 +140,8 @@ src/
 │   ├── execution-gate.ts      # 跨进程全局单飞租约 (execution.lock, 心跳 + 僵尸回收)
 │   ├── cancellation-registry.ts# 跨进程暂停/删除信号 (cancellations/<threadId>.json)
 │   ├── task-role-lock.ts      # 单任务 reviewer/developer 角色锁 (roles/<threadId>.json)
-│   ├── task-control.ts        # 暂停/删除控制面 (中断原因 + 删除墓碑日志)
+│   ├── task-control.ts        # 暂停/删除控制面 (中断原因 + 删除墓碑日志 + 原生对话清理)
+│   ├── native-session-cleanup.ts# 删除任务时尽力清理接收方原生对话 (Claude/Codex/Antigravity/DSH)
 │   ├── queue-drainer.ts       # 无常驻 supervisor 时的 FIFO 队列泵
 │   ├── async-dispatcher.ts    # 异步非阻塞任务派发器 (生成 threadId, 全局排队, 立即返回)
 │   ├── rework-controller.ts   # 同会话多轮返修控制器 (绑定 receiverSessionId)
@@ -108,6 +151,13 @@ src/
 │   ├── task-store.ts          # 1000 条任务持久化、原子写入与 LRU 淘汰
 │   ├── agent-detector.ts      # 本地可执行文件与健康度探测
 │   ├── model-catalog.ts       # 模型发现/缓存/默认值解析 (models-cache.json, model-config.json)
+│   ├── model-approval.ts      # 模型默认优先解析 + 非默认切换的用户确认通道 (model-approvals/)
+│   ├── task-retarget.ts       # 执行者改派：换 Agent / 换模型 + 原生会话重置与改派留痕
+│   ├── caller-poll-guard.ts   # 派发后轮询抑制：同进度重复读取只回短载荷 + 停止指令
+│   ├── round-log.ts           # 每轮日志/归档路径、数值最轮取用、分页读取
+│   ├── bridge-policy.ts       # 跨进程策略镜像 (bridge-policy.json: contextCompaction)
+│   ├── context-compactor.ts   # 上下文滞后压缩：协议注入、胶囊解析、归档、幂等与失败隔离
+│   ├── token-usage-collector.ts# Token 计量：四端解析归一化、估算、跨 attempt 累加、读时派生汇总
 │   ├── deepseek-harness.ts    # DeepSeek Harness 专属接入面 (安装探测/headless 契约/原生会话/MCP patch)
 │   └── mcp-server.ts          # MCP JSON-RPC 协议解析与工具处理
 ├── config/
@@ -115,6 +165,7 @@ src/
 └── ui/
     ├── task-tree-provider.ts  # 侧边栏 1000 条任务列表与状态徽章渲染
     ├── detail-panel.ts        # 任务详情与多轮时间轴 Webview (含 30s 实时流与文件范围)
+    ├── model-approval-service.ts # 非默认模型切换的模态确认对话框 (轮询 model-approvals/)
     └── status-bar.ts          # 状态栏当前 Agent 切换器
 ```
 
@@ -126,20 +177,23 @@ src/
 
 | 工具名                    | 关键入参                                                           | 语义与行为                                                                                    |
 | :------------------------ | :----------------------------------------------------------------- | :-------------------------------------------------------------------------------------------- |
-| `dispatch_task`           | `targetAgent`, `title`, `prompt`, `expectedFiles`（必填）, `allowNoScope?`, `allowScopeOverlap?`, `callerSessionId?`, `model?`, `initiatorModel?` | 异步发起新任务，`expectedFiles` 必须是**具体代码文件**（禁止目录、结尾斜杠、`*`/`?` 通配符），派发前校验失败即拒绝；**缺省即拒绝**（确实不改任何工作区文件时显式传 `allowNoScope: true`）。`model?` 固定**接收方模型**（缺省用该 Agent 配置的默认模型），`initiatorModel?` 声明**发送方模型**（缺省按 环境提示 → 发送方配置默认 推断）；两端模型都随任务落账本，任务树/详情/MCP 响应统一展示 `发送 A(x) ➔ 接收 B(y)`，返修/重试沿用同一接收方模型。只要存在任何**未完成任务**（含 `waiting_review` / `paused`）就进入任务级 FIFO 队列；接收方进程内不可用 |
-| `request_rework`          | `threadId`, `feedback`                                             | **在同一个原生会话中唤醒接收方返修**，进入第 N+1 轮                                           |
+| `dispatch_task`           | `targetAgent`, `title`, `prompt`, `expectedFiles`（必填）, `allowNoScope?`, `allowScopeOverlap?`, `callerSessionId?`, `model?`, `modelRequestedByUser?`, `initiatorModel?` | 异步发起新任务，`expectedFiles` 必须是**具体代码文件**（禁止目录、结尾斜杠、`*`/`?` 通配符），派发前校验失败即拒绝；**缺省即拒绝**（确实不改任何工作区文件时显式传 `allowNoScope: true`）。`model?` 固定**接收方模型**：**缺省即用该 Agent 配置的默认模型**；非默认型号必须同时传 `modelRequestedByUser: true`（仅在用户点名时）并由用户在 VS Code 点击确认才生效，否则忽略该型号回落默认（见第 18 条）。`initiatorModel?` 声明**发送方模型**（缺省按 环境提示 → 发送方配置默认 推断）；两端模型都随任务落账本，任务树/详情/MCP 响应统一展示 `发送 A(x) ➔ 接收 B(y)`，返修/重试沿用同一接收方模型。只要存在任何**未完成任务**（含 `waiting_review` / `paused`）就进入任务级 FIFO 队列；接收方进程内不可用。**返回后发起方必须立即结束 Turn**（回包含 `nextAction=END_TURN_AND_WAIT_FOR_CALLBACK` 与 `stopInstruction`，见第 19 条） |
+| `request_rework`          | `threadId`, `feedback`, `targetAgent?`, `model?`, `modelRequestedByUser?` | **在同一个原生会话中唤醒接收方返修**，进入第 N+1 轮；传 `targetAgent`/`model` 时先改派执行者再开新轮（换 Agent 会重置原生会话，见第 18 条） |
 | `approve_task`            | `threadId`, `remarks?`                                             | 验收通过，标记为 `COMPLETED`，归档任务                                                        |
 | `pause_task`              | `threadId`, `reason`                                               | 暂停运行中/排队中的任务：终止 Agent 进程、轮次标记 `paused`、记录中断原因，可随后恢复          |
-| `resume_task`             | `threadId`                                                         | 恢复暂停轮次：保留原 prompt 与原生会话；未捕获原生会话时以初始轮重新执行                        |
-| `retry_task`              | `threadId`                                                         | **原地重跑失败轮**：复用同一轮号、同一 prompt、同一原生会话；不追加新轮次，因此不会在账本里出现"看起来重复的第二轮"。调用者想"把原任务再做一遍"时必须用它，**不要**把原始 prompt 原样传给 `request_rework` |
+| `resume_task`             | `threadId`, `targetAgent?`, `model?`, `modelRequestedByUser?`      | 恢复暂停轮次：保留原 prompt 与原生会话；未捕获原生会话时以初始轮重新执行；带 `targetAgent`/`model` 时在恢复前改派执行者 |
+| `retry_task`              | `threadId`, `targetAgent?`, `model?`, `modelRequestedByUser?`      | **原地重跑失败轮**：复用同一轮号、同一 prompt、同一原生会话；不追加新轮次，因此不会在账本里出现"看起来重复的第二轮"。调用者想"把原任务再做一遍"时必须用它，**不要**把原始 prompt 原样传给 `request_rework`；带 `targetAgent`/`model` 时换执行者重跑 |
+| `retarget_task`           | `threadId`, `targetAgent?`, `model?`, `modelRequestedByUser?`, `reason?` | **执行者改派**：把已有任务切到另一个 Agent 和/或该 Agent 的另一个模型，保留 threadId、轮次历史与文件范围；`queued`/`paused`/`waiting_review`/`failed` 可改派且状态不变，有在飞轮次（先 pause）或已 `completed` 则拒绝。换 Agent 必重置原生会话，旧 id 记入 `retargets[].previousReceiverSessionId`；非默认模型仍需 `modelRequestedByUser: true` + 用户点击确认。receiver 不可用 |
 | `allow_scope_overlap`     | `threadId`, `reason?`                                              | **放行文件归属互斥**：让被 scope 闸门挡住的任务继续执行（仅当重叠确实安全，例如前一个任务已提交）。调用者控制面工具，receiver 不可用 |
-| `delete_task`             | `threadId`, `reason`                                               | 永久删除任务：先终止进程，再移除账本条目，原因写入 `deleted_tasks.log` 墓碑                     |
+| `delete_task`             | `threadId`, `reason`, `force?`                                     | 永久删除任务：先终止进程，再移除账本条目，原因写入 `deleted_tasks.log` 墓碑；同时**尽力清理接收方原生对话**（Claude `~/.claude/projects`、Codex `~/.codex/sessions` + `session_index.jsonl`、Antigravity `conversations/*.db` + `brain/annotations/implicit` + cache 元数据、DSH `sessions/<slug>/<sessionId>/` + projcache + `workspace.json` 引用）。找不到对话不是错误，单个文件失败只记录在墓碑 `nativeSessions[].error`，绝不回滚删除；调用方（initiator）会话永不清理 |
 | `record_merge_request`    | `threadId`, `url?`, `branch?`, `commit?`, `remote?`, `baseBranch?`, `status?`, `summary?` | **调用者/检视方专用**：任务或批次验收通过后，记录 MR URL/分支/提交/远端与状态；MR 由调用者创建并推送，receiver 不可调用 |
-| `list_recent_tasks`       | `limit` (最大1000), `statusFilter?`                                | 查询任务列表（包含 `A -> B 标题 摘要` 与 `queued/running` 状态）                               |
-| `get_thread_details`      | `threadId`                                                         | 查询该任务全部轮次（提示词、30s实时输出、Diff、耗时、文件范围、最近日志）                    |
+| `list_recent_tasks`       | `limit` (最大1000), `statusFilter?`                                | 查询任务列表（包含 `A -> B 标题 摘要` 与 `queued/running` 状态），每条附**读时派生**的 `tokenUsage` 汇总 |
+| `get_thread_details`      | `threadId`, `includeRawLogs?`                                      | 查询任务轮次。**默认有界**：最新轮全量、已压缩轮给提纯卡片、其他超长历史轮截断到 4,000 字符并附 `recallHint`；**不默认返回千行日志**。`includeRawLogs: true` 才返回完整历史 + 最近日志（很大，仅在确需时使用）。顶层附**读时派生**的 `tokenUsage` 汇总 |
+| `get_round_raw_log`       | `threadId`, `round`, `source?` (`output`/`execution`), `offsetBytes?`, `maxBytes?` | **单轮原文分页读取**：`output` 读压缩前归档（尚未归档时回退账本副本），`execution` 读原始 stdio 日志。默认 20KB、上限 200KB，用 `nextOffset` 续读；用于核验某一历史轮，避免整段历史灌入上下文 |
+| `get_task_token_usage`    | `threadId`, `round?`                                               | **被调用方 Token 只读查询**：默认返回任务级汇总（输入/输出/缓存拆分、按 Agent/模型分布、`isPartialOrEstimated`）＋每轮一行摘要；给 `round` 返回该轮明细。计量口径见铁律 21；`unavailable` 不等于 0，估算值带 `estimated`；**不受轮询守卫影响**（不是进度信号） |
 | `get_recent_logs`         | `threadId`, `maxLines?` (默认1000)                                 | **获取运行中或历史任务最近 1,000 行实时日志**（流式捕获与磁盘持久化对齐）                      |
-| `invoke_agent`            | `targetAgent`, `prompt`, `model?`                                  | 同步阻塞调用（仅限轻量即时问询）                                                              |
-| `list_agent_models`       | `targetAgent?` (`all` 或具体 Agent), `forceRefresh?`                | **读取各 Agent 可用模型**：Antigravity 走 `agy models`、Codex 走 `codex debug models`、Claude/DSH 走各自 provider 的 `/models`；同时返回该 Agent 当前配置的默认模型 |
+| `invoke_agent`            | `targetAgent`, `prompt`, `model?`, `modelRequestedByUser?`          | 同步阻塞调用（仅限轻量即时问询）；`model?` 与 `dispatch_task` 同一套模型策略（缺省用配置默认，非默认需 `modelRequestedByUser: true` + 用户点击确认） |
+| `list_agent_models`       | `targetAgent?` (`all` 或具体 Agent), `forceRefresh?`                | **读取各 Agent 可用模型**：Antigravity 走 `agy models`、Codex 走 `codex debug models`、Claude/DSH 走各自 provider 的 `/models`；`configuredModel` 置于 payload 最前，该型号同时**置顶** `models` 数组并打 `configured default` 标签 |
 | `query_agent_mesh_status` | 无                                                                 | 查询四端 Agent 在网格中的连接与版本状态                                                       |
 
 ---
@@ -196,7 +250,7 @@ code --install-extension agent-mesh-bridge-1.0.0.vsix
    - 暂停/删除先持久化目标状态，再写 `~/.agent-mesh-bridge/cancellations/<threadId>.json`；真正持有子进程的 runner 轮询该文件并终止进程树。
    - 禁止只改账本状态而不终止进程；也禁止只杀进程而不记录 `TaskInterruption`。
    - 暂停轮次必须保留原 prompt 与 `receiverSessionId`，恢复时使用 `shouldResumeNativeSession()` 决定续聊还是重新初始执行。
-   - `delete_task` 先取消进程，再 `TaskStore.deleteTask()`，并向 `deleted_tasks.log` 追加包含原因的墓碑记录。
+   - `delete_task` 先取消进程，再 `TaskStore.deleteTask()`，并向 `deleted_tasks.log` 追加包含原因的墓碑记录；随后调用 `cleanupThreadNativeSessions()` **尽力**清理接收方原生对话（Claude / Codex / Antigravity / DSH），找不到对话不算错误，单个文件失败只写入墓碑 `nativeSessions[].error`，不得回滚删除、不得阻断队列推进；`callerSessionId` 对应的调用方会话**永远不清理**。
 12. **响应成功判定不可只看退出码**：
    - `AutonomousRunner.evaluateResponse()` 统一计算两段式结果：`exitCode` + `stream` 健康度。
    - `extractAnswerOnly()` 负责识别真正的最终答案；Codex `item.completed.agent_message`、DSH `final`、Antigravity `result`、Claude result 均已适配。
@@ -224,7 +278,7 @@ code --install-extension agent-mesh-bridge-1.0.0.vsix
    - receiver 进程调用该工具必须被拒绝；已完成任务仍允许补记 MR。
 
 16. **模型两端必须留痕**：每条任务必须同时记录**发送方模型**与**接收方模型**。
-   - `targetModel` 在派发时解析并固定（显式 `model` → 接收方配置默认），返修/重试沿用同一模型，不得中途静默换模型。
+   - `targetModel` 在派发时解析并固定（显式 `model` → 接收方配置默认），返修/重试默认沿用同一模型，不得中途静默换模型；确实需要换执行者时只能走显式改派（`retarget_task`，或 `request_rework` / `retry_task` / `resume_task` 的 `targetAgent` / `model` 覆盖参数），并写入 `thread.retargets[]` 留痕（见第 18 条）。
    - `initiatorModel` 按 `显式传参 → 环境提示（如 ANTHROPIC_MODEL / CODEX_MODEL）→ 发送方配置默认` 推断，并用 `initiatorModelSource` 标注来源，禁止把推断值伪装成用户显式选择。
    - 任务树、详情面板、`dispatch_task` 响应、`list_recent_tasks` / `get_thread_details` 必须统一使用 `getModelRouting()` 输出 `sender A: x -> receiver B: y`，不得各写一套格式。
    - 模型参数注入必须按各 CLI 语法落位：Codex 用全局 `-c model="..."`（在 `exec` 之前），Claude / Antigravity 用 `--model`，DSH 用一次性 `--patch` overlay（不得改写用户 profile patch）。

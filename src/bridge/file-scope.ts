@@ -285,6 +285,17 @@ function isScopeBlocking(thread: DelegationThread, now: number): boolean {
 }
 
 /**
+ * Queue order is `createdAt` ascending; equal timestamps fall back to threadId
+ * so exactly one direction wins and the relation stays acyclic.
+ */
+function isQueuedBefore(other: DelegationThread, candidate: DelegationThread): boolean {
+  const otherAt = new Date(other.createdAt || 0).getTime();
+  const candidateAt = new Date(candidate.createdAt || 0).getTime();
+  if (otherAt !== candidateAt) return otherAt < candidateAt;
+  return String(other.threadId) < String(candidate.threadId);
+}
+
+/**
  * Batch-level scope gate.
  *
  * A task may only start when none of the files it declares are already owned by
@@ -307,6 +318,11 @@ export function findScopeConflicts(
 
   for (const other of others) {
     if (other.threadId === candidate.threadId) continue;
+    // The gate is directional: only a task that entered the queue EARLIER can
+    // hold files against a later one. A younger task that is merely queued has
+    // not written anything yet — letting it block the queue head would invert
+    // FIFO and deadlock the whole queue (head ← younger → head).
+    if (!isQueuedBefore(other, candidate)) continue;
     if (!isScopeBlocking(other, now)) continue;
 
     const theirs = knownTaskFiles(other);
