@@ -102,11 +102,12 @@
 - **运行宿主**：Visual Studio Code (`^1.90.0`)
 - **语言标准**：TypeScript 5.4+ (Node.js 20+)
 - **通信协议**：Model Context Protocol (MCP) JSON-RPC 2.0 over Stdio
-- **可执行文件依赖探测**：
-  - Antigravity: `~/.gemini/bin/agy.exe` 或 `PATH`
-  - Claude Code: `npm/claude.cmd` 或 `PATH`
-  - OpenAI Codex: `~/.vscode/extensions/openai.chatgpt-*/bin/windows-x86_64/codex.exe` 或 `PATH`
-  - DeepSeek Harness: `<安装根>/resources/runtime/cli/bin/dsh.cmd`（自动扫描各盘符下含 `harness` 的目录）、`DSH_CLI_PATH` 环境变量，或 `agentMeshBridge.deepseekHarnessPath` 配置
+- **可执行文件依赖探测（跨平台，平台差异统一由 `src/bridge/platform.ts` 裁决）**：
+  - Antigravity: `~/.gemini/bin/agy`、`~/.local/bin/agy`、`/usr/local/bin/agy`（Windows 为 `agy.exe`）或 `PATH`
+  - Claude Code: `~/.npm-global/bin/claude`、`~/.local/bin/claude`、`/usr/local/bin/claude`、`~/.claude/bin/claude`（Windows 额外探测 `%APPDATA%\npm\claude.cmd`）或 `PATH`
+  - OpenAI Codex: `~/.vscode{,-server,-insiders}/extensions/openai.chatgpt-*/bin/<平台架构>/codex[.exe]`、`~/.codex/bin/codex`、`/usr/local/bin/codex` 或 `PATH`
+  - DeepSeek Harness: `<安装根>/resources/runtime/cli/bin/dsh[.cmd]`（Windows 扫描盘符；POSIX 探测 `/opt`、`/usr/lib` 与 `PATH`）、`DSH_CLI_PATH` / `DSH_LAUNCHER_PATH` 环境变量，或 `agentMeshBridge.deepseekHarnessPath` 配置
+  - **可执行性与 shell 包装**：POSIX 只有带可执行位（`X_OK`）的文件才算已安装；只有 Windows 批处理 shim（`.cmd` / `.bat`）才经 `cmd.exe` 启动，其余一律直接 spawn
 - **本地存储路径**：`~/.agent-mesh-bridge/delegation_threads.json`（上限 1,000 条）
 - **运行时协调文件**：`~/.agent-mesh-bridge/supervisor.json`（常驻 supervisor 心跳）、`~/.agent-mesh-bridge/execution.lock`（全局单飞租约）、`~/.agent-mesh-bridge/roles/<threadId>.json`（单任务 reviewer/developer 角色锁）、`~/.agent-mesh-bridge/cancellations/<threadId>.json`（跨进程暂停/删除信号）、`~/.agent-mesh-bridge/model-approvals/<id>.request.json|.decision.json`（非默认模型切换的跨进程确认握手）与 `~/.agent-mesh-bridge/model-approvals.log`（裁决审计）、`~/.agent-mesh-bridge/bridge-policy.json`（跨进程策略镜像，如 `contextCompaction`）、`~/.agent-mesh-bridge/deleted_tasks.log`（删除墓碑与原因）、`~/.agent-mesh-bridge/logs/`（每轮原始 stdio `<threadId>_round_<n>.log` 与压缩前输出归档 `<threadId>_round_<n>.output.md`）
 
@@ -149,6 +150,7 @@ src/
 │   ├── task-supervisor.ts     # 宿主常驻守护进程 (30s 实时流式同步, FIFO 冲突任务排队调度)
 │   ├── callback-manager.ts    # 回调唤醒引擎 (Codex queue / Claude resume / Anti wake / DSH headless)
 │   ├── task-store.ts          # 1000 条任务持久化、原子写入与 LRU 淘汰
+│   ├── platform.ts            # 平台差异唯一出口（PATH 探测/可执行位/扩展目录/进程树终止）
 │   ├── agent-detector.ts      # 本地可执行文件与健康度探测
 │   ├── model-catalog.ts       # 模型发现/缓存/默认值解析 (models-cache.json, model-config.json)
 │   ├── model-approval.ts      # 模型默认优先解析 + 非默认切换的用户确认通道 (model-approvals/)

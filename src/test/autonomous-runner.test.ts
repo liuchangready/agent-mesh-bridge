@@ -17,7 +17,11 @@ import { TaskStore } from '../bridge/task-store';
 import { DelegationThread } from '../bridge/types';
 
 describe('AutonomousRunner Tests', () => {
-  const detector = new AgentDetector();
+  // The runner refuses to spawn an agent it cannot resolve, so a test that only
+  // exercises the execution pipeline must not depend on a real Claude install.
+  // `process.execPath` exists and is executable everywhere; the tests that care
+  // about the spawned program override `buildCommand` anyway.
+  const detector = new AgentDetector({ claude_code: process.execPath });
   const runner = new AutonomousRunner(detector);
 
   test('should use a 10-minute silence watchdog by default', () => {
@@ -679,14 +683,42 @@ describe('AutonomousRunner Tests', () => {
   });
 
   test('should detect active sessions for claude_code and antigravity', () => {
-    const claudeSession = detector.detectActiveSession('claude_code', 'D:\\majiang');
-    assert.ok(claudeSession, 'Should detect active session for claude_code in D:\\majiang');
-    assert.match(claudeSession, /^[0-9a-f-]{36}$/i, 'Detected session should be a valid UUID');
+    // Detection reads the agents' native session stores under the user home, so
+    // the fixtures live in a throwaway home instead of a pre-existing install.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-detect-session-'));
+    const workspace = path.join(home, 'workspace');
+    const claudeSession = '7f3c9a1e-0b2d-4c5e-8f60-112233445566';
+    const antigravitySession = 'anti-session-fixture';
+    const previousHome = process.env.HOME;
+    const previousUserProfile = process.env.USERPROFILE;
 
-    const antiSession = detector.detectActiveSession('antigravity', undefined, [
-      'non-existent-excluded-session',
-    ]);
-    assert.ok(antiSession, 'Should detect active session for antigravity');
+    try {
+      fs.mkdirSync(path.join(home, '.claude', 'projects', 'workspace-project'), { recursive: true });
+      fs.writeFileSync(
+        path.join(home, '.claude', 'projects', 'workspace-project', `${claudeSession}.jsonl`),
+        '{}\n',
+      );
+      const conversations = path.join(home, '.gemini', 'antigravity-cli', 'conversations');
+      fs.mkdirSync(conversations, { recursive: true });
+      fs.writeFileSync(path.join(conversations, `${antigravitySession}.db`), 'fixture');
+
+      process.env.HOME = home;
+      process.env.USERPROFILE = home;
+
+      const detectedClaude = detector.detectActiveSession('claude_code', workspace);
+      assert.strictEqual(detectedClaude, claudeSession);
+
+      const detectedAnti = detector.detectActiveSession('antigravity', undefined, [
+        'non-existent-excluded-session',
+      ]);
+      assert.strictEqual(detectedAnti, antigravitySession);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = previousUserProfile;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 
   test('should detect transient network and eligibility errors correctly', () => {

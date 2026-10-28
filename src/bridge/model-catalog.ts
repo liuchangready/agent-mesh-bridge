@@ -28,6 +28,7 @@ import * as path from 'path';
 import { AgentId, ModelResolutionSource } from './types';
 import { AgentDetector } from './agent-detector';
 import { getDshHome, readDshConfiguredProvider } from './deepseek-harness';
+import { needsShellWrapper } from './platform';
 
 /** Bridge storage root; overridable so tests never touch the real home directory. */
 export function getBridgeHome(): string {
@@ -633,11 +634,9 @@ interface CliResult {
 /** Run a short-lived CLI probe with stdin closed (never let it block on input). */
 export function runCli(command: string, args: string[], timeoutMs: number): Promise<CliResult> {
   return new Promise((resolve) => {
-    const lower = command.toLowerCase();
-    const needsShellWrapper =
-      process.platform === 'win32' && (lower.endsWith('.cmd') || lower.endsWith('.bat'));
-    const spawnCommand = needsShellWrapper ? 'cmd.exe' : command;
-    const spawnArgs = needsShellWrapper ? ['/c', command, ...args] : args;
+    const wrap = needsShellWrapper(command);
+    const spawnCommand = wrap ? 'cmd.exe' : command;
+    const spawnArgs = wrap ? ['/c', command, ...args] : args;
 
     let stdout = '';
     let stderr = '';

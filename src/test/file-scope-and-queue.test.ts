@@ -31,8 +31,10 @@ import { DelegationThread } from '../bridge/types';
 describe('File Scope and Conflict Queueing Tests', () => {
   describe('Path Normalization and Conflict Detection', () => {
     test('should normalize relative and workspace absolute paths uniformly', () => {
-      const ws = 'd:/majiang';
-      const p1 = 'd:\\majiang\\presentation\\src\\main\\MenuScreen.kt';
+      // Workspace paths are fixtures, not this machine's layout: the point is
+      // that a backslash absolute path and a relative one normalize alike.
+      const ws = path.join(os.tmpdir(), 'majiang');
+      const p1 = `${ws.replace(/\//g, '\\')}\\presentation\\src\\main\\MenuScreen.kt`;
       const p2 = 'presentation/src/main/MenuScreen.kt';
       const p3 = './presentation/src/main/MenuScreen.kt';
 
@@ -132,7 +134,7 @@ describe('File Scope and Conflict Queueing Tests', () => {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         receiverSessionId: 'sess-1',
-        workspacePath: 'd:/majiang',
+        workspacePath: path.join(os.tmpdir(), 'majiang'),
         expectedFiles: ['presentation/menu/MenuScreen.kt'],
         summary: {
           lastPromptSnippet: 'test',

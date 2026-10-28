@@ -25,6 +25,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { execFile } from 'child_process';
+import { defaultBinary, lookupInPath as lookupPlatformPath } from './platform';
 
 /** Canonical mesh id for DeepSeek Harness. */
 export const DSH_AGENT_ID = 'deepseek_harness';
@@ -314,9 +315,22 @@ export function getDshCandidatePaths(customPath?: string): string[] {
 }
 
 /**
+ * Whether this launcher can be spawned as a program on POSIX.
+ *
+ * Windows installs expose the CLI as `dsh.cmd`; that file is a batch script and
+ * is meaningless on Linux/macOS, where the launcher is a shebang script.
+ */
+function isPosixExecutableLauncher(launcherPath: string): boolean {
+  if (process.platform === 'win32') return !launcherPath.toLowerCase().endsWith('.cmd');
+  const base = path.basename(launcherPath).toLowerCase();
+  return base !== 'dsh.cmd' && base !== 'dsh.bat' && !base.endsWith('.exe');
+}
+
+/**
  * Resolve a launcher path into a concrete spawn strategy.
  * Returns `null` when the launcher itself does not exist.
  */
+
 export function resolveDshInstall(launcherPath: string): DshInstall | null {
   try {
     if (!fs.existsSync(launcherPath)) return null;
@@ -348,8 +362,10 @@ export function resolveDshInstall(launcherPath: string): DshInstall | null {
         install.cliPath = path.join(root, CLI_RELATIVE);
       }
     } catch {}
-  } else if (isLauncherScript) {
-    // POSIX launchers are directly executable.
+  } else if (isLauncherScript && isPosixExecutableLauncher(launcherPath)) {
+    // POSIX launchers are directly executable. A `.cmd` / `.bat` shim is a
+    // Windows batch script: on POSIX it is just a text file, so it must not be
+    // recorded as a spawn strategy.
     install.execPath = launcherPath;
   }
 
@@ -424,6 +440,10 @@ export function buildDshHeadlessCommand(
       env: permissionEnv,
     };
   }
+
+  // A Windows batch shim cannot be executed here. Report "no strategy" so the
+  // caller surfaces an actionable error instead of a spawn ENOEXEC.
+  if (!isPosixExecutableLauncher(install.launcherPath)) return null;
 
   return {
     command: install.launcherPath,
@@ -671,7 +691,7 @@ export function queryDshVersion(launcherPath: string): Promise<string | undefine
 export function resolveNodeCommand(): string {
   const override = process.env.DSH_BRIDGE_NODE;
   if (override && override.trim()) return override.trim();
-  const found = lookupInPath(process.platform === 'win32' ? 'node.exe' : 'node');
+  const found = lookupInPath(defaultBinary('node'));
   return found || 'node';
 }
 
@@ -880,14 +900,5 @@ export function syncDshMcpConfigs(
 
 /** PATH lookup shared by discovery and node resolution. */
 function lookupInPath(command: string): string | null {
-  const envPath = process.env.PATH || '';
-  const delimiter = process.platform === 'win32' ? ';' : ':';
-  for (const dir of envPath.split(delimiter)) {
-    if (!dir) continue;
-    const full = path.join(dir, command);
-    try {
-      if (fs.existsSync(full)) return full;
-    } catch {}
-  }
-  return null;
+  return lookupPlatformPath(command);
 }

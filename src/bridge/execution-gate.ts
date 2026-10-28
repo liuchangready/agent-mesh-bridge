@@ -3,6 +3,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { killPidTree } from './platform';
 
 /**
  * Cross-process execution gate for delegated task execution.
@@ -478,14 +479,7 @@ export class ExecutionGate {
   private killProcessTree(pid: number): void {
     if (!pid || !this.isPidAlive(pid, false)) return;
     try {
-      if (process.platform === 'win32') {
-        child_process.execFileSync('taskkill', ['/pid', String(pid), '/T', '/F'], {
-          stdio: 'ignore',
-          windowsHide: true,
-        });
-        return;
-      }
-      process.kill(pid, 'SIGKILL');
+      killPidTree(pid);
     } catch {}
   }
 

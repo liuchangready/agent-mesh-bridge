@@ -5,6 +5,15 @@ import { execFile } from 'child_process';
 import { AgentId, AgentInfo, AgentStatusType } from './types';
 import { RateLimitTracker } from './rate-limit-tracker';
 import {
+  IS_WINDOWS,
+  binaryCandidates,
+  bundledCliRelativePaths,
+  isExecutableFile,
+  lookupInPath,
+  needsShellWrapper,
+  vscodeExtensionDirs,
+} from './platform';
+import {
   checkDshAuth,
   detectDshActiveSession,
   getDshCandidatePaths,
@@ -43,16 +52,19 @@ export class AgentDetector {
     }
 
     const home = os.homedir();
-    if (process.platform === 'win32') {
+    if (IS_WINDOWS) {
       candidates.push(path.join(home, '.gemini', 'bin', 'agy.exe'));
       candidates.push(path.join(home, 'AppData', 'Local', 'Programs', 'Antigravity', 'agy.exe'));
     } else {
       candidates.push(path.join(home, '.gemini', 'bin', 'agy'));
+      candidates.push(path.join(home, '.local', 'bin', 'agy'));
       candidates.push('/usr/local/bin/agy');
     }
 
-    const pathBin = this.lookupInPath(process.platform === 'win32' ? 'agy.exe' : 'agy');
-    if (pathBin) candidates.push(pathBin);
+    for (const name of binaryCandidates('agy')) {
+      const pathBin = this.lookupInPath(name);
+      if (pathBin) candidates.push(pathBin);
+    }
 
     return Array.from(new Set(candidates));
   }
@@ -67,7 +79,7 @@ export class AgentDetector {
     }
 
     const home = os.homedir();
-    if (process.platform === 'win32') {
+    if (IS_WINDOWS) {
       const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
       candidates.push(
         path.join(appData, 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'),
@@ -77,18 +89,26 @@ export class AgentDetector {
       candidates.push(path.join(home, '.claude', 'bin', 'claude.cmd'));
     } else {
       candidates.push(path.join(home, '.npm-global', 'bin', 'claude'));
+      candidates.push(path.join(home, '.local', 'bin', 'claude'));
       candidates.push('/usr/local/bin/claude');
+      candidates.push('/usr/bin/claude');
       candidates.push(path.join(home, '.claude', 'bin', 'claude'));
     }
 
-    const pathBin = this.lookupInPath(process.platform === 'win32' ? 'claude.cmd' : 'claude');
-    if (pathBin) candidates.push(pathBin);
+    for (const name of binaryCandidates('claude')) {
+      const pathBin = this.lookupInPath(name);
+      if (pathBin) candidates.push(pathBin);
+    }
 
     return Array.from(new Set(candidates));
   }
 
   /**
    * Find candidate paths for OpenAI Codex (codex).
+   *
+   * The extension-bundled binary is looked up in every VS Code extension root
+   * that exists here — a remote workspace keeps its extensions under
+   * `~/.vscode-server`, not `~/.vscode`.
    */
   public getCodexCandidatePaths(): string[] {
     const candidates: string[] = [];
@@ -97,43 +117,35 @@ export class AgentDetector {
     }
 
     const home = os.homedir();
-    if (process.platform === 'win32') {
-      const extensionsDir = path.join(home, '.vscode', 'extensions');
-      if (fs.existsSync(extensionsDir)) {
-        try {
-          const dirs = fs.readdirSync(extensionsDir);
-          const codexDirs = dirs.filter(
-            (d) => d.startsWith('openai.chatgpt-') || d.startsWith('openai.codex-'),
-          );
-          for (const d of codexDirs) {
-            candidates.push(path.join(extensionsDir, d, 'bin', 'windows-x86_64', 'codex.exe'));
-            candidates.push(path.join(extensionsDir, d, 'bin', 'codex.exe'));
+    const cliRelativePaths = bundledCliRelativePaths('codex');
+    for (const extensionsDir of vscodeExtensionDirs(home)) {
+      if (!fs.existsSync(extensionsDir)) continue;
+      try {
+        const dirs = fs.readdirSync(extensionsDir);
+        const codexDirs = dirs.filter(
+          (d) => d.startsWith('openai.chatgpt-') || d.startsWith('openai.codex-'),
+        );
+        for (const d of codexDirs) {
+          for (const relative of cliRelativePaths) {
+            candidates.push(path.join(extensionsDir, d, relative));
           }
-        } catch {}
-      }
+        }
+      } catch {}
+    }
+
+    if (IS_WINDOWS) {
       candidates.push(path.join(home, '.codex', 'bin', 'codex.exe'));
       candidates.push(path.join(home, 'AppData', 'Local', 'Programs', 'Codex', 'codex.exe'));
     } else {
-      const extensionsDir = path.join(home, '.vscode', 'extensions');
-      if (fs.existsSync(extensionsDir)) {
-        try {
-          const dirs = fs.readdirSync(extensionsDir);
-          const codexDirs = dirs.filter(
-            (d) => d.startsWith('openai.chatgpt-') || d.startsWith('openai.codex-'),
-          );
-          for (const d of codexDirs) {
-            candidates.push(path.join(extensionsDir, d, 'bin', 'linux-x86_64', 'codex'));
-            candidates.push(path.join(extensionsDir, d, 'bin', 'darwin-arm64', 'codex'));
-            candidates.push(path.join(extensionsDir, d, 'bin', 'codex'));
-          }
-        } catch {}
-      }
       candidates.push(path.join(home, '.codex', 'bin', 'codex'));
+      candidates.push(path.join(home, '.local', 'bin', 'codex'));
       candidates.push('/usr/local/bin/codex');
     }
 
-    const pathBin = this.lookupInPath(process.platform === 'win32' ? 'codex.exe' : 'codex');
-    if (pathBin) candidates.push(pathBin);
+    for (const name of binaryCandidates('codex')) {
+      const pathBin = this.lookupInPath(name);
+      if (pathBin) candidates.push(pathBin);
+    }
 
     return Array.from(new Set(candidates));
   }
@@ -168,12 +180,10 @@ export class AgentDetector {
         return 'vscode_internal';
     }
 
+    // Only a path that can actually be launched here counts as installed: on
+    // POSIX a present-but-not-executable shim still has to be reported offline.
     for (const p of candidates) {
-      try {
-        if (fs.existsSync(p)) {
-          return p;
-        }
-      } catch {}
+      if (isExecutableFile(p)) return p;
     }
     return null;
   }
@@ -361,13 +371,12 @@ export class AgentDetector {
   private queryVersion(execPath: string): Promise<string | undefined> {
     return new Promise((resolve) => {
       try {
-        // `.cmd` / `.bat` launchers (Claude Code, DeepSeek Harness) are shell
-        // scripts and must be executed through cmd.exe on Windows.
-        const lower = execPath.toLowerCase();
-        const needsShellWrapper =
-          process.platform === 'win32' && (lower.endsWith('.cmd') || lower.endsWith('.bat'));
-        const command = needsShellWrapper ? 'cmd.exe' : execPath;
-        const args = needsShellWrapper ? ['/c', execPath, '--version'] : ['--version'];
+        // Windows `.cmd` / `.bat` launchers (Claude Code, DeepSeek Harness) are
+        // batch scripts and must be executed through cmd.exe. POSIX launchers
+        // run directly.
+        const wrap = needsShellWrapper(execPath);
+        const command = wrap ? 'cmd.exe' : execPath;
+        const args = wrap ? ['/c', execPath, '--version'] : ['--version'];
 
         const proc = execFile(command, args, { timeout: 8000 }, (error, stdout) => {
           if (error) {
@@ -386,19 +395,7 @@ export class AgentDetector {
   }
 
   private lookupInPath(command: string): string | null {
-    const envPath = process.env.PATH || '';
-    const delimiter = process.platform === 'win32' ? ';' : ':';
-    const dirs = envPath.split(delimiter);
-
-    for (const dir of dirs) {
-      const full = path.join(dir, command);
-      try {
-        if (fs.existsSync(full)) {
-          return full;
-        }
-      } catch {}
-    }
-    return null;
+    return lookupInPath(command);
   }
 
   /**

@@ -198,7 +198,11 @@ describe('context compaction - lagged ledger rule', () => {
 
   test('never replaces a small output with a bigger card', () => {
     const { store, dir } = makeStore();
-    const original = 's'.repeat(1_600);
+    // A deterministic card always spends ~1,400 chars on head/tail plus a few
+    // hundred on its header, so any output below that budget must be left
+    // alone. The exact figure must not depend on the platform's temp-path
+    // length, which is why this output is far smaller than the card.
+    const original = 's'.repeat(600);
     const thread = makeThread([makeRound(1, original), makeRound(2, 'current')]);
     store.upsertTask(thread);
 

@@ -776,6 +776,11 @@ describe('MCPServer Protocol Tests', () => {
     // A task that was accepted but never收口 (no merge request) still owns its
     // files: the next task would overwrite the uncommitted work.
     const now = new Date().toISOString();
+    // The gate only lets an EARLIER task hold files, and equal timestamps are
+    // broken by threadId, which would make this assertion depend on the id the
+    // dispatcher happens to mint. Seed the owner in the past so ordering is
+    // deterministic.
+    const earlier = new Date(Date.now() - 60_000).toISOString();
     taskStore.upsertTask({
       threadId: 'thread_seeded_owner',
       title: 'Earlier overlapping task',
@@ -783,7 +788,7 @@ describe('MCPServer Protocol Tests', () => {
       targetAgent: 'deepseek_harness',
       status: 'completed',
       currentRound: 1,
-      createdAt: now,
+      createdAt: earlier,
       updatedAt: now,
       receiverSessionId: 'session-seeded-owner',
       callerSessionId: 'caller-seeded',

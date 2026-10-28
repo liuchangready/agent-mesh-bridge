@@ -14,6 +14,7 @@ import {
   isValidSessionId,
 } from './types';
 import { AgentDetector } from './agent-detector';
+import { defaultBinary, needsShellWrapper } from './platform';
 import { buildDshHeadlessCommand } from './deepseek-harness';
 import { TaskRoleLock, TaskRoleLease } from './task-role-lock';
 import { CallerWakeQueue, WakeRequest } from './caller-wake-queue';
@@ -484,8 +485,7 @@ export class CallbackManager extends EventEmitter {
     try {
       if (initiator === 'antigravity') {
         const agyPath =
-          this.detector.resolveExecutable('antigravity') ||
-          (process.platform === 'win32' ? 'agy.exe' : 'agy');
+          this.detector.resolveExecutable('antigravity') || defaultBinary('agy');
         // agy.exe --conversation <callerSessionId> -p "<promptMessage>" --dangerously-skip-permissions --mode accept-edits
         const child = child_process.spawn(
           agyPath,
@@ -505,10 +505,8 @@ export class CallbackManager extends EventEmitter {
       }
 
       if (initiator === 'claude_code') {
-        const isWindows = process.platform === 'win32';
         const claudePath =
-          this.detector.resolveExecutable('claude_code') || (isWindows ? 'claude.cmd' : 'claude');
-        const isExe = claudePath.toLowerCase().endsWith('.exe');
+          this.detector.resolveExecutable('claude_code') || defaultBinary('claude');
         // The wake prompt is multi-line and `-p` is a boolean flag, so the
         // prompt travels on stdin. As an argv element it would be routed
         // through cmd.exe on Windows (npm shim), which truncates the message at
@@ -519,10 +517,11 @@ export class CallbackManager extends EventEmitter {
           // stdout/stderr are pumped into the callback log by attachErrorLogging.
           stdio: ['pipe', 'pipe', 'pipe'],
         };
-        const child =
-          isWindows && !isExe
-            ? child_process.spawn('cmd.exe', ['/c', claudePath, ...claudeArgs], claudeSpawnOpts)
-            : child_process.spawn(claudePath, claudeArgs, claudeSpawnOpts);
+        // A Windows batch shim must go through cmd.exe; a POSIX launcher is
+        // spawned directly, so the stdin prompt is never re-quoted by a shell.
+        const child = needsShellWrapper(claudePath)
+          ? child_process.spawn('cmd.exe', ['/c', claudePath, ...claudeArgs], claudeSpawnOpts)
+          : child_process.spawn(claudePath, claudeArgs, claudeSpawnOpts);
         if (child.stdin) {
           child.stdin.on('error', () => {});
           try {
@@ -537,9 +536,7 @@ export class CallbackManager extends EventEmitter {
       }
 
       if (initiator === 'codex') {
-        const isWindows = process.platform === 'win32';
-        const codexPath =
-          this.detector.resolveExecutable('codex') || (isWindows ? 'codex.exe' : 'codex');
+        const codexPath = this.detector.resolveExecutable('codex') || defaultBinary('codex');
         // `--ask-for-approval` is a global option and must precede `exec`.
         // codex --ask-for-approval never exec resume <callerSessionId> "<promptMessage>" --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --skip-git-repo-check
         const child = child_process.spawn(

@@ -17,6 +17,7 @@ import {
 import { AgentDetector } from './agent-detector';
 import { buildDshHeadlessCommand } from './deepseek-harness';
 import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
+import { defaultBinary, killProcessTree, needsShellWrapper } from './platform';
 import { normalizeModelId, resolveConfiguredModel, writeDshModelOverlay } from './model-catalog';
 import { accumulateTokenUsage, collectTokenUsage } from './token-usage-collector';
 import {
@@ -548,7 +549,6 @@ export class AutonomousRunner {
   public buildCommand(options: RunOptions): RunCommand {
     const { agent, prompt, isRework, receiverSessionId, title } = options;
     const resolvedPath = this.detector.resolveExecutable(agent);
-    const isWindows = process.platform === 'win32';
     const model = this.resolveModel(agent, options.model);
     // Codex accepts `--model` only on some subcommands, so the model travels as
     // a global `-c model="..."` config override: it parses identically for a
@@ -557,7 +557,7 @@ export class AutonomousRunner {
     const modelFlagArgs = model ? ['--model', model] : [];
 
     if (agent === 'codex') {
-      const exec = resolvedPath || (isWindows ? 'codex.exe' : 'codex');
+      const exec = resolvedPath || defaultBinary('codex');
       if (isRework) {
         // `--ask-for-approval` is a GLOBAL option: it must precede `exec`, not
         // follow the prompt. Passing it after `exec` makes Codex reject the
@@ -602,7 +602,7 @@ export class AutonomousRunner {
     }
 
     if (agent === 'claude_code') {
-      const exec = resolvedPath || (isWindows ? 'claude.cmd' : 'claude');
+      const exec = resolvedPath || defaultBinary('claude');
       // Two CLI realities shape this branch:
       //   1. The npm shim is a `.cmd`, so on Windows it is launched through
       //      cmd.exe. A multi-line prompt passed as an argument is cut at the
@@ -629,16 +629,18 @@ export class AutonomousRunner {
         ? ['--resume', receiverSessionId]
         : ['--session-id', receiverSessionId, '-n', title || 'Task'];
       const tailArgs = [...sessionArgs, ...sharedArgs];
+      // Only a Windows batch shim needs cmd.exe; a POSIX launcher runs directly.
+      const wrap = needsShellWrapper(exec);
       return {
-        command: isWindows ? 'cmd.exe' : exec,
-        args: isWindows ? ['/c', exec, ...tailArgs] : tailArgs,
+        command: wrap ? 'cmd.exe' : exec,
+        args: wrap ? ['/c', exec, ...tailArgs] : tailArgs,
         useShell: false,
         stdinPayload: prompt,
       };
     }
 
     if (agent === 'antigravity') {
-      const exec = resolvedPath || (isWindows ? 'agy.exe' : 'agy');
+      const exec = resolvedPath || defaultBinary('agy');
       if (isRework) {
         // agy --conversation <receiverSessionId> -p "<feedback>" --dangerously-skip-permissions --mode accept-edits --output-format stream-json
         return {
@@ -696,11 +698,13 @@ export class AutonomousRunner {
       }
     }
 
-    // Default generic fallback
+    // Default generic fallback. A shell is only needed to unwrap a Windows
+    // batch shim; on POSIX the resolved executable is spawned directly.
+    const fallback = resolvedPath || agent;
     return {
-      command: resolvedPath || agent,
+      command: fallback,
       args: ['-p', prompt, ...modelFlagArgs],
-      useShell: isWindows,
+      useShell: needsShellWrapper(fallback),
     };
   }
 
@@ -1642,15 +1646,7 @@ export class AutonomousRunner {
 
   private killProcess(child: child_process.ChildProcess): void {
     if (!child.pid) return;
-    if (process.platform === 'win32') {
-      try {
-        child_process.execSync(`taskkill /pid ${child.pid} /T /F`);
-      } catch {
-        child.kill('SIGKILL');
-      }
-    } else {
-      child.kill('SIGKILL');
-    }
+    killProcessTree(child);
   }
 
   /**

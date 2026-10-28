@@ -439,7 +439,7 @@ function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     receiverSessionId: 'session-x',
-    workspacePath: 'D:\\agent_bridge',
+    workspacePath: path.join(os.tmpdir(), 'bridge-workspace-agent'),
     summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
     rounds: [],
     ...overrides,

@@ -41,7 +41,7 @@ describe('ConfigSyncService - single MCP registration per agent', () => {
         'command = "node"',
         'args = ["stale.cjs", "--caller", "codex"]',
         '',
-        "[projects.'d:\\majiang']",
+        "[projects.'/tmp/bridge-workspace']",
         'trust_level = "trusted"',
         '',
       ].join('\n'),
@@ -53,7 +53,7 @@ describe('ConfigSyncService - single MCP registration per agent', () => {
       'utf8',
     );
 
-    const sync = new ConfigSyncService('C:\\tools\\agent-bridge-mcp.cjs', null, home);
+    const sync = new ConfigSyncService(path.join(os.tmpdir(), 'bridge-tools', 'agent-bridge-mcp.cjs'), null, home);
     await sync.syncAll();
 
     const toml = fs.readFileSync(path.join(codexDir, 'config.toml'), 'utf8');
@@ -77,7 +77,7 @@ describe('ConfigSyncService - single MCP registration per agent', () => {
   });
 
   test('registers one server for Claude Code and Antigravity too', async () => {
-    const sync = new ConfigSyncService('C:\\tools\\agent-bridge-mcp.cjs', null, home);
+    const sync = new ConfigSyncService(path.join(os.tmpdir(), 'bridge-tools', 'agent-bridge-mcp.cjs'), null, home);
     await sync.syncAll();
 
     const claude = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8'));
@@ -103,7 +103,7 @@ describe('ConfigSyncService - single MCP registration per agent', () => {
     fs.mkdirSync(dshPatchDir, { recursive: true });
     fs.writeFileSync(path.join(dshPatchDir, 'cordis.patch.yml'), '[]\n', 'utf8');
 
-    const sync = new ConfigSyncService('C:\\tools\\agent-bridge-mcp.cjs', provider, home);
+    const sync = new ConfigSyncService(path.join(os.tmpdir(), 'bridge-tools', 'agent-bridge-mcp.cjs'), provider, home);
     sync.setAgentMcpEnv({ COMMANDCODE_API_KEY: 'secret-key-value' });
     await sync.syncAll();
 

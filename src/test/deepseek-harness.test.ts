@@ -44,14 +44,22 @@ after(() => {
   }
 });
 
+// Path of the bridge MCP entrypoint as it appears inside a generated patch.
+const MCP_SCRIPT = path.join(os.tmpdir(), 'bridge-tools', 'agent-bridge-mcp.cjs');
+const asPatchPath = (file: string) => file.split(path.sep).join('/');
+
 describe('DeepSeek Harness - workspace slug encoding', () => {
   test('should collapse separator runs into a single dash', () => {
-    if (process.platform !== 'win32') return;
-    assert.strictEqual(encodeWorkspaceSlug('D:\\agent_bridge'), '--D-agent_bridge--');
-    assert.strictEqual(
-      encodeWorkspaceSlug('C:\\Users\\sncdc\\Documents\\deepseek-harness\\default workspace'),
-      '--C-Users-sncdc-Documents-deepseek-harness-default-workspace--',
-    );
+    // Runs on every platform: whatever separators and spaces the workspace path
+    // contains, the slug must stay a portable directory name.
+    const workspace = path.join(os.tmpdir(), 'deepseek  harness', 'default workspace');
+    const slug = encodeWorkspaceSlug(workspace);
+    const body = slug.slice(2, -2);
+
+    assert.ok(slug.startsWith('--') && slug.endsWith('--'));
+    assert.ok(!/[^A-Za-z0-9_-]/.test(body), `slug body must be portable: ${slug}`);
+    assert.ok(!body.includes('--'), 'separator runs must collapse to one dash');
+    assert.ok(body.endsWith('default-workspace'), `spaces must become one dash: ${slug}`);
   });
 });
 
@@ -151,7 +159,7 @@ describe('DeepSeek Harness - native session detection', () => {
     const previous = process.env.DSH_HOME;
     process.env.DSH_HOME = home;
     try {
-      const workspace = path.resolve('D:\\agent_bridge');
+      const workspace = path.join(home, 'agent_bridge');
       const slug = encodeWorkspaceSlug(workspace);
 
       const own = path.join(home, 'sessions', slug, 'session-11111111-1111-1111-1111-111111111111');
@@ -161,7 +169,7 @@ describe('DeepSeek Harness - native session detection', () => {
       const other = path.join(
         home,
         'sessions',
-        '--C-other--',
+        '--other-workspace--',
         'session-22222222-2222-2222-2222-222222222222',
       );
       writeFile(path.join(other, 'session.v4.jsonl.zstd'), 'x');
@@ -189,7 +197,10 @@ describe('DeepSeek Harness - native session detection', () => {
     const previous = process.env.DSH_HOME;
     process.env.DSH_HOME = home;
     try {
-      assert.strictEqual(detectDshActiveSession('D:\\agent_bridge'), undefined);
+      assert.strictEqual(
+        detectDshActiveSession(path.join(home, 'agent_bridge')),
+        undefined,
+      );
     } finally {
       if (previous === undefined) delete process.env.DSH_HOME;
       else process.env.DSH_HOME = previous;
@@ -198,13 +209,14 @@ describe('DeepSeek Harness - native session detection', () => {
 });
 
 describe('DeepSeek Harness - profile patch management', () => {
+
   test('should emit a single-server stdio MCP registration block', () => {
-    const block = buildDshMcpPatchBlock('D:\\tools\\agent-bridge-mcp.cjs', 'node');
+    const block = buildDshMcpPatchBlock(MCP_SCRIPT, 'node');
     assert.ok(block.includes("name: '@deepseek-ai/dsh-mcp-client'"));
     assert.ok(block.includes('transport: stdio'));
     // Each dsh-mcp-client instance connects to exactly one server.
     assert.ok(block.includes('serverName: agent-mesh-bridge'));
-    assert.ok(block.includes("'D:/tools/agent-bridge-mcp.cjs'"));
+    assert.ok(block.includes(`'${asPatchPath(MCP_SCRIPT)}'`));
     assert.ok(block.includes("'--caller'"));
     assert.ok(block.includes('MESH_CALLER_AGENT: deepseek_harness'));
   });
@@ -224,7 +236,7 @@ describe('DeepSeek Harness - profile patch management', () => {
   });
 
   test('should be idempotent across repeated syncs', () => {
-    const block = buildDshMcpPatchBlock('D:\\tools\\agent-bridge-mcp.cjs', 'node');
+    const block = buildDshMcpPatchBlock(MCP_SCRIPT, 'node');
     let content = '# comment\n\n[]\n';
     content = mergeManagedPatchBlock(content, block);
     content = mergeManagedPatchBlock(content, block);
@@ -233,15 +245,17 @@ describe('DeepSeek Harness - profile patch management', () => {
   });
 
   test('should replace a stale managed block with the current one', () => {
-    const stale = buildDshMcpPatchBlock('D:\\old\\agent-bridge-mcp.cjs', 'old-node');
-    const current = buildDshMcpPatchBlock('D:\\new\\agent-bridge-mcp.cjs', 'new-node');
+    const staleScript = path.join(os.tmpdir(), 'bridge-old', 'agent-bridge-mcp.cjs');
+    const currentScript = path.join(os.tmpdir(), 'bridge-new', 'agent-bridge-mcp.cjs');
+    const stale = buildDshMcpPatchBlock(staleScript, 'old-node');
+    const current = buildDshMcpPatchBlock(currentScript, 'new-node');
 
     let content = mergeManagedPatchBlock('[]\n', stale);
-    assert.ok(content.includes("'D:/old/agent-bridge-mcp.cjs'"));
+    assert.ok(content.includes(`'${asPatchPath(staleScript)}'`));
 
     content = mergeManagedPatchBlock(content, current);
-    assert.ok(content.includes("'D:/new/agent-bridge-mcp.cjs'"));
-    assert.ok(!content.includes("'D:/old/agent-bridge-mcp.cjs'"));
+    assert.ok(content.includes(`'${asPatchPath(currentScript)}'`));
+    assert.ok(!content.includes(`'${asPatchPath(staleScript)}'`));
     assert.ok(!content.includes('old-node'));
   });
 });
@@ -251,7 +265,11 @@ describe('DeepSeek Harness - run-output parsing', () => {
 
   test('should capture the native session id from the first run event', () => {
     const stream = [
-      '{"type":"session","sessionId":"session-807deafa-091d-4122-a287-ade252e863ab","cwd":"D:\\\\agent_bridge"}',
+      JSON.stringify({
+        type: 'session',
+        sessionId: 'session-807deafa-091d-4122-a287-ade252e863ab',
+        cwd: path.join(os.tmpdir(), 'agent_bridge'),
+      }),
       '{"type":"status","phase":"turn_start","turn":1}',
       '{"type":"final","text":"PONG"}',
     ].join('\n');
@@ -322,7 +340,7 @@ describe('DeepSeek Harness - configurable model provider', () => {
   });
 
   test('should keep the MCP and provider blocks independent', () => {
-    const mcp = buildDshMcpPatchBlock('D:\\tools\\agent-bridge-mcp.cjs', 'node');
+    const mcp = buildDshMcpPatchBlock(MCP_SCRIPT, 'node');
     const prov = buildDshProviderPatchBlock(provider);
 
     let text = mergeManagedPatchBlock('[]\n', mcp, MCP_MARKERS);

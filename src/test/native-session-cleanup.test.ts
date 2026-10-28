@@ -10,6 +10,12 @@ import {
 } from '../bridge/native-session-cleanup';
 import { DelegationThread, TaskRetargetRecord } from '../bridge/types';
 
+// Workspace paths are fixtures, not Windows-specific literals: the cleanup code
+// keys its records by whatever path the task really ran in.
+const WORKSPACE_A = path.join(os.tmpdir(), 'bridge-workspace-a');
+const WORKSPACE_B = path.join(os.tmpdir(), 'bridge-workspace-b');
+
+
 const SESSION_CLAUDE = '11111111-2222-3333-4444-555555555555';
 const SESSION_CODEX = '01a16bb5-4139-7231-910b-3bed102caa6e';
 const SESSION_ANTI = 'aa9fd1da-01b7-4bd7-a8df-8aae3b0aee44';
@@ -66,7 +72,7 @@ describe('native conversation cleanup on task deletion', () => {
     cleanupThreadNativeSessions(thread, { homeDir: home, env: {} });
 
   test('Claude Code: removes the transcript, subagent dir and per-session state', () => {
-    const project = path.join(home, '.claude', 'projects', 'D--agent-bridge');
+    const project = path.join(home, '.claude', 'projects', 'bridge-workspace-a');
     const transcript = path.join(project, `${SESSION_CLAUDE}.jsonl`);
     writeFile(transcript);
     writeFile(path.join(project, SESSION_CLAUDE, 'subagents', 'agent-1.jsonl'));
@@ -158,7 +164,7 @@ describe('native conversation cleanup on task deletion', () => {
       );
       writeFile(
         path.join(root, 'cache', 'last_conversations.json'),
-        JSON.stringify({ 'D:\\agent_bridge': SESSION_ANTI, 'D:\\other': SESSION_OTHER }),
+        JSON.stringify({ [WORKSPACE_A]: SESSION_ANTI, [WORKSPACE_B]: SESSION_OTHER }),
       );
     }
 
@@ -182,12 +188,12 @@ describe('native conversation cleanup on task deletion', () => {
       const metadata = readJson(path.join(root, 'cache', 'conversation_metadata.json'));
       assert.deepStrictEqual(Object.keys(metadata.conversations), [SESSION_OTHER]);
       const last = readJson(path.join(root, 'cache', 'last_conversations.json'));
-      assert.deepStrictEqual(last, { 'D:\\other': SESSION_OTHER });
+      assert.deepStrictEqual(last, { [WORKSPACE_B]: SESSION_OTHER });
     }
   });
 
   test('DeepSeek Harness: removes the session dir, projcache and workspace references', () => {
-    const workspaceSlug = '--D-agent_bridge--';
+    const workspaceSlug = '--bridge-workspace-a--';
     const sessionDir = path.join(home, '.dsh', 'sessions', workspaceSlug, SESSION_DSH);
     writeSessionDir(sessionDir);
     writeSessionDir(path.join(home, '.dsh', 'sessions', workspaceSlug, SESSION_OTHER));
@@ -206,8 +212,8 @@ describe('native conversation cleanup on task deletion', () => {
         },
         tables: {
           workspaces: {
-            w1: { path: 'D:\\agent_bridge', sessionIds: [SESSION_DSH, SESSION_OTHER] },
-            w2: { path: 'D:\\other', sessionIds: [SESSION_OTHER] },
+            w1: { path: WORKSPACE_A, sessionIds: [SESSION_DSH, SESSION_OTHER] },
+            w2: { path: WORKSPACE_B, sessionIds: [SESSION_OTHER] },
           },
         },
       }),

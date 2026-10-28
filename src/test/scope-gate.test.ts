@@ -1,5 +1,7 @@
 import { test, describe } from 'node:test';
 import * as assert from 'node:assert';
+import * as os from 'os';
+import * as path from 'path';
 
 import { describeScopeConflict, findScopeConflicts, knownTaskFiles } from '../bridge/file-scope';
 import { DelegationThread } from '../bridge/types';
@@ -20,7 +22,7 @@ function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread
     updatedAt: RECENT,
     receiverSessionId: 'session-a',
     callerSessionId: 'caller-a',
-    workspacePath: 'D:\\repo',
+    workspacePath: path.join(os.tmpdir(), 'bridge-workspace-repo'),
     summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
     rounds: [],
     ...overrides,
