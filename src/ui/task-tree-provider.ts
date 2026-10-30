@@ -123,6 +123,22 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
             : ' · ⚠️检视唤醒失败'
       : '';
 
+    // A review the caller parked with `blocked: true` is NOT a review still in
+    // progress: the verdict was "hold until a dependency lands". Without this
+    // the tree row is indistinguishable from one the reviewer is still working
+    // on. `waiting_review` stays the lifecycle status on purpose (task-level
+    // FIFO keeps the slot until approve/rework), so surface the sub-state here.
+    const reviewBlocked =
+      thread.status === 'waiting_review' && thread.reviewBlocked ? thread.reviewBlocked : undefined;
+    if (reviewBlocked) {
+      statusLabel = `Parked Review · 已挂起 (${roundText})`;
+    }
+    const blockedBadge = reviewBlocked
+      ? reviewBlocked.waitingForThreadId
+        ? ` · ⏸等 ${reviewBlocked.waitingForThreadId.replace(/^thread_/, '').slice(0, 20)}`
+        : ' · ⏸挂起(外部依赖)'
+      : '';
+
     // Derived from the rounds (never a stored aggregate): cheap, and cannot go
     // stale after another process finalizes a round.
     const tokenSummary = aggregateThreadTokenUsage(thread.rounds || []);
@@ -131,7 +147,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
         ? ` · ${tokenSummary.isPartialOrEstimated ? '~' : ''}${formatTokenCount(tokenSummary.totalTokens)} tok`
         : '';
 
-    const description = `${statusLabel} · ${durationText}${modelBadge}${tokenBadge}${repeatBadge}${scopeBadge}${reviewBadge}`;
+    const description = `${statusLabel} · ${durationText}${modelBadge}${tokenBadge}${repeatBadge}${scopeBadge}${reviewBadge}${blockedBadge}`;
 
     const item = new TaskTreeItem(label, vscode.TreeItemCollapsibleState.Collapsed, thread);
     item.description = description;
@@ -139,10 +155,13 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     item.contextValue =
       thread.status === 'waiting_review'
         ? // A healthy review needs no manual wake: only a recorded wake failure
-          // exposes the "re-review" action (see the menu `when` clause).
+          // exposes the "re-review" action (see the menu `when` clause). A
+          // parked review gets its own value so the user can release the park.
           reviewWake
           ? 'waiting_review_stalled'
-          : 'waiting_review'
+          : reviewBlocked
+            ? 'waiting_review_blocked'
+            : 'waiting_review'
         : thread.status === 'paused'
           ? 'paused_task'
           : 'task_item';
