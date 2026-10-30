@@ -159,6 +159,7 @@ src/
 │   ├── caller-poll-guard.ts   # 派发后轮询抑制：同进度重复读取只回短载荷 + 停止指令
 │   ├── round-log.ts           # 每轮日志/归档路径、数值最轮取用、分页读取
 │   ├── reviewer-log.ts        # 检视方（caller）侧日志：逐轮落盘、字节上限、尾部读取
+│   ├── build-staleness.ts     # 宿主构建落后自检：磁盘 vs 内存代码、新版本目录探测（装完未重载）
 │   ├── bridge-policy.ts       # 跨进程策略镜像 (bridge-policy.json: contextCompaction)
 │   ├── context-compactor.ts   # 上下文滞后压缩：协议注入、胶囊解析、归档、幂等与失败隔离
 │   ├── token-usage-collector.ts# Token 计量：四端解析归一化、估算、跨 attempt 累加、读时派生汇总
