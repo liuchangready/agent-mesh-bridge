@@ -19,6 +19,7 @@ import {
   buildReviewWakeState,
 } from '../bridge/review-wake';
 import { DelegationRound, DelegationThread } from '../bridge/types';
+import { TaskRoleLock } from '../bridge/task-role-lock';
 
 describe('Review wake failure policy', () => {
   const now = Date.parse('2026-10-23T12:00:00.000Z');
@@ -279,6 +280,54 @@ describe('ReviewWakeScheduler', () => {
     assert.strictEqual(stored.status, 'waiting_review');
     assert.strictEqual(stored.reviewWake!.autoRetryAttempts, 1);
     assert.ok(Date.parse(stored.reviewWake!.autoRetryAt!) > nowMs);
+    scheduler.dispose();
+    store.dispose();
+  });
+
+  test('does not fire a planned retry while a reviewer is already running', async () => {
+    const nowMs = Date.parse('2026-10-23T12:00:00.000Z');
+    const { store, scheduler, launches } = setup(nowMs, { isReviewerActive: () => true });
+    store.upsertTask(makeThread({ autoRetryAt: new Date(nowMs - 1_000).toISOString() }));
+
+    // A live reviewer owns the caller session; a second `resume` of the same
+    // native thread is rejected by codex ("no rollout found").
+    const launched = await scheduler.runDue();
+
+    assert.strictEqual(launched, 0);
+    assert.strictEqual(launches.length, 0);
+    scheduler.dispose();
+    store.dispose();
+  });
+
+  test('does not retry while a sibling task is reviewing the same caller session', async () => {
+    const nowMs = Date.parse('2026-10-23T12:00:00.000Z');
+    const { store, scheduler, launches } = setup(nowMs, { isReviewerActive: () => false });
+    const sharedUuid = '11111111-2222-3333-4444-555555555555';
+
+    // A sibling task spells the same codex thread by its rollout file name.
+    const sibling = makeThread();
+    sibling.threadId = 'thread_sibling_same_session';
+    sibling.callerSessionId = `rollout-2026-10-23T10-00-00-${sharedUuid}`;
+    delete sibling.reviewWake;
+    store.upsertTask(sibling);
+
+    // The retried task spells it as the bare thread id.
+    const retried = makeThread({ autoRetryAt: new Date(nowMs - 1_000).toISOString() });
+    retried.threadId = 'thread_review_wake_sched';
+    retried.callerSessionId = sharedUuid;
+    store.upsertTask(retried);
+
+    const lock = new TaskRoleLock();
+    const lease = lock.tryAcquire(sibling.threadId, 'reviewer');
+    assert.ok(lease, 'the sibling holds the reviewer role for that session');
+    try {
+      const launched = await scheduler.runDue();
+      assert.strictEqual(launched, 0, 'the busy caller session must not be resumed twice');
+      assert.strictEqual(launches.length, 0);
+    } finally {
+      lock.release(lease);
+    }
+
     scheduler.dispose();
     store.dispose();
   });

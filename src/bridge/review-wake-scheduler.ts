@@ -13,6 +13,7 @@ import {
 } from './review-wake';
 import { DelegationRound, DelegationThread, RateLimitInfo, ReviewWakeState } from './types';
 import { TaskRoleLock } from './task-role-lock';
+import { callerSessionKey } from './caller-wake-queue';
 
 export interface ReviewWakeSchedulerOptions {
   now?: () => number;
@@ -330,11 +331,45 @@ export class ReviewWakeScheduler extends EventEmitter {
             t.reviewWake.gaveUp !== true &&
             // A review parked on a dependency is not stalled: its wake is
             // driven by the dependency's completion, not by a timer.
-            !t.reviewBlocked,
+            !t.reviewBlocked &&
+            // A reviewer is already running this review. Firing the planned
+            // retry now would spawn a second process on the SAME native
+            // session, and codex rejects that with "no rollout found".
+            !this.isReviewerActive(t.threadId) &&
+            // Sibling tasks can share one caller session (the same codex
+            // thread). While any of them has a live reviewer, this session is
+            // busy: resuming it again is rejected by the CLI.
+            !this.isCallerSessionBusy(t),
         );
     } catch {
       return [];
     }
+  }
+
+  /**
+   * True when a live reviewer of a SIBLING task owns the same caller session.
+   *
+   * The wake queue is keyed per process; two tasks whose callerSessionId spells
+   * the same codex thread differently (`rollout-…-uuid` vs bare `uuid`) used to
+   * get separate slots and both resumed it, which codex rejects with
+   * "no rollout found for thread id". The role lock is the cross-process truth:
+   * if a sibling thread still holds a live reviewer role for that session, this
+   * task must wait for it to finish.
+   */
+  private isCallerSessionBusy(thread: DelegationThread): boolean {
+    const key = callerSessionKey(thread.callerSessionId || '');
+    if (!key) return false;
+    try {
+      const lock = new TaskRoleLock();
+      for (const other of this.taskStore.getAllTasks()) {
+        if (other.threadId === thread.threadId) continue;
+        if (callerSessionKey(other.callerSessionId || '') !== key) continue;
+        if (lock.getOwner(other.threadId)?.role === 'reviewer') return true;
+      }
+    } catch {
+      // Best effort: a lock read failure must not block the retry path.
+    }
+    return false;
   }
 
   private rateLimitOf(thread: DelegationThread): RateLimitInfo | undefined {
