@@ -1040,6 +1040,19 @@ export function activate(context: vscode.ExtensionContext) {
           return;
         }
 
+        // An explicit manual re-review overrides the caller's `blocked` hold;
+        // `CallbackManager.notifyCaller` refuses to wake a parked task, so the
+        // park has to be released here (the user asked for it by name).
+        if (thread.reviewBlocked) {
+          const parkedOn = thread.reviewBlocked.waitingForThreadId || '外部依赖';
+          thread.reviewBlocked = undefined;
+          thread.updatedAt = new Date().toISOString();
+          taskStore.upsertTask(thread);
+          vscode.window.showInformationMessage(
+            `已解除【${thread.title}】的挂起（原本等待 ${parkedOn}），正在唤醒下发者重新检视。`,
+          );
+        }
+
         const lastRound =
           [...thread.rounds].reverse().find((r) => r.status === 'completed') ||
           thread.rounds[thread.rounds.length - 1];

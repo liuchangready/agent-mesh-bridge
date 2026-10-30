@@ -891,6 +891,27 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
           : ''
       }
       ${
+        thread.status === 'waiting_review' && thread.reviewBlocked
+          ? `
+      <div class="meta-item" style="grid-column: 1 / -1;">
+        <div class="meta-label" style="color: #f59e0b;">Review Parked（检视已完成 · 挂起等待依赖）</div>
+        <div class="meta-val" style="color: #fcd34d;">
+          ${
+            thread.reviewBlocked.waitingForThreadId
+              ? `已挂起，等待依赖任务 <strong>${escapeHtml(thread.reviewBlocked.waitingForThreadId)}</strong> 到达 completed / failed 后自动唤醒复核。`
+              : '已挂起等待 <strong>外部依赖</strong>（未记录 waitingForThreadId）：桥接无法自动恢复，需要人工重新检视。'
+          }
+          ${
+            thread.reviewBlocked.reason
+              ? `<div style="margin-top: 6px; white-space: pre-wrap; color: #fde68a; opacity: 0.9;">${escapeHtml(thread.reviewBlocked.reason.slice(0, 800))}</div>`
+              : ''
+          }
+          <div style="margin-top: 6px; opacity: 0.85;">检视已经完成并由检视方主动挂起，因此任务生命周期状态保持 <strong>waiting_review</strong>（未批准、未新增返修轮）。任务树的标签会显示“Parked Review · 已挂起”。</div>
+        </div>
+      </div>`
+          : ''
+      }
+      ${
         thread.expectedFiles && thread.expectedFiles.length > 0
           ? `
       <div class="meta-item" style="grid-column: 1 / -1;">
