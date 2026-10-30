@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { TaskStore } from './bridge/task-store';
@@ -37,6 +38,27 @@ import {
   resolveConfiguredModel,
   saveModelDefaults,
 } from './bridge/model-catalog';
+import {
+  BuildStamp,
+  FreshnessVerdict,
+  describeStaleBuild,
+  detectStaleBuild,
+  findNewerInstalledVersion,
+  readBuildStamp,
+} from './bridge/build-staleness';
+
+/**
+ * When this module was read into memory.
+ *
+ * A reload (or a fresh window) imports it again, so this is the instant the
+ * running code was loaded — the correct reference point for "did the files
+ * change under us?". Process start is too coarse: an extension can be activated
+ * long after the window opened.
+ */
+const MODULE_LOADED_AT_MS = Date.now();
+
+/** One nudge per host: reloading is the user's call, not a loop. */
+let staleBuildWarned = false;
 
 /** Settings key holding the default model of each agent. */
 const MODEL_SETTING_KEYS: Record<AgentId, string> = {
@@ -57,6 +79,89 @@ const AGENT_LABELS: Record<AgentId, string> = {
 
 export function activate(context: vscode.ExtensionContext) {
   console.log('[Agent Mesh Bridge] Activating extension...');
+
+  // Which build is actually rendering the UI?
+  //
+  // VS Code can keep an extension host (and its in-memory JS) alive across a
+  // reinstall, so a brand-new feature then looks like a plain bug. This marker
+  // makes the live UI build verifiable from outside the editor, and the
+  // freshness check below turns the same evidence into a reload prompt: if the
+  // files on disk were replaced after this module was loaded (same-version
+  // force-reinstall, `tsc -w`, a copied build) or a newer version is installed
+  // in a sibling folder, the running code is stale by definition.
+  const extensionVersion = (context.extension.packageJSON as { version?: string })?.version;
+  const buildStamp: BuildStamp = readBuildStamp(context.extensionPath);
+  // Only an installed folder has siblings worth scanning (and a version to
+  // compare against). In the F5 dev host `extensionPath` is the repository, so
+  // scanning its parent would walk a drive root for nothing.
+  const newerInstalledVersion =
+    buildStamp.installedAtMs !== undefined
+      ? findNewerInstalledVersion({
+          extensionPath: context.extensionPath,
+          extensionId: context.extension.id,
+          runningVersion: buildStamp.version || extensionVersion,
+        })
+      : undefined;
+  const freshness: FreshnessVerdict = detectStaleBuild({
+    moduleLoadedAtMs: MODULE_LOADED_AT_MS,
+    stamp: buildStamp,
+    newerInstalledVersion,
+  });
+
+  try {
+    const markerDir = path.join(os.homedir(), '.agent-mesh-bridge');
+    fs.mkdirSync(markerDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(markerDir, 'extension-host.json'),
+      JSON.stringify(
+        {
+          pid: process.pid,
+          activatedAt: new Date().toISOString(),
+          version: extensionVersion,
+          extensionPath: context.extensionPath,
+          // Diagnostic snapshot only: "which build is this window executing?".
+          // No feature registry here — a hardcoded capability map drifts away
+          // from the code it claims to describe; version + build times answer
+          // the question without lying.
+          build: {
+            moduleLoadedAt: new Date(MODULE_LOADED_AT_MS).toISOString(),
+            installedAt:
+              buildStamp.installedAtMs !== undefined
+                ? new Date(buildStamp.installedAtMs).toISOString()
+                : undefined,
+            scriptMtime:
+              buildStamp.scriptMtimeMs !== undefined
+                ? new Date(buildStamp.scriptMtimeMs).toISOString()
+                : undefined,
+            stale: freshness.stale,
+            reasons: freshness.reasons,
+            driftMs: freshness.driftMs,
+            newerInstalledVersion: freshness.newerInstalledVersion,
+          },
+        },
+        null,
+        2,
+      ),
+    );
+  } catch (err) {
+    console.warn('[Agent Mesh Bridge] Could not write extension-host marker:', err);
+  }
+
+  if (freshness.stale && !staleBuildWarned) {
+    staleBuildWarned = true;
+    console.warn(`[Agent Mesh Bridge] ${describeStaleBuild(freshness)}`);
+    vscode.window
+      .showWarningMessage(
+        `⚠️ [Agent Bridge] ${describeStaleBuild(freshness)}`,
+        '立即重载 (Reload Now)',
+        '稍后 (Later)',
+      )
+      .then((choice) => {
+        if (choice === '立即重载 (Reload Now)') {
+          vscode.commands.executeCommand('workbench.action.reloadWindow');
+        }
+      });
+  }
 
   // 1. Read configuration
   const config = vscode.workspace.getConfiguration('agentMeshBridge');
