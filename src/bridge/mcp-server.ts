@@ -1,4 +1,5 @@
 import * as readline from 'readline';
+import * as fs from 'fs';
 import * as path from 'path';
 import { AsyncDispatcher } from './async-dispatcher';
 import { ReworkController } from './rework-controller';
@@ -28,6 +29,7 @@ import {
   roundExecutionLogPath,
   roundOutputArchivePath,
 } from './round-log';
+import { listReviewerLogRounds, reviewerLogPath } from './reviewer-log';
 import { aggregateThreadTokenUsage } from './token-usage-collector';
 
 /** Older non-compacted rounds are excerpted to this many characters. */
@@ -235,6 +237,89 @@ export class MCPServer {
       hint:
         'This round is not archived yet; serving the ledger copy. ' +
         (nextOffset < text.length ? `Continue with offsetBytes=${nextOffset}.` : 'End of output.'),
+    };
+  }
+
+  /**
+   * Verbatim, bounded read of the reviewer side of one round.
+   *
+   * The reviewer is the caller's own process, so its stream is not part of the
+   * round ledger. `CallbackManager` tees it into
+   * `logs/<threadId>_round_<n>.reviewer.log`; this serves that artifact with
+   * the same paging contract as `get_round_raw_log`.
+   */
+  private readReviewerLog(args: any) {
+    const threadId: string = args?.threadId;
+    const task = this.taskStore.getTask(threadId);
+    if (!task) throw new Error(`Thread not found: ${threadId}`);
+
+    const withLogs = [
+      ...new Set([
+        ...listReviewerLogRounds(threadId, this.storeRoot()),
+        ...listReviewerLogRounds(threadId),
+      ]),
+    ].sort((a, b) => b - a);
+
+    const requested = Number(args?.round);
+    const round = Number.isFinite(requested) && requested >= 1 ? Math.floor(requested) : withLogs[0];
+    if (!Number.isFinite(round) || round < 1) {
+      return {
+        threadId,
+        available: false,
+        reason: 'no_reviewer_log',
+        roundsWithReviewerLog: [],
+        message:
+          'No reviewer log exists for this task yet: the bridge only records one while it wakes the caller ' +
+          '(waiting_review), and rounds reviewed before this artifact existed have none. ' +
+          'The reviewer verdict itself is still on the round ledger (approval remarks / next round feedback).',
+      };
+    }
+
+    const maxBytes = Math.min(
+      Math.max(1, Number(args?.maxBytes) || DEFAULT_RAW_LOG_BYTES),
+      MAX_RAW_LOG_BYTES,
+    );
+    const offsetBytes = Math.max(0, Number(args?.offsetBytes) || 0);
+
+    const found = [
+      reviewerLogPath(threadId, round, this.storeRoot()),
+      reviewerLogPath(threadId, round),
+    ].find((candidate) => fs.existsSync(candidate));
+
+    if (!found) {
+      return {
+        threadId,
+        round,
+        available: false,
+        reason: 'no_reviewer_log_for_round',
+        roundsWithReviewerLog: withLogs,
+        message:
+          `Round ${round} has no reviewer log on disk. ` +
+          (withLogs.length
+            ? `Rounds with a reviewer log: ${withLogs.join(', ')}.`
+            : 'No round of this task has one.'),
+      };
+    }
+
+    const page = readTextFilePaged(found, { offsetBytes, maxBytes });
+    const latest = (task.rounds || []).reduce(
+      (max, entry) => (entry.round > max ? entry.round : max),
+      0,
+    );
+    return {
+      threadId,
+      round,
+      available: true,
+      unit: 'bytes',
+      ...page,
+      returnedBytes: Buffer.byteLength(page.content, 'utf8'),
+      reviewerAgent: task.initiatorAgent,
+      /** True while the caller is still reviewing this round. */
+      live: task.status === 'waiting_review' && round === (task.currentRound || latest),
+      roundsWithReviewerLog: withLogs,
+      hint: page.truncated
+        ? `Paged: continue with offsetBytes=${page.nextOffset}.`
+        : 'End of reviewer log. The reviewer verdict lives on the ledger, not in this stream.',
     };
   }
 
@@ -676,6 +761,33 @@ export class MCPServer {
             },
           },
           required: ['threadId', 'round'],
+        },
+      },
+      {
+        name: 'get_reviewer_log',
+        description:
+          'Read the REVIEWER (caller) side of one task round: the stdout/stderr the bridge captured while it woke the initiator agent in its native session. ' +
+          'Receiver output lives in get_round_raw_log; this is the other half of a review, and it is the only place a reviewer\'s reasoning is available (the ledger stores its verdict, not its stream). ' +
+          'Bounded and paged (default 20,000 bytes, max 200,000); pass round to pick a round (default: the newest round that has a reviewer log). ' +
+          'A task whose reviewer never ran returns available=false instead of an empty string.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            threadId: { type: 'string', description: 'Task thread ID.' },
+            round: {
+              type: 'number',
+              description: 'Round number to read (1-based). Omit for the newest reviewed round.',
+            },
+            offsetBytes: {
+              type: 'number',
+              description: 'Byte offset to start from (default 0).',
+            },
+            maxBytes: {
+              type: 'number',
+              description: `Bytes to return (default ${DEFAULT_RAW_LOG_BYTES}, max ${MAX_RAW_LOG_BYTES}).`,
+            },
+          },
+          required: ['threadId'],
         },
       },
       {
@@ -1176,6 +1288,10 @@ export class MCPServer {
           throw new Error('`round` must be a positive round number.');
         }
         return this.readRoundRawLog(args.threadId, roundNumber, args);
+      }
+
+      case 'get_reviewer_log': {
+        return this.readReviewerLog(args);
       }
 
       case 'get_recent_logs': {

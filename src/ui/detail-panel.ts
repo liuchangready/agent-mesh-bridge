@@ -6,10 +6,12 @@ import { DelegationThread } from '../bridge/types';
 import { TaskSupervisor } from '../bridge/task-supervisor';
 import { AgentDetector } from '../bridge/agent-detector';
 import {
+  formatBytes,
   resolveExistingArtifactPath,
   roundExecutionLogPath,
   roundOutputArchivePath,
 } from '../bridge/round-log';
+import { readReviewerLogTail, reviewerLogPath, statReviewerLog } from '../bridge/reviewer-log';
 import { aggregateThreadTokenUsage, formatTokenCount } from '../bridge/token-usage-collector';
 
 export class TaskDetailPanel {
@@ -48,6 +50,15 @@ export class TaskDetailPanel {
         this.taskStore.off('changed', onTasksChanged);
       },
     });
+
+    // The reviewer runs outside the ledger, so `changed` never fires while it
+    // works. Tick once every 30s during `waiting_review` so the Reviewer Output
+    // block follows the live log instead of freezing on the first chunk.
+    const reviewerTick = setInterval(() => {
+      const thread = this.taskStore.getTask(this.currentThreadId);
+      if (thread?.status === 'waiting_review') this.update();
+    }, 30_000);
+    this.disposables.push({ dispose: () => clearInterval(reviewerTick) });
 
     // Handle messages from Webview
     this.panel.webview.onDidReceiveMessage(
@@ -88,6 +99,9 @@ export class TaskDetailPanel {
             break;
           case 'openRoundRawLog':
             await this.handleOpenRoundRawLog(Number(message.round));
+            break;
+          case 'openReviewerLog':
+            await this.handleOpenReviewerLog(Number(message.round));
             break;
           case 'printRecentLogs':
             await vscode.commands.executeCommand(
@@ -323,6 +337,50 @@ export class TaskDetailPanel {
     }
   }
 
+  /**
+   * Open the reviewer-side log of one round in the editor.
+   *
+   * The reviewer (caller) never writes into the ledger, so its output lives in
+   * a dedicated artifact: `logs/<threadId>_round_<n>.reviewer.log`.
+   */
+  private async handleOpenReviewerLog(roundNumber: number): Promise<void> {
+    const root = path.dirname(this.taskStore.getStoragePath());
+    const file = resolveExistingArtifactPath([
+      reviewerLogPath(this.currentThreadId, roundNumber, root),
+      reviewerLogPath(this.currentThreadId, roundNumber),
+    ]);
+    if (!file) {
+      vscode.window.showWarningMessage(
+        `第 ${roundNumber} 轮没有 reviewer 输出记录（该轮未唤醒检视方，或记录早于本功能）。`,
+      );
+      return;
+    }
+    try {
+      const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
+      await vscode.window.showTextDocument(document, { preview: true });
+    } catch (err) {
+      vscode.window.showErrorMessage(`无法打开 reviewer 日志：${String(err)}`);
+    }
+  }
+
+  /** Reviewer log tail for one round, or undefined when the reviewer never ran. */
+  private readReviewerOutput(roundNumber: number) {
+    const root = path.dirname(this.taskStore.getStoragePath());
+    return (
+      readReviewerLogTail(this.currentThreadId, roundNumber, { root }) ??
+      readReviewerLogTail(this.currentThreadId, roundNumber)
+    );
+  }
+
+  /** Cheap existence probe for rounds whose bytes are not rendered inline. */
+  private reviewerLogExists(roundNumber: number): boolean {
+    const root = path.dirname(this.taskStore.getStoragePath());
+    return (
+      statReviewerLog(this.currentThreadId, roundNumber, root).exists ||
+      statReviewerLog(this.currentThreadId, roundNumber).exists
+    );
+  }
+
   private getHtmlForWebview(thread: DelegationThread): string {
     const escapeHtml = (str: string) => {
       return (str || '')
@@ -362,6 +420,19 @@ export class TaskDetailPanel {
         const isPaused = r.status === 'paused';
         const roundBorderColor = isFailed ? '#ef4444' : isPaused ? '#f97316' : '#334155';
         const capsule = r.isCompacted ? r.compactSummary : undefined;
+        // Reviewer side of this round: read on every render so the block follows
+        // the live wake log while the caller is still thinking. Only the newest
+        // rounds ship their bytes into the webview; older ones just get a button,
+        // so a 100-round ledger cannot inflate the panel.
+        const reviewerRound = Number(thread.currentRound || 0);
+        const newestRound = thread.rounds.reduce(
+          (max, entry) => (entry.round > max ? entry.round : max),
+          reviewerRound,
+        );
+        const reviewerTail =
+          r.round > newestRound - 10 ? this.readReviewerOutput(r.round) : undefined;
+        const reviewerExists = reviewerTail ? true : this.reviewerLogExists(r.round);
+        const reviewerLive = r.round === reviewerRound && thread.status === 'waiting_review';
 
         return `
         <div class="round-card" style="border-left: 4px solid ${roundBorderColor};">
@@ -455,6 +526,36 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
               Receiver Output ${r.status === 'running' ? '(实时流式更新中 · 每30s自动刷新):' : ':'}
             </div>
             <pre class="code-block output-text">${escapeHtml(r.output)}</pre>
+          </div>`
+              : ''
+          }
+
+          ${
+            reviewerExists || reviewerLive
+              ? `
+          <div class="output-section" style="border:1px solid #1d4ed8; border-radius:8px; padding:10px; background:rgba(29,78,216,0.10); margin-top:8px;">
+            <div class="section-title" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              ${reviewerLive ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#3b82f6;box-shadow:0 0 6px #3b82f6;"></span>` : ''}
+              Reviewer Output · ${escapeHtml(thread.initiatorAgent)}
+              ${reviewerLive ? '(检视进行中 · 每30s自动刷新)' : ''}
+            </div>
+            ${
+              reviewerTail
+                ? `
+            <div class="round-meta" style="margin-bottom:6px;">${escapeHtml(reviewerTail.path)} · ${formatBytes(reviewerTail.totalBytes)}${reviewerTail.truncated ? ' · 仅显示末尾片段' : ''}</div>
+            <pre class="code-block output-text" style="max-height:320px;">${escapeHtml(reviewerTail.content)}</pre>
+            <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
+              <button class="secondary" style="padding:4px 10px;font-size:12px;" onclick="openReviewerLog(${r.round})">📄 查看完整 Reviewer 日志</button>
+            </div>`
+                : reviewerExists
+                  ? `
+            <div class="round-meta" style="margin-bottom:6px;">本轮已有 reviewer 记录（较早轮次，内容不内联渲染）。</div>
+            <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
+              <button class="secondary" style="padding:4px 10px;font-size:12px;" onclick="openReviewerLog(${r.round})">📄 查看完整 Reviewer 日志</button>
+            </div>`
+                  : `
+            <pre class="code-block" style="color:#93c5fd;">本轮尚未采集到 reviewer 输出（唤醒进程还没产生输出，或记录早于本功能）。</pre>`
+            }
           </div>`
               : ''
           }
@@ -999,6 +1100,10 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
 
     function openRoundRawLog(round) {
       vscode.postMessage({ command: 'openRoundRawLog', round: round });
+    }
+
+    function openReviewerLog(round) {
+      vscode.postMessage({ command: 'openReviewerLog', round: round });
     }
 
     function copyLogs() {

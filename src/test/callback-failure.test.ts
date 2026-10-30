@@ -69,6 +69,7 @@ describe('CallbackManager failure wake-ups', () => {
       sessionId: string,
       prompt: string,
       round: DelegationRound,
+      _kind: 'review' | 'failure',
       release: () => void,
     ) => {
       captured = { sessionId, prompt, round };
@@ -104,6 +105,7 @@ describe('CallbackManager failure wake-ups', () => {
       _s: any,
       _p: any,
       _r: any,
+      _kind: 'review' | 'failure',
       release: () => void,
     ) => {
       launches++;
@@ -125,6 +127,7 @@ describe('CallbackManager failure wake-ups', () => {
       _s: any,
       _p: any,
       _r: any,
+      _kind: 'review' | 'failure',
       release: () => void,
     ) => {
       launches++;
@@ -150,6 +153,7 @@ describe('CallbackManager failure wake-ups', () => {
       _s: string,
       p: string,
       _r: any,
+      _kind: 'review' | 'failure',
       release: () => void,
     ) => {
       prompt = p;

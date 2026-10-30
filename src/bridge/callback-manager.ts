@@ -22,6 +22,7 @@ import type { TaskStore } from './task-store';
 import { aggregateThreadTokenUsage, formatTokenCount } from './token-usage-collector';
 import { buildReviewWakeState } from './review-wake';
 import { detectRateLimitSignal } from './autonomous-runner';
+import { ReviewerLogWriter, createReviewerLogWriter } from './reviewer-log';
 
 /**
  * How many times one task may wake its caller about failures.
@@ -215,6 +216,7 @@ export class CallbackManager extends EventEmitter {
       callerSessionId,
       promptMessage,
       round,
+      'review',
       release,
       (childPid) => roleLock.attachChild(roleLease, childPid),
     );
@@ -327,7 +329,7 @@ export class CallbackManager extends EventEmitter {
       this.wakeQueue.release(callerSessionId);
       this.drainNextWake(callerSessionId);
     };
-    const launched = this.launchCaller(thread, callerSessionId, promptMessage, round, release);
+    const launched = this.launchCaller(thread, callerSessionId, promptMessage, round, 'failure', release);
     if (launched) {
       thread.failureNotifications = [...alreadyNotified, roundNumber];
       this.emit('taskFailed', { thread, round, error: reason });
@@ -372,6 +374,7 @@ export class CallbackManager extends EventEmitter {
     callerSessionId: string,
     promptMessage: string,
     round: DelegationRound,
+    wakeKind: 'review' | 'failure',
     release: () => void,
     onChildPid?: (pid: number | undefined) => void,
   ): boolean {
@@ -396,6 +399,19 @@ export class CallbackManager extends EventEmitter {
       CI: '1',
       NON_INTERACTIVE: 'true',
     };
+    // Besides the shared callbacks.log, give this wake its own artifact so the
+    // detail panel and MCP callers can read the reviewer's side of one round
+    // without grepping a multi-hundred-megabyte global file.
+    const reviewerLog: ReviewerLogWriter = createReviewerLogWriter(
+      thread.threadId,
+      round.round,
+      {
+        agent: initiator,
+        sessionId: callerSessionId,
+        kind: wakeKind,
+        note: `${thread.title} | receiver=${thread.targetAgent} | roundType=${round.type}`,
+      },
+    );
     // The callback wakes the INITIATOR, which must retain full bridge tools
     // (review/rework/approve). Never inherit a receiver marker from whatever
     // process happened to trigger this callback.
@@ -420,6 +436,7 @@ export class CallbackManager extends EventEmitter {
     const tee = (chunk: Buffer | string) => {
       const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
       capture.push(text);
+      reviewerLog.write(text);
       if (typeof outFd !== 'number') return;
       try {
         fs.writeSync(outFd, text);
@@ -435,6 +452,8 @@ export class CallbackManager extends EventEmitter {
       const settle = (outcome: { exitCode?: number; error?: string }) => {
         if (settled) return;
         settled = true;
+        reviewerLog.writeOutcome(outcome);
+        reviewerLog.close();
         release();
         try {
           const state = this.finalizeWake(thread, round, callerSessionId, {
@@ -560,6 +579,8 @@ export class CallbackManager extends EventEmitter {
       if (initiator === 'deepseek_harness') {
         const launcher = this.detector.resolveExecutable('deepseek_harness');
         if (!launcher) {
+          reviewerLog.writeOutcome({ error: 'DeepSeek Harness launcher not found' });
+          reviewerLog.close();
           release();
           console.error(
             '[CallbackManager] DeepSeek Harness launcher not found; cannot wake caller session.',
@@ -573,6 +594,8 @@ export class CallbackManager extends EventEmitter {
           json: false,
         });
         if (!built) {
+          reviewerLog.writeOutcome({ error: 'unbuildable DeepSeek Harness launch command' });
+          reviewerLog.close();
           release();
           console.error(
             `[CallbackManager] Could not build a DeepSeek Harness launch command for ${launcher}.`,
@@ -588,11 +611,14 @@ export class CallbackManager extends EventEmitter {
         return true;
       }
     } catch (err) {
+      reviewerLog.writeOutcome({ error: String(err) });
+      reviewerLog.close();
       release();
       console.error(`[CallbackManager] Failed to wake up caller ${initiator}:`, err);
       return false;
     }
 
+    reviewerLog.close();
     release();
     return false;
   }

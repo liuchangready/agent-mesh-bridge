@@ -157,6 +157,7 @@ src/
 │   ├── task-retarget.ts       # 执行者改派：换 Agent / 换模型 + 原生会话重置与改派留痕
 │   ├── caller-poll-guard.ts   # 派发后轮询抑制：同进度重复读取只回短载荷 + 停止指令
 │   ├── round-log.ts           # 每轮日志/归档路径、数值最轮取用、分页读取
+│   ├── reviewer-log.ts        # 检视方（caller）侧日志：逐轮落盘、字节上限、尾部读取
 │   ├── bridge-policy.ts       # 跨进程策略镜像 (bridge-policy.json: contextCompaction)
 │   ├── context-compactor.ts   # 上下文滞后压缩：协议注入、胶囊解析、归档、幂等与失败隔离
 │   ├── token-usage-collector.ts# Token 计量：四端解析归一化、估算、跨 attempt 累加、读时派生汇总
@@ -192,6 +193,7 @@ src/
 | `list_recent_tasks`       | `limit` (最大1000), `statusFilter?`                                | 查询任务列表（包含 `A -> B 标题 摘要` 与 `queued/running` 状态），每条附**读时派生**的 `tokenUsage` 汇总 |
 | `get_thread_details`      | `threadId`, `includeRawLogs?`                                      | 查询任务轮次。**默认有界**：最新轮全量、已压缩轮给提纯卡片、其他超长历史轮截断到 4,000 字符并附 `recallHint`；**不默认返回千行日志**。`includeRawLogs: true` 才返回完整历史 + 最近日志（很大，仅在确需时使用）。顶层附**读时派生**的 `tokenUsage` 汇总 |
 | `get_round_raw_log`       | `threadId`, `round`, `source?` (`output`/`execution`), `offsetBytes?`, `maxBytes?` | **单轮原文分页读取**：`output` 读压缩前归档（尚未归档时回退账本副本），`execution` 读原始 stdio 日志。默认 20KB、上限 200KB，用 `nextOffset` 续读；用于核验某一历史轮，避免整段历史灌入上下文 |
+| `get_reviewer_log`        | `threadId`, `round?`, `offsetBytes?`, `maxBytes?`                  | **检视方（caller）侧原文分页读取**：读 `CallbackManager` 唤醒 caller 时 tee 落盘的 `logs/<threadId>_round_<n>.reviewer.log`（默认 20KB、上限 200KB）；`round` 省略时取最新有记录的轮。没有记录返回 `available=false` + `roundsWithReviewerLog`，不返回空串。receiver 的流在 `get_round_raw_log`；reviewer 的**裁决**仍在账本（approval remarks / 下一轮 feedback），本工具只还原它的过程输出 |
 | `get_task_token_usage`    | `threadId`, `round?`                                               | **被调用方 Token 只读查询**：默认返回任务级汇总（输入/输出/缓存拆分、按 Agent/模型分布、`isPartialOrEstimated`）＋每轮一行摘要；给 `round` 返回该轮明细。计量口径见铁律 21；`unavailable` 不等于 0，估算值带 `estimated`；**不受轮询守卫影响**（不是进度信号） |
 | `get_recent_logs`         | `threadId`, `maxLines?` (默认1000)                                 | **获取运行中或历史任务最近 1,000 行实时日志**（流式捕获与磁盘持久化对齐）                      |
 | `invoke_agent`            | `targetAgent`, `prompt`, `model?`, `modelRequestedByUser?`          | 同步阻塞调用（仅限轻量即时问询）；`model?` 与 `dispatch_task` 同一套模型策略（缺省用配置默认，非默认需 `modelRequestedByUser: true` + 用户点击确认） |
