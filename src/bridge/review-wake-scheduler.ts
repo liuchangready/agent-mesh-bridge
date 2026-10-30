@@ -9,9 +9,11 @@ import {
   noteAutoRetryLaunched,
   planAutoRetry,
   describeReviewWake,
+  reviewBlockDependencyId,
 } from './review-wake';
 import { DelegationRound, DelegationThread, RateLimitInfo, ReviewWakeState } from './types';
 import { TaskRoleLock } from './task-role-lock';
+import { callerSessionKey } from './caller-wake-queue';
 
 export interface ReviewWakeSchedulerOptions {
   now?: () => number;
@@ -238,14 +240,32 @@ export class ReviewWakeScheduler extends EventEmitter {
     for (const thread of tasks) {
       try {
         if (thread.status !== 'waiting_review') continue;
-        // Parked on a dependency on purpose: no stall, no retry timer.
-        if (thread.reviewBlocked) continue;
         const state = thread.reviewWake;
         if (state) {
           // A record from an older round is stale, not "review in progress".
           if (state.round !== thread.currentRound) this.clear(thread);
           continue;
         }
+        // A park is only healthy when it names a dependency that still exists
+        // and has not finished yet: the dependency driver wakes the caller when
+        // that thread reaches a terminal state.
+        //
+        // Two shapes can never be released by the mesh, and both used to
+        // deadlock silently (this watchdog skipped every `reviewBlocked`
+        // thread, and the driver needs a resolvable id):
+        //   - `blocked: true` with NO `waitingForThreadId` ("waiting for an
+        //     external dependency" — there is nothing to watch);
+        //   - `waitingForThreadId` naming a thread that is gone from the ledger
+        //     (deleted dependency).
+        // Convert exactly those into a terminal stall: visible in the tree and
+        // detail panel, never auto-retried (a re-wake would just re-block), and
+        // with the dead park cleared so "Re-Review" is allowed to run.
+        const dependencyId = thread.reviewBlocked ? reviewBlockDependencyId(thread) : undefined;
+        const parkedWithoutDependency = !!thread.reviewBlocked && !dependencyId;
+        const parkedOnDeletedDependency =
+          !!dependencyId && !this.taskStore.getTask(dependencyId);
+        const unresolvablePark = parkedWithoutDependency || parkedOnDeletedDependency;
+        if (thread.reviewBlocked && !unresolvablePark) continue;
         if (this.isReviewerActive(thread.threadId)) continue;
         if (this.reviewAgeMs(thread, now) < this.stallTimeoutMs) continue;
 
@@ -254,9 +274,22 @@ export class ReviewWakeScheduler extends EventEmitter {
           round: thread.currentRound || 1,
           agent: thread.initiatorAgent,
           kind: 'timeout',
-          error: `检视无进展：已等待超过 ${minutes} 分钟且没有活跃的检视进程（reviewer timeout）`,
+          error: parkedWithoutDependency
+            ? `已挂起但未记录 waitingForThreadId：没有可等待的依赖线程，桥接无法自动恢复；` +
+              `已转为可人工重新检视的停滞（parked without dependency）`
+            : parkedOnDeletedDependency
+              ? `已挂起等待 ${dependencyId}，但该依赖线程已不在账本中，桥接无法自动恢复；` +
+                `已转为可人工重新检视的停滞（parked on a deleted dependency）`
+              : `检视无进展：已等待超过 ${minutes} 分钟且没有活跃的检视进程（reviewer timeout）`,
           now,
         });
+        if (unresolvablePark) {
+          next.autoRetryAt = undefined;
+          next.gaveUp = true;
+          // Clearing the park is what makes `notifyCaller` accept the manual
+          // re-review; the original intent stays in `reviewWake.lastError`.
+          thread.reviewBlocked = undefined;
+        }
         this.persist(thread, next);
         stalled.push(thread);
       } catch (err) {
@@ -298,11 +331,45 @@ export class ReviewWakeScheduler extends EventEmitter {
             t.reviewWake.gaveUp !== true &&
             // A review parked on a dependency is not stalled: its wake is
             // driven by the dependency's completion, not by a timer.
-            !t.reviewBlocked,
+            !t.reviewBlocked &&
+            // A reviewer is already running this review. Firing the planned
+            // retry now would spawn a second process on the SAME native
+            // session, and codex rejects that with "no rollout found".
+            !this.isReviewerActive(t.threadId) &&
+            // Sibling tasks can share one caller session (the same codex
+            // thread). While any of them has a live reviewer, this session is
+            // busy: resuming it again is rejected by the CLI.
+            !this.isCallerSessionBusy(t),
         );
     } catch {
       return [];
     }
+  }
+
+  /**
+   * True when a live reviewer of a SIBLING task owns the same caller session.
+   *
+   * The wake queue is keyed per process; two tasks whose callerSessionId spells
+   * the same codex thread differently (`rollout-…-uuid` vs bare `uuid`) used to
+   * get separate slots and both resumed it, which codex rejects with
+   * "no rollout found for thread id". The role lock is the cross-process truth:
+   * if a sibling thread still holds a live reviewer role for that session, this
+   * task must wait for it to finish.
+   */
+  private isCallerSessionBusy(thread: DelegationThread): boolean {
+    const key = callerSessionKey(thread.callerSessionId || '');
+    if (!key) return false;
+    try {
+      const lock = new TaskRoleLock();
+      for (const other of this.taskStore.getAllTasks()) {
+        if (other.threadId === thread.threadId) continue;
+        if (callerSessionKey(other.callerSessionId || '') !== key) continue;
+        if (lock.getOwner(other.threadId)?.role === 'reviewer') return true;
+      }
+    } catch {
+      // Best effort: a lock read failure must not block the retry path.
+    }
+    return false;
   }
 
   private rateLimitOf(thread: DelegationThread): RateLimitInfo | undefined {

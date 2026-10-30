@@ -19,6 +19,7 @@ import {
   buildReviewWakeState,
 } from '../bridge/review-wake';
 import { DelegationRound, DelegationThread } from '../bridge/types';
+import { TaskRoleLock } from '../bridge/task-role-lock';
 
 describe('Review wake failure policy', () => {
   const now = Date.parse('2026-10-23T12:00:00.000Z');
@@ -283,6 +284,54 @@ describe('ReviewWakeScheduler', () => {
     store.dispose();
   });
 
+  test('does not fire a planned retry while a reviewer is already running', async () => {
+    const nowMs = Date.parse('2026-10-23T12:00:00.000Z');
+    const { store, scheduler, launches } = setup(nowMs, { isReviewerActive: () => true });
+    store.upsertTask(makeThread({ autoRetryAt: new Date(nowMs - 1_000).toISOString() }));
+
+    // A live reviewer owns the caller session; a second `resume` of the same
+    // native thread is rejected by codex ("no rollout found").
+    const launched = await scheduler.runDue();
+
+    assert.strictEqual(launched, 0);
+    assert.strictEqual(launches.length, 0);
+    scheduler.dispose();
+    store.dispose();
+  });
+
+  test('does not retry while a sibling task is reviewing the same caller session', async () => {
+    const nowMs = Date.parse('2026-10-23T12:00:00.000Z');
+    const { store, scheduler, launches } = setup(nowMs, { isReviewerActive: () => false });
+    const sharedUuid = '11111111-2222-3333-4444-555555555555';
+
+    // A sibling task spells the same codex thread by its rollout file name.
+    const sibling = makeThread();
+    sibling.threadId = 'thread_sibling_same_session';
+    sibling.callerSessionId = `rollout-2026-10-23T10-00-00-${sharedUuid}`;
+    delete sibling.reviewWake;
+    store.upsertTask(sibling);
+
+    // The retried task spells it as the bare thread id.
+    const retried = makeThread({ autoRetryAt: new Date(nowMs - 1_000).toISOString() });
+    retried.threadId = 'thread_review_wake_sched';
+    retried.callerSessionId = sharedUuid;
+    store.upsertTask(retried);
+
+    const lock = new TaskRoleLock();
+    const lease = lock.tryAcquire(sibling.threadId, 'reviewer');
+    assert.ok(lease, 'the sibling holds the reviewer role for that session');
+    try {
+      const launched = await scheduler.runDue();
+      assert.strictEqual(launched, 0, 'the busy caller session must not be resumed twice');
+      assert.strictEqual(launches.length, 0);
+    } finally {
+      lock.release(lease);
+    }
+
+    scheduler.dispose();
+    store.dispose();
+  });
+
   test('does not retry while the quota is still cooling down', async () => {
     const nowMs = Date.parse('2026-10-23T12:00:00.000Z');
     const { store, tracker, scheduler, launches } = setup(nowMs);
@@ -391,7 +440,71 @@ describe('ReviewWakeScheduler', () => {
       store.dispose();
     });
 
-    test('leaves a review parked on a dependency alone', async () => {
+    test('leaves a review parked on a live dependency alone', async () => {
+      const nowMs = Date.parse('2026-10-23T12:00:00.000Z');
+      const { store, scheduler } = setup(nowMs, {
+        stallTimeoutMs: 10 * 60_000,
+        isReviewerActive: () => false,
+      });
+      // The dependency the review is parked on still exists and is unfinished:
+      // its own completion is what wakes the caller, not a timer here.
+      const dependency = makeThread();
+      dependency.threadId = 'thread_live_dependency';
+      dependency.status = 'running';
+      dependency.rounds[0].status = 'running';
+      delete dependency.reviewWake;
+      store.upsertTask(dependency);
+
+      const thread = staleThread(nowMs);
+      thread.reviewBlocked = {
+        waitingForThreadId: 'thread_live_dependency',
+        at: new Date(nowMs).toISOString(),
+        by: 'caller',
+      };
+      store.upsertTask(thread);
+
+      assert.strictEqual(await scheduler.runWatchdog(), 0);
+      const parked = store.getTask('thread_review_wake_sched')!;
+      assert.strictEqual(parked.reviewWake, undefined);
+      assert.strictEqual(parked.reviewBlocked?.waitingForThreadId, 'thread_live_dependency');
+      scheduler.dispose();
+      store.dispose();
+    });
+
+    test('turns a park without a dependency id into a visible, terminal stall', async () => {
+      const nowMs = Date.parse('2026-10-23T12:00:00.000Z');
+      const { store, scheduler, launches, advance } = setup(nowMs, {
+        stallTimeoutMs: 10 * 60_000,
+        isReviewerActive: () => false,
+      });
+      const thread = staleThread(nowMs);
+      // What `request_rework(blocked: true)` records when the caller names no
+      // sibling: "waiting for an external dependency" — unresolvable by design.
+      thread.reviewBlocked = {
+        reason: 'blocked on the full batch',
+        at: new Date(nowMs).toISOString(),
+        by: 'caller',
+      };
+      store.upsertTask(thread);
+
+      assert.strictEqual(await scheduler.runWatchdog(), 1);
+
+      const stalled = store.getTask('thread_review_wake_sched')!;
+      assert.strictEqual(stalled.reviewWake!.kind, 'timeout');
+      assert.match(stalled.reviewWake!.lastError, /waitingForThreadId/);
+      assert.strictEqual(stalled.reviewWake!.gaveUp, true, 'no auto retry for a dead park');
+      assert.strictEqual(stalled.reviewWake!.autoRetryAt, undefined);
+      assert.strictEqual(stalled.reviewBlocked, undefined, 'the dead park must be cleared');
+
+      // Terminal: the scheduler must not keep waking a caller that will re-block.
+      advance(61_000);
+      assert.strictEqual(await scheduler.runDue(), 0);
+      assert.deepStrictEqual(launches, []);
+      scheduler.dispose();
+      store.dispose();
+    });
+
+    test('turns a park on a deleted dependency into a visible, terminal stall', async () => {
       const nowMs = Date.parse('2026-10-23T12:00:00.000Z');
       const { store, scheduler } = setup(nowMs, {
         stallTimeoutMs: 10 * 60_000,
@@ -399,15 +512,18 @@ describe('ReviewWakeScheduler', () => {
       });
       const thread = staleThread(nowMs);
       thread.reviewBlocked = {
-        waitingForThreadId: 'thread_pg_dependency',
+        waitingForThreadId: 'thread_deleted_dependency',
         at: new Date(nowMs).toISOString(),
         by: 'caller',
       };
       store.upsertTask(thread);
 
-      // A parked review is not stalled: no failure record and no retry timer.
-      assert.strictEqual(await scheduler.runWatchdog(), 0);
-      assert.strictEqual(store.getTask('thread_review_wake_sched')!.reviewWake, undefined);
+      assert.strictEqual(await scheduler.runWatchdog(), 1);
+
+      const stalled = store.getTask('thread_review_wake_sched')!;
+      assert.match(stalled.reviewWake!.lastError, /已不在账本/);
+      assert.strictEqual(stalled.reviewWake!.gaveUp, true);
+      assert.strictEqual(stalled.reviewBlocked, undefined);
       scheduler.dispose();
       store.dispose();
     });

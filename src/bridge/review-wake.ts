@@ -1,4 +1,4 @@
-import { AgentId, RateLimitInfo, ReviewWakeState } from './types';
+import { AgentId, DelegationThread, RateLimitInfo, ReviewWakeState } from './types';
 
 /**
  * Reviewer wake-up failures and their automatic recovery.
@@ -188,4 +188,18 @@ export function describeReviewWake(state: ReviewWakeState): string {
     parts.push(`将于 ${at.toLocaleTimeString()} 自动重新检视`);
   }
   return parts.join(' · ');
+}
+
+/**
+ * The sibling task a blocked review is parked on, when the caller named one.
+ *
+ * `request_rework(..., blocked: true)` without `waitingForThreadId` means
+ * "parked on an external dependency" — nothing in the mesh can ever release
+ * that park, so it must not be treated as a healthy wait (see the scheduler's
+ * watchdog, which converts such a deadlock into a visible, manually releasable
+ * stall). A present but blank id is the same unresolvable case.
+ */
+export function reviewBlockDependencyId(thread: DelegationThread): string | undefined {
+  const id = thread.reviewBlocked?.waitingForThreadId;
+  return typeof id === 'string' && id.trim() ? id.trim() : undefined;
 }

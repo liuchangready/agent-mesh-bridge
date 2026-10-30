@@ -219,7 +219,7 @@
         },
         {
           "command": "agent-mesh-bridge.wakeUpCaller",
-          "when": "viewItem == waiting_review_stalled && (view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks)",
+          "when": "(viewItem == waiting_review_stalled || viewItem == waiting_review_blocked) && (view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks)",
           "group": "1_actions"
         }
       ]

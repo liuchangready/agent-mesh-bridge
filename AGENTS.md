@@ -30,6 +30,7 @@
       - 队头由 `findQueueHead()` 按 `createdAt` 选出：队头在 `waiting_review` / `paused` 时，`TaskSupervisor` / `QueueDrainer` 不得启动任何其他任务。
       - 新任务派发时，只要存在任何未完成任务，直接返回 `QUEUED`，消息必须说明在等哪个 `threadId` 的哪个阶段。
       - 任务被 approve / delete 后，队列自动推进到下一个任务；无需手动唤醒。
+      - **检视挂起（blocked）不是新状态**：检视方用 `request_rework(..., blocked=true)` 主动挂起时，任务**保持 `waiting_review`**（不新增轮次、不释放队列槽），只把依赖与理由写进 `thread.reviewBlocked`；任务树显示 `Parked Review · 已挂起` 与等待的依赖，详情面板给出依赖、理由和「重新检视（解除挂起）」入口（`wakeUpCaller` 会先清掉 `reviewBlocked` 再唤醒）。`reviewBlocked` **无 `waitingForThreadId`**、或依赖线程**已从账本删除**属于不可恢复挂起：看门狗必须把它转成可见的终态停滞（`reviewWake.kind='timeout'` + `gaveUp`，不自动重试）并清掉死挂起，绝不静默跳过。
 
   14. **MR 收口由调用者完成**：任务（或同一批任务）验收通过后，由**调用者/检视方**统一合成一个 MR 并同步远端；开发者(receiver)不负责提交/推送。
       - 调用者汇总该任务及同批尚未推送的改动，只创建一个 MR，使用仓库既有远端与 `gh` / `glab` / 等价 CLI 推送。
@@ -158,6 +159,7 @@ src/
 │   ├── caller-poll-guard.ts   # 派发后轮询抑制：同进度重复读取只回短载荷 + 停止指令
 │   ├── round-log.ts           # 每轮日志/归档路径、数值最轮取用、分页读取
 │   ├── reviewer-log.ts        # 检视方（caller）侧日志：逐轮落盘、字节上限、尾部读取
+│   ├── build-staleness.ts     # 宿主构建落后自检：磁盘 vs 内存代码、新版本目录探测（装完未重载）
 │   ├── bridge-policy.ts       # 跨进程策略镜像 (bridge-policy.json: contextCompaction)
 │   ├── context-compactor.ts   # 上下文滞后压缩：协议注入、胶囊解析、归档、幂等与失败隔离
 │   ├── token-usage-collector.ts# Token 计量：四端解析归一化、估算、跨 attempt 累加、读时派生汇总

@@ -83,6 +83,75 @@ describe('AutonomousRunner Tests', () => {
     assert.strictEqual(detectStructuredRateLimitSignal('{"status":500,"error":"boom"}'), undefined);
   });
 
+  test('replays a DSH round without --session-id when the native session vanished', async () => {
+    const local = new AutonomousRunner(new AgentDetector({ deepseek_harness: process.execPath }));
+    const seen: Array<{ isRework: boolean; receiverSessionId: string }> = [];
+    (local as any).executeOnce = async (opts: any) => {
+      seen.push({ isRework: opts.isRework, receiverSessionId: opts.receiverSessionId });
+      if (seen.length === 1) {
+        const message =
+          'dsh: session "session-gone" does not exist; omit --session-id to start a new Session';
+        return {
+          exitCode: 1,
+          stdout: '',
+          stderr: message,
+          error: message,
+          durationMs: 1,
+          assessment: {
+            success: false,
+            errorCode: 'NONZERO_EXIT',
+            exitCode: 1,
+            stream: {
+              chunkCount: 1,
+              stdoutBytes: 0,
+              stderrBytes: message.length,
+              maxGapMs: 1,
+              gapThresholdMs: 600_000,
+              hasActualOutput: false,
+              continuous: true,
+            },
+          },
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: '{"type":"session","sessionId":"session-new"}',
+        stderr: '',
+        extractedOutput: 'ok',
+        actualSessionId: 'session-new',
+        durationMs: 1,
+        assessment: {
+          success: true,
+          errorCode: 'OK',
+          exitCode: 0,
+          stream: {
+            chunkCount: 1,
+            stdoutBytes: 40,
+            stderrBytes: 0,
+            maxGapMs: 1,
+            gapThresholdMs: 600_000,
+            hasActualOutput: true,
+            continuous: true,
+          },
+        },
+      };
+    };
+
+    const result = await local.execute({
+      agent: 'deepseek_harness',
+      prompt: 'do it',
+      isRework: true,
+      receiverSessionId: 'session-gone',
+      retryBackoffMs: 1,
+      maxRetries: 3,
+    });
+
+    assert.strictEqual(result.exitCode, 0, 'the fresh session run succeeds');
+    assert.strictEqual(result.actualSessionId, 'session-new');
+    assert.strictEqual(seen.length, 2, 'exactly one replay without the id');
+    assert.deepStrictEqual(seen[1], { isRework: false, receiverSessionId: '' });
+  });
+
   test('a transcript quoting RATE_LIMITED does not abort the run', async () => {
     const runner = new AutonomousRunner(detector);
     const transcript = [

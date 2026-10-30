@@ -802,6 +802,31 @@ export class AutonomousRunner {
           if (removed.length > 0) continue;
         }
 
+        // `dsh headless --session-id` ADOPTS an existing native session and
+        // rejects unknown ids: "session <id> does not exist; omit --session-id
+        // to start a new Session". A session can disappear while the ledger
+        // still holds it (workspace renamed, DSH store pruned, another task's
+        // cleanup). Replay the same prompt WITHOUT the id — DSH creates a fresh
+        // session and the executor adopts the new id from the stream, so the
+        // next round resumes the new one instead of failing the whole task.
+        const dshSessionMissing =
+          options.agent === 'deepseek_harness' &&
+          /\bsession\b[^\n]*does not exist[^\n]*omit --session-id/i.test(
+            `${result.stderr}\n${result.stdout}\n${result.error || ''}`,
+          );
+        if (attempt <= maxRetries && dshSessionMissing && attemptOptions.isRework) {
+          console.warn(
+            `[AutonomousRunner] DSH session ${attemptOptions.receiverSessionId} no longer exists; ` +
+              `starting a fresh session for the same prompt.`,
+          );
+          attemptOptions = {
+            ...attemptOptions,
+            isRework: false,
+            receiverSessionId: '',
+          };
+          continue;
+        }
+
         if (attempt <= maxRetries && this.isRetryableFailure(result)) {
           const backoffMs = Math.min(baseBackoffMs * Math.pow(2, attempt - 1), 10_000);
           console.warn(
