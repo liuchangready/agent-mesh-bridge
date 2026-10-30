@@ -23,6 +23,7 @@ import { aggregateThreadTokenUsage, formatTokenCount } from './token-usage-colle
 import { buildReviewWakeState } from './review-wake';
 import { detectRateLimitSignal } from './autonomous-runner';
 import { ReviewerLogWriter, createReviewerLogWriter } from './reviewer-log';
+import { resolveCodexResumeId } from './codex-session';
 
 /**
  * How many times one task may wake its caller about failures.
@@ -556,8 +557,24 @@ export class CallbackManager extends EventEmitter {
 
       if (initiator === 'codex') {
         const codexPath = this.detector.resolveExecutable('codex') || defaultBinary('codex');
+        // `codex exec resume` resolves a thread by its rollout record; a bare
+        // thread UUID fails with "no rollout found for thread id". Heal the id
+        // (and the ledger copy) so the caller never has to know which spelling
+        // its own CLI printed.
+        const resumeId = resolveCodexResumeId(callerSessionId);
+        if (resumeId !== callerSessionId) {
+          console.log(
+            `[CallbackManager] Normalising codex session ${callerSessionId} -> ${resumeId} for resume.`,
+          );
+          try {
+            thread.callerSessionId = resumeId;
+            this.taskStore?.upsertTask(thread);
+          } catch (err) {
+            console.warn('[CallbackManager] Could not persist the normalised caller session:', err);
+          }
+        }
         // `--ask-for-approval` is a global option and must precede `exec`.
-        // codex --ask-for-approval never exec resume <callerSessionId> "<promptMessage>" --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --skip-git-repo-check
+        // codex --ask-for-approval never exec resume <rollout> "<promptMessage>" --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --skip-git-repo-check
         const child = child_process.spawn(
           codexPath,
           [
@@ -565,7 +582,7 @@ export class CallbackManager extends EventEmitter {
             'never',
             'exec',
             'resume',
-            callerSessionId,
+            resumeId,
             promptMessage,
             '--dangerously-bypass-approvals-and-sandbox',
             '--dangerously-bypass-hook-trust',

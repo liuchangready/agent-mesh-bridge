@@ -18,6 +18,23 @@ import * as path from 'path';
 
 export type WakeKind = 'review' | 'failure';
 
+/**
+ * Canonical key for one caller session.
+ *
+ * Codex exposes the same native thread under two spellings depending on where
+ * the id came from: the bare thread UUID (`01a17d29-…`, captured from the JSON
+ * event stream) and the rollout file name (`rollout-2026-10-27T19-40-56-01a17d29-…`,
+ * captured from a session index). Hashing the raw string lets two tasks wake the
+ * same thread at the same time; codex then answers
+ * `thread/resume failed: no rollout found for thread id …`, and the review is
+ * lost. Collapse both spellings to the UUID before using the id as a slot key.
+ */
+export function callerSessionKey(callerSessionId: string): string {
+  const raw = String(callerSessionId || '');
+  const match = /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f-]{36})$/i.exec(raw);
+  return match ? match[1].toLowerCase() : raw;
+}
+
 export interface WakeRequest {
   threadId: string;
   round: number;
@@ -50,7 +67,11 @@ export class CallerWakeQueue {
   }
 
   private callerDir(callerSessionId: string): string {
-    const key = crypto.createHash('sha1').update(callerSessionId).digest('hex').slice(0, 16);
+    const key = crypto
+      .createHash('sha1')
+      .update(callerSessionKey(callerSessionId))
+      .digest('hex')
+      .slice(0, 16);
     return path.join(this.root, key);
   }
 

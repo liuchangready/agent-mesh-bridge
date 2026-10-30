@@ -4,14 +4,43 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { CallerWakeQueue } from '../bridge/caller-wake-queue';
+import { CallerWakeQueue, callerSessionKey } from '../bridge/caller-wake-queue';
 
 function lockPathFor(root: string, callerSessionId: string): string {
-  const key = crypto.createHash('sha1').update(callerSessionId).digest('hex').slice(0, 16);
+  const key = crypto
+    .createHash('sha1')
+    .update(callerSessionKey(callerSessionId))
+    .digest('hex')
+    .slice(0, 16);
   return path.join(root, 'wakes', key, 'active.json');
 }
 
 describe('CallerWakeQueue - one wake at a time per caller session', () => {
+  test('treats a codex rollout name and its bare thread id as one wake slot', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wake-queue-'));
+    const queue = new CallerWakeQueue(root);
+    const rollout = 'rollout-2026-10-27T19-40-56-01a17d29-d40d-74c3-831d-878dd4edc0e5';
+    const bare = '01a17d29-d40d-74c3-831d-878dd4edc0e5';
+    try {
+      assert.strictEqual(
+        queue.tryAcquire(rollout),
+        true,
+        'the rollout spelling wins the slot first',
+      );
+      // The same native thread under its bare UUID must NOT get a second slot:
+      // a concurrent `codex exec resume` fails with "no rollout found".
+      assert.strictEqual(queue.isBusy(bare), true);
+      assert.strictEqual(queue.tryAcquire(bare), false, 'one native thread, one wake at a time');
+
+      queue.release(bare);
+      assert.strictEqual(queue.isBusy(rollout), false);
+      assert.strictEqual(queue.tryAcquire(bare), true);
+      queue.release(rollout);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('serializes wakes for the same caller and keeps different callers independent', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wake-queue-'));
     const queue = new CallerWakeQueue(root);
