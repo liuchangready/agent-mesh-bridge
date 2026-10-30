@@ -122,8 +122,64 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(toolNames.includes('get_recent_logs'));
     assert.ok(toolNames.includes('get_round_raw_log'));
     assert.ok(toolNames.includes('get_task_token_usage'));
+    assert.ok(toolNames.includes('get_reviewer_log'));
     assert.ok(toolNames.includes('list_agent_models'));
-    assert.strictEqual(toolNames.length, 18);
+    assert.strictEqual(toolNames.length, 19);
+  });
+
+  test('serves the reviewer side of a round and reports a missing log honestly', async () => {
+    const call = async (name: string, args: any) =>
+      mcpServer.handleRpcMessage({
+        jsonrpc: '2.0',
+        id: 61,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      });
+    const payload = (res: any) => JSON.parse(res.result.content[0].text);
+
+    const dispatched = payload(
+      await call('dispatch_task', {
+        targetAgent: 'claude_code',
+        title: 'Reviewer output',
+        prompt: 'do the work',
+        allowNoScope: true,
+      }),
+    );
+    await waitForStatus(dispatched.threadId, 'waiting_review');
+
+    // No wake has been captured for this task yet.
+    const missing = payload(await call('get_reviewer_log', { threadId: dispatched.threadId }));
+    assert.strictEqual(missing.available, false);
+    assert.deepStrictEqual(missing.roundsWithReviewerLog, []);
+    assert.match(missing.message, /No reviewer log/);
+
+    // A captured reviewer stream must be served with the same paging contract.
+    const logsDir = path.join(tempDir, 'logs');
+    fs.mkdirSync(logsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(logsDir, `${dispatched.threadId}_round_1.reviewer.log`),
+      '--- wake ---\n[reviewer] EditMode 82/82\n[reviewer] verdict pending\n',
+    );
+
+    const page = payload(
+      await call('get_reviewer_log', { threadId: dispatched.threadId, round: 1 }),
+    );
+    assert.strictEqual(page.available, true);
+    assert.match(page.content, /EditMode 82\/82/);
+    assert.match(page.content, /verdict pending/);
+    assert.strictEqual(page.reviewerAgent, taskStore.getTask(dispatched.threadId)!.initiatorAgent);
+    assert.deepStrictEqual(page.roundsWithReviewerLog, [1]);
+
+    // Bounded reads keep the tail and flag the truncation.
+    const tail = payload(
+      await call('get_reviewer_log', {
+        threadId: dispatched.threadId,
+        round: 1,
+        maxBytes: 20,
+      }),
+    );
+    assert.strictEqual(tail.truncated, true);
+    assert.match(tail.hint, /offsetBytes=/);
   });
 
   test('tells the caller to stop and wait, and starves repeated polls', async () => {
