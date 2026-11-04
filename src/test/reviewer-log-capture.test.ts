@@ -254,6 +254,9 @@ describe('Reviewer stream capture', () => {
       const thread = makeThread();
       thread.threadId = 'thread_capture_dedicated_review';
       thread.reviewFlow = 'dedicated';
+      thread.reviewBootstrap = { phase: 'confirmed', attempts: 1 };
+      thread.reviewerSessionCaptured = true;
+      thread.reviewerSessionId = reviewerSession;
       thread.requesterSessionId = 'requester-session-1';
       thread.callerSessionId = reviewerSession;
 

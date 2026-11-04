@@ -19,7 +19,7 @@ import { TaskDetailPanel } from './ui/detail-panel';
 import { ModelApprovalService } from './ui/model-approval-service';
 import { TaskRetargetService } from './bridge/task-retarget';
 import { TaskRoleLock } from './bridge/task-role-lock';
-import { AgentId } from './bridge/types';
+import { AgentId, isValidSessionId } from './bridge/types';
 import { TaskSupervisor } from './bridge/task-supervisor';
 import { TaskControlService } from './bridge/task-control';
 import { TaskArchiveService } from './bridge/task-archive';
@@ -1303,6 +1303,22 @@ export function activate(context: vscode.ExtensionContext) {
           return;
         }
 
+        if (thread.reviewFlow === 'dedicated') {
+          const reviewerSessionId = thread.reviewerSessionId;
+          if (
+            thread.reviewBootstrap?.phase !== 'confirmed' ||
+            thread.reviewerSessionCaptured !== true ||
+            !reviewerSessionId ||
+            !isValidSessionId(reviewerSessionId) ||
+            thread.callerSessionId !== reviewerSessionId
+          ) {
+            vscode.window.showErrorMessage(
+              `无法唤醒专用 reviewer：任务 ${threadId} 的 reviewer 会话 handoff 缺失或不一致，请修复 bootstrap 捕获状态后重试。`,
+            );
+            return;
+          }
+        }
+
         // Re-review is allowed whenever nobody is actually reviewing. A second
         // wake during a live review would fight it for the same native session,
         // but a crashed host (or a role lock whose owner already exited) is
@@ -1355,7 +1371,8 @@ export function activate(context: vscode.ExtensionContext) {
           return;
         }
 
-        // If callerSessionId is missing, allow user to input or confirm detected
+        // Legacy tasks may recover a missing caller session from detection or user input.
+        // Dedicated reviewer sessions are validated above and never replaced here.
         if (!thread.callerSessionId) {
           const detected = detector.detectActiveSession(
             thread.initiatorAgent,
