@@ -692,7 +692,15 @@ export function resolveNodeCommand(): string {
   const override = process.env.DSH_BRIDGE_NODE;
   if (override && override.trim()) return override.trim();
   const found = lookupInPath(defaultBinary('node'));
-  return found || 'node';
+  if (found) return found;
+  const knownCandidates = [
+    'D:/harness/resources/runtime/primary-runtime/dependencies/node/bin/node.exe',
+    'D:\\harness\\resources\\runtime\\primary-runtime\\dependencies\\node\\bin\\node.exe',
+  ];
+  for (const candidate of knownCandidates) {
+    if (fs.existsSync(candidate)) return candidate.replace(/\\/g, '/');
+  }
+  return 'node';
 }
 
 /**
