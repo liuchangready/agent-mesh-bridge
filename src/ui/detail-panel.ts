@@ -4,14 +4,13 @@ import { TaskStore } from '../bridge/task-store';
 import { ReworkController } from '../bridge/rework-controller';
 import { DelegationThread } from '../bridge/types';
 import { TaskSupervisor } from '../bridge/task-supervisor';
-import { AgentDetector } from '../bridge/agent-detector';
 import {
   formatBytes,
   resolveExistingArtifactPath,
   roundExecutionLogPath,
   roundOutputArchivePath,
 } from '../bridge/round-log';
-import { readReviewerLogTail, reviewerLogPath, statReviewerLog } from '../bridge/reviewer-log';
+import { readReviewerLogTail, resolveReviewerLogRound, reviewerLogPath, statReviewerLog } from '../bridge/reviewer-log';
 import { aggregateThreadTokenUsage, formatTokenCount } from '../bridge/token-usage-collector';
 
 export class TaskDetailPanel {
@@ -93,9 +92,6 @@ export class TaskDetailPanel {
               this.currentThreadId,
             );
             this.update();
-            break;
-          case 'openTerminal':
-            this.handleOpenTerminal();
             break;
           case 'openRoundRawLog':
             await this.handleOpenRoundRawLog(Number(message.round));
@@ -271,32 +267,6 @@ export class TaskDetailPanel {
     }
   }
 
-  private handleOpenTerminal() {
-    const thread = this.taskStore.getTask(this.currentThreadId);
-    if (!thread) return;
-
-    const term = vscode.window.createTerminal(`Agent Bridge (${thread.targetAgent})`);
-    term.show();
-
-    let cmd = '';
-    if (thread.targetAgent === 'codex') {
-      cmd = `codex exec resume ${thread.receiverSessionId} ""`;
-    } else if (thread.targetAgent === 'claude_code') {
-      cmd = `claude -p "" --resume ${thread.receiverSessionId} --permission-mode bypassPermissions`;
-    } else if (thread.targetAgent === 'antigravity') {
-      cmd = `agy --conversation ${thread.receiverSessionId}`;
-    } else if (thread.targetAgent === 'deepseek_harness') {
-      // DSH resumes an existing native Session through the `tui` app.
-      const launcher = new AgentDetector().resolveExecutable('deepseek_harness') || 'dsh';
-      cmd = `"${launcher}" tui --resume ${thread.receiverSessionId}`;
-    }
-
-    if (cmd) {
-      term.sendText(cmd, false);
-      vscode.window.showInformationMessage(`Terminal command prepared: ${cmd}`);
-    }
-  }
-
   public update() {
     const thread = this.taskStore.getTask(this.currentThreadId);
     if (!thread) {
@@ -381,6 +351,18 @@ export class TaskDetailPanel {
     );
   }
 
+  /**
+   * Reviewer log to render for a round, tolerating a wake that was planned for
+   * an older round than the ledger's current one.
+   */
+  private resolveReviewerLog(roundNumber: number): { round: number; fallback: boolean } | undefined {
+    const root = path.dirname(this.taskStore.getStoragePath());
+    return (
+      resolveReviewerLogRound(this.currentThreadId, roundNumber, root) ??
+      resolveReviewerLogRound(this.currentThreadId, roundNumber)
+    );
+  }
+
   private getHtmlForWebview(thread: DelegationThread): string {
     const escapeHtml = (str: string) => {
       return (str || '')
@@ -429,10 +411,27 @@ export class TaskDetailPanel {
           (max, entry) => (entry.round > max ? entry.round : max),
           reviewerRound,
         );
-        const reviewerTail =
+        let reviewerTail =
           r.round > newestRound - 10 ? this.readReviewerOutput(r.round) : undefined;
-        const reviewerExists = reviewerTail ? true : this.reviewerLogExists(r.round);
+        let reviewerExists = reviewerTail ? true : this.reviewerLogExists(r.round);
         const reviewerLive = r.round === reviewerRound && thread.status === 'waiting_review';
+        let reviewerLogRound = r.round;
+        let reviewerFallback = false;
+        // The live wake may run for an older planned round (see
+        // resolveReviewerLogRound). Render its actual output under the current
+        // card instead of pretending nothing was captured.
+        if (reviewerLive && !reviewerTail) {
+          const resolved = this.resolveReviewerLog(r.round);
+          if (resolved && resolved.round !== r.round) {
+            reviewerLogRound = resolved.round;
+            reviewerFallback = resolved.fallback;
+            const fallbackTail = this.readReviewerOutput(resolved.round);
+            if (fallbackTail) {
+              reviewerTail = fallbackTail;
+              reviewerExists = true;
+            }
+          }
+        }
 
         return `
         <div class="round-card" style="border-left: 4px solid ${roundBorderColor};">
@@ -540,18 +539,23 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
               ${reviewerLive ? '(检视进行中 · 每30s自动刷新)' : ''}
             </div>
             ${
+              reviewerFallback
+                ? `<div class="round-meta" style="margin-bottom:6px;color:#fbbf24;">当前轮（第 ${r.round} 轮）尚无独立 reviewer 记录，以下显示第 ${reviewerLogRound} 轮的实际输出。</div>`
+                : ''
+            }
+            ${
               reviewerTail
                 ? `
             <div class="round-meta" style="margin-bottom:6px;">${escapeHtml(reviewerTail.path)} · ${formatBytes(reviewerTail.totalBytes)}${reviewerTail.truncated ? ' · 仅显示末尾片段' : ''}</div>
             <pre class="code-block output-text" style="max-height:320px;">${escapeHtml(reviewerTail.content)}</pre>
             <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
-              <button class="secondary" style="padding:4px 10px;font-size:12px;" onclick="openReviewerLog(${r.round})">📄 查看完整 Reviewer 日志</button>
+              <button class="secondary" style="padding:4px 10px;font-size:12px;" onclick="openReviewerLog(${reviewerLogRound})">📄 查看完整 Reviewer 日志</button>
             </div>`
                 : reviewerExists
                   ? `
             <div class="round-meta" style="margin-bottom:6px;">本轮已有 reviewer 记录（较早轮次，内容不内联渲染）。</div>
             <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
-              <button class="secondary" style="padding:4px 10px;font-size:12px;" onclick="openReviewerLog(${r.round})">📄 查看完整 Reviewer 日志</button>
+              <button class="secondary" style="padding:4px 10px;font-size:12px;" onclick="openReviewerLog(${reviewerLogRound})">📄 查看完整 Reviewer 日志</button>
             </div>`
                   : `
             <pre class="code-block" style="color:#93c5fd;">本轮尚未采集到 reviewer 输出（唤醒进程还没产生输出，或记录早于本功能）。</pre>`
@@ -788,12 +792,37 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
         <div class="meta-label">Model Routing / 模型路由 (发送 ➔ 接收)</div>
         <div class="meta-val">
           <strong>发送 ${escapeHtml(thread.initiatorAgent)}</strong> [${escapeHtml(thread.initiatorModel || 'Agent 默认')}${
-            thread.initiatorModelSource === 'configured' ? ' · 配置默认' : ''
+            thread.initiatorModelSource === 'sender-configured'
+              ? ' · 下发者配置默认'
+              : thread.initiatorModelSource === 'configured'
+                ? ' · 接收者配置默认'
+                : ''
           }]
           ➔
           <strong>接收 ${escapeHtml(thread.targetAgent)}</strong> [${escapeHtml(thread.targetModel || 'Agent 默认')}]
         </div>
       </div>
+      <div class="meta-item" style="grid-column: 1 / -1;">
+        <div class="meta-label">Review Flow / 审阅拓扑</div>
+        <div class="meta-val">
+          ${
+            thread.reviewFlow === 'dedicated'
+              ? `🧭 专用 reviewer 会话 ${escapeHtml(thread.reviewerSessionId || '（待捕获）')}
+                 · reviewer 模型 ${escapeHtml(thread.reviewerModel || 'Agent 默认')}
+                 · 请求方 ${escapeHtml(thread.requesterSessionId || '未知')}`
+              : 'legacy — 请求方会话审阅'
+          }
+          ${thread.archivedAt ? ` · 📦 已归档 (${escapeHtml(thread.archivedAt)})` : ''}
+        </div>
+      </div>
+      ${
+        thread.finalSummary
+          ? `<div class="meta-item" style="grid-column: 1 / -1;">
+               <div class="meta-label">Final Summary / 终态摘要（只读）</div>
+               <div class="meta-val">${escapeHtml(thread.finalSummary.summary)}</div>
+             </div>`
+          : ''
+      }
       <div class="meta-item" style="grid-column: 1 / -1;">
         <div class="meta-label">Callee Token / 被调用方 Token（仅接收方）</div>
         <div class="meta-val">
@@ -1008,6 +1037,22 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
       <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">已主动唤醒 <strong>${escapeHtml(thread.initiatorAgent)}</strong>，正在后台独立执行全量构建与回归跑测（通常耗时 30~60 秒）。任务正常流转中，请等待审查结论。</div>
     </div>
   </div>`
+      : thread.status === 'review_failed'
+      ? `
+  <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
+    <div style="font-size: 28px;">🚫</div>
+    <div>
+      <div style="font-weight: 700; font-size: 16px; color: #f87171;">检视失败 · 第 ${thread.reviewFailure?.round || thread.currentRound || 1} 轮未取得检视结论 (Review Failed)</div>
+      <div style="font-size: 13px; opacity: 0.95; margin-top: 6px;"><strong>失败原因：</strong>${escapeHtml(thread.reviewFailure?.reason || '未记录原因')}</div>
+      <div style="font-size: 12px; opacity: 0.8; margin-top: 4px;">
+        ${thread.reviewFailure?.kind === 'unresolvable_park'
+          ? '检视方挂起在一个桥接无法观测的外部依赖上（未记录 waitingForThreadId），自动恢复不可能成功。'
+          : '检视唤醒的自动重试预算已耗尽，不会再有自动唤醒。'}
+        ${thread.reviewFailure?.by ? ` 记录者：${escapeHtml(thread.reviewFailure.by)}。` : ''}
+      </div>
+      <div style="font-size: 12px; opacity: 0.75; margin-top: 4px;">该状态是终态（与 failed 一样已释放队列槽）。验收通过的产物不会被删除；可点下方“重新检视下发者”在原会话重试，或直接下发返修 / 手动验收。</div>
+    </div>
+  </div>`
       : thread.status === 'paused'
       ? `
   <div style="background: rgba(249, 115, 22, 0.15); border: 1px solid #f97316; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
@@ -1042,13 +1087,13 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
   <div class="action-bar">
     ${(thread.status === 'failed' || thread.rounds.some((r) => r.status === 'failed')) ? `<button class="retry-btn" style="background: #dc2626; color: white;" onclick="retryFailedRound()">🔄 重试失败轮次 (Retry Failed)</button>` : ''}
     ${thread.status === 'waiting_review' && thread.reviewWake && thread.reviewWake.round === (thread.currentRound || 1) ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（唤醒失败）</button>` : ''}
+    ${thread.status === 'review_failed' ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（检视失败）</button>` : ''}
     ${(thread.status === 'running' || thread.status === 'reworking' || thread.status === 'queued') ? `<button style="background:#ea580c;color:white;" onclick="pauseTask()">⏸ 暂停任务 (Pause)</button>` : ''}
     ${thread.status === 'paused' ? `<button class="resume-btn" onclick="resumeTask()">▶ 恢复执行 (Resume)</button>` : ''}
-    ${(thread.status === 'failed' || thread.status === 'waiting_review') ? `<button class="resume-btn" onclick="resumeTask()">▶ 下发返修要求 / 重新执行</button>` : ''}
+    ${(thread.status === 'failed' || thread.status === 'waiting_review' || thread.status === 'review_failed') ? `<button class="resume-btn" onclick="resumeTask()">▶ 下发返修要求 / 重新执行</button>` : ''}
     ${thread.status !== 'completed' ? `<button onclick="approveTask()">✓ 手动验收通过 (Approve Task)</button>` : ''}
     <button style="background:#7f1d1d;color:white;" onclick="deleteTask()">🗑 删除任务 (Delete)</button>
     <button class="secondary" onclick="printRecentLogs()">📄 打印最近1000行日志 (Print 1,000 Lines)</button>
-    <button class="secondary" onclick="openTerminal()">💻 Open Terminal in Session</button>
     <button class="secondary" onclick="refresh()">⟳ Refresh</button>
   </div>
 
@@ -1109,10 +1154,6 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
 
     function approveTask() {
       vscode.postMessage({ command: 'approve' });
-    }
-
-    function openTerminal() {
-      vscode.postMessage({ command: 'openTerminal' });
     }
 
     function printRecentLogs() {

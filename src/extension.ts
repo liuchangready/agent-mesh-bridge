@@ -8,6 +8,7 @@ import { ActiveAgentResolver } from './bridge/active-agent-resolver';
 import { AutonomousRunner } from './bridge/autonomous-runner';
 import { CallbackManager } from './bridge/callback-manager';
 import { ReviewWakeScheduler } from './bridge/review-wake-scheduler';
+import { reopenFailedReview } from './bridge/review-wake';
 import { AsyncDispatcher } from './bridge/async-dispatcher';
 import { ReworkController } from './bridge/rework-controller';
 import { ConfigSyncService } from './config/config-sync';
@@ -21,7 +22,11 @@ import { TaskRoleLock } from './bridge/task-role-lock';
 import { AgentId } from './bridge/types';
 import { TaskSupervisor } from './bridge/task-supervisor';
 import { TaskControlService } from './bridge/task-control';
+import { TaskArchiveService } from './bridge/task-archive';
+import { ReviewerBootstrapService } from './bridge/reviewer-bootstrap';
+import { ExecutionGate } from './bridge/execution-gate';
 import { saveBridgePolicy } from './bridge/bridge-policy';
+import { probeCodexResumeSupport } from './bridge/codex-session';
 import {
   DSH_PROVIDER_ENV_HINT,
   DSH_PROVIDER_ID_HINT,
@@ -33,6 +38,7 @@ import {
 import {
   ModelCatalog,
   ModelDefaults,
+  ModelRole,
   invalidateConfiguredModelCache,
   normalizeModelId,
   resolveConfiguredModel,
@@ -60,7 +66,7 @@ const MODULE_LOADED_AT_MS = Date.now();
 /** One nudge per host: reloading is the user's call, not a loop. */
 let staleBuildWarned = false;
 
-/** Settings key holding the default model of each agent. */
+/** Settings key holding the receiver-side default model of each agent. */
 const MODEL_SETTING_KEYS: Record<AgentId, string> = {
   antigravity: 'models.antigravity',
   codex: 'models.codex',
@@ -68,6 +74,28 @@ const MODEL_SETTING_KEYS: Record<AgentId, string> = {
   deepseek_harness: 'models.deepseekHarness',
   vscode_chat: 'models.vscodeChat',
 };
+
+/**
+ * Settings key holding the sender-side default model of each agent.
+ *
+ * Deliberately separate from `MODEL_SETTING_KEYS`: an agent executes delegated
+ * work with one model and reviews the tasks it dispatched with another. The two
+ * sides may name the SAME agent (self-dispatch), which is exactly why keeping a
+ * sender-side model distinct from the receiver-side default matters: a model
+ * must never review its own output.
+ */
+const INITIATOR_MODEL_SETTING_KEYS: Record<AgentId, string> = {
+  antigravity: 'initiatorModels.antigravity',
+  codex: 'initiatorModels.codex',
+  claude_code: 'initiatorModels.claudeCode',
+  deepseek_harness: 'initiatorModels.deepseekHarness',
+  vscode_chat: 'initiatorModels.vscodeChat',
+};
+
+/** Model setting key for a role; `undefined` for agents with no picker. */
+function modelSettingKey(agent: AgentId, role: ModelRole): string {
+  return (role === 'initiator' ? INITIATOR_MODEL_SETTING_KEYS : MODEL_SETTING_KEYS)[agent];
+}
 
 const AGENT_LABELS: Record<AgentId, string> = {
   antigravity: 'Google Antigravity',
@@ -250,6 +278,36 @@ export function activate(context: vscode.ExtensionContext) {
   // 2. Initialize Core Services
   const taskStore = TaskStore.getInstance();
   const detector = new AgentDetector(customPaths);
+  // Ledger retention: keep the newest N tasks hot, archive older terminal ones.
+  // Archival keeps the read-only digest and removes rounds/logs/session ids, so
+  // the sidebar and get_task_summary stay useful without an ever-growing ledger.
+  const archiveService = new TaskArchiveService(taskStore, { keepRecent: 20 });
+  let archiveTimer: NodeJS.Timeout | undefined;
+  const scheduleArchive = (delayMs = 4000) => {
+    if (archiveTimer) clearTimeout(archiveTimer);
+    archiveTimer = setTimeout(() => {
+      archiveTimer = undefined;
+      try {
+        archiveService.run(
+          vscode.workspace
+            .getConfiguration('agentMeshBridge')
+            .get<number>('archive.keepRecentTasks', 20),
+        );
+      } catch (e: any) {
+        console.warn('[AgentBridge] Archival pass failed:', e?.message || e);
+      }
+    }, delayMs);
+    archiveTimer.unref?.();
+  };
+  context.subscriptions.push({ dispose: () => archiveTimer && clearTimeout(archiveTimer) });
+  taskStore.on('changed', () => scheduleArchive());
+  scheduleArchive(1500);
+  // Which spelling Codex's `resume` accepts (thread UUID vs rollout name) and
+  // whether it needs `--no-daemon` depend on the installed build. Probe once at
+  // activation so the reviewer wake uses the right form; the result is cached in
+  // codex-session for every later caller.
+  const codexExecutable = detector.resolveExecutable('codex');
+  if (codexExecutable) void probeCodexResumeSupport(codexExecutable);
   const resolver = new ActiveAgentResolver(detector);
   const modelCatalog = new ModelCatalog(detector);
 
@@ -259,28 +317,39 @@ export function activate(context: vscode.ExtensionContext) {
    * The MCP server runs in its own process (spawned by each agent, without VS
    * Code APIs), so the settings are not directly visible to it. This snapshot is
    * what `dispatch_task` uses when the caller does not pin a model.
+   *
+   * Both sides are mirrored: `models.*` is what the agent runs when it RECEIVES
+   * a task, `initiatorModels.*` is what it runs when it SENDS/reviews one. They
+   * are separate on purpose: one agent reviews on its sender-side model while
+   * the task itself runs on another agent. (Self-dispatch is rejected.)
    */
-  const readModelSettings = (): ModelDefaults => {
+  const readModelSettings = (): { receiver: ModelDefaults; initiator: ModelDefaults } => {
     const modelCfg = vscode.workspace.getConfiguration('agentMeshBridge');
-    const defaults: ModelDefaults = {};
+    const receiver: ModelDefaults = {};
+    const initiator: ModelDefaults = {};
     for (const agent of ['antigravity', 'codex', 'claude_code', 'deepseek_harness'] as AgentId[]) {
-      const value = normalizeModelId(modelCfg.get<string>(MODEL_SETTING_KEYS[agent]));
-      if (value) defaults[agent] = value;
+      const received = normalizeModelId(modelCfg.get<string>(MODEL_SETTING_KEYS[agent]));
+      if (received) receiver[agent] = received;
+      const sent = normalizeModelId(modelCfg.get<string>(INITIATOR_MODEL_SETTING_KEYS[agent]));
+      if (sent) initiator[agent] = sent;
     }
-    return defaults;
+    return { receiver, initiator };
   };
 
   const applyModelSettings = (): ModelDefaults => {
-    const defaults = readModelSettings();
+    const settings = readModelSettings();
     // The approval policy travels with the same snapshot, because the agents'
     // MCP processes decide in their own process whether a model switch needs the
     // user's click.
     const requireModelApproval = vscode.workspace
       .getConfiguration('agentMeshBridge')
       .get<boolean>('requireModelApproval', true);
-    saveModelDefaults(defaults, undefined, { requireModelApproval });
+    saveModelDefaults(settings.receiver, undefined, {
+      requireModelApproval,
+      initiatorModels: settings.initiator,
+    });
     invalidateConfiguredModelCache();
-    return defaults;
+    return settings.receiver;
   };
 
   applyModelSettings();
@@ -295,6 +364,10 @@ export function activate(context: vscode.ExtensionContext) {
     const bridgeCfg = vscode.workspace.getConfiguration('agentMeshBridge');
     saveBridgePolicy({
       contextCompaction: bridgeCfg.get<boolean>('contextCompaction', true),
+      // New tasks get a dedicated reviewer conversation. `legacy` keeps the old
+      // caller-resume flow and is the rollback switch; existing tasks stay on
+      // whatever topology they were created with.
+      reviewFlow: bridgeCfg.get<'dedicated' | 'legacy'>('reviewFlow', 'dedicated'),
       concurrency: {
         enabled: bridgeCfg.get<boolean>('concurrency.enabled', false),
         maxConcurrentTasks: bridgeCfg.get<number>('concurrency.maxConcurrentTasks', 2),
@@ -350,11 +423,13 @@ export function activate(context: vscode.ExtensionContext) {
       .map((t) => `【${t.title}】`)
       .join('、');
     const more = threads.length > 5 ? ` 等 ${threads.length} 个任务` : '';
+    const terminalFailures = threads.filter((t) => t.status === 'review_failed').length;
+    const tail =
+      terminalFailures > 0
+        ? `已记录为“检视失败”(review_failed, 终态) 并释放队列槽；需手动重新检视或下发返修。`
+        : '已记录为检视卡住并安排自动重新检视。';
     vscode.window
-      .showWarningMessage(
-        `⚠️ [Agent Bridge] 检视卡住：${names}${more} 长时间处于等待检视且没有活跃的检视进程，已记录为检视失败并安排自动重新检视。`,
-        '查看首个任务 (Details)',
-      )
+      .showWarningMessage(`⚠️ [Agent Bridge] 检视未完成：${names}${more}${tail}`, '查看首个任务 (Details)')
       .then((choice) => {
         if (choice !== '查看首个任务 (Details)') return;
         TaskDetailPanel.render(
@@ -372,6 +447,22 @@ export function activate(context: vscode.ExtensionContext) {
   configSync.setAgentMcpEnv(agentMcpEnvFor(dshProvider));
   const supervisor = new TaskSupervisor(taskStore, runner, callbackManager, detector);
   context.subscriptions.push({ dispose: () => supervisor.dispose() });
+
+  // Dedicated review: launch the fresh reviewer conversation for new tasks, wait
+  // for its one-shot dispatch call, then let the normal queue start the developer.
+  const reviewerBootstrap = new ReviewerBootstrapService({
+    taskStore,
+    runner,
+    detector,
+    executionGate: new ExecutionGate(),
+    onSettled: () => {
+      // The supervisor observes ledger changes, but a direct nudge removes the
+      // up-to-one-poll delay after the bootstrap releases the slot.
+      supervisor.checkPendingTasks();
+    },
+  });
+  reviewerBootstrap.start();
+  context.subscriptions.push({ dispose: () => reviewerBootstrap.stop() });
 
   supervisor.on('taskStarted', ({ thread, round }) => {
     statusBar.update();
@@ -469,7 +560,7 @@ export function activate(context: vscode.ExtensionContext) {
       if (t.status !== 'waiting_review') continue;
       const dependency = byThreadId.get(blocked.waitingForThreadId);
       if (!dependency) continue;
-      if (dependency.status !== 'completed' && dependency.status !== 'failed') continue;
+      if (dependency.status !== 'completed' && dependency.status !== 'failed' && dependency.status !== 'review_failed') continue;
 
       const reviewRound = [...(t.rounds || [])]
         .reverse()
@@ -563,6 +654,90 @@ export function activate(context: vscode.ExtensionContext) {
         });
     },
   );
+
+  /**
+   * Delete a task (or force-delete it) through one shared flow.
+   *
+   * The bridge refuses exactly one deletion: a temporary worktree whose output
+   * was never merged back (the merge gate). Force is the deliberate way past it,
+   * so the UI must offer that decision instead of leaving the user with a bare
+   * error — and it must say plainly what is about to be thrown away.
+   */
+  const deleteTaskCommand = async (
+    itemOrThreadId?: TaskTreeItem | string,
+    force = false,
+  ): Promise<void> => {
+    let threadId =
+      typeof itemOrThreadId === 'string' ? itemOrThreadId : itemOrThreadId?.thread?.threadId;
+
+    if (!threadId) {
+      const input = await vscode.window.showInputBox({
+        prompt: '输入要删除的 Thread ID:',
+      });
+      if (!input) return;
+      threadId = input.trim();
+    }
+
+    taskStore.loadFromDisk();
+    const thread = taskStore.getTask(threadId);
+    const title = thread ? thread.title : threadId;
+    const worktree = thread?.worktree;
+    const mergeGate = !!worktree && !thread?.mergeRequest;
+    const running = !!thread && (thread.status === 'running' || thread.status === 'reworking');
+
+    const details = [
+      force ? `确定要【强制删除】任务【${title}】吗？` : `确定要永久删除任务【${title}】吗？`,
+      ...(running ? ['该任务正在运行：会先终止 Agent 进程。'] : []),
+      ...(mergeGate
+        ? [
+            `⚠️ worktree ${worktree!.path} 尚未合并回 ${worktree!.mainPath}` +
+              `${worktree!.branch ? `（分支 ${worktree!.branch}）` : ''}：` +
+              '删除会把只存在于该 worktree 的改动永久丢弃。',
+          ]
+        : []),
+      '接收方原生对话（Claude Code / Codex / Antigravity / DeepSeek Harness）会一并尽力清理；删除后不可恢复。',
+    ];
+    const confirmLabel = force ? '强制删除' : '删除';
+    const confirm = await vscode.window.showWarningMessage(
+      details.join(' '),
+      { modal: true },
+      confirmLabel,
+      '取消',
+    );
+    if (confirm !== confirmLabel) return;
+
+    if (!force && mergeGate) {
+      // Recommend the merge request first, but keep the escape hatch one click
+      // away: the normal command must not dead-end on a worktree task.
+      const escalate = await vscode.window.showWarningMessage(
+        `任务【${title}】有未合并的 worktree 输出。推荐先 record_merge_request 再删除；` +
+          '若确认放弃这些改动，可以强制删除。',
+        { modal: true },
+        '强制删除',
+        '取消',
+      );
+      if (escalate !== '强制删除') return;
+      return deleteTaskCommand(threadId, true);
+    }
+
+    const reason = await vscode.window.showInputBox({
+      prompt: `请输入删除【${title}】的原因（会写入删除墓碑日志）:`,
+      value: force ? '用户强制删除（放弃未合并的 worktree 输出）' : '用户手动删除',
+      placeHolder: '例如：任务重复 / 需求取消',
+    });
+    if (reason === undefined) return;
+
+    try {
+      const result = taskControl.deleteTask(threadId, reason, 'user', force);
+      vscode.window.showInformationMessage(result.message);
+      taskStore.loadFromDisk();
+      activeTreeProvider.refresh();
+      recentTreeProvider.refresh();
+      statusBar.update();
+    } catch (e: any) {
+      vscode.window.showErrorMessage(`删除任务失败: ${e.message}`);
+    }
+  };
 
   // 6. Register Commands
   context.subscriptions.push(
@@ -734,49 +909,12 @@ export function activate(context: vscode.ExtensionContext) {
 
     vscode.commands.registerCommand(
       'agent-mesh-bridge.deleteTask',
-      async (itemOrThreadId?: TaskTreeItem | string) => {
-        let threadId =
-          typeof itemOrThreadId === 'string' ? itemOrThreadId : itemOrThreadId?.thread?.threadId;
+      (itemOrThreadId?: TaskTreeItem | string) => deleteTaskCommand(itemOrThreadId, false),
+    ),
 
-        if (!threadId) {
-          const input = await vscode.window.showInputBox({
-            prompt: '输入要删除的 Thread ID:',
-          });
-          if (!input) return;
-          threadId = input.trim();
-        }
-
-        taskStore.loadFromDisk();
-        const thread = taskStore.getTask(threadId);
-        const title = thread ? thread.title : threadId;
-        const confirm = await vscode.window.showWarningMessage(
-          `确定要永久删除任务【${title}】吗？如果它正在运行，会先终止 Agent 进程；` +
-            `该任务对应的接收方原生对话（Claude Code / Codex / Antigravity / DeepSeek Harness）` +
-            `也会一并清理（找不到对话不算错误）。删除后不可恢复。`,
-          { modal: true },
-          '删除',
-          '取消',
-        );
-        if (confirm !== '删除') return;
-
-        const reason = await vscode.window.showInputBox({
-          prompt: `请输入删除【${title}】的原因（会写入删除墓碑日志）:`,
-          value: '用户手动删除',
-          placeHolder: '例如：任务重复 / 需求取消',
-        });
-        if (reason === undefined) return;
-
-        try {
-          const result = taskControl.deleteTask(threadId, reason, 'user');
-          vscode.window.showInformationMessage(result.message);
-          taskStore.loadFromDisk();
-          activeTreeProvider.refresh();
-          recentTreeProvider.refresh();
-          statusBar.update();
-        } catch (e: any) {
-          vscode.window.showErrorMessage(`删除任务失败: ${e.message}`);
-        }
-      },
+    vscode.commands.registerCommand(
+      'agent-mesh-bridge.deleteTaskForce',
+      (itemOrThreadId?: TaskTreeItem | string) => deleteTaskCommand(itemOrThreadId, true),
     ),
 
     vscode.commands.registerCommand(
@@ -1127,7 +1265,15 @@ export function activate(context: vscode.ExtensionContext) {
         // but a crashed host (or a role lock whose owner already exited) is
         // exactly when the user must be able to recover. Requiring a recorded
         // `reviewWake` first made that impossible: a lost wake could only be
-        // fixed by editing the ledger by hand.
+        // fixed by editing the ledger by hand. A terminal `review_failed` task is
+        // precisely a review that needs another chance, so it re-opens here.
+        if (thread.status === 'review_failed') {
+          reopenFailedReview(thread);
+          taskStore.upsertTask(thread);
+          vscode.window.showInformationMessage(
+            `【${thread.title}】上次检视失败（${thread.reviewFailure?.reason || '原因未记录'}），正在重新打开检视并唤醒下发者。`,
+          );
+        }
         if (thread.status !== 'waiting_review') {
           vscode.window.showWarningMessage(
             `任务【${thread.title}】当前状态为 ${thread.status}；只有处于“等待检视”的任务才能重新检视。`,
@@ -1232,24 +1378,52 @@ export function activate(context: vscode.ExtensionContext) {
 
     vscode.commands.registerCommand(
       'agent-mesh-bridge.selectAgentModel',
-      async (item?: AgentNodeItem) => {
+      async (item?: AgentNodeItem, roleArg?: ModelRole) => {
         const targets: AgentId[] = ['antigravity', 'codex', 'claude_code', 'deepseek_harness'];
+        const roleOptions: Array<{ role: ModelRole; label: string; description: string }> = [
+          {
+            role: 'receiver',
+            label: '$(arrow-down) 接收者默认模型',
+            description: '该 Agent 被派发任务时执行使用的模型',
+          },
+          {
+            role: 'initiator',
+            label: '$(arrow-up) 下发者默认模型',
+            description:
+              '该 Agent 作为下发者/检视者运行时使用的模型（同 Agent 自派发时，必须与接收模型不同）',
+          },
+        ];
+
+        // Receiver and sender defaults are independent: an agent can review on
+        // one model while the delegated task runs on another agent's model.
+        let role: ModelRole | undefined =
+          roleArg === 'initiator' || roleArg === 'receiver' ? roleArg : undefined;
+        if (!role) {
+          const pickedRole = await vscode.window.showQuickPick(roleOptions, {
+            placeHolder: '配置哪一侧的默认模型？',
+          });
+          if (!pickedRole) return;
+          role = pickedRole.role;
+        }
+        const modelRole: ModelRole = role;
+        const roleLabel = modelRole === 'initiator' ? '下发者默认模型' : '接收者默认模型';
 
         let agent = item?.info?.id;
         if (!agent || agent === 'vscode_chat') {
           const pick = await vscode.window.showQuickPick(
             targets.map((a) => ({
               label: AGENT_LABELS[a],
-              description: resolveConfiguredModel(a) || 'Agent 默认模型',
+              description: resolveConfiguredModel(a, undefined, modelRole) || 'Agent 默认模型',
               agent: a,
             })),
-            { placeHolder: '选择要配置默认模型的 Agent' },
+            { placeHolder: `选择要配置${roleLabel}的 Agent` },
           );
           if (!pick) return;
           agent = pick.agent;
         }
         const targetAgent: AgentId = agent;
         const modelCfg = vscode.workspace.getConfiguration('agentMeshBridge');
+        const settingKey = modelSettingKey(targetAgent, modelRole);
 
         for (;;) {
           const catalog = await vscode.window.withProgress(
@@ -1266,7 +1440,7 @@ export function activate(context: vscode.ExtensionContext) {
             );
           }
 
-          const current = resolveConfiguredModel(targetAgent);
+          const current = resolveConfiguredModel(targetAgent, undefined, modelRole);
           const items: any[] = [
             {
               label: '$(check) 使用 Agent 默认模型',
@@ -1293,7 +1467,7 @@ export function activate(context: vscode.ExtensionContext) {
           ];
 
           const selected = await vscode.window.showQuickPick(items, {
-            placeHolder: `${AGENT_LABELS[targetAgent]} 默认模型 · 来源: ${catalog.source}`,
+            placeHolder: `${AGENT_LABELS[targetAgent]} ${roleLabel} · 来源: ${catalog.source}`,
             matchOnDescription: true,
           });
           if (!selected) return;
@@ -1306,7 +1480,7 @@ export function activate(context: vscode.ExtensionContext) {
           let model: string | undefined;
           if (selected.action === 'manual') {
             const input = await vscode.window.showInputBox({
-              prompt: `输入 ${AGENT_LABELS[targetAgent]} 要使用的模型 ID`,
+              prompt: `输入 ${AGENT_LABELS[targetAgent]} 作为${roleLabel.replace('默认模型', '')}要使用的模型 ID`,
               value: current || '',
               placeHolder: '例如 gpt-6-sol / sonnet / gemini-3.8-flash-high',
             });
@@ -1329,17 +1503,21 @@ export function activate(context: vscode.ExtensionContext) {
           }
 
           await modelCfg.update(
-            MODEL_SETTING_KEYS[targetAgent],
+            settingKey,
             model ?? '',
             vscode.ConfigurationTarget.Global,
           );
           applyModelSettings();
           agentNodesProvider.refresh(false);
 
+          const roleHint =
+            modelRole === 'initiator'
+              ? '该 Agent 作为下发者/检视者唤醒时将使用该模型'
+              : '后续派发给该 Agent 的任务将使用该模型';
           vscode.window.showInformationMessage(
             model
-              ? `Agent Bridge: ${AGENT_LABELS[targetAgent]} 默认模型已设为 ${model}，后续下发任务将使用该模型。`
-              : `Agent Bridge: 已清除 ${AGENT_LABELS[targetAgent]} 的模型配置，恢复使用 Agent 默认模型。`,
+              ? `Agent Bridge: ${AGENT_LABELS[targetAgent]} ${roleLabel}已设为 ${model}，${roleHint}。`
+              : `Agent Bridge: 已清除 ${AGENT_LABELS[targetAgent]} 的${roleLabel}配置，恢复使用 Agent 默认模型。`,
           );
           return;
         }
@@ -1444,6 +1622,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (
         !e.affectsConfiguration('agentMeshBridge.models') &&
+        !e.affectsConfiguration('agentMeshBridge.initiatorModels') &&
         !e.affectsConfiguration('agentMeshBridge.requireModelApproval') &&
         !e.affectsConfiguration('agentMeshBridge.contextCompaction') &&
         !e.affectsConfiguration('agentMeshBridge.concurrency') &&

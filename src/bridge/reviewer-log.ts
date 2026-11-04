@@ -89,6 +89,29 @@ export function listReviewerLogRounds(threadId: string, root?: string): number[]
 }
 
 /**
+ * Locate the reviewer log the panel should show for a requested round.
+ *
+ * A stalled wake can carry an older round number than the ledger's current
+ * round (the retry was planned before the next rework completed), so the live
+ * reviewer may be writing `round_4.reviewer.log` while the task already shows
+ * round 5. In that case, fall back to the newest reviewer log that actually
+ * exists and tell the caller the output is from an earlier round instead of
+ * pretending nothing was captured.
+ */
+export function resolveReviewerLogRound(
+  threadId: string,
+  requestedRound: number,
+  root?: string,
+): { round: number; fallback: boolean } | undefined {
+  if (statReviewerLog(threadId, requestedRound, root).exists) {
+    return { round: requestedRound, fallback: false };
+  }
+  const latest = listReviewerLogRounds(threadId, root)[0];
+  if (latest === undefined) return undefined;
+  return { round: latest, fallback: latest !== requestedRound };
+}
+
+/**
  * Bounded tail of one round's reviewer log.
  *
  * Returns `undefined` when the reviewer never ran (or the file was removed), so

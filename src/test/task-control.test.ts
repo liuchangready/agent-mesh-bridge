@@ -122,6 +122,8 @@ describe('TaskControlService - pause/delete reasons', () => {
     const record = JSON.parse(tombstone);
     assert.strictEqual(record.threadId, 'thread_control_1');
     assert.strictEqual(record.reason, 'duplicate request');
+    // A normal delete is not a forced one: the tombstone must not claim otherwise.
+    assert.strictEqual(record.forced, undefined);
   });
 
   test('deleting a task also records the receiver conversation cleanup', () => {

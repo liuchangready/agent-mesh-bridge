@@ -20,6 +20,13 @@ export interface TaskRoleOwner {
   token: string;
   threadId: string;
   role: TaskRole;
+  /**
+   * Dedicated-reviewer mode: the native reviewer conversation this role is bound
+   * to. The lock file is keyed by this id, not by the thread, so two tasks can
+   * never write the same reviewer conversation and a stale process is rejected
+   * by session identity (not just by thread).
+   */
+  conversationId?: string;
   /** Process that acquired (and heartbeats) the lock. */
   pid: number;
   /**
@@ -52,6 +59,7 @@ export interface TaskRoleLease {
   token: string;
   threadId: string;
   role: TaskRole;
+  conversationId?: string;
 }
 
 const ROLE_DIR = 'roles';
@@ -71,14 +79,19 @@ export class TaskRoleLock {
     } catch {}
   }
 
-  public tryAcquire(threadId: string, role: TaskRole): TaskRoleLease | null {
+  public tryAcquire(
+    threadId: string,
+    role: TaskRole,
+    conversationId?: string,
+  ): TaskRoleLease | null {
     if (this.activeLease) return null;
 
-    const file = this.filePath(threadId);
+    const file = this.filePath(threadId, conversationId);
     const payload: TaskRoleOwner = {
       token: crypto.randomUUID(),
       threadId,
       role,
+      ...(conversationId ? { conversationId } : {}),
       pid: process.pid,
       acquiredAt: Date.now(),
       updatedAt: Date.now(),
@@ -87,14 +100,19 @@ export class TaskRoleLock {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         fs.writeFileSync(file, JSON.stringify(payload), { encoding: 'utf8', flag: 'wx' });
-        const lease: TaskRoleLease = { token: payload.token, threadId, role };
+        const lease: TaskRoleLease = {
+          token: payload.token,
+          threadId,
+          role,
+          ...(conversationId ? { conversationId } : {}),
+        };
         this.activeLease = lease;
-        this.startHeartbeat(threadId);
+        this.startHeartbeat(lease);
         return lease;
       } catch (err: any) {
         if (err?.code !== 'EEXIST') return null;
 
-        const owner = this.readOwner(threadId);
+        const owner = this.readOwnerFile(file);
         if (!owner) {
           if (!this.isFileStale(file)) return null;
           this.removeStale(file, undefined);
@@ -109,8 +127,18 @@ export class TaskRoleLock {
   }
 
   public getOwner(threadId: string): TaskRoleOwner | undefined {
-    const owner = this.readOwner(threadId);
-    return owner && this.isOwnerLive(owner) ? owner : undefined;
+    const threadOwner = this.readOwner(threadId);
+    if (threadOwner && this.isOwnerLive(threadOwner)) return threadOwner;
+    // Dedicated review locks live under the reviewer conversation id. The
+    // directory is tiny (one file per active role), so a scan is the simplest
+    // cross-process index that cannot go stale.
+    for (const name of this.listLockFiles()) {
+      if (!name.startsWith('conv_')) continue;
+      const owner = this.readOwnerFile(path.join(this.dir, name));
+      if (!owner || owner.threadId !== threadId) continue;
+      if (this.isOwnerLive(owner)) return owner;
+    }
+    return undefined;
   }
 
   public release(lease?: TaskRoleLease): void {
@@ -119,8 +147,8 @@ export class TaskRoleLock {
     this.activeLease = null;
     if (!target) return;
 
-    const file = this.filePath(target.threadId);
-    const owner = this.readOwner(target.threadId);
+    const file = this.filePath(target.threadId, target.conversationId);
+    const owner = this.readOwnerFile(file);
     if (!owner || owner.token !== target.token) return;
     try {
       fs.unlinkSync(file);
@@ -138,7 +166,7 @@ export class TaskRoleLock {
     const owner = this.getOwner(threadId);
     if (!owner || owner.role !== role) return false;
     try {
-      fs.unlinkSync(this.filePath(threadId));
+      fs.unlinkSync(this.filePath(owner.threadId, owner.conversationId));
       return true;
     } catch {
       return false;
@@ -154,12 +182,13 @@ export class TaskRoleLock {
    */
   public attachChild(lease: TaskRoleLease | null, childPid: number | undefined): boolean {
     if (!lease || !childPid) return false;
-    const owner = this.readOwner(lease.threadId);
+    const file = this.filePath(lease.threadId, lease.conversationId);
+    const owner = this.readOwnerFile(file);
     if (!owner || owner.token !== lease.token) return false;
     try {
       owner.childPid = childPid;
       owner.updatedAt = Date.now();
-      fs.writeFileSync(this.filePath(lease.threadId), JSON.stringify(owner), 'utf8');
+      fs.writeFileSync(file, JSON.stringify(owner), 'utf8');
       return true;
     } catch {
       return false;
@@ -168,23 +197,40 @@ export class TaskRoleLock {
 
   public describe(owner?: TaskRoleOwner): string {
     if (!owner) return 'another role';
+    const conversation = owner.conversationId ? `, conversation ${owner.conversationId}` : '';
     return owner.childPid
-      ? `${owner.role} (pid ${owner.pid}, reviewer child ${owner.childPid})`
-      : `${owner.role} (pid ${owner.pid})`;
+      ? `${owner.role} (pid ${owner.pid}${conversation}, reviewer child ${owner.childPid})`
+      : `${owner.role} (pid ${owner.pid}${conversation})`;
   }
 
   public getLockFilePath(threadId: string): string {
     return this.filePath(threadId);
   }
 
-  private filePath(threadId: string): string {
+  private filePath(threadId: string, conversationId?: string): string {
+    if (conversationId) {
+      const hash = crypto.createHash('sha1').update(conversationId).digest('hex').slice(0, 24);
+      return path.join(this.dir, `conv_${hash}.json`);
+    }
     const safe = threadId.replace(/[^A-Za-z0-9_.-]/g, '_');
     return path.join(this.dir, `${safe}.json`);
   }
 
-  private readOwner(threadId: string): TaskRoleOwner | undefined {
+  private listLockFiles(): string[] {
     try {
-      const parsed = JSON.parse(fs.readFileSync(this.filePath(threadId), 'utf8'));
+      return fs.readdirSync(this.dir).filter((name) => name.endsWith('.json'));
+    } catch {
+      return [];
+    }
+  }
+
+  private readOwner(threadId: string): TaskRoleOwner | undefined {
+    return this.readOwnerFile(this.filePath(threadId));
+  }
+
+  private readOwnerFile(file: string): TaskRoleOwner | undefined {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
       if (
         parsed &&
         typeof parsed.token === 'string' &&
@@ -230,24 +276,25 @@ export class TaskRoleLock {
         if (this.isFileStale(file)) fs.unlinkSync(file);
         return;
       }
-      const current = this.readOwner(owner.threadId);
+      const current = this.readOwnerFile(file);
       if (current?.token === owner.token) {
         fs.unlinkSync(file);
       }
     } catch {}
   }
 
-  private startHeartbeat(threadId: string): void {
+  private startHeartbeat(lease: TaskRoleLease): void {
     if (this.heartbeatTimer) return;
+    const file = this.filePath(lease.threadId, lease.conversationId);
     this.heartbeatTimer = setInterval(() => {
-      const lease = this.activeLease;
-      if (!lease) {
+      const current = this.activeLease;
+      if (!current) {
         this.stopHeartbeat();
         return;
       }
 
-      const owner = this.readOwner(threadId);
-      if (!owner || owner.token !== lease.token) {
+      const owner = this.readOwnerFile(file);
+      if (!owner || owner.token !== current.token) {
         this.activeLease = null;
         this.stopHeartbeat();
         return;
@@ -255,7 +302,7 @@ export class TaskRoleLock {
 
       owner.updatedAt = Date.now();
       try {
-        fs.writeFileSync(this.filePath(threadId), JSON.stringify(owner), 'utf8');
+        fs.writeFileSync(file, JSON.stringify(owner), 'utf8');
       } catch {}
     }, HEARTBEAT_INTERVAL_MS);
     this.heartbeatTimer.unref?.();

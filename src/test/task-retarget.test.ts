@@ -82,7 +82,9 @@ function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread
   return {
     threadId: 'thread_retarget_1',
     title: '统一码牌千术',
-    initiatorAgent: 'codex',
+    // The reviewer must differ from every executor these tests switch to:
+    // a task may never run on its own initiator (AGENTS.md §22).
+    initiatorAgent: 'claude_code',
     targetAgent: 'deepseek_harness',
     status: 'waiting_review',
     currentRound: 1,
@@ -297,15 +299,39 @@ describe('TaskRetargetService - switching a task executor', () => {
       taskStore.upsertTask(makeThread({ threadId, status }));
       const res = await service.retargetTask({
         threadId,
-        targetAgent: 'claude_code',
+        targetAgent: 'codex',
         reason: 'move off DeepSeek',
       });
       assert.strictEqual(res.status, 'RETARGETED');
       const stored = taskStore.getTask(threadId)!;
       // The task keeps its parked status; only the executor changed.
       assert.strictEqual(stored.status, status);
-      assert.strictEqual(stored.targetAgent, 'claude_code');
+      assert.strictEqual(stored.targetAgent, 'codex');
       assert.ok(stored.retargets && stored.retargets.length === 1);
     }
+  });
+
+  test('refuses to hand a legacy task to its own initiator (self-review deadlock)', async () => {
+    taskStore.upsertTask(makeThread());
+    service.setModelApprovalHandler(async () => {
+      throw new Error('a rejected self-dispatch must not ask the user for a model');
+    });
+
+    await assert.rejects(
+      () =>
+        service.retargetTask({
+          threadId: 'thread_retarget_1',
+          targetAgent: 'claude_code',
+          reason: 'run it on the reviewer',
+        }),
+      /legacy review flow/i,
+    );
+
+    // Nothing moved: no executor change, no session reset, no retarget record.
+    const stored = taskStore.getTask('thread_retarget_1')!;
+    assert.strictEqual(stored.targetAgent, 'deepseek_harness');
+    assert.strictEqual(stored.receiverSessionId, 'session-old');
+    assert.strictEqual(stored.receiverSessionCaptured, true);
+    assert.strictEqual(stored.retargets, undefined);
   });
 });

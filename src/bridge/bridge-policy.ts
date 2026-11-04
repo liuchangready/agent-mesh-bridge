@@ -47,6 +47,12 @@ export interface BridgePolicy {
     maxConcurrentTasks?: number;
     maxConcurrentPerAgent?: number;
   };
+  /**
+   * Review topology for NEW tasks. Omitted = dedicated when the extension host
+   * is alive, legacy otherwise (standalone MCP has no process able to run the
+   * reviewer bootstrap).
+   */
+  reviewFlow?: 'legacy' | 'dedicated';
   updatedAt?: string;
 }
 
@@ -102,6 +108,9 @@ export function saveBridgePolicy(patch: BridgePolicy, root?: string): BridgePoli
     const perAgent = positiveSlotCount(patch.concurrency.maxConcurrentPerAgent);
     if (perAgent !== undefined) merged.maxConcurrentPerAgent = perAgent;
     if (Object.keys(merged).length > 0) next.concurrency = merged;
+  }
+  if (patch.reviewFlow === 'legacy' || patch.reviewFlow === 'dedicated') {
+    next.reviewFlow = patch.reviewFlow;
   }
   next.updatedAt = new Date().toISOString();
 
