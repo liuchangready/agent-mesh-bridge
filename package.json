@@ -352,19 +352,19 @@
         "agentMeshBridge.concurrency.enabled": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Allow more than one delegated task round to run at the same time, one per workspace, up to `#agentMeshBridge.concurrency.maxConcurrentTasks#` mesh-wide. **OFF by default**: the mesh stays strictly single-flight (one round at a time). Even when ON, two tasks in the SAME workspace never overlap, and the file-scope gate, the single-task role lock and pause/delete cancellation are unchanged."
+          "markdownDescription": "Apply the configured best-effort concurrency limits when enabled. **OFF (default) means unlimited concurrency**, not single-flight. Tasks in the same workspace may overlap when their declared file scopes do not conflict. Scope checks, one active role per task, one active round per task, and pause/delete cancellation remain in force. Scope measurements use git snapshots and may observe changes from other concurrently running tasks."
         },
         "agentMeshBridge.concurrency.maxConcurrentTasks": {
           "type": "number",
           "default": 2,
           "minimum": 1,
-          "description": "Mesh-wide execution slots used when concurrency is enabled (each slot executes one task in one workspace). Ignored while concurrency is off."
+          "description": "Best-effort mesh-wide active task limit when concurrency is enabled. Ignored while concurrency is off. Counts are observed across processes but are not reserved atomically, so short-lived limit overshoots are possible."
         },
         "agentMeshBridge.concurrency.maxConcurrentPerAgent": {
           "type": "number",
           "default": 1,
           "minimum": 1,
-          "description": "How many task rounds a single agent may execute at the same time when concurrency is enabled. Ignored while concurrency is off."
+          "description": "Best-effort active task limit per agent when concurrency is enabled. Ignored while concurrency is off. Counts are observed across processes but are not reserved atomically, so short-lived limit overshoots are possible."
         },
         "agentMeshBridge.taskTimeoutMinutes": {
           "type": "number",

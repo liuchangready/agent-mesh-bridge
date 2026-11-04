@@ -16,7 +16,7 @@ import { CallbackManager } from '../bridge/callback-manager';
 import { AsyncDispatcher } from '../bridge/async-dispatcher';
 import { ReworkController } from '../bridge/rework-controller';
 import { MCPServer } from '../bridge/mcp-server';
-import { ExecutionGate } from '../bridge/execution-gate';
+import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { getBridgeHome } from '../bridge/model-catalog';
 import {
   clearReviewerBootstrapToken,
@@ -55,7 +55,7 @@ describe('dedicated reviewer bootstrap identity', () => {
     const callbackManager = new CallbackManager(detector);
     callbackManager.notifyCaller = async () => true;
     callbackManager.notifyCallerOfFailure = async () => false;
-    const gate = new ExecutionGate(tempDir);
+    const gate = new TaskExecutionRegistry(tempDir);
     const dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector, gate);
     const reworkController = new ReworkController(taskStore, runner, callbackManager, detector, gate);
     mcpServer = new MCPServer(dispatcher, reworkController, taskStore, detector, resolver, runner);
@@ -153,9 +153,29 @@ describe('dedicated reviewer bootstrap identity', () => {
     }
   });
 
+  test('a paused task cannot be confirmed by a delayed bootstrap and keeps its token', async () => {
+    const threadId = 'thread_paused_bootstrap';
+    prepareTask(threadId, 'token-before-pause');
+    const paused = taskStore.getTask(threadId)!;
+    paused.status = 'paused';
+    taskStore.upsertTask(paused);
+    try {
+      const res = await callDispatch({
+        reviewBootstrap: { threadId, token: 'token-before-pause' },
+      });
+      assert.ok(res.error, JSON.stringify(res));
+      assert.strictEqual(taskStore.getTask(threadId)?.status, 'paused');
+      assert.strictEqual(taskStore.getTask(threadId)?.reviewBootstrap?.phase, 'pending');
+      assert.strictEqual(readReviewerBootstrapToken(threadId, getBridgeHome())?.token, 'token-before-pause');
+    } finally {
+      clearReviewerBootstrapToken(threadId, getBridgeHome());
+      taskStore.dispose();
+    }
+  });
+
   test('without a pending bootstrap a brief-less call is still an ordinary error', async () => {
     try {
-      const res = await callDispatch({});
+      const res = await callDispatch({ targetAgent: 'claude_code' });
       assert.ok(res.error, JSON.stringify(res));
       assert.match(String(res.error.message), /requires expectedFiles/i);
     } finally {

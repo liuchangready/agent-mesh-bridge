@@ -12,7 +12,7 @@ import { TaskStore } from '../bridge/task-store';
 import { AgentDetector } from '../bridge/agent-detector';
 import { AutonomousRunner, RunOptions, RunResult } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
-import { ExecutionGate } from '../bridge/execution-gate';
+import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { CancellationRegistry } from '../bridge/cancellation-registry';
 import { TaskControlService } from '../bridge/task-control';
 import { ReworkController } from '../bridge/rework-controller';
@@ -208,7 +208,7 @@ describe('TaskControlService - pause/delete reasons', () => {
       runner,
       callbackManager,
       new AgentDetector(),
-      new ExecutionGate(tempDir),
+      new TaskExecutionRegistry(tempDir),
     );
 
     let executedPrompt = '';
@@ -265,7 +265,7 @@ describe('TaskControlService - pause/delete reasons', () => {
       runner,
       callbackManager,
       new AgentDetector(),
-      new ExecutionGate(tempDir),
+      new TaskExecutionRegistry(tempDir),
     );
     runner.execute = async (): Promise<RunResult> => ({
       exitCode: 0,

@@ -19,7 +19,7 @@
 5. **同会话多次返修直至认可 (Multi-Turn Rework)**：若 A 对 B 的产出不满意，可在**同一个原生会话中多次要求其返修**（保留上下文、修改历史与中间思考），直至 A 验收通过。
 6. **1000 条任务中心与对话看板**：VSCode 侧边栏提供实时任务列表，以 `A -> B 标题` 格式呈现，显示对话摘要与轮次进度，支持点开查看全量多轮对话与 Diff 详情，持久化保留最新 1,000 条。
 7. **全自动无人值守运行 (`skip-danger`)**：严格封装非交互与权限旁路参数，避免后台进程因权限询问、终端等待或 Git 安全检查而挂起卡死；Codex 的全局审批参数必须位于 `exec` 之前，DSH 必须注入 `DSH_PERMISSION_MODE=danger-full-access`。
-8. **严格串行执行**：任意时刻整个网格只允许一个任务轮次真实执行；排队单位是**任务**，一个任务在 `completed` 之前始终占用全局任务槽（含 `waiting_review` / `paused`），其他任务继续排队；跨进程由 `execution.lock` 裁决，不再以文件范围是否重叠作为并发依据。
+8. **按候选并发调度（替代旧全局串行铁律）**：没有全局执行锁或 workspace 队头。同一 workspace 不同 scope 的任务可并发；scope 冲突、thread 级单轮和角色锁仍是硬闸门。paused、waiting_review、blocked review 和 bootstrap pending 不会挡住 scope 无关的候选。`TaskExecutionRegistry` 只登记执行者/PID，不互斥；旧 `execution.lock` 与 `leases/` 不参与启动判定。启用数值限额时仅以跨进程 best-effort 观察做 admission，计数不原子，可能短暂超额。
 
 ---
 
@@ -72,7 +72,7 @@ flowchart TD
 2. **`AsyncTaskDispatcher`（异步派发引擎）**：
    - 负责解析 A 的下发意向，生成全局唯一 `threadId` 与接收方原生 `receiverSessionId`；
    - 立即向发起方返回 `DISPATCHED` / `QUEUED` 确认报文，断开长连接等待，允许 A 结束当前 Turn；
-   - 只要已有任务在执行（无论文件范围是否重叠），新任务一律进入 **全局 FIFO 队列**，不再并发启动。
+   - 只在 scope 冲突或显式启用的并发限额阻止启动时返回 `QUEUED`；调度器跳过该候选并继续扫描其他任务。paused / waiting_review / blocked / bootstrap pending 仅阻挡自身后续 developer 轮次。
 3. **`MultiTurnReworkController`（多轮返修控制器）**：
    - 维系 `threadId` ↔ `receiverSessionId` 强绑定；
    - 处理 A 的 `request_rework` 指令，递增轮次并在接收方原有原生会话中触发续聊命令；
@@ -89,25 +89,24 @@ flowchart TD
    - 单文件/轻量存储 `~/.agent-mesh-bridge/delegation_threads.json`；
    - 保证最多 1,000 条任务历史，超出部分自动截断清理；
    - 跨进程文件监听与原子写入。
-7. **`ExecutionGate`（跨进程全局单飞）**：
-   - 以 `~/.agent-mesh-bridge/execution.lock` 的原子 `wx` 创建作为唯一裁决点，协调“扩展宿主 supervisor + 各 Agent 独立 MCP server”多个进程；
-   - 5 秒心跳刷新、30 秒僵尸判定、按 token 安全释放；进程崩溃后锁可被安全接管；
-   - 锁内额外记录真实 Agent 子进程 `childPid`（spawn 后由 `onChildPid` 回填、子进程退出时清空）。Windows 上父进程崩溃不会连带杀掉子进程，因此存活判定必须同时探活宿主与子进程：宿主已死但子进程仍在时，租约在整个**孤儿宽限期**（默认 120s）内仍视为占用；超过宽限期则先 `taskkill /T /F` 杀掉孤儿，再接管锁，避免新轮次与残留 Agent 同时改同一工作区；
-   - `pause_task` / `delete_task` 会调用 `killOrphanChild(threadId)`：宿主存活时交给其自身的取消轮询，宿主已死时直接杀掉锁里记录的孤儿进程。
-8. **`QueueDrainer`（回退队列泵）**：
-   - 无常驻 supervisor 时，轮次结束后由当前 MCP 进程按 FIFO 继续泵下一轮；
-   - 每个进程都可以泵，但只有拿到 `ExecutionGate` 租约的进程真正执行。
+7. **`TaskExecutionRegistry`（跨进程执行登记，不互斥）**：
+   - 以 `~/.agent-mesh-bridge/executions/` 登记活动 thread、round、agent、workspace 与 PID，供跨进程观察与定向取消；它不创建全局锁或 workspace 锁，旧 `execution.lock` / `leases/` 不参与启动判定；
+   - 每条登记带 token 和更新时间，维护子进程 PID 以支持定向取消及过期登记回收；登记只供观察，不作为加锁/互斥证明。跨进程并发限额基于读取到的活跃登记，属于 best-effort，不能保证原子限额；
+   - `pause_task` / `delete_task` 先发 cancellation，再按 thread 登记杀掉该任务的孤儿进程；不影响其他 thread。
+8. **`QueueDrainer`（回退候选扫描器）**：
+   - 无常驻 supervisor 时扫描所有 ready 候选；因 scope、角色或限额阻塞的候选不阻止扫描后续任务；
+   - paused / waiting_review / blocked / bootstrap pending 只跳过自身，不形成全局或 workspace 队头。
 9. **`git-probe` + scope gate（文件归属互斥）**：
-   - 单飞锁只解决「不同时改」。两个任务先后改同一文件、后一个覆盖前一个未收口的改动，锁管不到。
-   - 每个轮次在 spawn 前 `captureWorkspaceSnapshot()`、结束后 `diffWorkspaceSnapshots()`，把本轮**实际改动**的文件写入 `round.touchedFiles`（`git status --porcelain=v1 -z` 签名对比 + HEAD 变化；非 git 工作区返回空）。
-   - 启动任何轮次前 `findScopeConflicts(candidate, others)`：候选 `expectedFiles` 与**未收口任务**的 `expectedFiles ∪ touchedFiles` 有交集即拒绝启动，置 `queued` 并记录 `thread.scopeBlockedBy`。
+   - 并发时，同一工作区内其他任务的改动也可能出现在本轮前后快照中；`touchedFiles` 是观测到的变化，不保证精确归因给单个 task。
+   - 每个轮次在 spawn 前 `captureWorkspaceSnapshot()`、结束后 `diffWorkspaceSnapshots()`，把观察到的文件变化写入 `round.touchedFiles`（`git status --porcelain=v1 -z` 签名对比 + HEAD 变化；非 git 工作区返回空）。
+   - 启动任何轮次前 `findScopeConflicts(candidate, others)`：候选 `expectedFiles` 与 scope owner 的 `expectedFiles ∪ touchedFiles` 有交集即拒绝启动，置 `queued` 并记录 `thread.scopeBlockedBy`。已运行 / 有实际变化的 owner 不论创建时间都保护；queued peers 依 `createdAt`、`threadId` 单向仲裁。
    - 「未收口」= 未完成任务，或已完成但没有 `mergeRequest` 且在 24h 内；`failed` 不阻塞。
    - 放行：`allow_scope_overlap(threadId)` 或派发时 `allowScopeOverlap: true`。`dispatch_task` 必须声明 `expectedFiles`，除非显式 `allowNoScope: true`。
 
 ### 2.1 运行时三条硬准则
 
 1. **拆分任务不因权限停摆**：所有被派发的轮次必须携带各端 `skip-danger` 参数；Codex 的 `--ask-for-approval` 是全局参数，必须位于 `exec` 之前；DSH 注入 `DSH_PERMISSION_MODE=danger-full-access`，使其 `approval` 策略变为 `never`。
-2. **严格一来一回、全局串行**：任意时刻整个网格只允许一个任务轮次执行。任务按创建时间 FIFO 排队；上一轮未结束，任何下一轮（包括另一个任务）都不得 spawn。
+2. **多任务并发、同任务单轮**：不同任务可并发启动，包括同 workspace 的不同 scope；同一 thread 任一时刻只允许一个活跃 round/role。scope owner 可阻挡交叠文件；queued peers 按创建时间再按 threadId 单向仲裁，防止互相循环阻挡。并发计数限额可选且跨进程 best-effort。
 3. **接收方不转发**：`AutonomousRunner` 以 `MESH_TASK_RECEIVER=1`（及 `MESH_TASK_THREAD_ID` / `MESH_TASK_ROUND`）标记任务接收方进程；该进程继承给其 MCP server 后，`dispatch_task` / `invoke_agent` / 旧版 `invoke_*` 会被隐藏并拒绝，`request_rework` / `approve_task` 也不能作用于它自己正在执行的任务。`CallbackManager` 唤醒发起方时会显式清除这些标记。
 4. **锁范围只到具体文件**：`expectedFiles` 必须是具体代码文件路径，`validateExpectedFiles()` 在派发前拒绝目录、结尾斜杠、`*`/`?` 通配符；`doPathsConflict()` 只做精确同文件匹配，不再做目录前缀或 glob 展开。这样声明 `src/service/Foo.ts` 不会锁住 `src/service/` 下的其他文件。
 
@@ -176,19 +175,16 @@ interface ResponseAssessment {
 - Claude Code: `result` 字符串；
 - 非 JSON 纯文本：原始文本本身。
 
-### 2.4 任务级 FIFO（端到端单任务）
+### 2.4 候选独立调度（替代旧任务级 FIFO）
 
-排队单位是**任务**，不是单轮：
+没有全局任务槽或 workspace 队头。调度器逐个检查 ready round：
 
-- 一个任务从进入队列到 `completed` 之前，始终占用唯一的全局任务槽；
-- `queued` / `running` / `reworking` / `waiting_review` / `paused` 都算未完成；
-- 即使任务已经交付并处于 `waiting_review`，其他任务也不得启动；
-- `failed` 作为终止态释放队列（避免历史失败任务永久阻塞），重试后重新占用；
-- `review_failed` 同样是终止态并释放队列：receiver 已交付，但检视没有取得结论且桥接不再自动唤醒（`reviewWake.gaveUp`），原因记录在 `thread.reviewFailure`；重新检视 / 返修 / 重试 / 验收后重新占用；
-- 队头按 `createdAt` 由 `findQueueHead()` 选出；
-- `TaskSupervisor` / `QueueDrainer` 只允许启动队头任务；队头无在飞轮次时直接停止调度；
-- `AsyncDispatcher` 只要有任意未完成任务，新任务立即返回 `QUEUED`，并注明等待的 `threadId` 与阶段；
-- approve / delete / retry / resume 改变队头状态后，通过 `TaskStore.changed` 或 supervisor 轮询自动推进队列。
+- 任一任务的 `paused` / `waiting_review` / blocked review / pending bootstrap 状态只阻挡该任务自身开发轮次，不阻挡 scope 无关任务；
+- scope 冲突、同 thread 正在运行的 round/role、以及启用的并发限额会将该候选置为 queued；调度器继续扫描其他候选；
+- 已运行任务及已记录 `touchedFiles` 的任务始终作为 scope owner，不受创建时间影响。尚未启动且 scope 重叠的 queued peers 按 `createdAt`、再按 `threadId` 单向仲裁，避免队列互相循环阻挡；
+- `failed` / `review_failed` 仍是终态；重试或重新检视按该任务自身的角色和 scope 规则重新参加候选扫描；
+- scope 冲突提示需指出冲突 thread 与文件。`allow_scope_overlap` 可显式放行；
+- `findQueueHead()` 仅为兼容保留，运行时不得用它过滤候选或判定是否可启动。
 
 ### 2.5 MR 收口（调用者）
 
@@ -222,8 +218,8 @@ interface ResponseAssessment {
 新任务（`reviewFlow: 'dedicated'`）不再 resume 请求方会话，而是由桥接创建独立的 reviewer 会话：
 
 1. `dispatch_task` 解析两端模型并校验同 Agent 时 `reviewerModel !== targetModel`，创建 `status=queued`、`reviewBootstrap.phase='pending'` 的任务；developer 轮次被 `isReviewerBootstrapPending()` 拦住。
-2. 扩展宿主的 `ReviewerBootstrapService` 在 FIFO 队头、执行槽空闲时拉起一个**全新** reviewer 会话（`MESH_REVIEW_BOOTSTRAP=1` + 一次性 token，token 同时写进 bootstrap prompt），该轮只调用一次 `dispatch_task`；MCP 的 `confirmReviewerBootstrap()` 用账本固化的 brief 确认任务，不创建第二个任务。识别按序走四条通道（prompt 里的 `reviewBootstrap` 凭证 → env 三元组 → 启动记录 pid == `process.ppid` → 无 brief 调用且该 Agent 只有唯一待确认任务），因为宿主可能清洗环境变量，也可能让 MCP server 的父进程不是桥接启动的 CLI。
-3. reviewer 进程退出后，宿主捕获原生会话 id 写入 `reviewerSessionId` / `callerSessionId`，释放执行槽，正常队列启动 developer。
+2. 扩展宿主的 `ReviewerBootstrapService` 可独立启动多个待处理任务的**全新** reviewer 会话（每个 thread 单独登记与加锁，不设全局队头或执行槽）；启动使用 `MESH_REVIEW_BOOTSTRAP=1` + 一次性 token，token 同时写进 bootstrap prompt，该轮只调用一次 `dispatch_task`。MCP 的 `confirmReviewerBootstrap()` 用账本固化的 brief 确认任务，不创建第二个任务。识别按序走四条通道（prompt 里的 `reviewBootstrap` 凭证 → env 三元组 → 启动记录 pid == `process.ppid` → 无 brief 调用且该 Agent 只有唯一待确认任务），因为宿主可能清洗环境变量，也可能让 MCP server 的父进程不是桥接启动的 CLI。
+3. reviewer 进程退出后，宿主捕获原生会话 id 写入 `reviewerSessionId` / `callerSessionId`，结束该 thread 的执行登记并释放 reviewer 角色；开发者轮次由独立候选调度启动。
 4. developer 完成后，审阅唤醒 resume **reviewer 会话**；`TaskRoleLock` 以该会话 id 为 key（`roles/conv_<sha1>.json`），并注入 `MESH_REVIEW_SESSION_ID`，`approve_task` / `request_rework` 校验会话一致。legacy 任务继续 resume 请求方会话、使用 thread 级锁。
 5. bootstrap 失败（超时、未调用工具、token 不匹配）→ 任务 `failed` + interruption，不会启动 developer。只靠 env 或只靠 pid 的识别会以 `the reviewer turn ended without calling dispatch_task` 误报失败（reviewer 其实已经调过工具）——2026-11-02 的 `thread_20261102_224144_b057` 即此事故。
 
@@ -515,13 +511,13 @@ D:\agent_bridge\
 │   ├── bridge\
 │   │   ├── types.ts               # DelegationThread, AgentId, Round 等类型定义
 │   │   ├── active-agent-resolver.ts# 默认 Agent 探测与选路算法
-│   │   ├── execution-gate.ts      # 跨进程全局单飞租约 (execution.lock)
+│   │   ├── task-execution-registry.ts # 非互斥执行登记与 child PID 定向恢复
 │   │   ├── git-probe.ts           # 轮次改动测量 (git status 前后快照 -> round.touchedFiles)
 │   │   ├── cancellation-registry.ts# 跨进程暂停/删除信号
 │   │   ├── task-role-lock.ts      # 单任务 reviewer/developer 角色锁
 │   │   ├── task-control.ts        # 暂停/删除控制面与删除墓碑
 │   │   ├── native-session-cleanup.ts# 删除任务时尽力清理接收方原生对话
-│   │   ├── queue-drainer.ts       # 无 supervisor 时的 FIFO 队列泵
+│   │   ├── queue-drainer.ts       # 无 supervisor 时的候选扫描与启动
 │   │   ├── async-dispatcher.ts    # 异步非阻塞任务派发器
 │   │   ├── rework-controller.ts   # 同会话多轮返修控制器
 │   │   ├── autonomous-runner.ts   # 跨平台 skip-danger 进程执行器

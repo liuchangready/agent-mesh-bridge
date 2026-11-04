@@ -135,10 +135,9 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
       : '';
 
     // A review the caller parked with `blocked: true` is NOT a review still in
-    // progress: the verdict was "hold until a dependency lands". Without this
-    // the tree row is indistinguishable from one the reviewer is still working
-    // on. `waiting_review` stays the lifecycle status on purpose (task-level
-    // FIFO keeps the slot until approve/rework), so surface the sub-state here.
+    // progress: the verdict was "hold until a dependency lands". Keep that
+    // state visible while allowing unrelated tasks to run; only scope conflicts
+    // or an explicitly configured concurrency limit can delay them.
     const reviewBlocked =
       thread.status === 'waiting_review' && thread.reviewBlocked ? thread.reviewBlocked : undefined;
     if (reviewBlocked) {

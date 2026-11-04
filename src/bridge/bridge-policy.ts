@@ -21,10 +21,11 @@ export const DEFAULT_COMPACTION_MIN_CHARS = 1500;
 /**
  * Bounded-concurrency switches.
  *
- * Off by default: the mesh stays strictly single-flight (one task round at a
- * time, mesh-wide) unless a user turns this on deliberately. When it IS on, the
- * unit of parallelism is the WORKSPACE, never a task tree: two tasks in the same
- * workspace still exclude each other.
+ * The enabled flag keeps its historical opt-in meaning for the numeric limits:
+ * when false there is no concurrency limit; when true the configured mesh-wide
+ * and per-agent limits are applied as best-effort admission checks. Neither
+ * setting creates a global or per-workspace mutex. Scope conflicts and the
+ * per-thread role lock remain the actual execution blockers.
  */
 export type AgentLogDirectories = Partial<Record<AgentId | 'default', string>>;
 
@@ -44,7 +45,7 @@ export interface BridgePolicy {
   contextCompaction?: boolean;
   /** Outputs at or below this many characters stay verbatim. */
   contextCompactionMinChars?: number;
-  /** Bounded concurrency (default OFF: one task round at a time, mesh-wide). */
+  /** Optional best-effort slot limits (disabled means unlimited). */
   concurrency?: {
     enabled?: boolean;
     maxConcurrentTasks?: number;
@@ -61,7 +62,7 @@ export interface BridgePolicy {
   updatedAt?: string;
 }
 
-/** Concurrency is opt-in; these numbers apply once it is switched on. */
+/** Limits apply only when enabled; disabled means no concurrency cap. */
 export const DEFAULT_CONCURRENCY_POLICY: ConcurrencyPolicy = {
   enabled: false,
   maxConcurrentTasks: 2,
@@ -167,13 +168,13 @@ function positiveSlotCount(value: unknown): number | undefined {
   return Math.max(1, Math.floor(value));
 }
 
-/** Effective concurrency policy, with the conservative defaults filled in. */
+/** Effective concurrency policy, preserving the historical enabled getter semantics. */
 export function concurrencyPolicy(root?: string): ConcurrencyPolicy {
   const raw = readBridgePolicy(root).concurrency;
   if (!raw || typeof raw !== 'object') return { ...DEFAULT_CONCURRENCY_POLICY };
   return {
-    // Only an explicit `true` enables concurrency: a missing/garbled value must
-    // never silently turn the strict single-flight rule off.
+    // Only an explicit `true` enables the configured numeric limits. With the
+    // flag false, callers must not interpret the returned defaults as a cap.
     enabled: raw.enabled === true,
     maxConcurrentTasks: positiveSlotCount(raw.maxConcurrentTasks) ?? DEFAULT_CONCURRENCY_POLICY.maxConcurrentTasks,
     maxConcurrentPerAgent:

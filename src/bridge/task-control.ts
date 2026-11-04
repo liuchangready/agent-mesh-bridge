@@ -1,9 +1,8 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { AutonomousRunner } from './autonomous-runner';
 import { CancellationRegistry } from './cancellation-registry';
-import { ExecutionGate } from './execution-gate';
+import { TaskExecutionRegistry } from './task-execution-registry';
 import {
   NativeSessionCleanupResult,
   cleanupThreadNativeSessions,
@@ -43,7 +42,7 @@ export class TaskControlService {
   private readonly taskStore: TaskStore;
   private readonly runner?: AutonomousRunner;
   private readonly cancellationRegistry: CancellationRegistry;
-  private readonly executionGate: ExecutionGate;
+  private readonly executionRegistry: TaskExecutionRegistry;
   private readonly storageDir: string;
   private readonly sessionCleanup: (thread: DelegationThread) => NativeSessionCleanupResult;
 
@@ -56,9 +55,9 @@ export class TaskControlService {
   ) {
     this.taskStore = taskStore;
     this.runner = runner;
-    this.cancellationRegistry = cancellationRegistry || new CancellationRegistry(storageDir);
-    this.storageDir = storageDir || path.join(os.homedir(), '.agent-mesh-bridge');
-    this.executionGate = new ExecutionGate(this.storageDir);
+    this.storageDir = storageDir || path.dirname(taskStore.getStoragePath());
+    this.cancellationRegistry = cancellationRegistry || new CancellationRegistry(this.storageDir);
+    this.executionRegistry = new TaskExecutionRegistry(this.storageDir);
     this.sessionCleanup = sessionCleanup || ((thread) => cleanupThreadNativeSessions(thread));
   }
 
@@ -104,12 +103,12 @@ export class TaskControlService {
 
     const round = this.resolveCurrentRound(thread);
     if (thread.status === 'paused') {
-      // Idempotent, but still publish cancellation in case a stale child lives.
+      // Idempotent, but still publish cancellation and stop this task's child.
       this.cancellationRegistry.request(threadId, 'pause', normalizedReason, by);
       this.runner?.cancelThread(threadId, 'pause', normalizedReason, by);
-      // A host restart drops the in-memory child handle; the execution lease is
-      // the only place the real agent PID survives.
-      this.executionGate.killOrphanChild(threadId, true);
+      // Registry records are observational; kill only this task's child. Its
+      // compatibility reader also checks old execution.lock/leases records.
+      this.executionRegistry.killOrphanChild(threadId, true);
       return {
         threadId,
         status: 'PAUSED',
@@ -132,7 +131,7 @@ export class TaskControlService {
     // Publish the stop signal for whichever process owns the child.
     this.cancellationRegistry.request(threadId, 'pause', normalizedReason, by);
     this.runner?.cancelThread(threadId, 'pause', normalizedReason, by);
-    this.executionGate.killOrphanChild(threadId);
+    this.executionRegistry.killOrphanChild(threadId, true);
 
     return {
       threadId,
@@ -190,7 +189,7 @@ export class TaskControlService {
     if (active) {
       this.cancellationRegistry.request(threadId, 'delete', normalizedReason, by);
       this.runner?.cancelThread(threadId, 'delete', normalizedReason, by);
-      this.executionGate.killOrphanChild(threadId, true);
+      this.executionRegistry.killOrphanChild(threadId, true);
     }
 
     this.taskStore.deleteTask(threadId);

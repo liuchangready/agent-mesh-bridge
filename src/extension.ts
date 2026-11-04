@@ -24,7 +24,7 @@ import { TaskSupervisor } from './bridge/task-supervisor';
 import { TaskControlService } from './bridge/task-control';
 import { TaskArchiveService } from './bridge/task-archive';
 import { ReviewerBootstrapService } from './bridge/reviewer-bootstrap';
-import { ExecutionGate } from './bridge/execution-gate';
+import { TaskExecutionRegistry } from './bridge/task-execution-registry';
 import { saveBridgePolicy, AgentLogDirectories } from './bridge/bridge-policy';
 import { probeCodexResumeSupport } from './bridge/codex-session';
 import {
@@ -462,24 +462,45 @@ export function activate(context: vscode.ExtensionContext) {
         );
       });
   });
-  const _dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector);
-  const reworkController = new ReworkController(taskStore, runner, callbackManager, detector);
+  const executionRegistry = new TaskExecutionRegistry(path.dirname(taskStore.getStoragePath()));
+  context.subscriptions.push({ dispose: () => executionRegistry.dispose() });
+  const _dispatcher = new AsyncDispatcher(
+    taskStore,
+    resolver,
+    runner,
+    callbackManager,
+    detector,
+    executionRegistry,
+  );
+  const reworkController = new ReworkController(
+    taskStore,
+    runner,
+    callbackManager,
+    detector,
+    executionRegistry,
+  );
   const taskControl = new TaskControlService(taskStore, runner);
   const configSync = new ConfigSyncService(undefined, dshProvider);
   configSync.setAgentMcpEnv(agentMcpEnvFor(dshProvider));
-  const supervisor = new TaskSupervisor(taskStore, runner, callbackManager, detector);
+  const supervisor = new TaskSupervisor(
+    taskStore,
+    runner,
+    callbackManager,
+    detector,
+    executionRegistry,
+  );
   context.subscriptions.push({ dispose: () => supervisor.dispose() });
 
-  // Dedicated review: launch the fresh reviewer conversation for new tasks, wait
-  // for its one-shot dispatch call, then let the normal queue start the developer.
+  // Dedicated review: launch each pending reviewer conversation independently;
+  // the developer round starts after its reviewer session is captured.
   const reviewerBootstrap = new ReviewerBootstrapService({
     taskStore,
     runner,
     detector,
-    executionGate: new ExecutionGate(),
+    executionRegistry,
     onSettled: () => {
       // The supervisor observes ledger changes, but a direct nudge removes the
-      // up-to-one-poll delay after the bootstrap releases the slot.
+      // up-to-one-poll delay after the bootstrap records its session handoff.
       supervisor.checkPendingTasks();
     },
   });

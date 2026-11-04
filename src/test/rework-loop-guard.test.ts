@@ -12,7 +12,7 @@ import { TaskStore } from '../bridge/task-store';
 import { AgentDetector } from '../bridge/agent-detector';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
-import { ExecutionGate } from '../bridge/execution-gate';
+import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import {
   ReworkController,
   assertNotNoopRework,
@@ -94,7 +94,7 @@ describe('review block and terminal state', () => {
     const runner = new AutonomousRunner(detector);
     const callbackManager = new CallbackManager(detector);
     callbackManager.notifyCaller = async () => true;
-    controller = new ReworkController(store, runner, callbackManager, detector, new ExecutionGate(tempDir));
+    controller = new ReworkController(store, runner, callbackManager, detector, new TaskExecutionRegistry(tempDir));
   });
 
   afterEach(() => {

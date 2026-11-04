@@ -13,7 +13,7 @@ import { TaskStore } from '../bridge/task-store';
 import { AgentDetector } from '../bridge/agent-detector';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
-import { ExecutionGate } from '../bridge/execution-gate';
+import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { TaskSupervisor } from '../bridge/task-supervisor';
 import { DelegationThread } from '../bridge/types';
 
@@ -183,10 +183,11 @@ describe('Task role enforcement in execution', () => {
       runner,
       callbackManager,
       detector,
-      new ExecutionGate(tempDir),
+      new TaskExecutionRegistry(tempDir),
     );
 
-    const reviewer = new TaskRoleLock().tryAcquire('thread_role_1', 'reviewer');
+    const roleLock = new TaskRoleLock(tempDir);
+    const reviewer = roleLock.tryAcquire('thread_role_1', 'reviewer');
     assert.ok(reviewer);
 
     try {
@@ -195,9 +196,9 @@ describe('Task role enforcement in execution', () => {
       await supervisor.executeThreadRound(thread, thread.rounds[0]);
 
       assert.strictEqual(executions, 0, 'developer must not start during reviewer role');
-      assert.strictEqual(store.getTask('thread_role_1')?.status, 'queued');
+      assert.strictEqual(store.getTask('thread_role_1')?.status, 'running', 'a live same-task role owner must not rewrite lifecycle state');
 
-      new TaskRoleLock().release(reviewer!);
+      roleLock.release(reviewer!);
       supervisor.checkPendingTasks();
 
       const deadline = Date.now() + 2_000;
@@ -209,6 +210,7 @@ describe('Task role enforcement in execution', () => {
       assert.strictEqual(executions, 1, 'developer starts after reviewer handoff');
       assert.strictEqual(store.getTask('thread_role_1')?.status, 'waiting_review');
     } finally {
+      if (reviewer) roleLock.release(reviewer);
       supervisor.dispose();
       store.dispose();
       try {

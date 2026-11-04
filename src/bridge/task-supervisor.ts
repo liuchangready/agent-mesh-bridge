@@ -11,7 +11,6 @@ import {
   DelegationRound,
   ThreadStatus,
   findInFlightRound,
-  findQueueHead,
   getInFlightRounds,
   isReviewerBootstrapPending,
   isUserInterruption,
@@ -24,9 +23,9 @@ import {
   ScopeConflict,
 } from './file-scope';
 import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
-import { ExecutionGate, ExecutionOwner, normalizeWorkspaceKey } from './execution-gate';
+import { TaskExecutionOwner, TaskExecutionRegistration, TaskExecutionRegistry } from './task-execution-registry';
 import { ConcurrencyPolicy, concurrencyPolicy } from './bridge-policy';
-import { QueueDrainer, QueuedExecution, groupTasksByWorkspace } from './queue-drainer';
+import { QueueDrainer, QueuedExecution } from './queue-drainer';
 import { TaskRoleLock } from './task-role-lock';
 import { appendCompactionProtocol, compactRoundBestEffort } from './context-compactor';
 import { readStoredRoundUsage } from './token-usage-collector';
@@ -66,7 +65,8 @@ export class TaskSupervisor extends EventEmitter {
   private pollInterval: NodeJS.Timeout | null = null;
   private isDisposed: boolean = false;
   private streamSyncIntervalMs: number = 30000;
-  private executionGate: ExecutionGate;
+  private executionRegistry: TaskExecutionRegistry;
+  private readonly storageDir: string;
   /**
    * Re-entrancy guard: `taskStore.upsertTask()` emits `changed` synchronously,
    * which calls back into `checkPendingTasks()`. Without this flag that nested
@@ -79,7 +79,7 @@ export class TaskSupervisor extends EventEmitter {
     runner: AutonomousRunner,
     callbackManager: CallbackManager,
     detector?: AgentDetector,
-    executionGate?: ExecutionGate,
+    executionRegistry?: TaskExecutionRegistry,
   ) {
     super();
     TaskSupervisor.instance = this;
@@ -87,9 +87,9 @@ export class TaskSupervisor extends EventEmitter {
     this.runner = runner;
     this.callbackManager = callbackManager;
     this.detector = detector;
-    this.executionGate = executionGate || new ExecutionGate();
-
-    const storageDir = path.join(os.homedir(), '.agent-mesh-bridge');
+    this.storageDir = path.dirname(taskStore.getStoragePath());
+    this.executionRegistry = executionRegistry || new TaskExecutionRegistry(this.storageDir);
+    const storageDir = this.storageDir;
     if (!fs.existsSync(storageDir)) {
       try {
         fs.mkdirSync(storageDir, { recursive: true });
@@ -218,12 +218,9 @@ export class TaskSupervisor extends EventEmitter {
   /**
    * Queue pump: decides which task round may execute next.
    *
-   * Concurrency is opt-in. With it disabled this is the historical strict FIFO
-   * pump: exactly one round may run mesh-wide, so it starts at most one thread
-   * and marks every other candidate queued. With it enabled the mesh is
-   * partitioned by workspace and up to `maxConcurrentTasks` workspaces may run
-   * at once (see `scheduleConcurrent`); the per-workspace lease inside
-   * `executeThreadRound` is still the final authority.
+   * Every process scans all runnable task rounds. TaskRoleLock protects a task's
+   * reviewer/developer handoff; the registry tracks PIDs and may feed optional
+   * best-effort count limits, but neither imposes workspace or FIFO exclusion.
    */
   public checkPendingTasks(): void {
     if (this.isDisposed || this.startingThreadId) return;
@@ -231,14 +228,10 @@ export class TaskSupervisor extends EventEmitter {
     this.taskStore.loadFromDisk();
     const allTasks = this.taskStore.getAllTasks();
 
-    // If an active task was deleted from disk while executing, proactively abort its runner.
-    // If it was marked paused, stop the child process to preserve the round.
+    // A deleted or paused task must stop its local runner promptly.
     for (const activeThreadId of Array.from(this.activeTasks.keys())) {
       const live = this.taskStore.getTask(activeThreadId);
       if (!live) {
-        console.warn(
-          `[TaskSupervisor] Active task ${activeThreadId} was deleted from store; aborting runner.`,
-        );
         this.runner.cancelThread(activeThreadId, 'delete', 'Task was deleted from store', 'supervisor');
       } else if (live.status === 'paused') {
         this.runner.cancelThread(
@@ -250,429 +243,120 @@ export class TaskSupervisor extends EventEmitter {
       }
     }
 
-    // Orphaned execution leases: a lock whose task is gone must not hold a slot.
-    // Every lease is scanned (the legacy mesh-wide lock and each per-workspace
-    // one), so a deleted task cannot block one workspace forever.
-    for (const lockOwner of this.executionGate.listOwners()) {
-      if (this.taskStore.getTask(lockOwner.threadId)) continue;
-      console.warn(
-        `[TaskSupervisor] Lock owner task ${lockOwner.threadId} no longer exists in store; clearing orphaned gate.`,
-      );
-      this.executionGate.killOrphanChild(lockOwner.threadId, true);
-      if (lockOwner.pid === process.pid && !this.activeTasks.has(lockOwner.threadId)) {
-        // Release exactly this lease: with concurrency on, releasing every lease
-        // here would hand another, perfectly healthy task's slot away.
-        this.executionGate.release({
-          token: lockOwner.token,
-          threadId: lockOwner.threadId,
-          round: lockOwner.round,
-          lockPath: lockOwner.lockPath || this.executionGate.getLockFilePath(),
-          workspace: lockOwner.workspace,
+    // Registry records are observations for PID recovery, never execution locks.
+    for (const owner of this.executionRegistry.listOwners()) {
+      if (this.taskStore.getTask(owner.threadId)) continue;
+      this.executionRegistry.killOrphanChild(owner.threadId, true);
+      if (owner.pid === process.pid && !this.activeTasks.has(owner.threadId)) {
+        this.executionRegistry.end({
+          token: owner.token,
+          threadId: owner.threadId,
+          round: owner.round,
+          recordPath: owner.recordPath,
         });
       }
     }
 
-    const policy = concurrencyPolicy();
-    if (policy.enabled) {
-      this.scheduleConcurrent(allTasks, policy);
-      return;
-    }
-    this.scheduleSerial(allTasks);
+    this.scheduleReadyTasks(allTasks, concurrencyPolicy());
   }
 
-  /**
-   * Legacy, strict single-flight pump.
-   *
-   * Only ONE delegated round may execute across the whole mesh. This method
-   * therefore either starts exactly one thread and returns, or (when something
-   * is already in flight) marks every other candidate as queued. It never
-   * launches two rounds in one pass. This is the behaviour whenever concurrency
-   * is not explicitly enabled.
-   */
-  private scheduleSerial(allTasks: DelegationThread[]): void {
-    // Task-level queue head: the oldest unfinished task owns the single global
-    // slot. A waiting_review/paused head blocks every younger task until it is
-    // completed (or deleted/retried).
-    const queueHead = findQueueHead(allTasks);
-    let queueHeadBlockReason: string | undefined;
-    if (queueHead) {
-      if (this.activeTasks.has(queueHead.threadId)) {
-        queueHeadBlockReason = `Queued: Waiting for task ${queueHead.threadId} to finish; tasks execute one whole task at a time.`;
-      } else {
-        const headRound = findInFlightRound(queueHead);
-        if (
-          !headRound ||
-          queueHead.status === 'waiting_review' ||
-          queueHead.status === 'paused'
-        ) {
-          queueHeadBlockReason =
-            `Queued: Waiting for task ${queueHead.threadId} (${queueHead.status}) to complete ` +
-            `before another task runs; tasks execute one whole task at a time.`;
-        }
-      }
-    }
-
-    // Candidate tasks that need execution:
-    // status is running, reworking, or queued, OR has running rounds.
-    let candidateTasks = allTasks
+  /** Scan every ready round; a parked or blocked task never blocks a peer. */
+  private scheduleReadyTasks(allTasks: DelegationThread[], policy: ConcurrencyPolicy): void {
+    const candidates = allTasks
       .filter((thread) => {
-        if (this.activeTasks.has(thread.threadId)) {
-          return false;
-        }
-        // A paused task must only restart through the explicit resume path.
-        if (thread.status === 'paused') {
-          return false;
-        }
-        const hasRunningRound = (thread.rounds || []).some(
-          (r: DelegationRound) => r.status === 'running',
-        );
-        return (
-          thread.status === 'running' ||
-          thread.status === 'reworking' ||
-          thread.status === 'queued' ||
-          hasRunningRound
-        );
-      })
-      // Sort candidate tasks by createdAt ascending (FIFO queue order)
-      .sort((a, b) => {
-        const timeA = new Date(a.createdAt).getTime();
-        const timeB = new Date(b.createdAt).getTime();
-        return timeA - timeB;
-      });
-
-    // Heal ledgers written before the one-round-in-flight invariant existed.
-    for (const thread of candidateTasks) {
-      this.normalizeRoundIntegrity(thread);
-    }
-
-    // A waiting_review/paused head (or an active head elsewhere) means no
-    // younger task may start.
-    if (queueHeadBlockReason) {
-      for (const thread of candidateTasks) {
-        if (queueHead && thread.threadId === queueHead.threadId) continue;
-        this.markQueued(thread, undefined, queueHeadBlockReason);
-      }
-      return;
-    }
-
-    // Only the queue head is eligible, even if several candidates have rounds.
-    if (queueHead) {
-      candidateTasks = candidateTasks.filter((thread) => thread.threadId === queueHead.threadId);
-    }
-
-    const owner = this.executionGate.getOwner();
-    const somethingRunning = this.activeTasks.size > 0 || !!owner;
-
-    if (somethingRunning) {
-      // Strict serialization: nothing else starts. The owner (whether in this
-      // process or another one) will pump the queue when it finishes.
-      for (const thread of candidateTasks) {
-        if (this.activeTasks.has(thread.threadId)) continue;
-        if (owner && owner.threadId === thread.threadId) continue;
-        if (!findInFlightRound(thread)) continue;
-        this.markQueued(thread, owner);
-      }
-      return;
-    }
-
-    // Free gate: start exactly one task, then stop.
-    for (const thread of candidateTasks) {
-      const targetRound = findInFlightRound(thread);
-      if (!targetRound || !targetRound.prompt) {
-        continue;
-      }
-
-      // Batch-level scope gate: single flight only stops *simultaneous* edits.
-      // This stops a task from starting on files another open task already
-      // changed (declared scope or measured touchedFiles) and overwriting them.
-      const scopeConflict = findScopeConflicts(thread, allTasks);
-      if (scopeConflict) {
-        this.markQueued(thread, undefined, describeScopeConflict(scopeConflict), scopeConflict);
-        continue;
-      }
-
-      // File-scope check is now normally moot (nothing else is executing), but
-      // keep it for ledgers/threads that were already in flight when the global
-      // gate was introduced.
-      const executingThreads = allTasks.filter((t) => this.activeTasks.has(t.threadId));
-      const conflict = findFileConflicts(thread, executingThreads);
-      if (conflict.hasConflict && conflict.conflictingThread) {
-        this.markQueued(
-          thread,
-          undefined,
-          `Queued: Waiting for task ${conflict.conflictingThread.threadId} to release the same file(s) [${(conflict.conflictingFiles || []).join(', ')}]`,
-        );
-        continue;
-      }
-
-      // Dedicated review: the reviewer conversation must dispatch the task
-      // before any developer round may start. Flipping the task to `running`
-      // here and bouncing it back to `queued` inside executeThreadRound() made
-      // the pump rewrite the whole ledger twice per tick for a task that could
-      // never start.
-      if (isReviewerBootstrapPending(thread)) {
-        this.markQueued(
-          thread,
-          undefined,
-          'Queued: waiting for the dedicated reviewer conversation to dispatch this task.',
-        );
-        continue;
-      }
-
-      this.startingThreadId = thread.threadId;
-      try {
-        if (thread.status === 'queued') {
-          const restoredStatus: ThreadStatus =
-            targetRound.type === 'rework' ? 'reworking' : 'running';
-          thread.status = restoredStatus;
-          thread.scopeBlockedBy = undefined;
-          thread.summary.lastOutputSnippet = 'Executing in background...';
-          this.taskStore.upsertTask(thread);
-        }
-
-        console.log(
-          `[TaskSupervisor] Starting task ${thread.threadId} (Round ${targetRound.round}, status: ${thread.status}); all other tasks stay queued.`,
-        );
-        this.executeThreadRound(thread, targetRound);
-      } finally {
-        this.startingThreadId = null;
-      }
-      return;
-    }
-  }
-
-  /**
-   * Bounded-concurrency pump (only used when the policy enables it).
-   *
-   * Each workspace has its own queue head, so a `waiting_review`/`paused` head
-   * only blocks the tasks that share its workspace. Startable heads are ordered
-   * by `createdAt` and started until the mesh-wide slot cap is reached; the
-   * per-workspace lease independently refuses a second task of the same
-   * workspace, so this pass can never start two rounds in one workspace.
-   */
-  private scheduleConcurrent(allTasks: DelegationThread[], policy: ConcurrencyPolicy): void {
-    const candidateTasks = allTasks
-      .filter((thread) => {
-        if (this.activeTasks.has(thread.threadId)) return false;
-        // A paused task must only restart through the explicit resume path.
-        if (thread.status === 'paused') return false;
-        const hasRunningRound = (thread.rounds || []).some(
-          (r: DelegationRound) => r.status === 'running',
-        );
-        return (
-          thread.status === 'running' ||
-          thread.status === 'reworking' ||
-          thread.status === 'queued' ||
-          hasRunningRound
-        );
+        if (!thread || !thread.threadId || this.activeTasks.has(thread.threadId)) return false;
+        if (thread.status === 'paused' || thread.status === 'waiting_review') return false;
+        if (thread.reviewBlocked || isReviewerBootstrapPending(thread)) return false;
+        return thread.status === 'running' || thread.status === 'reworking' || thread.status === 'queued';
       })
       .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 
-    // Heal ledgers written before the one-round-in-flight invariant existed.
-    for (const thread of candidateTasks) {
+    for (const thread of candidates) {
       this.normalizeRoundIntegrity(thread);
-    }
+      const round = findInFlightRound(thread);
+      if (!round || !round.prompt) continue;
 
-    const groups = groupTasksByWorkspace(allTasks);
-    const startable: QueuedExecution[] = [];
-    const blockedReasons = new Map<string, string>();
+      if (this.executionRegistry.getOwner(thread.threadId)) continue;
+      const roleLock = new TaskRoleLock(this.storageDir);
+      const roleOwner = roleLock.getOwner(thread.threadId);
+      if (roleOwner) continue;
 
-    for (const [key, group] of groups) {
-      const head = findQueueHead(group);
-      if (!head) continue;
-      const headRound = findInFlightRound(head);
-      if (
-        !headRound ||
-        !headRound.prompt ||
-        head.status === 'waiting_review' ||
-        head.status === 'paused'
-      ) {
-        blockedReasons.set(
-          key,
-          `Queued: Waiting for task ${head.threadId} (${head.status}) to complete in workspace ` +
-            `${head.workspacePath}; only one task per workspace may run at a time.`,
-        );
-        continue;
-      }
-      if (this.activeTasks.has(head.threadId)) continue;
-      startable.push({ thread: head, round: headRound });
-    }
-
-    // Everything that is not a startable head stays queued, naming its blocker.
-    for (const thread of candidateTasks) {
-      if (startable.some((entry) => entry.thread.threadId === thread.threadId)) continue;
-      const workspaceKey = normalizeWorkspaceKey(thread.workspacePath);
-      const owner = this.executionGate.getOwner(workspaceKey);
-      if (owner && owner.threadId === thread.threadId) continue;
-      if (!findInFlightRound(thread)) continue;
-      const reason =
-        blockedReasons.get(workspaceKey) ||
-        // Keep this text stable: a number that moves on every pass would rewrite
-        // the ledger of an already-queued task on every poll.
-        `Queued: waiting for a free execution slot for workspace ${thread.workspacePath}.`;
-      this.markQueued(thread, owner, reason);
-    }
-
-    startable.sort(
-      (a, b) => new Date(a.thread.createdAt).getTime() - new Date(b.thread.createdAt).getTime(),
-    );
-
-    for (const { thread, round } of startable) {
-      const workspaceKey = normalizeWorkspaceKey(thread.workspacePath);
-      // Already executing (this process or another one): leave it alone.
-      const currentOwner = this.executionGate.getOwner(workspaceKey);
-      if (currentOwner && currentOwner.threadId === thread.threadId) continue;
-
-      const activeSlots = this.executionGate.countActive();
-      if (activeSlots >= policy.maxConcurrentTasks) {
-        this.markQueued(
-          thread,
-          undefined,
-          `Queued: global concurrency limit reached (${activeSlots}/${policy.maxConcurrentTasks}); ` +
-            `waiting for a free execution slot.`,
-        );
-        continue;
-      }
-
-      const agentSlots = this.executionGate
-        .listOwners()
-        .filter((owner) => owner.agent === thread.targetAgent).length;
-      if (agentSlots >= policy.maxConcurrentPerAgent) {
-        this.markQueued(
-          thread,
-          undefined,
-          `Queued: agent ${thread.targetAgent} already occupies ${agentSlots}/` +
-            `${policy.maxConcurrentPerAgent} of its concurrent slots; waiting for one of its ` +
-            `running tasks to finish.`,
-        );
-        continue;
-      }
-
-      // Batch-level scope gate: the per-workspace slot only stops *simultaneous*
-      // edits in one workspace, not the same file being rewritten in sequence.
       const scopeConflict = findScopeConflicts(thread, allTasks);
       if (scopeConflict) {
         this.markQueued(thread, undefined, describeScopeConflict(scopeConflict), scopeConflict);
         continue;
       }
 
-      const executingThreads = allTasks.filter((t) => this.activeTasks.has(t.threadId));
-      const conflict = findFileConflicts(thread, executingThreads);
-      if (conflict.hasConflict && conflict.conflictingThread) {
-        this.markQueued(
-          thread,
-          undefined,
-          `Queued: Waiting for task ${conflict.conflictingThread.threadId} to release the same file(s) [${(conflict.conflictingFiles || []).join(', ')}]`,
-        );
-        continue;
+      if (isReviewerBootstrapPending(thread)) continue;
+      if (policy.enabled) {
+        const owners = this.executionRegistry.listOwners();
+        const agentSlots = owners.filter((owner) => owner.agent === thread.targetAgent).length;
+        if (owners.length >= policy.maxConcurrentTasks || agentSlots >= policy.maxConcurrentPerAgent) {
+          this.markQueued(thread, undefined, this.describeConcurrencyBlocked(thread.targetAgent, policy));
+          continue;
+        }
       }
 
-      // Dedicated review: the reviewer conversation must dispatch the task
-      // before any developer round may start. Flipping the task to `running`
-      // here and bouncing it back to `queued` inside executeThreadRound() made
-      // the pump rewrite the whole ledger twice per tick for a task that could
-      // never start.
-      if (isReviewerBootstrapPending(thread)) {
-        this.markQueued(
-          thread,
-          undefined,
-          'Queued: waiting for the dedicated reviewer conversation to dispatch this task.',
-        );
-        continue;
-      }
-
+      // executeThreadRound takes the role and records the PID synchronously before yielding to the runner.
       this.startingThreadId = thread.threadId;
       try {
-        if (thread.status === 'queued') {
-          const restoredStatus: ThreadStatus =
-            round.type === 'rework' ? 'reworking' : 'running';
-          thread.status = restoredStatus;
-          thread.scopeBlockedBy = undefined;
-          thread.summary.lastOutputSnippet = 'Executing in background...';
-          this.taskStore.upsertTask(thread);
-        }
-
-        console.log(
-          `[TaskSupervisor] Starting task ${thread.threadId} (Round ${round.round}, status: ${thread.status}) ` +
-            `in workspace ${workspaceKey}; other workspaces may still start.`,
-        );
-        this.executeThreadRound(thread, round);
+        void this.executeThreadRound(thread, round);
+      } catch (error: any) {
+        console.warn(`[TaskSupervisor] Could not start ${thread.threadId} round ${round.round}: ${error?.message || error}`);
       } finally {
         this.startingThreadId = null;
       }
     }
   }
 
-  /** Why no slot could be taken when no same-workspace owner explains it. */
-  private describeConcurrencyBlocked(
-    targetAgent: string,
-    policy: ConcurrencyPolicy,
-  ): string | undefined {
-    if (!policy.enabled) return undefined;
-    const owners = this.executionGate.listOwners();
-    if (owners.length >= policy.maxConcurrentTasks) {
-      return (
-        `Queued: global concurrency limit reached (${owners.length}/${policy.maxConcurrentTasks}); ` +
-        `waiting for a free execution slot.`
-      );
-    }
+  private describeConcurrencyBlocked(targetAgent: string, policy: ConcurrencyPolicy): string {
+    const owners = this.executionRegistry.listOwners();
     const sameAgent = owners.filter((owner) => owner.agent === targetAgent).length;
-    if (sameAgent >= policy.maxConcurrentPerAgent) {
-      return (
-        `Queued: agent ${targetAgent} already occupies ${sameAgent}/${policy.maxConcurrentPerAgent} ` +
-        `of its concurrent slots; waiting for one of its running tasks to finish.`
-      );
+    if (owners.length >= policy.maxConcurrentTasks) {
+      return `Queued: active execution limit reached (${owners.length}/${policy.maxConcurrentTasks}); waiting for a free execution record.`;
     }
-    return undefined;
+    return `Queued: agent ${targetAgent} has ${sameAgent}/${policy.maxConcurrentPerAgent} active executions; waiting for one to finish.`;
   }
 
   private markQueued(
     thread: DelegationThread,
-    owner?: ExecutionOwner,
+    owner?: TaskExecutionOwner,
     detail?: string,
     scopeConflict?: ScopeConflict,
   ): void {
-    // Never demote a task that is genuinely executing. A live lease owned by
-    // THIS thread means another process is running its round: every VS Code
-    // window hosts a supervisor, but only the lease owner executes. The loser
-    // of the lease race used to write `queued` on every pump, so a running task
-    // displayed as "Queued" for the whole round while its log kept growing.
-    if (this.activeTasks.has(thread.threadId)) return;
-    const gatePolicy = concurrencyPolicy();
-    const liveOwner = this.executionGate.getOwner(
-      gatePolicy.enabled ? normalizeWorkspaceKey(thread.workspacePath) : undefined,
-    );
-    if (liveOwner && liveOwner.threadId === thread.threadId) return;
-
-    const snippet =
-      detail ||
-      (owner
-        ? `Queued: Waiting for task ${owner.threadId} (round ${owner.round}) to finish; tasks execute strictly one at a time.`
-        : 'Queued: Waiting for the current task to finish; tasks execute strictly one at a time.');
-
+    if (this.executionRegistry.getOwner(thread.threadId)) return;
+    const roleOwner = new TaskRoleLock(this.storageDir).getOwner(thread.threadId);
+    if (roleOwner) return;
+    this.taskStore.loadFromDisk();
+    const fresh = this.taskStore.getTask(thread.threadId);
+    const candidateRound = findInFlightRound(thread);
+    const freshRound = fresh ? findInFlightRound(fresh) : undefined;
+    if (
+      !fresh ||
+      (fresh.status !== 'queued' && fresh.status !== 'running' && fresh.status !== 'reworking') ||
+      fresh.targetAgent !== thread.targetAgent ||
+      fresh.reviewBlocked ||
+      isReviewerBootstrapPending(fresh) ||
+      !candidateRound || freshRound?.round !== candidateRound.round || freshRound.prompt !== candidateRound.prompt
+    ) return;
+    const message = detail || (owner
+      ? `Queued: waiting for task ${owner.threadId} round ${owner.round}.`
+      : 'Queued: waiting for an execution slot.');
     const nextBlock = scopeConflict
       ? { threadId: scopeConflict.threadId, title: scopeConflict.title, files: scopeConflict.files }
       : undefined;
-    const blockChanged =
-      JSON.stringify(thread.scopeBlockedBy || null) !== JSON.stringify(nextBlock || null);
-    thread.scopeBlockedBy = nextBlock;
-    if (thread.status === 'queued' && thread.summary.lastOutputSnippet === snippet && !blockChanged) {
-      return;
-    }
-
-    thread.status = 'queued';
-    thread.summary.lastOutputSnippet = snippet;
-    this.taskStore.upsertTask(thread);
+    const blockChanged = JSON.stringify(fresh.scopeBlockedBy || null) !== JSON.stringify(nextBlock || null);
+    fresh.scopeBlockedBy = nextBlock;
+    if (fresh.status === 'queued' && fresh.summary.lastOutputSnippet === message && !blockChanged) return;
+    fresh.status = 'queued';
+    fresh.summary.lastOutputSnippet = message;
+    this.taskStore.upsertTask(fresh);
   }
-
-  /**
-   * Executes a thread round autonomously within the persistent supervisor process,
-   * syncing live streamed output to taskStore every 30 seconds.
-   */
   public executeThreadRound(thread: DelegationThread, round: DelegationRound): Promise<void> {
     if (this.activeTasks.has(thread.threadId)) {
       return this.activeTasks.get(thread.threadId)!;
     }
+    if (this.executionRegistry.getOwner(thread.threadId)) return Promise.resolve();
 
     // Last line of defence: never launch a round while a DIFFERENT round of the
     // same task is still in flight. `activeTasks` only covers this process, so
@@ -684,64 +368,91 @@ export class TaskSupervisor extends EventEmitter {
       );
       return Promise.resolve();
     }
-    const fresh = stored;
+    let fresh = stored;
     // Dedicated review: the reviewer conversation must dispatch first.
     if (isReviewerBootstrapPending(fresh)) {
-      this.markQueued(
-        fresh,
-        undefined,
-        'Queued: waiting for the dedicated reviewer conversation to dispatch this task.',
-      );
       return Promise.resolve();
     }
     const inFlight = findInFlightRound(fresh);
-    if (inFlight && inFlight.round !== round.round) {
+    if (
+      fresh.status === 'paused' || fresh.status === 'waiting_review' ||
+      fresh.status === 'completed' || fresh.status === 'failed' || fresh.status === 'review_failed' ||
+      fresh.targetAgent !== thread.targetAgent || !inFlight || inFlight.round !== round.round ||
+      inFlight.status !== 'running' || inFlight.prompt !== round.prompt
+    ) {
       console.warn(
-        `[TaskSupervisor] Refusing to start round ${round.round} for ${thread.threadId}: ` +
-          `round ${inFlight.round} is still in flight.`,
+        `[TaskSupervisor] Refusing stale round ${round.round} for ${thread.threadId}; task state changed before admission.`,
       );
       return Promise.resolve();
     }
 
     // Per-task role exclusivity: developer only after reviewer handoff.
-    const roleLock = new TaskRoleLock();
+    const roleLock = new TaskRoleLock(this.storageDir);
     const roleLease = roleLock.tryAcquire(thread.threadId, 'developer');
-    if (!roleLease) {
-      const owner = roleLock.getOwner(thread.threadId);
-      this.markQueued(
-        fresh,
-        undefined,
-        owner?.role === 'reviewer'
-          ? 'Queued: Reviewer is still active; developer starts after review handoff.'
-          : `Queued: ${roleLock.describe(owner)} is active; a task may only have one role at a time.`,
-      );
+    if (!roleLease) return Promise.resolve();
+
+    // Re-read after role acquisition so a pause/approval/retarget during the
+    // scan cannot revive a stale candidate.
+    this.taskStore.loadFromDisk();
+    const latest = this.taskStore.getTask(thread.threadId);
+    const latestRound = latest?.rounds.filter((entry) => entry.round === round.round).slice(-1)[0];
+    if (
+      !latest || latest.status === 'paused' || latest.status === 'waiting_review' ||
+      latest.status === 'completed' || latest.status === 'failed' || latest.status === 'review_failed' ||
+      latest.targetAgent !== thread.targetAgent || !latestRound || latestRound.status !== 'running' ||
+      latestRound.prompt !== round.prompt || findInFlightRound(latest)?.round !== round.round ||
+      isReviewerBootstrapPending(latest)
+    ) {
+      roleLock.release(roleLease);
+      return Promise.resolve();
+    }
+    fresh = latest;
+
+    const scopeConflict = findScopeConflicts(fresh, this.taskStore.getAllTasks());
+    if (scopeConflict) {
+      roleLock.release(roleLease);
+      this.markQueued(fresh, undefined, describeScopeConflict(scopeConflict), scopeConflict);
       return Promise.resolve();
     }
 
-    // Cross-process execution slot: with concurrency off this is the single
-    // mesh-wide lease; with it on, the lease belongs to this task's workspace, so
-    // two tasks of the SAME workspace can never overlap no matter who asks.
     const gatePolicy = concurrencyPolicy();
-    const workspaceKey = gatePolicy.enabled
-      ? normalizeWorkspaceKey(thread.workspacePath)
-      : undefined;
-    const lease = this.executionGate.tryAcquire(
-      thread.threadId,
-      round.round,
-      workspaceKey,
-      thread.targetAgent,
-    );
-    if (!lease) {
-      roleLock.release(roleLease);
-      const owner = this.executionGate.getOwner(workspaceKey);
-      if (owner?.threadId !== thread.threadId) {
-        this.markQueued(
-          fresh,
-          owner,
-          this.describeConcurrencyBlocked(thread.targetAgent, gatePolicy),
-        );
+    if (gatePolicy.enabled) {
+      const owners = this.executionRegistry.listOwners();
+      const agentSlots = owners.filter((owner) => owner.agent === fresh.targetAgent).length;
+      if (owners.length >= gatePolicy.maxConcurrentTasks || agentSlots >= gatePolicy.maxConcurrentPerAgent) {
+        roleLock.release(roleLease);
+        this.markQueued(fresh, undefined, this.describeConcurrencyBlocked(fresh.targetAgent, gatePolicy));
+        return Promise.resolve();
       }
+    }
+
+    let registration: TaskExecutionRegistration;
+    try {
+      registration = this.executionRegistry.begin(
+        fresh.threadId,
+        round.round,
+        fresh.targetAgent,
+        fresh.workspacePath,
+      );
+    } catch (error: any) {
+      roleLock.release(roleLease);
+      latest.status = 'failed';
+      latestRound.status = 'failed';
+      latestRound.error = `Could not register task execution: ${error?.message || error}`;
+      latest.updatedAt = new Date().toISOString();
+      this.taskStore.upsertTask(latest);
       return Promise.resolve();
+    }
+
+    try {
+      latest.status = round.type === 'rework' ? 'reworking' : 'running';
+      latest.scopeBlockedBy = undefined;
+      latest.summary.lastOutputSnippet = 'Executing in background...';
+      this.taskStore.upsertTask(latest);
+    } catch (error) {
+      this.executionRegistry.end(registration);
+      roleLock.release(roleLease);
+      throw error;
     }
 
     const promise = (async () => {
@@ -818,7 +529,10 @@ export class TaskSupervisor extends EventEmitter {
           taskRound: roundNumber,
           model: thread.targetModel,
           previousTokenUsage: readStoredRoundUsage(this.taskStore, thread.threadId, roundNumber),
-          onChildPid: (pid) => this.executionGate.attachChildPid(pid, lease),
+          onChildPid: (pid) => {
+            this.executionRegistry.attachChildPid(pid, registration);
+            roleLock.attachChild(roleLease, pid);
+          },
           onStdoutChunk: (chunk: string) => {
             streamedOutput += chunk;
             const cur = this.liveLogs.get(thread.threadId) || '';
@@ -960,7 +674,7 @@ export class TaskSupervisor extends EventEmitter {
       } finally {
         // Release only after the round is finalized, then pump the next task.
         this.activeTasks.delete(thread.threadId);
-        this.executionGate.release(lease);
+        this.executionRegistry.end(registration);
         roleLock.release(roleLease);
         setTimeout(() => {
           this.checkPendingTasks();

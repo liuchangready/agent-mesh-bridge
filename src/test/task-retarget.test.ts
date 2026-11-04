@@ -258,6 +258,65 @@ describe('TaskRetargetService - switching a task executor', () => {
     assert.strictEqual(stored.retargets, undefined);
   });
 
+  test('an approval result cannot overwrite a task completed while the dialog was open', async () => {
+    taskStore.upsertTask(makeThread());
+    let beginApproval!: () => void;
+    let resolveApproval!: (decision: ModelApprovalDecision) => void;
+    const approvalStarted = new Promise<void>((resolve) => { beginApproval = resolve; });
+    service.setModelApprovalHandler((request) => {
+      beginApproval();
+      return new Promise((resolve) => { resolveApproval = resolve; });
+    });
+
+    const retargeting = service.retargetTask({
+      threadId: 'thread_retarget_1',
+      model: OTHER,
+      modelRequestedByUser: true,
+    });
+    await approvalStarted;
+    const completed = taskStore.getTask('thread_retarget_1')!;
+    completed.status = 'completed';
+    taskStore.upsertTask(completed);
+    resolveApproval({ id: 'approved-during-completion', status: 'approved', at: new Date().toISOString() });
+
+    await assert.rejects(retargeting, /state changed while model approval was pending/i);
+    const stored = taskStore.getTask('thread_retarget_1')!;
+    assert.strictEqual(stored.status, 'completed');
+    assert.strictEqual(stored.targetAgent, 'deepseek_harness');
+    assert.strictEqual(stored.receiverSessionId, 'session-old');
+    assert.strictEqual(stored.retargets, undefined);
+  });
+
+  test('an approval result cannot overwrite a task paused while the dialog was open', async () => {
+    taskStore.upsertTask(makeThread());
+    let beginApproval!: () => void;
+    let resolveApproval!: (decision: ModelApprovalDecision) => void;
+    const approvalStarted = new Promise<void>((resolve) => { beginApproval = resolve; });
+    service.setModelApprovalHandler((request) => {
+      beginApproval();
+      return new Promise((resolve) => { resolveApproval = resolve; });
+    });
+
+    const retargeting = service.retargetTask({
+      threadId: 'thread_retarget_1',
+      model: OTHER,
+      modelRequestedByUser: true,
+    });
+    await approvalStarted;
+    const paused = taskStore.getTask('thread_retarget_1')!;
+    paused.status = 'paused';
+    paused.rounds[0].status = 'paused';
+    taskStore.upsertTask(paused);
+    resolveApproval({ id: 'approved-during-pause', status: 'approved', at: new Date().toISOString() });
+
+    await assert.rejects(retargeting, /state changed while model approval was pending/i);
+    const stored = taskStore.getTask('thread_retarget_1')!;
+    assert.strictEqual(stored.status, 'paused');
+    assert.strictEqual(stored.targetAgent, 'deepseek_harness');
+    assert.strictEqual(stored.receiverSessionId, 'session-old');
+    assert.strictEqual(stored.retargets, undefined);
+  });
+
   test('refuses while a round is still in flight', async () => {
     taskStore.upsertTask(
       makeThread({

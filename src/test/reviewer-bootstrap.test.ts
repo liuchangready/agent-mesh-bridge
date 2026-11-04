@@ -21,7 +21,7 @@ import {
 import { TaskStore } from '../bridge/task-store';
 import { AgentDetector } from '../bridge/agent-detector';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
-import { ExecutionGate } from '../bridge/execution-gate';
+import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { DelegationThread, isReviewerBootstrapPending } from '../bridge/types';
 import { saveBridgePolicy } from '../bridge/bridge-policy';
 
@@ -72,7 +72,7 @@ function makeService(
     taskStore: store,
     runner,
     detector: new AgentDetector(),
-    executionGate: new ExecutionGate(dir),
+    executionRegistry: new TaskExecutionRegistry(dir),
     storageDir: dir,
     timeoutMs: 1000,
     onSettled,
@@ -262,6 +262,11 @@ test('a failed reviewer bootstrap is terminal, not "still starting"', () => {
   const pending = makeDedicatedThread('thread_phase_pending');
   const confirmed = makeDedicatedThread('thread_phase_confirmed');
   confirmed.reviewBootstrap = { phase: 'confirmed', attempts: 1 };
+  const captured = makeDedicatedThread('thread_phase_captured');
+  captured.reviewBootstrap = { phase: 'confirmed', attempts: 1 };
+  captured.reviewerSessionCaptured = true;
+  captured.reviewerSessionId = 'reviewer-session-captured';
+  captured.callerSessionId = 'reviewer-session-captured';
   const failed = makeDedicatedThread('thread_phase_failed', { status: 'failed' });
   failed.reviewBootstrap = { phase: 'failed', attempts: 1, lastError: 'boom' };
   const legacy = makeDedicatedThread('thread_phase_legacy');
@@ -269,49 +274,80 @@ test('a failed reviewer bootstrap is terminal, not "still starting"', () => {
   legacy.reviewBootstrap = undefined;
 
   assert.strictEqual(isReviewerBootstrapPending(pending), true);
-  assert.strictEqual(isReviewerBootstrapPending(confirmed), false);
+  assert.strictEqual(isReviewerBootstrapPending(confirmed), true, 'dispatch confirmation alone must not start developer work');
+  assert.strictEqual(isReviewerBootstrapPending(captured), false, 'the captured reviewer session completes the handoff');
   // A `failed` bootstrap can never be confirmed (its one-shot token is gone and
   // dispatch_task refuses it), so calling it "pending" left the supervisor
   // flipping the task running <-> queued on every pump, forever.
-  assert.strictEqual(isReviewerBootstrapPending(failed), false);
+  assert.strictEqual(isReviewerBootstrapPending(failed), true);
   assert.strictEqual(isReviewerBootstrapPending(legacy), false);
 });
 
-test('FIFO: an older unfinished task blocks the reviewer bootstrap', async () => {
-  const dir = makeTempDir('bridge-bootstrap-fifo-');
+test('paused and waiting-review tasks do not serialize independent reviewer bootstraps', async () => {
+  const dir = makeTempDir('bridge-bootstrap-independent-');
   const store = new TaskStore(dir);
-  const older = makeDedicatedThread('thread_older', {
+  const workspace = makeTempDir('bridge-bootstrap-shared-ws-');
+  const parked = makeDedicatedThread('thread_waiting_review', {
     status: 'waiting_review',
-    createdAt: '2026-10-31T23:00:00.000Z',
+    workspacePath: workspace,
+    expectedFiles: ['src/parked.ts'],
   });
-  older.reviewFlow = 'legacy';
-  older.reviewBootstrap = undefined;
-  store.upsertTask(older);
-  const younger = makeDedicatedThread('thread_younger', {
-    createdAt: '2026-11-01T00:00:00.000Z',
+  parked.reviewFlow = 'legacy';
+  parked.reviewBootstrap = undefined;
+  store.upsertTask(parked);
+
+  const targets = ['thread_bootstrap_a', 'thread_bootstrap_b'].map((threadId, index) => {
+    const target = makeDedicatedThread(threadId, {
+      workspacePath: workspace,
+      expectedFiles: [`src/bootstrap-${index}.ts`],
+      createdAt: `2026-11-01T00:00:0${index}.000Z`,
+    });
+    store.upsertTask(target);
+    writeReviewerBootstrapToken(
+      { threadId, token: `token-${index}`, agent: 'codex', createdAt: 'now' },
+      dir,
+    );
+    return target;
   });
-  store.upsertTask(younger);
-  writeReviewerBootstrapToken(
-    { threadId: younger.threadId, token: 'token-3', agent: 'codex', createdAt: 'now' },
-    dir,
-  );
 
   const runner = new AutonomousRunner(new AgentDetector(), 5_000);
-  let executed = 0;
-  runner.execute = async () => {
-    executed += 1;
-    return { exitCode: 0, stdout: '', stderr: '', extractedOutput: '', durationMs: 1 };
+  const calls: string[] = [];
+  runner.execute = async (options: any) => {
+    const threadId = options.taskThreadId as string;
+    calls.push(threadId);
+    const fresh = store.getTask(threadId)!;
+    fresh.reviewBootstrap = { phase: 'confirmed', attempts: 1 };
+    fresh.reviewerSessionCaptured = true;
+    fresh.reviewerSessionId = `reviewer-${threadId}`;
+    fresh.callerSessionId = fresh.reviewerSessionId;
+    store.upsertTask(fresh);
+    return {
+      exitCode: 0,
+      stdout: 'dispatched',
+      stderr: '',
+      extractedOutput: 'dispatched',
+      durationMs: 1,
+      actualSessionId: `reviewer-${threadId}`,
+    };
   };
   const service = makeService(dir, store, runner);
   await service.tick();
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline && calls.length < 2) await new Promise((resolve) => setTimeout(resolve, 10));
   service.stop();
 
-  assert.strictEqual(executed, 0, 'the queue head must be dispatched first');
-  assert.strictEqual(store.getTask(younger.threadId)?.reviewBootstrap?.phase, 'pending');
+  assert.deepStrictEqual(calls.slice().sort(), targets.map((task) => task.threadId).sort());
+  assert.strictEqual(store.getTask(parked.threadId)?.status, 'waiting_review');
+  for (const task of targets) {
+    const stored = store.getTask(task.threadId)!;
+    assert.strictEqual(stored.reviewBootstrap?.phase, 'confirmed');
+    assert.strictEqual(stored.reviewerSessionCaptured, true);
+  }
+  for (const task of targets) clearReviewerBootstrapToken(task.threadId, dir);
   store.dispose();
   fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(workspace, { recursive: true, force: true });
 });
-
 test('concurrency: a running task in another workspace does not block a pending bootstrap', async () => {
   const dir = makeTempDir('bridge-bootstrap-concurrent-');
   saveBridgePolicy(

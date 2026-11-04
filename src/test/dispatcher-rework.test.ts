@@ -18,7 +18,7 @@ import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
 import { AsyncDispatcher } from '../bridge/async-dispatcher';
 import { ReworkController } from '../bridge/rework-controller';
-import { ExecutionGate } from '../bridge/execution-gate';
+import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { getBridgeHome, invalidateConfiguredModelCache, saveModelDefaults } from '../bridge/model-catalog';
 import { clearReviewerBootstrapToken } from '../bridge/reviewer-bootstrap';
 import { describeModelRouting } from '../bridge/types';
@@ -52,7 +52,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     callbackManager = new CallbackManager(detector);
     callbackManager.notifyCaller = async () => true;
     callbackManager.notifyCallerOfFailure = async () => false;
-    const gate = new ExecutionGate(tempDir);
+    const gate = new TaskExecutionRegistry(tempDir);
     dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector, gate);
     reworkController = new ReworkController(taskStore, runner, callbackManager, detector, gate);
   });

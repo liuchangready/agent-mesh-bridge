@@ -67,7 +67,7 @@ export class TaskRetargetService {
    */
   public async retargetTask(params: RetargetTaskParams): Promise<RetargetTaskResult> {
     this.taskStore.loadFromDisk();
-    const thread = this.taskStore.getTask(params.threadId);
+    let thread = this.taskStore.getTask(params.threadId);
     if (!thread) {
       throw new Error(`Task thread not found: ${params.threadId}`);
     }
@@ -86,11 +86,23 @@ export class TaskRetargetService {
       );
     }
 
-    const previousAgent = thread.targetAgent;
-    const previousModel = thread.targetModel;
-    const nextAgent: AgentId = params.targetAgent || previousAgent;
+    const initialStatus = thread.status;
+    const initialCurrentRound = thread.currentRound;
+    const initialTargetAgent = thread.targetAgent;
+    const initialTargetModel = thread.targetModel;
+    const initialReceiverSessionId = thread.receiverSessionId;
+    const initialReviewFlow = thread.reviewFlow;
+    const initialBootstrapPhase = thread.reviewBootstrap?.phase;
+    const initialReviewerSessionId = thread.reviewerSessionId;
+    const initialReviewerSessionCaptured = thread.reviewerSessionCaptured;
+    const initialCallerSessionId = thread.callerSessionId;
+    const initialCurrentRoundEntry = (thread.rounds || [])
+      .filter((round) => round.round === initialCurrentRound)
+      .slice(-1)[0];
 
-    const agentChanged = nextAgent !== previousAgent;
+    const nextAgent: AgentId = params.targetAgent || initialTargetAgent;
+
+    const agentChanged = nextAgent !== initialTargetAgent;
     const requested = normalizeModelId(params.model);
 
     // Resolve the model BEFORE touching the thread: a declined switch must leave
@@ -103,6 +115,40 @@ export class TaskRetargetService {
       title: thread.title,
       handler: this.modelApprovalHandler,
     });
+
+    // Model approval is an async boundary. Re-read before writing so an approve,
+    // pause, retry, or other executor change during the dialog cannot be replaced
+    // by this stale snapshot.
+    this.taskStore.loadFromDisk();
+    const fresh = this.taskStore.getTask(params.threadId);
+    if (!fresh) throw new Error(`Cannot switch executor: task ${params.threadId} disappeared during model approval.`);
+    const freshCurrentRoundEntry = (fresh.rounds || [])
+      .filter((round) => round.round === fresh.currentRound)
+      .slice(-1)[0];
+    if (
+      fresh.archivedAt || fresh.status === 'completed' || findInFlightRound(fresh) ||
+      fresh.status !== initialStatus || fresh.currentRound !== initialCurrentRound ||
+      fresh.targetAgent !== initialTargetAgent || fresh.targetModel !== initialTargetModel ||
+      fresh.receiverSessionId !== initialReceiverSessionId ||
+      fresh.reviewFlow !== initialReviewFlow ||
+      fresh.reviewBootstrap?.phase !== initialBootstrapPhase ||
+      fresh.reviewerSessionId !== initialReviewerSessionId ||
+      fresh.reviewerSessionCaptured !== initialReviewerSessionCaptured ||
+      fresh.callerSessionId !== initialCallerSessionId ||
+      freshCurrentRoundEntry?.round !== initialCurrentRoundEntry?.round ||
+      freshCurrentRoundEntry?.type !== initialCurrentRoundEntry?.type ||
+      freshCurrentRoundEntry?.status !== initialCurrentRoundEntry?.status ||
+      freshCurrentRoundEntry?.prompt !== initialCurrentRoundEntry?.prompt
+    ) {
+      throw new Error(
+        `Cannot switch executor of ${params.threadId}: task state changed while model approval was pending. ` +
+          `No executor change was applied.`,
+      );
+    }
+    thread = fresh;
+
+    const previousAgent = thread.targetAgent;
+    const previousModel = thread.targetModel;
 
     // Same-agent execution is allowed only for a dedicated-review task, and only
     // when the reviewer model differs from the executor model. A model must never

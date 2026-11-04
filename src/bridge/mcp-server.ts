@@ -1066,16 +1066,23 @@ export class MCPServer {
    * environment or — when the host does not forward that environment — with the
    * pid of the CLI process the bridge launched it as. The business brief always
    * comes from the ledger, never from the model's arguments.
-   * Confirmation only marks the task runnable — the developer starts once the
-   * reviewer process exits and releases the execution slot.
+   * Confirmation only marks the task runnable — the developer starts after the
+   * bootstrap service has persisted the native reviewer session.
    */
   private confirmReviewerBootstrap(
     threadId: string,
     credential: { token?: string; hostPid?: number },
   ): any {
-    const thread = this.taskStore.getTask(threadId);
+    this.taskStore.loadFromDisk();
+    let thread = this.taskStore.getTask(threadId);
     if (!thread) {
       throw new Error(`Reviewer bootstrap thread not found: ${threadId}`);
+    }
+    if (thread.status !== 'queued') {
+      throw new Error(
+        `Reviewer bootstrap for ${threadId} cannot confirm while task status is "${thread.status}". ` +
+          `Only a queued task may be dispatched; resume it after a pause or retry after a failure.`,
+      );
     }
     if (thread.reviewFlow !== 'dedicated') {
       throw new Error(
@@ -1119,6 +1126,20 @@ export class MCPServer {
       );
     }
 
+    // Re-read immediately before consuming the credential. A pause/delete may
+    // have arrived from another bridge process while the launch record was
+    // being validated; in that case leave the one-shot token available for a
+    // later explicit resume.
+    this.taskStore.loadFromDisk();
+    const latest = this.taskStore.getTask(threadId);
+    if (!latest || latest.status !== 'queued') {
+      throw new Error(
+        `Reviewer bootstrap for ${threadId} was stopped before confirmation; ` +
+          `the task is ${latest?.status || 'deleted'} and its token was not consumed.`,
+      );
+    }
+    thread = latest;
+
     clearReviewerBootstrapToken(threadId);
     thread.reviewBootstrap = {
       ...(thread.reviewBootstrap || { phase: 'pending', attempts: 0 }),
@@ -1126,7 +1147,7 @@ export class MCPServer {
     };
     thread.status = 'queued';
     thread.summary.lastOutputSnippet =
-      'Reviewer dispatched the task; waiting for the execution slot.';
+      'Reviewer dispatched the task; waiting for the bootstrap process to persist its native session.';
     this.taskStore.upsertTask(thread);
 
     const stopInstruction =

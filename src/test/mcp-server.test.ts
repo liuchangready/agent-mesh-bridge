@@ -16,7 +16,7 @@ import { CallbackManager } from '../bridge/callback-manager';
 import { AsyncDispatcher } from '../bridge/async-dispatcher';
 import { ReworkController } from '../bridge/rework-controller';
 import { MCPServer } from '../bridge/mcp-server';
-import { ExecutionGate } from '../bridge/execution-gate';
+import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { TaskRoleLock } from '../bridge/task-role-lock';
 import { roundOutputArchivePath } from '../bridge/round-log';
 import {
@@ -60,7 +60,7 @@ describe('MCPServer Protocol Tests', () => {
     callbackManager.notifyCaller = async () => true;
     // Never spawn a real caller CLI from a protocol test.
     callbackManager.notifyCallerOfFailure = async () => false;
-    const gate = new ExecutionGate(tempDir);
+    const gate = new TaskExecutionRegistry(tempDir);
     dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector, gate);
     reworkController = new ReworkController(taskStore, runner, callbackManager, detector, gate);
     mcpServer = new MCPServer(dispatcher, reworkController, taskStore, detector, resolver, runner);

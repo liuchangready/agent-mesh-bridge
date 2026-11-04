@@ -288,8 +288,8 @@ function isScopeBlocking(thread: DelegationThread, now: number): boolean {
 }
 
 /**
- * Queue order is `createdAt` ascending; equal timestamps fall back to threadId
- * so exactly one direction wins and the relation stays acyclic.
+ * Untouched queued candidates use `createdAt` ascending; equal timestamps fall
+ * back to threadId so exactly one direction wins and the relation stays acyclic.
  */
 function isQueuedBefore(other: DelegationThread, candidate: DelegationThread): boolean {
   const otherAt = new Date(other.createdAt || 0).getTime();
@@ -298,14 +298,33 @@ function isQueuedBefore(other: DelegationThread, candidate: DelegationThread): b
   return String(other.threadId) < String(candidate.threadId);
 }
 
+/** Work that may already own edits is never displaced by a younger queue entry. */
+function hasRunOrTouchedFiles(thread: DelegationThread): boolean {
+  if (thread.status === 'running' || thread.status === 'reworking') return true;
+  return (thread.rounds || []).some(
+    (round) =>
+      (round.touchedFiles?.length || 0) > 0 ||
+      !!round.executorAgent ||
+      !!round.executorModel ||
+      (round.durationMs || 0) > 0,
+  );
+}
+
+/** Lifecycle states that intentionally retain scope independent of queue age. */
+function retainsScopeByLifecycle(thread: DelegationThread, now: number): boolean {
+  if (thread.status === 'waiting_review' || thread.status === 'paused') return true;
+  if (thread.status === 'completed') return isScopeBlocking(thread, now);
+  return false;
+}
+
 /**
  * Batch-level scope gate.
  *
  * A task may only start when none of the files it declares are already owned by
  * another open task — either declared by it or actually touched by one of its
- * rounds. This is what stops a later task from silently overwriting an earlier
- * task's uncommitted work, since the global single-flight lock only prevents
- * *simultaneous* edits.
+ * rounds. This protects work across overlapping rounds; concurrent unrelated
+ * files are admitted independently, so declared and measured file coverage is
+ * the boundary for detecting a conflict.
  *
  * Tasks without a declared scope cannot be checked up front; their measured
  * `touchedFiles` still protect everyone who runs after them.
@@ -321,12 +340,16 @@ export function findScopeConflicts(
 
   for (const other of others) {
     if (other.threadId === candidate.threadId) continue;
-    // The gate is directional: only a task that entered the queue EARLIER can
-    // hold files against a later one. A younger task that is merely queued has
-    // not written anything yet — letting it block the queue head would invert
-    // FIFO and deadlock the whole queue (head ← younger → head).
-    if (!isQueuedBefore(other, candidate)) continue;
     if (!isScopeBlocking(other, now)) continue;
+
+    // Work that has started, touched files, is parked for review, paused, or
+    // holds recent unmerged output owns its scope regardless of queue age.
+    // Only untouched queued candidates use the one-way queue order.
+    const ownsScope =
+      hasRunOrTouchedFiles(other) ||
+      retainsScopeByLifecycle(other, now) ||
+      other.status !== 'queued';
+    if (!ownsScope && !isQueuedBefore(other, candidate)) continue;
 
     const theirs = knownTaskFiles(other);
     if (theirs.length === 0) continue;

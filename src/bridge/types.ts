@@ -403,8 +403,9 @@ export type ReviewBootstrapPhase =
  *
  * The reviewer conversation is launched by the bridge in a FRESH native session;
  * its first turn only calls `dispatch_task` with a one-time bootstrap token. The
- * developer round starts only after the token confirms and the reviewer process
- * has exited (strict single-flight).
+ * developer round starts only after the token confirms, the reviewer process
+ * has exited, and its native session id has been durably captured. Other tasks
+ * may run concurrently when scope and configured limits permit.
  */
 export interface ReviewerBootstrapState {
   phase: ReviewBootstrapPhase;
@@ -1109,18 +1110,30 @@ export function latestCompletedWorkRound(
  * A dedicated task may not execute its developer round until its reviewer
  * bootstrap has dispatched. Legacy tasks never have a bootstrap state.
  *
- * Only `pending` (or a not-yet-recorded phase) is "still starting". A `failed`
- * bootstrap is TERMINAL: its one-shot token has been consumed and `dispatch_task`
- * refuses to confirm it again, so treating it as pending left the supervisor
- * flipping the task `running` ↔ `queued` forever instead of letting it fail.
+ * Pending/launching are not ready. A confirmed bootstrap also remains pending
+ * until the reviewer session id is durably captured for the developer handoff.
+ * A failed bootstrap is terminal: its one-shot token is gone and it is never
+ * selected as an executable developer candidate.
  */
 export function isReviewerBootstrapPending(thread: DelegationThread): boolean {
   if (!thread || thread.reviewFlow !== 'dedicated') return false;
   const phase = thread.reviewBootstrap?.phase;
-  return phase === 'pending' || phase === undefined;
+  // Any state other than a captured, canonical handoff must block developer
+  // admission, including terminal bootstrap failure.
+  if (phase !== 'confirmed') return true;
+  return !(
+    thread.reviewerSessionCaptured === true &&
+    isValidSessionId(thread.reviewerSessionId) &&
+    isValidSessionId(thread.callerSessionId) &&
+    thread.callerSessionId === thread.reviewerSessionId
+  );
 }
 
-/** Oldest unfinished task (the queue head), or undefined when the mesh is idle. */
+/**
+ * Legacy compatibility helper. Runtime scheduling must not use a global FIFO
+ * queue head: candidates are admitted independently subject to scope, role,
+ * per-thread round, bootstrap handoff, and optional concurrency limits.
+ */
 export function findQueueHead(tasks: DelegationThread[]): DelegationThread | undefined {
   return tasks
     .filter(isTaskUnfinished)

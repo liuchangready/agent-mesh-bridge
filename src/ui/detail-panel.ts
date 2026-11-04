@@ -1038,7 +1038,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
             ? `桥接将在 ${new Date(thread.reviewWake.autoRetryAt).toLocaleString()} 自动重新唤醒（第 ${(thread.reviewWake.autoRetryAttempts || 0) + 1} 次自动尝试）。`
             : ''
       }</div>
-      <div style="font-size: 12px; opacity: 0.75; margin-top: 4px;">该任务仍占据其 workspace 的队列队头，后续任务会持续排队，直到重新检视成功、验收或删除。</div>
+      <div style="font-size: 12px; opacity: 0.75; margin-top: 4px;">该任务仍在等待检视；它只会阻挡 scope 冲突或受显式并发限额约束的任务。</div>
     </div>
   </div>`
         : `
