@@ -479,6 +479,34 @@ export interface ReviewBlockInfo {
  * the global queue slot and no longer blocks the file-scope gate; re-review /
  * request_rework / retry / approve all re-open it.
  */
+/**
+ * Read-only terminal summary kept on the task, and the ONLY payload surviving
+ * archival.
+ *
+ * It is deterministic (built from the ledger, never by an extra model turn), so
+ * `get_task_summary` can answer after the rounds/logs/native sessions are gone.
+ */
+export interface TaskFinalSummary {
+  kind: 'completed' | 'failed' | 'review_failed';
+  at: string;
+  title: string;
+  /** Reviewer's approval remarks (completed) or the terminal error (failed). */
+  verdict?: string;
+  /** Bounded human-readable digest. */
+  summary: string;
+  changedFiles?: string[];
+  error?: string;
+  rounds: number;
+  mergeRequest?: MergeRequestInfo;
+  reviewerAgent?: AgentId;
+  reviewerModel?: string;
+  executorAgent: AgentId;
+  executorModel?: string;
+  totalTokens?: number;
+  promptTokens?: number;
+  outputTokens?: number;
+}
+
 export interface ReviewFailure {
   /** `retries_exhausted`: the wake retry budget ran out. */
   kind: 'retries_exhausted' | 'unresolvable_park';
