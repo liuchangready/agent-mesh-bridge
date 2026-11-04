@@ -268,6 +268,80 @@ describe('native conversation cleanup on task deletion', () => {
     assert.ok(fs.existsSync(callerTranscript), 'the caller chat is shared and must survive');
   });
 
+  test('a dedicated task without a captured reviewer never deletes the requester chat', () => {
+    const requesterRollout = path.join(
+      home,
+      '.codex',
+      'sessions',
+      '2026',
+      '10',
+      '24',
+      `rollout-2026-10-24T10-00-00-${SESSION_CODEX}.jsonl`,
+    );
+    writeFile(requesterRollout);
+
+    const result = cleanup(
+      makeThread({
+        initiatorAgent: 'codex',
+        targetAgent: 'claude_code',
+        receiverSessionId: SESSION_CLAUDE,
+        reviewFlow: 'dedicated',
+        requesterSessionId: SESSION_CODEX,
+        callerSessionId: SESSION_CODEX,
+        // Bootstrap never confirmed, so reviewerSessionId is absent.
+      }),
+    );
+
+    assert.deepStrictEqual(
+      result.entries.map((entry) => entry.sessionId),
+      [SESSION_CLAUDE],
+      'a pending reviewer must not be inferred from callerSessionId',
+    );
+    assert.ok(fs.existsSync(requesterRollout), 'the requester chat must survive');
+  });
+
+  test('a dedicated task deletes only the captured reviewer, never the requester', () => {
+    const requesterRollout = path.join(
+      home,
+      '.codex',
+      'sessions',
+      '2026',
+      '10',
+      '24',
+      `rollout-2026-10-24T10-00-00-${SESSION_CODEX}.jsonl`,
+    );
+    const reviewerRollout = path.join(
+      home,
+      '.codex',
+      'sessions',
+      '2026',
+      '10',
+      '24',
+      `rollout-2026-10-24T10-05-00-${SESSION_OTHER}.jsonl`,
+    );
+    writeFile(requesterRollout);
+    writeFile(reviewerRollout);
+
+    const result = cleanup(
+      makeThread({
+        initiatorAgent: 'codex',
+        targetAgent: 'claude_code',
+        receiverSessionId: SESSION_CLAUDE,
+        reviewFlow: 'dedicated',
+        requesterSessionId: SESSION_CODEX,
+        reviewerSessionId: SESSION_OTHER,
+        callerSessionId: SESSION_OTHER,
+      }),
+    );
+
+    assert.deepStrictEqual(
+      result.entries.map((entry) => entry.sessionId).sort(),
+      [SESSION_CLAUDE, SESSION_OTHER].sort(),
+    );
+    assert.ok(fs.existsSync(requesterRollout), 'the requester chat must survive');
+    assert.ok(!fs.existsSync(reviewerRollout), 'the dedicated reviewer chat is task-owned');
+  });
+
   test('retarget history cleans the sessions of previously-used agents', () => {
     const retarget: TaskRetargetRecord = {
       at: new Date().toISOString(),

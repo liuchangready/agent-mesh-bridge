@@ -10,6 +10,7 @@ import {
   describeNativeSessionCleanup,
 } from './native-session-cleanup';
 import { TaskStore } from './task-store';
+import { removeTaskArtifacts } from './task-summary';
 import {
   DelegationRound,
   DelegationThread,
@@ -193,12 +194,16 @@ export class TaskControlService {
     }
 
     this.taskStore.deleteTask(threadId);
+    // Everything the bridge itself stored for this task: per-round logs, output
+    // archives, reviewer logs and a pending bootstrap token. The ledger entry is
+    // already gone, so a cleanup failure can never resurrect the task.
+    removeTaskArtifacts(threadId, this.storageDir);
 
     // Clean up the receiver's native conversation(s) only after the ledger entry
     // is gone: a cleanup failure must never leave a "deleted but still listed"
     // task behind. The cleaner itself never throws, but guard the call site too.
     const nativeSessions = this.cleanupNativeSessions(thread);
-    this.appendTombstone(thread, normalizedReason, by, nativeSessions);
+    this.appendTombstone(thread, normalizedReason, by, nativeSessions, force);
 
     const cleanupNote = describeNativeSessionCleanup(nativeSessions);
     return {
@@ -236,6 +241,7 @@ export class TaskControlService {
     reason: string,
     by: string,
     nativeSessions?: NativeSessionCleanupResult,
+    forced: boolean = false,
   ): void {
     try {
       fs.mkdirSync(this.storageDir, { recursive: true });
@@ -247,6 +253,9 @@ export class TaskControlService {
         statusAtDeletion: thread.status,
         reason,
         by,
+        // A forced deletion bypassed the merge gate: the audit trail must show
+        // that the worktree output was discarded deliberately, not by accident.
+        ...(forced ? { forced: true } : {}),
         at: new Date().toISOString(),
         nativeSessions: nativeSessions
           ? {
