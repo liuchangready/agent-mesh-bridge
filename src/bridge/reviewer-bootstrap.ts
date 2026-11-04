@@ -27,6 +27,7 @@ import { concurrencyPolicy } from './bridge-policy';
 import { ExecutionGate, normalizeWorkspaceKey } from './execution-gate';
 import { TaskStore } from './task-store';
 import { bootstrapDir } from './task-summary';
+import { reviewerBootstrapLogPath } from './reviewer-log';
 import {
   DelegationThread,
   ReviewFlow,
@@ -404,11 +405,7 @@ export class ReviewerBootstrapService {
     thread.summary.lastOutputSnippet = 'Starting the dedicated reviewer conversation...';
     store.upsertTask(thread);
 
-    const logFile = path.join(
-      root || path.join(os.homedir(), '.agent-mesh-bridge'),
-      'logs',
-      `${thread.threadId}_bootstrap.log`,
-    );
+    const logFile = reviewerBootstrapLogPath(thread.threadId, root, thread.initiatorAgent);
     try {
       fs.mkdirSync(path.dirname(logFile), { recursive: true });
       fs.writeFileSync(logFile, '', 'utf8');

@@ -22,7 +22,14 @@ import {
   isMergePending,
 } from './types';
 import { aggregateThreadTokenUsage } from './token-usage-collector';
-import { bridgeHomeDir } from './round-log';
+import * as zlib from 'zlib';
+import {
+  bridgeHomeDir,
+  bridgeLogsDir,
+  getWorkerLogDir,
+  getReviewerLogDir,
+  getArchiveLogDir,
+} from './round-log';
 
 /** How many newest tasks stay hot; older terminal tasks are archived. */
 export const DEFAULT_ARCHIVE_KEEP_RECENT = 20;
@@ -182,20 +189,238 @@ export function bootstrapDir(root?: string): string {
   return path.join(bridgeHomeDir(root), 'bootstrap');
 }
 
-/** Remove every bridge-side artifact of one task (logs + bootstrap token). */
-export function removeTaskArtifacts(threadId: string, root?: string): number {
+/**
+ * Create a standard POSIX ustar tar.gz archive buffer from a list of files
+ * using only Node.js standard built-ins.
+ */
+export function createTarGzBuffer(
+  files: Array<{ name: string; content: Buffer | string; mtime?: Date }>,
+): Buffer {
+  const blocks: Buffer[] = [];
+  for (const file of files) {
+    const contentBuf = Buffer.isBuffer(file.content)
+      ? file.content
+      : Buffer.from(file.content, 'utf8');
+    const header = Buffer.alloc(512, 0);
+    const cleanName = file.name.replace(/\\/g, '/');
+    const nameBuf = Buffer.from(cleanName, 'utf8');
+    nameBuf.copy(header, 0, 0, Math.min(nameBuf.length, 100));
+    header.write('0000644\0', 100, 8, 'ascii');
+    header.write('0000000\0', 108, 8, 'ascii');
+    header.write('0000000\0', 116, 8, 'ascii');
+    const sizeOctal = contentBuf.length.toString(8).padStart(11, '0') + ' ';
+    header.write(sizeOctal, 124, 12, 'ascii');
+    const mtimeSec = Math.floor((file.mtime ? file.mtime.getTime() : Date.now()) / 1000);
+    const mtimeOctal = mtimeSec.toString(8).padStart(11, '0') + ' ';
+    header.write(mtimeOctal, 136, 12, 'ascii');
+    header.write('        ', 148, 8, 'ascii');
+    header.write('0', 156, 1, 'ascii');
+    header.write('ustar\0', 257, 6, 'ascii');
+    header.write('00', 263, 2, 'ascii');
+
+    let sum = 0;
+    for (let i = 0; i < 512; i++) {
+      sum += header[i];
+    }
+    const checksumOctal = sum.toString(8).padStart(6, '0') + '\0 ';
+    header.write(checksumOctal, 148, 8, 'ascii');
+
+    blocks.push(header);
+    blocks.push(contentBuf);
+
+    const remainder = contentBuf.length % 512;
+    if (remainder > 0) {
+      blocks.push(Buffer.alloc(512 - remainder, 0));
+    }
+  }
+
+  // End of archive marker: two 512-byte blocks of zeroes
+  blocks.push(Buffer.alloc(1024, 0));
+
+  const tarBuffer = Buffer.concat(blocks);
+  return zlib.gzipSync(tarBuffer);
+}
+
+/**
+ * Archive the task's logs and terminal summary into the Archive/ folder of
+ * the worker and reviewer agents (as well as default).
+ *
+ * Produces:
+ *   - <threadId>_archive.tar.gz (compressed tar containing worker_log, reviewer_log, and summary.json)
+ *   - <threadId>_archive.json (summary metadata and archive manifest)
+ */
+export function archiveCompletedTaskLogs(
+  thread: DelegationThread,
+  root?: string,
+): { tarGzPaths: string[]; jsonPaths: string[] } {
+  ensureFinalSummary(thread);
+  const safe = String(thread.threadId || '').replace(/[^A-Za-z0-9_.-]/g, '_');
+
+  const archiveDirs = Array.from(
+    new Set([
+      getArchiveLogDir(thread.targetAgent, root),
+      getArchiveLogDir(thread.initiatorAgent, root),
+      getArchiveLogDir(undefined, root),
+    ]),
+  );
+
+  for (const dir of archiveDirs) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch {}
+  }
+
+  const entries: Array<{ name: string; content: Buffer | string; mtime?: Date }> = [];
+  const foundFilenames = new Set<string>();
+
+  // 1. Gather worker logs
+  const workerDirs = Array.from(
+    new Set([
+      getWorkerLogDir(thread.targetAgent, root),
+      getWorkerLogDir(undefined, root),
+      bridgeLogsDir(root),
+    ]),
+  );
+  for (const dir of workerDirs) {
+    if (!fs.existsSync(dir)) continue;
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        if (!name.startsWith(`${safe}_round_`)) continue;
+        if (!name.endsWith('.log') && !name.endsWith('.output.md')) continue;
+        if (foundFilenames.has(name)) continue;
+        const full = path.join(dir, name);
+        try {
+          const content = fs.readFileSync(full);
+          const stat = fs.statSync(full);
+          entries.push({
+            name: `worker_log/${name}`,
+            content,
+            mtime: stat.mtime,
+          });
+          foundFilenames.add(name);
+        } catch {}
+      }
+    } catch {}
+  }
+
+  // 2. Gather reviewer logs
+  const reviewerDirs = Array.from(
+    new Set([
+      getReviewerLogDir(thread.initiatorAgent, root),
+      getReviewerLogDir(undefined, root),
+      bridgeLogsDir(root),
+    ]),
+  );
+  for (const dir of reviewerDirs) {
+    if (!fs.existsSync(dir)) continue;
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        if (
+          !name.startsWith(`${safe}_round_`) &&
+          !name.startsWith(`${safe}_bootstrap.log`)
+        ) {
+          continue;
+        }
+        if (!name.endsWith('.reviewer.log') && !name.endsWith('_bootstrap.log')) continue;
+        if (foundFilenames.has(name)) continue;
+        const full = path.join(dir, name);
+        try {
+          const content = fs.readFileSync(full);
+          const stat = fs.statSync(full);
+          entries.push({
+            name: `reviewer_log/${name}`,
+            content,
+            mtime: stat.mtime,
+          });
+          foundFilenames.add(name);
+        } catch {}
+      }
+    } catch {}
+  }
+
+  // 3. Manifest / summary entry
+  const manifest = {
+    threadId: thread.threadId,
+    title: thread.title,
+    status: thread.status,
+    initiatorAgent: thread.initiatorAgent,
+    targetAgent: thread.targetAgent,
+    initiatorModel: thread.initiatorModel,
+    targetModel: thread.targetModel,
+    reviewerModel: thread.reviewerModel,
+    createdAt: thread.createdAt,
+    updatedAt: thread.updatedAt,
+    archivedAt: thread.archivedAt || new Date().toISOString(),
+    finalSummary: thread.finalSummary,
+    mergeRequest: thread.mergeRequest,
+    archivedLogFiles: entries.map((e) => e.name),
+  };
+  const summaryJsonStr = JSON.stringify(manifest, null, 2);
+  entries.unshift({
+    name: 'summary.json',
+    content: summaryJsonStr,
+  });
+
+  const tarGzBuffer = createTarGzBuffer(entries);
+
+  const tarGzPaths: string[] = [];
+  const jsonPaths: string[] = [];
+
+  for (const dir of archiveDirs) {
+    try {
+      const tarGzPath = path.join(dir, `${safe}_archive.tar.gz`);
+      fs.writeFileSync(tarGzPath, tarGzBuffer);
+      tarGzPaths.push(tarGzPath);
+
+      const jsonPath = path.join(dir, `${safe}_archive.json`);
+      fs.writeFileSync(jsonPath, summaryJsonStr, 'utf8');
+      jsonPaths.push(jsonPath);
+    } catch {}
+  }
+
+  return { tarGzPaths, jsonPaths };
+}
+
+/**
+ * Remove bridge-side artifacts of one task (worker/reviewer logs + bootstrap token).
+ * By default, keeps the archived bundle in Archive/ when task is archived.
+ */
+export function removeTaskArtifacts(
+  threadId: string,
+  root?: string,
+  options: {
+    keepArchive?: boolean;
+    targetAgent?: string;
+    initiatorAgent?: string;
+  } = {},
+): number {
   let removed = 0;
   const safe = String(threadId || '').replace(/[^A-Za-z0-9_.-]/g, '_');
-  const logsDir = path.join(bridgeHomeDir(root), 'logs');
-  try {
-    for (const name of fs.readdirSync(logsDir)) {
-      if (!name.startsWith(`${safe}_`)) continue;
-      try {
-        fs.unlinkSync(path.join(logsDir, name));
-        removed++;
-      } catch {}
-    }
-  } catch {}
+  const keepArchive = options.keepArchive !== false;
+
+  const targetDirs = Array.from(
+    new Set([
+      getWorkerLogDir(options.targetAgent, root),
+      getWorkerLogDir(undefined, root),
+      getReviewerLogDir(options.initiatorAgent, root),
+      getReviewerLogDir(undefined, root),
+      bridgeLogsDir(root),
+    ]),
+  );
+
+  for (const dir of targetDirs) {
+    if (!fs.existsSync(dir)) continue;
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        if (!name.startsWith(`${safe}_`)) continue;
+        try {
+          fs.unlinkSync(path.join(dir, name));
+          removed++;
+        } catch {}
+      }
+    } catch {}
+  }
+
   try {
     const file = path.join(bootstrapDir(root), `${safe}.json`);
     if (fs.existsSync(file)) {
@@ -203,6 +428,29 @@ export function removeTaskArtifacts(threadId: string, root?: string): number {
       removed++;
     }
   } catch {}
+
+  if (!keepArchive) {
+    const archiveDirs = Array.from(
+      new Set([
+        getArchiveLogDir(options.targetAgent, root),
+        getArchiveLogDir(options.initiatorAgent, root),
+        getArchiveLogDir(undefined, root),
+      ]),
+    );
+    for (const dir of archiveDirs) {
+      if (!fs.existsSync(dir)) continue;
+      try {
+        for (const name of fs.readdirSync(dir)) {
+          if (!name.startsWith(`${safe}_archive.`)) continue;
+          try {
+            fs.unlinkSync(path.join(dir, name));
+            removed++;
+          } catch {}
+        }
+      } catch {}
+    }
+  }
+
   return removed;
 }
 

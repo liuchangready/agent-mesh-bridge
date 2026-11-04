@@ -5,12 +5,20 @@ import { ReworkController } from '../bridge/rework-controller';
 import { DelegationThread } from '../bridge/types';
 import { TaskSupervisor } from '../bridge/task-supervisor';
 import {
+  findExistingExecutionLog,
+  findExistingOutputArchive,
   formatBytes,
   resolveExistingArtifactPath,
   roundExecutionLogPath,
   roundOutputArchivePath,
 } from '../bridge/round-log';
-import { readReviewerLogTail, resolveReviewerLogRound, reviewerLogPath, statReviewerLog } from '../bridge/reviewer-log';
+import {
+  findExistingReviewerLog,
+  readReviewerLogTail,
+  resolveReviewerLogRound,
+  reviewerLogPath,
+  statReviewerLog,
+} from '../bridge/reviewer-log';
 import { aggregateThreadTokenUsage, formatTokenCount } from '../bridge/token-usage-collector';
 
 export class TaskDetailPanel {
@@ -288,9 +296,11 @@ export class TaskDetailPanel {
     const root = path.dirname(this.taskStore.getStoragePath());
     const file = resolveExistingArtifactPath([
       round?.rawOutputFilePath,
-      roundOutputArchivePath(this.currentThreadId, roundNumber, root),
+      findExistingOutputArchive(this.currentThreadId, roundNumber, { root, agent: thread?.targetAgent }),
+      findExistingExecutionLog(this.currentThreadId, roundNumber, { root, agent: thread?.targetAgent }),
+      roundOutputArchivePath(this.currentThreadId, roundNumber, root, thread?.targetAgent),
       roundOutputArchivePath(this.currentThreadId, roundNumber),
-      roundExecutionLogPath(this.currentThreadId, roundNumber, root),
+      roundExecutionLogPath(this.currentThreadId, roundNumber, root, thread?.targetAgent),
       roundExecutionLogPath(this.currentThreadId, roundNumber),
     ]);
     if (!file) {
@@ -314,9 +324,11 @@ export class TaskDetailPanel {
    * a dedicated artifact: `logs/<threadId>_round_<n>.reviewer.log`.
    */
   private async handleOpenReviewerLog(roundNumber: number): Promise<void> {
+    const thread = this.taskStore.getTask(this.currentThreadId);
     const root = path.dirname(this.taskStore.getStoragePath());
     const file = resolveExistingArtifactPath([
-      reviewerLogPath(this.currentThreadId, roundNumber, root),
+      findExistingReviewerLog(this.currentThreadId, roundNumber, { root, agent: thread?.initiatorAgent }),
+      reviewerLogPath(this.currentThreadId, roundNumber, root, thread?.initiatorAgent),
       reviewerLogPath(this.currentThreadId, roundNumber),
     ]);
     if (!file) {

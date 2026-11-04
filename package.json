@@ -289,6 +289,36 @@
           "default": "",
           "markdownDescription": "**Sender-side** default model for DeepSeek Harness: the model its review/wake-up runs use after it dispatched a task (applied as a one-run profile overlay, like receiver rounds). Configured separately from the receiver-side model, so DSH can review as `pro` while the tasks it delegates to other agents run on their own models. Leave empty to keep the agent's own model; the task ledger then reports the receiver-side default for the sender badge when one is set."
         },
+        "agentMeshBridge.logDirectories.default": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Default base directory for storing agent execution and review logs. When empty, defaults to `~/.agent-mesh-bridge/logs`. Contains `worker_log/`, `reviewer_log/`, and `Archive/` subdirectories."
+        },
+        "agentMeshBridge.logDirectories.antigravity": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Custom base log storage directory for **Google Antigravity**. Contains `worker_log/` (raw and compacted execution logs), `reviewer_log/` (review logs), and `Archive/` (compressed task archives)."
+        },
+        "agentMeshBridge.logDirectories.codex": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Custom base log storage directory for **OpenAI Codex**. Contains `worker_log/`, `reviewer_log/`, and `Archive/` subdirectories."
+        },
+        "agentMeshBridge.logDirectories.claudeCode": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Custom base log storage directory for **Anthropic Claude Code**. Contains `worker_log/`, `reviewer_log/`, and `Archive/` subdirectories."
+        },
+        "agentMeshBridge.logDirectories.deepseekHarness": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Custom base log storage directory for **DeepSeek Harness**. Contains `worker_log/`, `reviewer_log/`, and `Archive/` subdirectories."
+        },
         "agentMeshBridge.requireModelApproval": {
           "type": "boolean",
           "default": true,

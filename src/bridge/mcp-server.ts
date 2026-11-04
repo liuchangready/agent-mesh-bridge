@@ -36,12 +36,18 @@ import {
 import {
   DEFAULT_RAW_LOG_BYTES,
   MAX_RAW_LOG_BYTES,
+  findExistingExecutionLog,
+  findExistingOutputArchive,
   readTextFilePaged,
   resolveExistingArtifactPath,
   roundExecutionLogPath,
   roundOutputArchivePath,
 } from './round-log';
-import { listReviewerLogRounds, reviewerLogPath } from './reviewer-log';
+import {
+  findExistingReviewerLog,
+  listReviewerLogRounds,
+  reviewerLogPath,
+} from './reviewer-log';
 import { aggregateThreadTokenUsage } from './token-usage-collector';
 
 /** Older non-compacted rounds are excerpted to this many characters. */
@@ -113,14 +119,20 @@ export class MCPServer {
   }
 
   private resolveRoundOutputArchive(threadId: string, round: number): string | undefined {
+    const thread = this.taskStore.getTask(threadId);
     return resolveExistingArtifactPath([
+      findExistingOutputArchive(threadId, round, { root: this.storeRoot(), agent: thread?.targetAgent }),
+      roundOutputArchivePath(threadId, round, this.storeRoot(), thread?.targetAgent),
       roundOutputArchivePath(threadId, round, this.storeRoot()),
       roundOutputArchivePath(threadId, round),
     ]);
   }
 
   private resolveRoundExecutionLog(threadId: string, round: number): string | undefined {
+    const thread = this.taskStore.getTask(threadId);
     return resolveExistingArtifactPath([
+      findExistingExecutionLog(threadId, round, { root: this.storeRoot(), agent: thread?.targetAgent }),
+      roundExecutionLogPath(threadId, round, this.storeRoot(), thread?.targetAgent),
       roundExecutionLogPath(threadId, round, this.storeRoot()),
       roundExecutionLogPath(threadId, round),
     ]);
@@ -293,10 +305,12 @@ export class MCPServer {
     );
     const offsetBytes = Math.max(0, Number(args?.offsetBytes) || 0);
 
-    const found = [
-      reviewerLogPath(threadId, round, this.storeRoot()),
+    const thread = this.taskStore.getTask(threadId);
+    const found = resolveExistingArtifactPath([
+      findExistingReviewerLog(threadId, round, { root: this.storeRoot(), agent: thread?.initiatorAgent }),
+      reviewerLogPath(threadId, round, this.storeRoot(), thread?.initiatorAgent),
       reviewerLogPath(threadId, round),
-    ].find((candidate) => fs.existsSync(candidate));
+    ]);
 
     if (!found) {
       return {

@@ -13,6 +13,7 @@ import {
   isMergePending,
 } from './types';
 import {
+  archiveCompletedTaskLogs,
   archiveThreadData,
   buildFinalSummary,
   ensureFinalSummary,
@@ -674,10 +675,17 @@ export class TaskStore extends EventEmitter {
     try {
       cleanupThreadNativeSessions(thread);
     } catch {}
+    try {
+      archiveCompletedTaskLogs(thread, this.storageDir);
+    } catch {}
     if (!archiveThreadData(thread)) return undefined;
     this.tasks.set(threadId, thread);
     this.persistThread(thread);
-    removeTaskArtifacts(threadId, this.storageDir);
+    removeTaskArtifacts(threadId, this.storageDir, {
+      keepArchive: true,
+      targetAgent: thread.targetAgent,
+      initiatorAgent: thread.initiatorAgent,
+    });
     this.writeAggregate();
     this.emit('changed', Array.from(this.tasks.values()));
     return thread;
@@ -690,11 +698,17 @@ export class TaskStore extends EventEmitter {
    */
   public deleteTask(threadId: string): boolean {
     this.ensureUpToDate();
+    const thread = this.tasks.get(threadId);
     const existed = this.tasks.delete(threadId);
     if (existed) {
       try {
         fs.unlinkSync(this.threadFilePath(threadId));
       } catch {}
+      removeTaskArtifacts(threadId, this.storageDir, {
+        keepArchive: false,
+        targetAgent: thread?.targetAgent,
+        initiatorAgent: thread?.initiatorAgent,
+      });
       this.knownMtimes.delete(path.basename(this.threadFilePath(threadId)));
       this.writeAggregate();
       this.emit('changed', Array.from(this.tasks.values()));

@@ -19,6 +19,7 @@ import {
   shouldResumeNativeSession,
 } from './types';
 import { readBridgePolicy } from './bridge-policy';
+import { roundExecutionLogPath } from './round-log';
 import { resolveReviewFlow, writeReviewerBootstrapToken } from './reviewer-bootstrap';
 import { TaskStore } from './task-store';
 import { AgentDetector } from './agent-detector';
@@ -637,14 +638,14 @@ export class AsyncDispatcher {
         });
       }, this.streamSyncIntervalMs);
 
-      const logDir = path.join(os.homedir(), '.agent-mesh-bridge', 'logs');
-      if (!fs.existsSync(logDir)) {
-        try {
-          fs.mkdirSync(logDir, { recursive: true });
-        } catch {}
-      }
-      const logFilePath = path.join(logDir, `${thread.threadId}_round_${roundNumber}.log`);
+      const logFilePath = roundExecutionLogPath(
+        thread.threadId,
+        roundNumber,
+        undefined,
+        thread.targetAgent,
+      );
       try {
+        fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
         fs.writeFileSync(logFilePath, '', 'utf8');
       } catch {}
 

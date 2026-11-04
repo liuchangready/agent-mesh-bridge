@@ -795,8 +795,9 @@ export class TaskSupervisor extends EventEmitter {
         });
       }, syncIntervalMs);
 
-      const logFilePath = roundExecutionLogPath(thread.threadId, roundNumber);
+      const logFilePath = roundExecutionLogPath(thread.threadId, roundNumber, undefined, thread.targetAgent);
       try {
+        fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
         fs.writeFileSync(logFilePath, '', 'utf8');
       } catch {}
       this.liveLogs.set(thread.threadId, '');

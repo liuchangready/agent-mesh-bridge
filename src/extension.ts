@@ -25,7 +25,7 @@ import { TaskControlService } from './bridge/task-control';
 import { TaskArchiveService } from './bridge/task-archive';
 import { ReviewerBootstrapService } from './bridge/reviewer-bootstrap';
 import { ExecutionGate } from './bridge/execution-gate';
-import { saveBridgePolicy } from './bridge/bridge-policy';
+import { saveBridgePolicy, AgentLogDirectories } from './bridge/bridge-policy';
 import { probeCodexResumeSupport } from './bridge/codex-session';
 import {
   DSH_PROVIDER_ENV_HINT,
@@ -90,6 +90,27 @@ const INITIATOR_MODEL_SETTING_KEYS: Record<AgentId, string> = {
   claude_code: 'initiatorModels.claudeCode',
   deepseek_harness: 'initiatorModels.deepseekHarness',
   vscode_chat: 'initiatorModels.vscodeChat',
+};
+
+const LOG_DIR_SETTING_KEYS: Record<AgentId, string> = {
+  antigravity: 'logDirectories.antigravity',
+  codex: 'logDirectories.codex',
+  claude_code: 'logDirectories.claudeCode',
+  deepseek_harness: 'logDirectories.deepseekHarness',
+  vscode_chat: 'logDirectories.vscodeChat',
+};
+
+const readLogDirectorySettings = (): AgentLogDirectories => {
+  const cfg = vscode.workspace.getConfiguration('agentMeshBridge');
+  const dirs: AgentLogDirectories = {};
+  const defaultDir = cfg.get<string>('logDirectories.default');
+  if (defaultDir && defaultDir.trim()) dirs.default = defaultDir.trim();
+  for (const agent of ['antigravity', 'codex', 'claude_code', 'deepseek_harness'] as AgentId[]) {
+    const key = LOG_DIR_SETTING_KEYS[agent];
+    const val = cfg.get<string>(key);
+    if (val && val.trim()) dirs[agent] = val.trim();
+  }
+  return dirs;
 };
 
 /** Model setting key for a role; `undefined` for agents with no picker. */
@@ -368,6 +389,7 @@ export function activate(context: vscode.ExtensionContext) {
       // caller-resume flow and is the rollback switch; existing tasks stay on
       // whatever topology they were created with.
       reviewFlow: bridgeCfg.get<'dedicated' | 'legacy'>('reviewFlow', 'dedicated'),
+      logDirectories: readLogDirectorySettings(),
       concurrency: {
         enabled: bridgeCfg.get<boolean>('concurrency.enabled', false),
         maxConcurrentTasks: bridgeCfg.get<number>('concurrency.maxConcurrentTasks', 2),
@@ -1623,6 +1645,7 @@ export function activate(context: vscode.ExtensionContext) {
       if (
         !e.affectsConfiguration('agentMeshBridge.models') &&
         !e.affectsConfiguration('agentMeshBridge.initiatorModels') &&
+        !e.affectsConfiguration('agentMeshBridge.logDirectories') &&
         !e.affectsConfiguration('agentMeshBridge.requireModelApproval') &&
         !e.affectsConfiguration('agentMeshBridge.contextCompaction') &&
         !e.affectsConfiguration('agentMeshBridge.concurrency') &&

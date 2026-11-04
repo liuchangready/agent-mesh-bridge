@@ -18,6 +18,7 @@ import {
 import * as fs from 'fs';
 import * as path from 'path';
 import { roundExecutionLogPath } from './round-log';
+import { archiveCompletedTaskLogs } from './task-summary';
 import { TaskStore } from './task-store';
 import { AgentDetector } from './agent-detector';
 import { AutonomousRunner } from './autonomous-runner';
@@ -553,6 +554,9 @@ export class ReworkController {
     }
 
     this.taskStore.upsertTask(thread);
+    try {
+      archiveCompletedTaskLogs(thread, path.dirname(this.taskStore.getStoragePath()));
+    } catch {}
 
     return {
       threadId: thread.threadId,
@@ -651,6 +655,7 @@ export class ReworkController {
         thread.threadId,
         roundNumber,
         path.dirname(this.taskStore.getStoragePath()),
+        thread.targetAgent,
       );
       try {
         fs.mkdirSync(path.dirname(roundLogPath), { recursive: true });

@@ -13,7 +13,7 @@ import {
   reviewerLogPath,
   statReviewerLog,
 } from '../bridge/reviewer-log';
-import { roundExecutionLogPath } from '../bridge/round-log';
+import { getReviewerLogDir, roundExecutionLogPath } from '../bridge/round-log';
 
 function makeRoot(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-reviewer-log-'));
@@ -40,7 +40,7 @@ describe('Reviewer log artifact', () => {
     const root = makeRoot();
     try {
       const file = reviewerLogPath('../evil/thread', 0, root);
-      assert.strictEqual(path.dirname(file), path.join(root, 'logs'));
+      assert.strictEqual(path.dirname(file), getReviewerLogDir(undefined, root));
       assert.ok(!file.includes('..'));
       assert.ok(path.basename(file).includes('evil_thread_round_1'));
       assert.ok(path.basename(file).endsWith(REVIEWER_LOG_SUFFIX));

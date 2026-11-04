@@ -11,6 +11,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { bridgeHomeDir } from './round-log';
+import { AgentId } from './types';
 
 export const BRIDGE_POLICY_FILENAME = 'bridge-policy.json';
 
@@ -25,6 +26,8 @@ export const DEFAULT_COMPACTION_MIN_CHARS = 1500;
  * unit of parallelism is the WORKSPACE, never a task tree: two tasks in the same
  * workspace still exclude each other.
  */
+export type AgentLogDirectories = Partial<Record<AgentId | 'default', string>>;
+
 export interface ConcurrencyPolicy {
   enabled: boolean;
   /** Mesh-wide execution slots. */
@@ -53,6 +56,8 @@ export interface BridgePolicy {
    * reviewer bootstrap).
    */
   reviewFlow?: 'legacy' | 'dedicated';
+  /** Per-agent base log storage directories. */
+  logDirectories?: AgentLogDirectories;
   updatedAt?: string;
 }
 
@@ -112,6 +117,21 @@ export function saveBridgePolicy(patch: BridgePolicy, root?: string): BridgePoli
   if (patch.reviewFlow === 'legacy' || patch.reviewFlow === 'dedicated') {
     next.reviewFlow = patch.reviewFlow;
   }
+  if (patch.logDirectories !== undefined) {
+    const currentDirs = next.logDirectories || {};
+    const mergedDirs: AgentLogDirectories = { ...currentDirs };
+    for (const [key, value] of Object.entries(patch.logDirectories)) {
+      if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (trimmed) {
+          mergedDirs[key as AgentId | 'default'] = trimmed;
+        } else {
+          delete mergedDirs[key as AgentId | 'default'];
+        }
+      }
+    }
+    next.logDirectories = mergedDirs;
+  }
   next.updatedAt = new Date().toISOString();
 
   try {
@@ -159,4 +179,10 @@ export function concurrencyPolicy(root?: string): ConcurrencyPolicy {
     maxConcurrentPerAgent:
       positiveSlotCount(raw.maxConcurrentPerAgent) ?? DEFAULT_CONCURRENCY_POLICY.maxConcurrentPerAgent,
   };
+}
+
+
+/** Custom log directories configured per agent or globally. */
+export function getAgentLogDirectories(root?: string): AgentLogDirectories {
+  return readBridgePolicy(root).logDirectories || {};
 }

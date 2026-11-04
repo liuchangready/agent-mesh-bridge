@@ -33,6 +33,7 @@ import {
   isContextCompactionEnabled,
 } from './bridge-policy';
 import {
+  findExistingExecutionLog,
   formatBytes,
   resolveExistingArtifactPath,
   roundExecutionLogPath,

@@ -24,7 +24,9 @@ import {
   PagedText,
   bridgeLogsDir,
   formatBytes,
+  getReviewerLogDir,
   readTextFilePaged,
+  resolveExistingArtifactPath,
   safeThreadIdPart,
 } from './round-log';
 
@@ -41,12 +43,45 @@ export const REVIEWER_LOG_MAX_BYTES = 4 * 1024 * 1024;
 /** Bytes the detail panel renders inline (the full file stays on disk). */
 export const REVIEWER_LOG_TAIL_BYTES = 8 * 1024;
 
-export function reviewerLogPath(threadId: string, round: number, root?: string): string {
+export function reviewerLogPath(
+  threadId: string,
+  round: number,
+  root?: string,
+  agent?: string,
+): string {
   const safeRound = Number.isFinite(round) ? Math.max(1, Math.floor(round)) : 1;
   return path.join(
-    bridgeLogsDir(root),
+    getReviewerLogDir(agent, root),
     `${safeThreadIdPart(threadId)}_round_${safeRound}${REVIEWER_LOG_SUFFIX}`,
   );
+}
+
+export function reviewerBootstrapLogPath(
+  threadId: string,
+  root?: string,
+  agent?: string,
+): string {
+  return path.join(
+    getReviewerLogDir(agent, root),
+    `${safeThreadIdPart(threadId)}_bootstrap.log`,
+  );
+}
+
+export function findExistingReviewerLog(
+  threadId: string,
+  round: number,
+  options: { root?: string; agent?: string } = {},
+): string | undefined {
+  const safeRound = Number.isFinite(round) ? Math.max(1, Math.floor(round)) : 1;
+  const candidates: Array<string | undefined> = [
+    reviewerLogPath(threadId, round, options.root, options.agent),
+    reviewerLogPath(threadId, round, options.root),
+    path.join(
+      bridgeLogsDir(options.root),
+      `${safeThreadIdPart(threadId)}_round_${safeRound}${REVIEWER_LOG_SUFFIX}`,
+    ),
+  ];
+  return resolveExistingArtifactPath(candidates);
 }
 
 export interface ReviewerLogStat {
@@ -56,8 +91,15 @@ export interface ReviewerLogStat {
   mtimeMs: number;
 }
 
-export function statReviewerLog(threadId: string, round: number, root?: string): ReviewerLogStat {
-  const file = reviewerLogPath(threadId, round, root);
+export function statReviewerLog(
+  threadId: string,
+  round: number,
+  root?: string,
+  agent?: string,
+): ReviewerLogStat {
+  const file =
+    findExistingReviewerLog(threadId, round, { root, agent }) ||
+    reviewerLogPath(threadId, round, root, agent);
   try {
     const stat = fs.statSync(file);
     if (!stat.isFile()) return { path: file, exists: false, sizeBytes: 0, mtimeMs: 0 };
@@ -72,20 +114,30 @@ export function statReviewerLog(threadId: string, round: number, root?: string):
  *
  * Used to answer "which rounds can I inspect?" without guessing round numbers.
  */
-export function listReviewerLogRounds(threadId: string, root?: string): number[] {
-  const dir = bridgeLogsDir(root);
+export function listReviewerLogRounds(
+  threadId: string,
+  root?: string,
+  agent?: string,
+): number[] {
+  const dirs = new Set<string>();
+  dirs.add(getReviewerLogDir(agent, root));
+  dirs.add(getReviewerLogDir(undefined, root));
+  dirs.add(bridgeLogsDir(root));
+
   const prefix = `${safeThreadIdPart(threadId)}_round_`;
-  try {
-    const rounds: number[] = [];
-    for (const name of fs.readdirSync(dir)) {
-      if (!name.startsWith(prefix) || !name.endsWith(REVIEWER_LOG_SUFFIX)) continue;
-      const match = /_round_(\d+)\.reviewer\.log$/.exec(name);
-      if (match) rounds.push(Number(match[1]));
-    }
-    return rounds.sort((a, b) => b - a);
-  } catch {
-    return [];
+  const rounds = new Set<number>();
+
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir)) continue;
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        if (!name.startsWith(prefix) || !name.endsWith(REVIEWER_LOG_SUFFIX)) continue;
+        const match = /_round_(\d+)\.reviewer\.log$/.exec(name);
+        if (match) rounds.add(Number(match[1]));
+      }
+    } catch {}
   }
+  return Array.from(rounds).sort((a, b) => b - a);
 }
 
 /**
@@ -102,11 +154,12 @@ export function resolveReviewerLogRound(
   threadId: string,
   requestedRound: number,
   root?: string,
+  agent?: string,
 ): { round: number; fallback: boolean } | undefined {
-  if (statReviewerLog(threadId, requestedRound, root).exists) {
+  if (statReviewerLog(threadId, requestedRound, root, agent).exists) {
     return { round: requestedRound, fallback: false };
   }
-  const latest = listReviewerLogRounds(threadId, root)[0];
+  const latest = listReviewerLogRounds(threadId, root, agent)[0];
   if (latest === undefined) return undefined;
   return { round: latest, fallback: latest !== requestedRound };
 }
@@ -120,9 +173,11 @@ export function resolveReviewerLogRound(
 export function readReviewerLogTail(
   threadId: string,
   round: number,
-  options: { maxBytes?: number; root?: string } = {},
+  options: { maxBytes?: number; root?: string; agent?: string } = {},
 ): PagedText | undefined {
-  const file = reviewerLogPath(threadId, round, options.root);
+  const file =
+    findExistingReviewerLog(threadId, round, options) ||
+    reviewerLogPath(threadId, round, options.root, options.agent);
   if (!fs.existsSync(file)) return undefined;
   const totalBytes = fs.statSync(file).size;
   const maxBytes = Math.max(1, options.maxBytes ?? REVIEWER_LOG_TAIL_BYTES);
@@ -158,9 +213,10 @@ export class ReviewerLogWriter {
     threadId: string,
     round: number,
     header: ReviewerLogHeader,
-    options: { root?: string; maxBytes?: number } = {},
+    options: { root?: string; maxBytes?: number; agent?: string } = {},
   ) {
-    this.path = reviewerLogPath(threadId, round, options.root);
+    const agent = options.agent || header.agent;
+    this.path = reviewerLogPath(threadId, round, options.root, agent);
     this.maxBytes = Math.max(1024, options.maxBytes ?? REVIEWER_LOG_MAX_BYTES);
     try {
       fs.mkdirSync(path.dirname(this.path), { recursive: true });
@@ -247,7 +303,7 @@ export function createReviewerLogWriter(
   threadId: string,
   round: number,
   header: ReviewerLogHeader,
-  options: { root?: string; maxBytes?: number } = {},
+  options: { root?: string; maxBytes?: number; agent?: string } = {},
 ): ReviewerLogWriter {
   return new ReviewerLogWriter(threadId, round, header, options);
 }
