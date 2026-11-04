@@ -85,6 +85,12 @@ export class TaskControlService {
         `Cannot pause task ${threadId}: it is waiting for the caller's review, not executing.`,
       );
     }
+    if (thread.status === 'review_failed') {
+      throw new Error(
+        `Cannot pause task ${threadId}: its review already failed (terminal). ` +
+          `Use re-review / rework / retry instead.`,
+      );
+    }
 
     const normalizedReason = (reason || '').trim() || 'Paused by user';
     const now = new Date().toISOString();

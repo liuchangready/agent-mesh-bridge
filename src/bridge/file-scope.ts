@@ -274,7 +274,10 @@ export function knownTaskFiles(thread: DelegationThread): string[] {
 
 /** True when another open task still occupies this task's declared files. */
 function isScopeBlocking(thread: DelegationThread, now: number): boolean {
-  if (thread.status === 'failed') return false; // terminal; caller decides
+  // Terminal states release the file scope too: `failed` because the caller
+  // decides what to do, `review_failed` because the developer round finished and
+  // only the verdict is missing (its work is still in the worktree / branch).
+  if (thread.status === 'failed' || thread.status === 'review_failed') return false;
   if (thread.status === 'completed') {
     if (thread.mergeRequest) return false; //收口完成：改动已经推出工作区
     const updated = new Date(thread.updatedAt || thread.createdAt || 0).getTime();

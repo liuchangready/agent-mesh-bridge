@@ -4,6 +4,7 @@ import type { CallbackManager } from './callback-manager';
 import {
   REVIEW_STALL_TIMEOUT_MS,
   REVIEW_WAKE_MAX_AUTO_RETRIES,
+  applyReviewFailure,
   buildReviewWakeState,
   isAutoRetryDue,
   noteAutoRetryLaunched,
@@ -11,7 +12,14 @@ import {
   describeReviewWake,
   reviewBlockDependencyId,
 } from './review-wake';
-import { DelegationRound, DelegationThread, RateLimitInfo, ReviewWakeState } from './types';
+import {
+  DelegationRound,
+  DelegationThread,
+  RateLimitInfo,
+  ReviewFailure,
+  ReviewWakeState,
+  latestCompletedWorkRound,
+} from './types';
 import { TaskRoleLock } from './task-role-lock';
 import { callerSessionKey } from './caller-wake-queue';
 
@@ -171,7 +179,13 @@ export class ReviewWakeScheduler extends EventEmitter {
         // Out of automatic attempts: surface "manual action required" instead of
         // re-arming a timer that can never fire.
         if ((state.autoRetryAttempts || 0) >= REVIEW_WAKE_MAX_AUTO_RETRIES) {
-          if (!state.gaveUp) this.persist(thread, planAutoRetry(state, now));
+          const planned = state.gaveUp ? state : planAutoRetry(state, now);
+          this.persist(thread, planned, {
+            kind: 'retries_exhausted',
+            reason:
+              `检视唤醒自动重试已耗尽（${planned.attempts} 次失败）：` +
+              `${planned.lastError || '未知原因'}`,
+          });
           continue;
         }
         if (!isAutoRetryDue(state, now)) continue;
@@ -243,7 +257,36 @@ export class ReviewWakeScheduler extends EventEmitter {
         const state = thread.reviewWake;
         if (state) {
           // A record from an older round is stale, not "review in progress".
-          if (state.round !== thread.currentRound) this.clear(thread);
+          if (state.round !== thread.currentRound) {
+            this.clear(thread);
+            continue;
+          }
+          // Heal ledgers written before `review_failed` existed: a wake plan that
+          // already gave up means no reviewer is coming. Rows used to stay
+          // `waiting_review` forever in that shape (the old watchdog skipped any
+          // thread that already had a record), which keeps occupying the queue.
+          if (state.gaveUp) {
+            const healed = applyReviewFailure(thread, {
+              kind: (state.autoRetryAttempts || 0) > 0 ? 'retries_exhausted' : 'unresolvable_park',
+              reason:
+                `检视未取得结论（历史记录迁移）：${state.lastError || '未知原因'}`,
+              round: state.round,
+              by: 'watchdog',
+              wake: state,
+            });
+            if (healed) {
+              try {
+                thread.updatedAt = new Date().toISOString();
+                this.taskStore.upsertTask(thread);
+                stalled.push(thread);
+              } catch (err) {
+                console.warn(
+                  `[ReviewWakeScheduler] Could not heal gave-up review for ${thread.threadId}:`,
+                  err,
+                );
+              }
+            }
+          }
           continue;
         }
         // A park is only healthy when it names a dependency that still exists
@@ -283,14 +326,28 @@ export class ReviewWakeScheduler extends EventEmitter {
               : `检视无进展：已等待超过 ${minutes} 分钟且没有活跃的检视进程（reviewer timeout）`,
           now,
         });
+        // Clear the park is what makes `notifyCaller` accept the manual
+        // re-review. Capture the caller's own reason BEFORE clearing: the park
+        // reason is the most useful part of the failure record, and it used to
+        // be lost when the dead park was removed.
+        const parkReason = thread.reviewBlocked?.reason?.trim();
         if (unresolvablePark) {
           next.autoRetryAt = undefined;
           next.gaveUp = true;
-          // Clearing the park is what makes `notifyCaller` accept the manual
-          // re-review; the original intent stays in `reviewWake.lastError`.
           thread.reviewBlocked = undefined;
         }
-        this.persist(thread, next);
+        this.persist(
+          thread,
+          next,
+          unresolvablePark
+            ? {
+                kind: 'unresolvable_park',
+                reason: `检视挂起在桥接无法观测的依赖上${
+                  parkedOnDeletedDependency ? `（依赖线程 ${dependencyId} 已不存在）` : ''
+                }${parkReason ? `：${parkReason}` : '：检视方未记录 waitingForThreadId'}`,
+              }
+            : undefined,
+        );
         stalled.push(thread);
       } catch (err) {
         console.warn(
@@ -380,19 +437,42 @@ export class ReviewWakeScheduler extends EventEmitter {
     }
   }
 
-  /** The round the reviewer still has to inspect. */
+  /**
+   * The round the reviewer still has to inspect.
+   *
+   * Always the LATEST completed work round. A stalled `reviewWake.round` is a
+   * historical record of when the retry plan was armed; a rework may have
+   * completed since then, and reviewing that older round would both log into the
+   * wrong `<round>.reviewer.log` and hand the reviewer a stale report.
+   */
   private reviewRound(thread: DelegationThread): DelegationRound | undefined {
-    const target = thread.reviewWake?.round ?? thread.currentRound;
-    return (
-      (thread.rounds || []).find((r) => r.round === target && r.status === 'completed') ||
-      [...(thread.rounds || [])].reverse().find((r) => r.status === 'completed')
-    );
+    return latestCompletedWorkRound(thread);
   }
 
-  private persist(thread: DelegationThread, state: ReviewWakeState): void {
+  private persist(
+    thread: DelegationThread,
+    state: ReviewWakeState,
+    failure?: { kind: ReviewFailure['kind']; reason: string },
+  ): void {
     try {
       thread.reviewWake = state;
-      thread.updatedAt = new Date().toISOString();
+      if (state.gaveUp) {
+        // No automatic attempt left: the review did not succeed and will not
+        // retry itself. Make that a first-class terminal status so the queue
+        // advances and the cause stays visible, instead of parking the task in
+        // `waiting_review` forever.
+        applyReviewFailure(thread, {
+          kind: failure?.kind || 'retries_exhausted',
+          reason:
+            failure?.reason ||
+            `检视未能完成（${state.lastError || '达到自动重试上限'}）`,
+          round: state.round,
+          by: failure?.kind === 'unresolvable_park' ? 'watchdog' : 'scheduler',
+          wake: state,
+        });
+      } else {
+        thread.updatedAt = new Date().toISOString();
+      }
       this.taskStore.upsertTask(thread);
       this.emit('planChanged', { threadId: thread.threadId, state });
     } catch (err) {
