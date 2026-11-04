@@ -13,6 +13,7 @@ import {
   findInFlightRound,
   findQueueHead,
   getInFlightRounds,
+  isReviewerBootstrapPending,
   isUserInterruption,
   shouldResumeNativeSession,
 } from './types';
@@ -404,6 +405,20 @@ export class TaskSupervisor extends EventEmitter {
         continue;
       }
 
+      // Dedicated review: the reviewer conversation must dispatch the task
+      // before any developer round may start. Flipping the task to `running`
+      // here and bouncing it back to `queued` inside executeThreadRound() made
+      // the pump rewrite the whole ledger twice per tick for a task that could
+      // never start.
+      if (isReviewerBootstrapPending(thread)) {
+        this.markQueued(
+          thread,
+          undefined,
+          'Queued: waiting for the dedicated reviewer conversation to dispatch this task.',
+        );
+        continue;
+      }
+
       this.startingThreadId = thread.threadId;
       try {
         if (thread.status === 'queued') {
@@ -552,6 +567,20 @@ export class TaskSupervisor extends EventEmitter {
         continue;
       }
 
+      // Dedicated review: the reviewer conversation must dispatch the task
+      // before any developer round may start. Flipping the task to `running`
+      // here and bouncing it back to `queued` inside executeThreadRound() made
+      // the pump rewrite the whole ledger twice per tick for a task that could
+      // never start.
+      if (isReviewerBootstrapPending(thread)) {
+        this.markQueued(
+          thread,
+          undefined,
+          'Queued: waiting for the dedicated reviewer conversation to dispatch this task.',
+        );
+        continue;
+      }
+
       this.startingThreadId = thread.threadId;
       try {
         if (thread.status === 'queued') {
@@ -603,6 +632,18 @@ export class TaskSupervisor extends EventEmitter {
     detail?: string,
     scopeConflict?: ScopeConflict,
   ): void {
+    // Never demote a task that is genuinely executing. A live lease owned by
+    // THIS thread means another process is running its round: every VS Code
+    // window hosts a supervisor, but only the lease owner executes. The loser
+    // of the lease race used to write `queued` on every pump, so a running task
+    // displayed as "Queued" for the whole round while its log kept growing.
+    if (this.activeTasks.has(thread.threadId)) return;
+    const gatePolicy = concurrencyPolicy();
+    const liveOwner = this.executionGate.getOwner(
+      gatePolicy.enabled ? normalizeWorkspaceKey(thread.workspacePath) : undefined,
+    );
+    if (liveOwner && liveOwner.threadId === thread.threadId) return;
+
     const snippet =
       detail ||
       (owner
@@ -644,6 +685,15 @@ export class TaskSupervisor extends EventEmitter {
       return Promise.resolve();
     }
     const fresh = stored;
+    // Dedicated review: the reviewer conversation must dispatch first.
+    if (isReviewerBootstrapPending(fresh)) {
+      this.markQueued(
+        fresh,
+        undefined,
+        'Queued: waiting for the dedicated reviewer conversation to dispatch this task.',
+      );
+      return Promise.resolve();
+    }
     const inFlight = findInFlightRound(fresh);
     if (inFlight && inFlight.round !== round.round) {
       console.warn(

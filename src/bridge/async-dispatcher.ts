@@ -13,10 +13,13 @@ import {
   WorktreeInfo,
   getModelRouting,
   isTaskUnfinished,
+  isReviewerBootstrapPending,
   isValidSessionId,
   isUserInterruption,
   shouldResumeNativeSession,
 } from './types';
+import { readBridgePolicy } from './bridge-policy';
+import { resolveReviewFlow, writeReviewerBootstrapToken } from './reviewer-bootstrap';
 import { TaskStore } from './task-store';
 import { AgentDetector } from './agent-detector';
 import { ActiveAgentResolver } from './active-agent-resolver';
@@ -34,7 +37,7 @@ import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
 import { ExecutionGate, ExecutionOwner, normalizeWorkspaceKey } from './execution-gate';
 import { QueueDrainer, QueuedExecution } from './queue-drainer';
 import { TaskRoleLock } from './task-role-lock';
-import { resolveInitiatorModel } from './model-catalog';
+import { resolveConfiguredModel, resolveInitiatorModel } from './model-catalog';
 import { appendCompactionProtocol, compactRoundBestEffort } from './context-compactor';
 import { readStoredRoundUsage } from './token-usage-collector';
 import { concurrencyPolicy } from './bridge-policy';
@@ -147,7 +150,30 @@ export class AsyncDispatcher {
     }
 
     const callerFromEnv = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
-    const initiatorAgent: AgentId = params.initiatorAgent || callerFromEnv || 'antigravity';
+    // Who is speaking for itself here. `undefined` means the caller identity is
+    // genuinely unknown (legacy in-process callers); the historical
+    // "antigravity" fallback below must not turn that into a self-dispatch hit.
+    const knownInitiator: AgentId | undefined = params.initiatorAgent || callerFromEnv;
+
+    // Review topology is pinned per task. Dedicated needs a long-lived host to
+    // launch the reviewer bootstrap, so a standalone MCP process falls back to
+    // legacy instead of creating a task nobody could dispatch.
+    const reviewFlow = resolveReviewFlow(params.reviewFlow, readBridgePolicy().reviewFlow);
+
+    // Same-agent dispatch is allowed ONLY with the dedicated reviewer: the
+    // reviewer gets its own fresh conversation, so it can never collide with the
+    // session that is running this very dispatch. Legacy review resumes the
+    // requester's own conversation and would deadlock on the native writer lock.
+    if (knownInitiator && targetAgent === knownInitiator && reviewFlow !== 'dedicated') {
+      throw new Error(
+        `Refusing to dispatch "${params.title || 'Untitled Delegation Task'}" from ${knownInitiator} to itself: ` +
+          `self-dispatch requires the dedicated reviewer flow (the VS Code extension host must be running so a ` +
+          `fresh reviewer conversation can dispatch the task). A legacy review would resume the requester's own ` +
+          `session while it is still busy with this dispatch.`,
+      );
+    }
+
+    const initiatorAgent: AgentId = knownInitiator || 'antigravity';
     const now = new Date();
     const threadId = this.generateThreadId(now);
     const receiverSessionId = crypto.randomUUID();
@@ -250,17 +276,56 @@ export class AsyncDispatcher {
     const targetModel = modelResolution.model;
     const modelNotice = modelResolution.notice;
 
+    // Dedicated reviewer model: the sender-side default, pinned for the whole
+    // task. It must never fall back to the receiver default, or a same-agent task
+    // would trivially review itself with the execution model.
+    const reviewerModel =
+      reviewFlow === 'dedicated'
+        ? resolveConfiguredModel(initiatorAgent, undefined, 'initiator')
+        : undefined;
+    if (reviewFlow === 'dedicated' && initiatorAgent === targetAgent) {
+      if (!reviewerModel) {
+        throw new Error(
+          `Refusing same-agent task "${params.title}": configure a sender-side reviewer model for ` +
+            `${initiatorAgent} (agentMeshBridge.initiatorModels.*) that differs from the receiver model.`,
+        );
+      }
+      if (!targetModel) {
+        throw new Error(
+          `Refusing same-agent task "${params.title}": configure a receiver-side model for ` +
+            `${initiatorAgent} (agentMeshBridge.models.*) so the reviewer and the executor cannot be the same model.`,
+        );
+      }
+      if (reviewerModel === targetModel) {
+        throw new Error(
+          `Refusing same-agent task "${params.title}": reviewer and receiver both run ${reviewerModel}. ` +
+            `A model must not review its own output; configure a different sender-side model for ${initiatorAgent}.`,
+        );
+      }
+    }
+
     const tempCandidate: DelegationThread = {
       threadId,
       title: params.title || 'Untitled Delegation Task',
       initiatorAgent,
       targetAgent,
-      status: 'running',
+      status: reviewFlow === 'dedicated' ? 'queued' : 'running',
       currentRound: 1,
       createdAt: nowIso,
       updatedAt: nowIso,
       receiverSessionId,
-      callerSessionId,
+      ...(reviewFlow === 'dedicated'
+        ? {
+            reviewFlow,
+            requesterSessionId: callerSessionId,
+            requesterAgent: initiatorAgent,
+            requesterModel: initiatorModel.model,
+            requesterModelSource: initiatorModel.source,
+            reviewerModel,
+            reviewerModelSource: reviewerModel ? ('sender-configured' as const) : ('none' as const),
+            reviewBootstrap: { phase: 'pending' as const, attempts: 0 },
+          }
+        : { callerSessionId }),
       workspacePath,
       ...(worktree ? { worktree } : {}),
       initiatorModel: initiatorModel.model,
@@ -273,7 +338,10 @@ export class AsyncDispatcher {
       scopeOverride: params.allowScopeOverlap ? true : undefined,
       summary: {
         lastPromptSnippet: (params.prompt || '').slice(0, 100),
-        lastOutputSnippet: 'Executing in background...',
+        lastOutputSnippet:
+          reviewFlow === 'dedicated'
+            ? 'Starting the dedicated reviewer conversation...'
+            : 'Executing in background...',
         totalDurationMs: 0,
       },
       rounds: [round1],
@@ -344,6 +412,51 @@ export class AsyncDispatcher {
     // Commit initial state to TaskStore
     this.taskStore.upsertTask(thread);
 
+    // Dedicated review: the developer must NOT start yet. A fresh reviewer
+    // conversation is launched by the extension-host bootstrap service; its
+    // `dispatch_task` call (with the one-time token) is what releases the task.
+    if (reviewFlow === 'dedicated') {
+      const token = crypto.randomUUID();
+      const tokenWritten = writeReviewerBootstrapToken({
+        threadId,
+        token,
+        agent: initiatorAgent,
+        createdAt: nowIso,
+      });
+      if (!tokenWritten) {
+        thread.status = 'failed';
+        thread.reviewBootstrap = { phase: 'failed', attempts: 0, lastError: 'token write failed' };
+        thread.summary.lastOutputSnippet = '[Reviewer bootstrap failed] could not write the dispatch token';
+        this.taskStore.upsertTask(thread);
+        throw new Error(
+          `Could not start the dedicated reviewer for ${threadId}: the bootstrap token could not be written.`,
+        );
+      }
+      const routing = getModelRouting(thread);
+      const reviewerLine =
+        `Dedicated reviewer ${initiatorAgent}` +
+        `${reviewerModel ? `(${reviewerModel})` : ''} will dispatch this task to ${targetAgent}` +
+        `${targetModel ? `(${targetModel})` : ''}.`;
+      const stopInstruction =
+        'STOP NOW — a dedicated reviewer conversation is starting and will dispatch this task. ' +
+        'End your turn immediately: you are NOT the reviewer and the bridge will not wake you for review. ' +
+        'The reviewer reports the result into the task summary; use get_task_summary or the task tree.';
+      return {
+        threadId,
+        receiverSessionId,
+        targetAgent,
+        status: 'REVIEWER_STARTING',
+        message:
+          `nextAction=END_TURN_AND_WAIT_FOR_CALLBACK. ${stopInstruction} ` +
+          `Task ${threadId} created. ${reviewerLine} Model routing: ${routing.text}.`,
+        modelRouting: routing,
+        modelNotice,
+        modelApproval: modelResolution.approval,
+        nextAction: 'END_TURN_AND_WAIT_FOR_CALLBACK',
+        stopInstruction,
+      };
+    }
+
     // If TaskSupervisor is actively running (e.g. in VS Code extension host),
     // let it supervise execution persistently to prevent child processes from being killed when ephemeral MCP CLI exits.
     if (TaskSupervisor.isSupervisorActive()) {
@@ -405,6 +518,17 @@ export class AsyncDispatcher {
     prompt: string,
     isRework: boolean,
   ): Promise<void> {
+    // A dedicated task may not execute before its reviewer conversation has
+    // dispatched it. The bootstrap service owns that first turn.
+    if (isReviewerBootstrapPending(thread)) {
+      this.markThreadQueued(
+        thread,
+        undefined,
+        'Queued: waiting for the dedicated reviewer conversation to dispatch this task.',
+      );
+      this.queueDrainer.schedule(1_500);
+      return;
+    }
     // Batch-level scope gate: never start a round on files another open task is
     // still holding (declared or measured). Checked before any lease is taken so
     // a blocked task cannot sit on the global slot.

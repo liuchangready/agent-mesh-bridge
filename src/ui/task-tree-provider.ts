@@ -68,6 +68,10 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
         iconName = 'eye';
         statusLabel = `In-Review (${roundText})`;
         break;
+      case 'review_failed':
+        iconName = 'warning';
+        statusLabel = `Review Failed · 检视失败 (${roundText})`;
+        break;
       case 'paused':
         iconName = 'debug-pause';
         statusLabel = `Paused (已暂停)`;
@@ -90,6 +94,13 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     // dispatched from (↑) and which model the receiver executes with (↓).
     const routing = getModelRouting(thread);
     const modelBadge = ` · ↑${routing.initiatorModel || '默认'} → ↓${routing.targetModel || '默认'}`;
+    const flowBadge =
+      thread.reviewFlow === 'dedicated'
+        ? thread.reviewBootstrap && thread.reviewBootstrap.phase !== 'confirmed'
+          ? ' · 🧭审阅会话启动中'
+          : ' · 🧭专用审阅'
+        : '';
+    const archiveBadge = thread.archivedAt ? ' · 📦已归档' : '';
 
     // Surface a round that merely repeats an earlier instruction: it is a
     // re-send of the same prompt, not a second task.
@@ -139,6 +150,13 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
         : ' · ⏸挂起(外部依赖)'
       : '';
 
+    // A failed review is terminal (it released the queue slot). Show WHY on the
+    // row: without the reason the user only sees that nobody reviewed.
+    const reviewFailureBadge =
+      thread.status === 'review_failed'
+        ? ` · 🚫${(thread.reviewFailure?.reason || '未记录原因').slice(0, 60)}`
+        : '';
+
     // Derived from the rounds (never a stored aggregate): cheap, and cannot go
     // stale after another process finalizes a round.
     const tokenSummary = aggregateThreadTokenUsage(thread.rounds || []);
@@ -147,7 +165,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
         ? ` · ${tokenSummary.isPartialOrEstimated ? '~' : ''}${formatTokenCount(tokenSummary.totalTokens)} tok`
         : '';
 
-    const description = `${statusLabel} · ${durationText}${modelBadge}${tokenBadge}${repeatBadge}${scopeBadge}${reviewBadge}${blockedBadge}`;
+    const description = `${statusLabel} · ${durationText}${modelBadge}${flowBadge}${archiveBadge}${tokenBadge}${repeatBadge}${scopeBadge}${reviewBadge}${blockedBadge}${reviewFailureBadge}`;
 
     const item = new TaskTreeItem(label, vscode.TreeItemCollapsibleState.Collapsed, thread);
     item.description = description;
@@ -164,7 +182,9 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
             : 'waiting_review'
         : thread.status === 'paused'
           ? 'paused_task'
-          : 'task_item';
+          : thread.status === 'review_failed'
+            ? 'review_failed'
+            : 'task_item';
 
     // Click command
     item.command = {

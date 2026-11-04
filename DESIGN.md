@@ -184,6 +184,7 @@ interface ResponseAssessment {
 - `queued` / `running` / `reworking` / `waiting_review` / `paused` 都算未完成；
 - 即使任务已经交付并处于 `waiting_review`，其他任务也不得启动；
 - `failed` 作为终止态释放队列（避免历史失败任务永久阻塞），重试后重新占用；
+- `review_failed` 同样是终止态并释放队列：receiver 已交付，但检视没有取得结论且桥接不再自动唤醒（`reviewWake.gaveUp`），原因记录在 `thread.reviewFailure`；重新检视 / 返修 / 重试 / 验收后重新占用；
 - 队头按 `createdAt` 由 `findQueueHead()` 选出；
 - `TaskSupervisor` / `QueueDrainer` 只允许启动队头任务；队头无在飞轮次时直接停止调度；
 - `AsyncDispatcher` 只要有任意未完成任务，新任务立即返回 `QUEUED`，并注明等待的 `threadId` 与阶段；
@@ -212,9 +213,28 @@ interface ResponseAssessment {
 四端 CLI 的模型能力并不一致，因此每条下发任务都同时记录**发送方模型**与**接收方模型**：
 
 - **发现（`list_agent_models`）**：Antigravity 解析 `agy models`；Codex 解析 `codex debug models`（失败时回退 `~/.codex/models_cache.json` 与 `config.toml`）；Claude Code 查询其网关的 `GET {ANTHROPIC_BASE_URL}/v1/models`（失败时回退 `sonnet/opus/haiku` 别名与 `settings.json` 的别名映射）；DeepSeek Harness 查询 provider 的 `GET {baseUrl}/models`（失败时回退 profile 路由里的模型）。结果缓存于 `~/.agent-mesh-bridge/models-cache.json`（默认 6 小时）。
-- **配置**：`agentMeshBridge.models.<agent>` 设置项（或命令 **Agent Bridge: Select Model for Agent**）写入 `~/.agent-mesh-bridge/model-config.json`，供无 VS Code API 的独立 MCP server 进程读取。
-- **注入**：Codex 用全局 `-c model="..."`（对 `exec` 与 `exec resume` 都有效，且不会误判为位置参数）；Claude 用 `--model`；Antigravity 用 `--model`；DSH 无 `--model`，改为生成一次性 overlay patch 并以 `dsh headless --patch <file>` 应用（`--dump-config` 已验证：只覆盖本次运行的 `agent-default-model` 与 `llm-pi-ai`，不改用户 profile）。
-- **记录**：`dispatch_task` 把 `initiatorModel`（显式传参 → 环境提示 → 发送方配置默认）与 `targetModel`（显式 `model` → 接收方配置默认）落到账本；返修/重试沿用同一 `targetModel`，避免中途换模型。任务树、详情面板与 MCP 响应统一用 `getModelRouting()` 输出 `sender A: x -> receiver B: y`。
+- **配置（两端分开）**：`agentMeshBridge.models.<agent>` 是**接收者默认**（该 Agent 执行被派发任务时用），`agentMeshBridge.initiatorModels.<agent>` 是**下发者默认**（该 Agent 作为下发者/检视者被唤醒时用）。命令 **Agent Bridge: Select Model for Agent** 先选「接收者 / 下发者」，再选型号；两者分别写入 `~/.agent-mesh-bridge/model-config.json` 的 `models` / `initiatorModels`，供无 VS Code API 的独立 MCP server 进程读取，互不覆盖。同一个 Agent 可以自派发，但仅限专用 reviewer 流程，且 reviewer 模型与执行模型必须不同（同模型不得审阅自己的输出）。
+- **注入**：Codex 用全局 `-c model="..."`（对 `exec` 与 `exec resume` 都有效，且不会误判为位置参数）；Claude 用 `--model`；Antigravity 用 `--model`；DSH 无 `--model`，改为生成一次性 overlay patch 并以 `dsh headless --patch <file>` 应用（`--dump-config` 已验证：只覆盖本次运行的 `agent-default-model` 与 `llm-pi-ai`，不改用户 profile）。检视/失败唤醒 caller 时同样按**下发者默认**注入上述参数（`CallbackManager.launchCaller()`），caller 实际模型写入 `callbacks.log` 与 reviewer 日志头。
+- **记录**：`dispatch_task` 把 `initiatorModel`（显式传参 → 环境提示 → 下发者配置默认 → 接收者配置默认（兼容回退））与 `targetModel`（显式 `model` → 接收者配置默认）落到账本；`initiatorModelSource` 用 `sender-configured` / `configured` 区分两端默认来源。返修/重试沿用同一 `targetModel`，避免中途换模型。任务树、详情面板与 MCP 响应统一用 `getModelRouting()` 输出 `sender A: x -> receiver B: y`。
+
+### 2.8 专用 Reviewer 会话、会话级锁与终态归档
+
+新任务（`reviewFlow: 'dedicated'`）不再 resume 请求方会话，而是由桥接创建独立的 reviewer 会话：
+
+1. `dispatch_task` 解析两端模型并校验同 Agent 时 `reviewerModel !== targetModel`，创建 `status=queued`、`reviewBootstrap.phase='pending'` 的任务；developer 轮次被 `isReviewerBootstrapPending()` 拦住。
+2. 扩展宿主的 `ReviewerBootstrapService` 在 FIFO 队头、执行槽空闲时拉起一个**全新** reviewer 会话（`MESH_REVIEW_BOOTSTRAP=1` + 一次性 token，token 同时写进 bootstrap prompt），该轮只调用一次 `dispatch_task`；MCP 的 `confirmReviewerBootstrap()` 用账本固化的 brief 确认任务，不创建第二个任务。识别按序走四条通道（prompt 里的 `reviewBootstrap` 凭证 → env 三元组 → 启动记录 pid == `process.ppid` → 无 brief 调用且该 Agent 只有唯一待确认任务），因为宿主可能清洗环境变量，也可能让 MCP server 的父进程不是桥接启动的 CLI。
+3. reviewer 进程退出后，宿主捕获原生会话 id 写入 `reviewerSessionId` / `callerSessionId`，释放执行槽，正常队列启动 developer。
+4. developer 完成后，审阅唤醒 resume **reviewer 会话**；`TaskRoleLock` 以该会话 id 为 key（`roles/conv_<sha1>.json`），并注入 `MESH_REVIEW_SESSION_ID`，`approve_task` / `request_rework` 校验会话一致。legacy 任务继续 resume 请求方会话、使用 thread 级锁。
+5. bootstrap 失败（超时、未调用工具、token 不匹配）→ 任务 `failed` + interruption，不会启动 developer。只靠 env 或只靠 pid 的识别会以 `the reviewer turn ended without calling dispatch_task` 误报失败（reviewer 其实已经调过工具）——2026-11-02 的 `thread_20261102_224144_b057` 即此事故。
+
+终态与保留边界（`AGENTS.md` 第 23 条）：
+
+- `completed` / `failed` / `review_failed` 时生成确定性 `finalSummary`，`get_task_summary` 可读；归档只保留摘要与轻量元数据。
+- 检视失败（`reviewWake.gaveUp`：自动重试耗尽或挂起在不可观测依赖上）转成终态 `review_failed`，`thread.reviewFailure` 记录 `{ kind, reason, at, round, by }` 并释放队列槽；重新检视会 `reopenFailedReview()` 回到 `waiting_review` 并保留失败记录。
+- 默认保留最新 20 个任务，超出的终态任务自动归档：清空 rounds、会话 id、bootstrap/wake 状态，删除 bridge 日志与 native 会话；`mergePending` worktree 任务不自动归档。
+- `delete_task` 是彻底清除：账本条目、bridge 日志、bootstrap token、native 会话全部删除；legacy 请求方会话永不清理。
+
+---
 
 ---
 
@@ -282,7 +302,7 @@ sequenceDiagram
 
 ```typescript
 export type AgentId = 'antigravity' | 'claude_code' | 'codex' | 'deepseek_harness' | 'vscode_chat';
-export type ThreadStatus = 'queued' | 'running' | 'waiting_review' | 'reworking' | 'paused' | 'completed' | 'failed';
+export type ThreadStatus = 'queued' | 'running' | 'waiting_review' | 'reworking' | 'paused' | 'review_failed' | 'completed' | 'failed';
 export type RoundStatus = 'running' | 'paused' | 'completed' | 'failed';
 export type InterruptionKind = 'paused' | 'stopped' | 'deleted' | 'timeout' | 'watchdog' | 'error';
 
@@ -310,8 +330,8 @@ export interface DelegationThread {
   workspacePath: string; // 执行工作区绝对路径
 
   // 模型路由 (任务列表/详情/MCP 响应都展示两端)
-  initiatorModel?: string; // 发送方模型 (显式 > 环境提示 > 配置默认)
-  initiatorModelSource?: 'explicit' | 'env' | 'configured' | 'none';
+  initiatorModel?: string; // 发送方模型 (显式 > 环境提示 > 下发者配置默认 > 接收者配置默认)
+  initiatorModelSource?: 'explicit' | 'env' | 'sender-configured' | 'configured' | 'none';
   targetModel?: string; // 接收方模型 (显式 model > 接收方配置默认), 返修/重试沿用
 
   // 中断追溯
@@ -423,7 +443,7 @@ export interface DelegationRound {
 - **功能**：检索最近的委派任务列表（上限 1000 条）。
 - **参数**：
   - `limit` (number, 可选): 默认 20，最大 1000
-  - `statusFilter` (string, 可选): `'all' | 'active' | 'running' | 'waiting_review' | 'reworking' | 'paused' | 'completed' | 'failed'`
+  - `statusFilter` (string, 可选): `'all' | 'active' | 'running' | 'waiting_review' | 'review_failed' | 'reworking' | 'paused' | 'completed' | 'failed'`
 - **返回值**：包含 `threadId, title, initiatorAgent, targetAgent, status, currentRound, summary` 的对象数组。
 
 ### 5. `get_thread_details`（查看单条任务完整交互历史）

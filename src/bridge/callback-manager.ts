@@ -12,18 +12,20 @@ import {
   ReviewWakeState,
   findInFlightRound,
   isValidSessionId,
+  latestCompletedWorkRound,
 } from './types';
 import { AgentDetector } from './agent-detector';
 import { defaultBinary, needsShellWrapper } from './platform';
 import { buildDshHeadlessCommand } from './deepseek-harness';
+import { resolveConfiguredModel, writeDshModelOverlay } from './model-catalog';
 import { TaskRoleLock, TaskRoleLease } from './task-role-lock';
 import { CallerWakeQueue, WakeRequest } from './caller-wake-queue';
 import type { TaskStore } from './task-store';
 import { aggregateThreadTokenUsage, formatTokenCount } from './token-usage-collector';
-import { buildReviewWakeState } from './review-wake';
+import { applyReviewFailure, buildReviewWakeState, reopenFailedReview } from './review-wake';
 import { detectRateLimitSignal } from './autonomous-runner';
 import { ReviewerLogWriter, createReviewerLogWriter } from './reviewer-log';
-import { resolveCodexResumeId } from './codex-session';
+import { cachedCodexResumeSupport, codexResumeArgument, extractCodexThreadId } from './codex-session';
 
 /**
  * How many times one task may wake its caller about failures.
@@ -94,7 +96,7 @@ export class CallbackManager extends EventEmitter {
       return;
     }
     if (next.kind === 'review') {
-      if (thread.status !== 'waiting_review') {
+      if (thread.status !== 'waiting_review' && thread.status !== 'review_failed') {
         console.log(
           `[CallbackManager] Dropping queued review wake for ${next.threadId}: status is now "${thread.status}".`,
         );
@@ -118,10 +120,15 @@ export class CallbackManager extends EventEmitter {
   public async notifyCaller(thread: DelegationThread, round: DelegationRound): Promise<boolean> {
     const initiator = thread.initiatorAgent;
     const callerSessionId = this.resolveCallerSession(thread);
+    // A wake may be planned for an older round than the one actually delivered
+    // last. Always review/report the newest completed WORK round, so a stale plan
+    // cannot hand the reviewer an old report or write the wrong `<round>` log.
+    const latestWork = latestCompletedWorkRound(thread);
+    const reviewRound = latestWork && latestWork.round > round.round ? latestWork : round;
 
     if (!callerSessionId) {
       console.warn(
-        `[CallbackManager] Thread ${thread.threadId} completed round ${round.round}, but no valid callerSessionId provided or detected.`,
+        `[CallbackManager] Thread ${thread.threadId} completed round ${reviewRound.round}, but no valid callerSessionId provided or detected.`,
       );
       return false;
     }
@@ -142,6 +149,16 @@ export class CallbackManager extends EventEmitter {
       );
       return false;
     }
+    // A failed review is re-openable by definition: the delivered work is still
+    // there, only the verdict is missing. Waking the reviewer again turns the
+    // task back into a live review (and re-occupies its queue slot) on the same
+    // round and native session; the recorded failure stays as audit history.
+    if (thread.status === 'review_failed') {
+      reopenFailedReview(thread);
+      try {
+        this.taskStore?.upsertTask(thread);
+      } catch {}
+    }
     if (thread.status !== 'waiting_review') {
       console.warn(
         `[CallbackManager] Refusing to wake reviewer for ${thread.threadId}: ` +
@@ -159,7 +176,7 @@ export class CallbackManager extends EventEmitter {
 
     const wakeRequest: WakeRequest = {
       threadId: thread.threadId,
-      round: round.round,
+      round: reviewRound.round,
       kind: 'review',
       enqueuedAt: Date.now(),
     };
@@ -168,7 +185,13 @@ export class CallbackManager extends EventEmitter {
     }
 
     const roleLock = new TaskRoleLock();
-    const roleLease: TaskRoleLease | null = roleLock.tryAcquire(thread.threadId, 'reviewer');
+    const reviewerConversationId =
+      thread.reviewFlow === 'dedicated' ? thread.callerSessionId : undefined;
+    const roleLease: TaskRoleLease | null = roleLock.tryAcquire(
+      thread.threadId,
+      'reviewer',
+      reviewerConversationId,
+    );
     if (!roleLease) {
       const owner = roleLock.getOwner(thread.threadId);
       this.wakeQueue.release(callerSessionId);
@@ -179,30 +202,30 @@ export class CallbackManager extends EventEmitter {
       return false;
     }
 
-    this.emit('taskCompleted', { thread, round });
+    this.emit('taskCompleted', { thread, round: reviewRound });
 
-    const preview = round.output
-      ? round.output.slice(0, 200).replace(/[\r\n]+/g, ' ')
-      : round.error
-        ? `Error: ${round.error.slice(0, 150)}`
+    const preview = reviewRound.output
+      ? reviewRound.output.slice(0, 200).replace(/[\r\n]+/g, ' ')
+      : reviewRound.error
+        ? `Error: ${reviewRound.error.slice(0, 150)}`
         : 'Completed';
 
     // Callee token line: only when something was actually measured. A missing
     // measurement must not be rendered as "0 tokens".
     const tokenLine = (() => {
-      const usage = round.tokenUsage;
+      const usage = reviewRound.tokenUsage;
       if (!usage || !usage.available) return '';
       const tilde = usage.source === 'estimated' || usage.partial ? '~' : '';
       const cumulative = aggregateThreadTokenUsage(thread.rounds || []);
       const cumulativeTilde = cumulative.isPartialOrEstimated ? '~' : '';
       return (
-        `\n📊 Callee Token: Round ${round.round} ${tilde}${formatTokenCount(usage.totalTokens)}` +
+        `\n📊 Callee Token: Round ${reviewRound.round} ${tilde}${formatTokenCount(usage.totalTokens)}` +
         ` (输入 ${formatTokenCount(usage.promptTokens)} · 输出 ${formatTokenCount(usage.outputTokens)} · 缓存 ${formatTokenCount(usage.cacheReadTokens)})` +
         ` · 任务累计 ${cumulativeTilde}${formatTokenCount(cumulative.totalTokens)}`
       );
     })();
 
-    const promptMessage = `[Agent Mesh Bridge 自动化闭环验收指令] 任务【${thread.title}】第 ${round.round} 轮已由 ${thread.targetAgent} 执行完成。\n结果摘要: ${preview}${tokenLine}\n\n本任务已有中间文档链保存在任务账本（历轮指令 / 开发报告 / 返修意见）。get_thread_details(threadId="${thread.threadId}") 默认返回有界视图：最新轮完整，较早轮次可能是「提纯胶囊」卡片；需要逐字核对某一历史轮时用 get_round_raw_log(threadId="${thread.threadId}", round=<轮号>)，不要为此读取整段历史。必须沿用同一 threadId 与当前 callerSessionId 继续，禁止新建任务、另起会话或转派给其他 Agent。\n\n请作为任务下发方立即执行自动化检视闭环（判据只看**本任务自身范围**）：\n1. 审查本任务范围的代码与产出，并在当前工作区实际运行相关测试验证；\n2. 本任务范围内存在编译报错、测试未通过或功能缺陷：立即调用 request_rework(threadId="${thread.threadId}", feedback="具体报错与修复要求")；\n3. 本任务范围已通过、只是同批其他任务/依赖尚未交付：**不要**再发一轮 rework 空转，改用 request_rework(threadId="${thread.threadId}", feedback="阻塞说明", blocked=true, waitingForThreadId="<被依赖的 threadId>") 挂起；桥接不占用轮次，并在依赖到达 completed/failed 时自动唤醒你；\n4. 本任务范围通过即调用 approve_task(threadId="${thread.threadId}", remarks="本任务范围的验收结论与测试结果")。**不要用同批其他任务的 skip/失败否决本任务**——批次门禁属于收口阶段，由你在第 5 步统一处理；\n5. 验收通过后，由你作为调用者统一收口一个 MR：汇总该任务及同一批尚未推送的改动，只创建一个 MR，使用仓库既有远端与 gh/glab/等价 CLI 推送到远端；然后调用 mcp 工具 record_merge_request(threadId="${thread.threadId}", url="MR URL", branch="源分支", commit="提交 SHA", remote="origin", status="synced", summary="MR 摘要") 记录 MR 信息。不要每个子任务各推一次，不要新建任务/会话；开发者(receiver)不负责提交/推送。\n注意：上一轮没有任何文件改动时，本轮若再提交几乎相同的 rework 指令会被桥接拒绝（REWORK_NOOP_LOOP），只能 approve_task 或 blocked=true。\n请注意：请直接调用上述 MCP 工具完成闭环，请勿仅输出文本结论。`;
+    const promptMessage = `[Agent Mesh Bridge 自动化闭环验收指令] 任务【${thread.title}】第 ${reviewRound.round} 轮已由 ${thread.targetAgent} 执行完成。\n结果摘要: ${preview}${tokenLine}\n\n本任务已有中间文档链保存在任务账本（历轮指令 / 开发报告 / 返修意见）。get_thread_details(threadId="${thread.threadId}") 默认返回有界视图：最新轮完整，较早轮次可能是「提纯胶囊」卡片；需要逐字核对某一历史轮时用 get_round_raw_log(threadId="${thread.threadId}", round=<轮号>)，不要为此读取整段历史。必须沿用同一 threadId 与当前 callerSessionId 继续，禁止新建任务、另起会话或转派给其他 Agent。\n\n请作为任务下发方立即执行自动化检视闭环（判据只看**本任务自身范围**）：\n1. 审查本任务范围的代码与产出，并在当前工作区实际运行相关测试验证；\n2. 本任务范围内存在编译报错、测试未通过或功能缺陷：立即调用 request_rework(threadId="${thread.threadId}", feedback="具体报错与修复要求")；\n3. 本任务范围已通过、只是同批其他任务/依赖尚未交付：**不要**再发一轮 rework 空转，改用 request_rework(threadId="${thread.threadId}", feedback="阻塞说明", blocked=true, waitingForThreadId="<被依赖的 threadId>") 挂起；桥接不占用轮次，并在依赖到达 completed/failed 时自动唤醒你；\n4. 本任务范围通过即调用 approve_task(threadId="${thread.threadId}", remarks="本任务范围的验收结论与测试结果")。**不要用同批其他任务的 skip/失败否决本任务**——批次门禁属于收口阶段，由你在第 5 步统一处理；\n5. 验收通过后，由你作为调用者统一收口一个 MR：汇总该任务及同一批尚未推送的改动，只创建一个 MR，使用仓库既有远端与 gh/glab/等价 CLI 推送到远端；然后调用 mcp 工具 record_merge_request(threadId="${thread.threadId}", url="MR URL", branch="源分支", commit="提交 SHA", remote="origin", status="synced", summary="MR 摘要") 记录 MR 信息。不要每个子任务各推一次，不要新建任务/会话；开发者(receiver)不负责提交/推送。\n注意：上一轮没有任何文件改动时，本轮若再提交几乎相同的 rework 指令会被桥接拒绝（REWORK_NOOP_LOOP），只能 approve_task 或 blocked=true。\n请注意：请直接调用上述 MCP 工具完成闭环，请勿仅输出文本结论。`;
 
     let released = false;
     const release = () => {
@@ -216,7 +239,7 @@ export class CallbackManager extends EventEmitter {
       thread,
       callerSessionId,
       promptMessage,
-      round,
+      reviewRound,
       'review',
       release,
       (childPid) => roleLock.attachChild(roleLease, childPid),
@@ -348,6 +371,14 @@ export class CallbackManager extends EventEmitter {
     let callerSessionId = thread.callerSessionId;
     const initiator = thread.initiatorAgent;
 
+    // Dedicated review resumes the bridge-created reviewer conversation. If its
+    // native id was never captured, do NOT guess another session of the same
+    // agent: waking the requester (or an unrelated conversation) would put the
+    // review in the wrong chat and reintroduce the writer conflict.
+    if (thread.reviewFlow === 'dedicated') {
+      return callerSessionId && isValidSessionId(callerSessionId) ? callerSessionId : undefined;
+    }
+
     if ((!callerSessionId || !isValidSessionId(callerSessionId)) && this.detector) {
       callerSessionId = this.detector.detectActiveSession(initiator, thread.workspacePath, [
         thread.receiverSessionId,
@@ -381,6 +412,14 @@ export class CallbackManager extends EventEmitter {
   ): boolean {
     const initiator = thread.initiatorAgent;
     const cwd = thread.workspacePath || process.cwd();
+    // Wake the caller on its SENDER-side default model, which is configured
+    // separately from the receiver-side default: the same agent can dispatch a
+    // task to itself and execute it with a different model. An empty sender
+    // default means "whatever the agent/CLI already uses" (no flag).
+    const senderModel = resolveConfiguredModel(initiator, undefined, 'initiator');
+    const modelFlagArgs = senderModel ? ['--model', senderModel] : [];
+    // Codex takes the model as a global config override, valid for `exec resume`.
+    const codexModelArgs = senderModel ? ['-c', `model="${senderModel}"`] : [];
     const logDir = path.join(os.homedir(), '.agent-mesh-bridge');
     try {
       fs.mkdirSync(logDir, { recursive: true });
@@ -389,7 +428,7 @@ export class CallbackManager extends EventEmitter {
     let outFd: number | 'ignore' = 'ignore';
     try {
       outFd = fs.openSync(logPath, 'a');
-      const banner = `\n--- [${new Date().toISOString()}] Waking up ${initiator} (thread: ${thread.threadId}, round: ${round.round}, session: ${callerSessionId}) ---\n`;
+      const banner = `\n--- [${new Date().toISOString()}] Waking up ${initiator} (thread: ${thread.threadId}, round: ${round.round}, session: ${callerSessionId}, senderModel: ${senderModel || 'agent default'}) ---\n`;
       fs.writeSync(outFd, banner);
     } catch (e) {
       console.warn(`[CallbackManager] Could not open callback log:`, e);
@@ -410,7 +449,7 @@ export class CallbackManager extends EventEmitter {
         agent: initiator,
         sessionId: callerSessionId,
         kind: wakeKind,
-        note: `${thread.title} | receiver=${thread.targetAgent} | roundType=${round.type}`,
+        note: `${thread.title} | receiver=${thread.targetAgent} | roundType=${round.type} | senderModel=${senderModel || 'agent default'}`,
       },
     );
     // The callback wakes the INITIATOR, which must retain full bridge tools
@@ -419,6 +458,17 @@ export class CallbackManager extends EventEmitter {
     delete callbackEnv[MESH_TASK_RECEIVER_ENV];
     delete callbackEnv[MESH_TASK_THREAD_ENV];
     delete callbackEnv[MESH_TASK_ROUND_ENV];
+    // Never inherit bootstrap markers from the extension host; the reviewer
+    // wake is a normal caller turn, not a bootstrap turn.
+    delete callbackEnv.MESH_REVIEW_BOOTSTRAP;
+    delete callbackEnv.MESH_REVIEW_BOOTSTRAP_TOKEN;
+    delete callbackEnv.MESH_REVIEW_THREAD_ID;
+    if (thread.reviewFlow === 'dedicated') {
+      // Bind this wake to the reviewer conversation so approve/rework can only
+      // come from the conversation that holds the review role.
+      callbackEnv.MESH_REVIEW_SESSION_ID = callerSessionId;
+      callbackEnv.MESH_REVIEW_THREAD_ID = thread.threadId;
+    }
 
     const spawnOpts: child_process.SpawnOptions = {
       cwd,
@@ -506,7 +556,7 @@ export class CallbackManager extends EventEmitter {
       if (initiator === 'antigravity') {
         const agyPath =
           this.detector.resolveExecutable('antigravity') || defaultBinary('agy');
-        // agy.exe --conversation <callerSessionId> -p "<promptMessage>" --dangerously-skip-permissions --mode accept-edits
+        // agy.exe --conversation <callerSessionId> -p "<promptMessage>" --dangerously-skip-permissions --mode accept-edits [--model <senderModel>]
         const child = child_process.spawn(
           agyPath,
           [
@@ -517,6 +567,7 @@ export class CallbackManager extends EventEmitter {
             '--dangerously-skip-permissions',
             '--mode',
             'accept-edits',
+            ...modelFlagArgs,
           ],
           spawnOpts,
         );
@@ -531,7 +582,13 @@ export class CallbackManager extends EventEmitter {
         // prompt travels on stdin. As an argv element it would be routed
         // through cmd.exe on Windows (npm shim), which truncates the message at
         // the first newline and the caller would wake with half the checklist.
-        const claudeArgs = ['--resume', callerSessionId, '-p', '--dangerously-skip-permissions'];
+        const claudeArgs = [
+          '--resume',
+          callerSessionId,
+          '-p',
+          '--dangerously-skip-permissions',
+          ...modelFlagArgs,
+        ];
         const claudeSpawnOpts: child_process.SpawnOptions = {
           ...spawnOpts,
           // stdout/stderr are pumped into the callback log by attachErrorLogging.
@@ -557,27 +614,34 @@ export class CallbackManager extends EventEmitter {
 
       if (initiator === 'codex') {
         const codexPath = this.detector.resolveExecutable('codex') || defaultBinary('codex');
-        // `codex exec resume` resolves a thread by its rollout record; a bare
-        // thread UUID fails with "no rollout found for thread id". Heal the id
-        // (and the ledger copy) so the caller never has to know which spelling
-        // its own CLI printed.
-        const resumeId = resolveCodexResumeId(callerSessionId);
-        if (resumeId !== callerSessionId) {
+        // Which spelling `resume` accepts depends on the CLI generation: 0.16x
+        // resolves the thread UUID, older builds the rollout record. The
+        // launcher's own `resume --help` is probed once at activation (see
+        // extension.ts) and cached; the ledger always keeps the canonical UUID,
+        // so the stored value never depends on the installed build.
+        const support = cachedCodexResumeSupport(codexPath);
+        const resumeId = codexResumeArgument(callerSessionId, support);
+        const canonicalId = extractCodexThreadId(callerSessionId);
+        if (thread.callerSessionId !== canonicalId) {
           console.log(
-            `[CallbackManager] Normalising codex session ${callerSessionId} -> ${resumeId} for resume.`,
+            `[CallbackManager] Normalising codex session ${callerSessionId} -> ${canonicalId} in the ledger.`,
           );
           try {
-            thread.callerSessionId = resumeId;
+            thread.callerSessionId = canonicalId;
             this.taskStore?.upsertTask(thread);
           } catch (err) {
             console.warn('[CallbackManager] Could not persist the normalised caller session:', err);
           }
         }
-        // `--ask-for-approval` is a global option and must precede `exec`.
-        // codex --ask-for-approval never exec resume <rollout> "<promptMessage>" --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --skip-git-repo-check
+        // `--ask-for-approval` is a global option and must precede `exec`. The
+        // bundled thin client also needs `--no-daemon` (probed above) or it dies
+        // with "this CLI has no complete local package" before reviewing anything.
+        // codex [--no-daemon] [-c model="..."] --ask-for-approval never exec resume <id> "<promptMessage>" --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --skip-git-repo-check
         const child = child_process.spawn(
           codexPath,
           [
+            ...(support?.noDaemon ? ['--no-daemon'] : []),
+            ...codexModelArgs,
             '--ask-for-approval',
             'never',
             'exec',
@@ -604,11 +668,14 @@ export class CallbackManager extends EventEmitter {
           );
           return false;
         }
-        // dsh headless --session-id <callerSessionId> "<promptMessage>"
+        // dsh headless --session-id <callerSessionId> [--patch <sender-model-overlay>] "<promptMessage>"
         const built = buildDshHeadlessCommand(launcher, {
           prompt: promptMessage,
           sessionId: callerSessionId,
           json: false,
+          // DSH has no `--model`; the sender default travels as a one-run
+          // overlay patch, exactly like a receiver round's model.
+          modelOverlayPath: senderModel ? writeDshModelOverlay(senderModel) : undefined,
         });
         if (!built) {
           reviewerLog.writeOutcome({ error: 'unbuildable DeepSeek Harness launch command' });
@@ -707,6 +774,18 @@ export class CallbackManager extends EventEmitter {
     });
     target.reviewWake = state;
     target.updatedAt = new Date().toISOString();
+    if (state.gaveUp) {
+      // The retry budget is spent: no reviewer will ever be woken again on its
+      // own. Surface that as a terminal `review_failed` (releasing the queue
+      // slot) with the concrete cause, rather than a silent `waiting_review`.
+      applyReviewFailure(target, {
+        kind: 'retries_exhausted',
+        reason: `检视唤醒自动重试已耗尽（${state.attempts} 次失败）：${state.lastError}`,
+        round: round.round,
+        by: 'callback',
+        wake: state,
+      });
+    }
     try {
       this.taskStore?.upsertTask(target);
     } catch {}

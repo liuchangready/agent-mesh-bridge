@@ -37,7 +37,7 @@ import {
   ModelApprovalHandler,
   resolveDispatchModel,
 } from './model-approval';
-import { normalizeModelId } from './model-catalog';
+import { normalizeModelId, resolveConfiguredModel } from './model-catalog';
 
 export interface RetargetTaskParams extends ExecutorOverride {
   threadId: string;
@@ -89,6 +89,7 @@ export class TaskRetargetService {
     const previousAgent = thread.targetAgent;
     const previousModel = thread.targetModel;
     const nextAgent: AgentId = params.targetAgent || previousAgent;
+
     const agentChanged = nextAgent !== previousAgent;
     const requested = normalizeModelId(params.model);
 
@@ -102,6 +103,34 @@ export class TaskRetargetService {
       title: thread.title,
       handler: this.modelApprovalHandler,
     });
+
+    // Same-agent execution is allowed only for a dedicated-review task, and only
+    // when the reviewer model differs from the executor model. A model must never
+    // review its own output; a legacy task would also resume the busy session.
+    if (nextAgent === thread.initiatorAgent) {
+      if (thread.reviewFlow !== 'dedicated') {
+        throw new Error(
+          `Cannot run task ${thread.threadId} on ${nextAgent}: that is the task's initiator ` +
+            `and the task uses the legacy review flow, whose callback resumes the initiator's own session. ` +
+            `Pick a different executor agent.`,
+        );
+      }
+      const reviewerModel =
+        thread.reviewerModel || resolveConfiguredModel(thread.initiatorAgent, undefined, 'initiator');
+      const nextModel = resolution.model;
+      if (!reviewerModel || !nextModel) {
+        throw new Error(
+          `Cannot retarget ${thread.threadId} to its own agent ${nextAgent}: both the reviewer model and ` +
+            `the executor model must be configured so they can be proven different.`,
+        );
+      }
+      if (reviewerModel === nextModel) {
+        throw new Error(
+          `Cannot retarget ${thread.threadId} to ${nextAgent}(${nextModel}): reviewer and executor would ` +
+            `be the same model. Configure a different sender-side model for the reviewer first.`,
+        );
+      }
+    }
 
     let nextModel: string | undefined;
     if (!requested) {

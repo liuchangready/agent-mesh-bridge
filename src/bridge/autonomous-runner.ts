@@ -296,6 +296,14 @@ export interface RunOptions {
    * and must not delegate further.
    */
   markAsReceiver?: boolean;
+  /**
+   * Extra environment variables for this run only.
+   *
+   * Used by the reviewer bootstrap to hand the one-time dispatch token and
+   * thread id to the fresh reviewer session without putting them in argv (where
+   * they would leak into process listings and shell quoting).
+   */
+  extraEnv?: NodeJS.ProcessEnv;
   onStdoutChunk?: (chunk: string) => void;
   onStderrChunk?: (chunk: string) => void;
   /**
@@ -1205,6 +1213,12 @@ export class AutonomousRunner {
         env[MESH_TASK_RECEIVER_ENV] = '1';
         if (options.taskThreadId) env[MESH_TASK_THREAD_ENV] = options.taskThreadId;
         if (options.taskRound !== undefined) env[MESH_TASK_ROUND_ENV] = String(options.taskRound);
+      }
+      if (options.extraEnv) {
+        for (const [key, value] of Object.entries(options.extraEnv)) {
+          if (value === undefined) delete env[key];
+          else env[key] = String(value);
+        }
       }
 
       // DSH's headless profile derives BOTH its sandbox mode and its approval

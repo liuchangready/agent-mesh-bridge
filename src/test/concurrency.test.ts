@@ -461,6 +461,8 @@ describe('merge gate - delete refuses an unmerged worktree', () => {
     assert.strictEqual(taskStore.getTask('thread_worktree'), undefined);
     const tombstone = fs.readFileSync(path.join(tempDir, 'deleted_tasks.log'), 'utf8');
     assert.match(tombstone, /thread_worktree/);
+    // The audit trail must show the merge gate was bypassed deliberately.
+    assert.match(tombstone, /"forced":true/);
   });
 
   test('recording the merge request clears the gate and allows a normal delete', () => {

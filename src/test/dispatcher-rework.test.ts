@@ -19,6 +19,9 @@ import { CallbackManager } from '../bridge/callback-manager';
 import { AsyncDispatcher } from '../bridge/async-dispatcher';
 import { ReworkController } from '../bridge/rework-controller';
 import { ExecutionGate } from '../bridge/execution-gate';
+import { getBridgeHome, invalidateConfiguredModelCache, saveModelDefaults } from '../bridge/model-catalog';
+import { clearReviewerBootstrapToken } from '../bridge/reviewer-bootstrap';
+import { describeModelRouting } from '../bridge/types';
 
 describe('AsyncDispatcher and ReworkController Tests', () => {
   let tempDir: string;
@@ -106,6 +109,135 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.strictEqual(stored.initiatorModelSource, 'none');
   });
 
+  test('refuses a same-agent dispatch while the legacy review flow is active', async () => {
+    await assert.rejects(
+      () =>
+        dispatcher.dispatchTask({
+          targetAgent: 'codex',
+          initiatorAgent: 'codex',
+          title: 'Self dispatch',
+          prompt: 'do the work',
+        }),
+      /self-dispatch requires the dedicated reviewer flow/i,
+    );
+    // Rejected before the thread exists: it must not occupy the queue.
+    assert.strictEqual(taskStore.getAllTasks().length, 0);
+  });
+
+  test('refuses a same-agent dispatch detected from the caller environment (legacy)', async () => {
+    const previous = process.env.MESH_CALLER_AGENT;
+    process.env.MESH_CALLER_AGENT = 'deepseek_harness';
+    try {
+      await assert.rejects(
+        () =>
+          dispatcher.dispatchTask({
+            targetAgent: 'deepseek_harness',
+            title: 'Self dispatch via env',
+            prompt: 'do the work',
+          }),
+        /self-dispatch requires the dedicated reviewer flow/i,
+      );
+      assert.strictEqual(taskStore.getAllTasks().length, 0);
+    } finally {
+      if (previous === undefined) delete process.env.MESH_CALLER_AGENT;
+      else process.env.MESH_CALLER_AGENT = previous;
+    }
+  });
+
+  test('dedicated flow prepares a reviewer bootstrap instead of starting the developer', async () => {
+    const home = getBridgeHome();
+    saveModelDefaults({ codex: 'gpt-6-flash' }, home, {
+      initiatorModels: { codex: 'gpt-6-pro' },
+    });
+    invalidateConfiguredModelCache();
+    let executed = 0;
+    runner.execute = async () => {
+      executed += 1;
+      return {
+        exitCode: 0,
+        stdout: 'x',
+        stderr: '',
+        extractedOutput: 'x',
+        durationMs: 1,
+      };
+    };
+    try {
+      const res = await dispatcher.dispatchTask({
+        targetAgent: 'codex',
+        initiatorAgent: 'codex',
+        title: 'Self review with two models',
+        prompt: 'do the work',
+        model: 'gpt-6-flash',
+        reviewFlow: 'dedicated',
+      });
+      assert.strictEqual(res.status, 'REVIEWER_STARTING');
+      const stored = taskStore.getTask(res.threadId)!;
+      assert.strictEqual(stored.reviewFlow, 'dedicated');
+      assert.strictEqual(stored.reviewerModel, 'gpt-6-pro');
+      assert.strictEqual(stored.targetModel, 'gpt-6-flash');
+      assert.strictEqual(stored.reviewBootstrap?.phase, 'pending');
+      assert.strictEqual(stored.status, 'queued');
+      assert.strictEqual(stored.callerSessionId, undefined, 'caller is the reviewer, not the requester');
+      assert.strictEqual(stored.requesterAgent, 'codex');
+      // The developer must not run before the reviewer dispatches.
+      await new Promise((r) => setTimeout(r, 80));
+      assert.strictEqual(executed, 0);
+      clearReviewerBootstrapToken(res.threadId, home);
+    } finally {
+      saveModelDefaults({}, home, { initiatorModels: {} });
+      invalidateConfiguredModelCache();
+    }
+  });
+
+  test('dedicated same-agent dispatch rejects an identical reviewer/executor model', async () => {
+    const home = getBridgeHome();
+    saveModelDefaults({ codex: 'gpt-6-flash' }, home, {
+      initiatorModels: { codex: 'gpt-6-flash' },
+    });
+    invalidateConfiguredModelCache();
+    try {
+      await assert.rejects(
+        () =>
+          dispatcher.dispatchTask({
+            targetAgent: 'codex',
+            initiatorAgent: 'codex',
+            title: 'Same model self review',
+            prompt: 'do the work',
+            model: 'gpt-6-flash',
+            reviewFlow: 'dedicated',
+          }),
+        /same model/i,
+      );
+      assert.strictEqual(taskStore.getAllTasks().length, 0);
+    } finally {
+      saveModelDefaults({}, home, { initiatorModels: {} });
+      invalidateConfiguredModelCache();
+    }
+  });
+
+  test('dedicated same-agent dispatch requires a configured reviewer model', async () => {
+    const home = getBridgeHome();
+    saveModelDefaults({ codex: 'gpt-6-flash' }, home, { initiatorModels: {} });
+    invalidateConfiguredModelCache();
+    try {
+      await assert.rejects(
+        () =>
+          dispatcher.dispatchTask({
+            targetAgent: 'codex',
+            initiatorAgent: 'codex',
+            title: 'Unconfigured reviewer',
+            prompt: 'do the work',
+            model: 'gpt-6-flash',
+            reviewFlow: 'dedicated',
+          }),
+        /configure a sender-side reviewer model/i,
+      );
+    } finally {
+      saveModelDefaults({}, home, { initiatorModels: {} });
+      invalidateConfiguredModelCache();
+    }
+  });
+
   test('pins the model chosen at dispatch on the task and the runner call', async () => {
     const received: any[] = [];
     runner.execute = async (options: any) => {
@@ -147,6 +279,42 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.strictEqual(received.length, 1);
     assert.strictEqual(received[0].model, 'gpt-6-sol');
     assert.strictEqual(received[0].agent, 'codex');
+  });
+
+  test('records the sender-side default separately from the receiver-side default', async () => {
+    const bridgeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-two-ends-'));
+    const previousHome = process.env.AGENT_MESH_BRIDGE_HOME;
+    process.env.AGENT_MESH_BRIDGE_HOME = bridgeHome;
+    // Two different agents, each with its own side of the defaults: Antigravity
+    // reviews as `gemini-3-pro` while Codex executes as `gpt-6-flash`.
+    saveModelDefaults({ codex: 'gpt-6-flash' }, bridgeHome, {
+      initiatorModels: { antigravity: 'gemini-3-pro' },
+    });
+    invalidateConfiguredModelCache();
+
+    try {
+      const res = await dispatcher.dispatchTask({
+        targetAgent: 'codex',
+        title: 'One dispatch, two model defaults',
+        prompt: 'Implement the parser',
+        allowNoScope: true,
+        callerSessionId: 'caller-session-two-ends',
+        initiatorAgent: 'antigravity',
+      });
+      await waitForStatus(res.threadId, 'waiting_review');
+
+      const stored = taskStore.getTask(res.threadId)!;
+      assert.strictEqual(stored.targetModel, 'gpt-6-flash', 'receiver uses its own default');
+      assert.strictEqual(stored.initiatorModel, 'gemini-3-pro', 'sender is reported on its own default');
+      assert.strictEqual(stored.initiatorModelSource, 'sender-configured');
+      assert.match(describeModelRouting(stored), /gemini-3-pro/);
+      assert.match(describeModelRouting(stored), /gpt-6-flash/);
+    } finally {
+      if (previousHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME;
+      else process.env.AGENT_MESH_BRIDGE_HOME = previousHome;
+      invalidateConfiguredModelCache();
+      fs.rmSync(bridgeHome, { recursive: true, force: true });
+    }
   });
 
   test('ignores a non-default model the caller did not declare as a user request', async () => {
@@ -245,6 +413,32 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.strictEqual(thread.rounds[0].status, 'failed');
     assert.strictEqual(thread.rounds[0].assessment?.errorCode, 'EMPTY_OUTPUT');
     assert.match(thread.rounds[0].error || '', /no actual|actual final answer/i);
+  });
+
+  test('refuses a rework that would move a legacy task onto its own reviewer', async () => {
+    const dispatchRes = await dispatcher.dispatchTask({
+      targetAgent: 'claude_code',
+      title: 'Rework onto the reviewer',
+      prompt: 'do the work',
+      initiatorAgent: 'codex',
+    });
+    await waitForStatus(dispatchRes.threadId, 'waiting_review');
+
+    await assert.rejects(
+      () =>
+        reworkController.requestRework({
+          threadId: dispatchRes.threadId,
+          feedback: 'and now do it yourself',
+          targetAgent: 'codex',
+        }),
+      /legacy review flow/i,
+    );
+
+    // Rejected before a new round exists: still one round, still in review.
+    const thread = taskStore.getTask(dispatchRes.threadId)!;
+    assert.strictEqual(thread.rounds.length, 1);
+    assert.strictEqual(thread.status, 'waiting_review');
+    assert.strictEqual(thread.targetAgent, 'claude_code');
   });
 
   test('should request rework strictly reusing same receiverSessionId and incrementing round', async () => {

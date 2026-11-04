@@ -356,6 +356,18 @@ export class ReworkController {
       throw new Error(`Task thread not found: ${threadId}`);
     }
 
+    // A failed reviewer bootstrap is terminal: its one-shot token was consumed
+    // and `dispatch_task` refuses to confirm it again, so resuming would leave a
+    // task that can never run (and, before the pump guard, one that oscillated
+    // `running` ↔ `queued` on every poll).
+    if (thread.reviewBootstrap?.phase === 'failed') {
+      throw new Error(
+        `Cannot resume ${threadId}: its dedicated reviewer bootstrap failed and can never be ` +
+          `confirmed. Delete and re-dispatch the task, or reset reviewBootstrap.phase to ` +
+          `"pending" so a fresh reviewer conversation can dispatch it.`,
+      );
+    }
+
     const pausedRound =
       [...thread.rounds].reverse().find((round) => round.status === 'paused') ||
       (thread.status === 'paused' ? thread.rounds[thread.rounds.length - 1] : undefined);
@@ -820,6 +832,15 @@ export class ReworkController {
     detail?: string,
     scopeConflict?: ScopeConflict,
   ): void {
+    // Same rule as the supervisor's pump: a live lease owned by this thread
+    // means it is executing elsewhere (another window's supervisor), so writing
+    // `queued` here would mislabel a running task.
+    const gatePolicy = concurrencyPolicy();
+    const liveOwner = this.executionGate.getOwner(
+      gatePolicy.enabled ? normalizeWorkspaceKey(thread.workspacePath) : undefined,
+    );
+    if (liveOwner && liveOwner.threadId === thread.threadId) return;
+
     const message =
       detail ||
       (owner
