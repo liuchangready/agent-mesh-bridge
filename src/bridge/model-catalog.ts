@@ -69,15 +69,39 @@ export interface AgentModelCatalog {
 
 export type ModelDefaults = Partial<Record<AgentId, string>>;
 
+/**
+ * Which side of a delegated task an agent's configured default model is for.
+ *
+ * An agent's model is not one value: the model it EXECUTES delegated tasks with
+ * (receiver) and the model it runs on when it DISPATCHES/reviews (sender) may
+ * legitimately differ. The classic case is one model dispatching to itself:
+ * DeepSeek Harness running `pro` sends a task to DeepSeek Harness, and the
+ * receiver must execute with `flash` without the sender badge lying about it.
+ */
+export type ModelRole = 'receiver' | 'initiator';
+
 interface ModelConfigFile {
   updatedAt?: string;
+  /** Receiver-side defaults: what a task runs on when delegated to this agent. */
   models?: ModelDefaults;
+  /** Sender-side defaults: what this agent runs on when it dispatches/reviews. */
+  initiatorModels?: ModelDefaults;
   /**
    * Whether pinning a receiver model other than the configured default requires
    * the user's click consent in VS Code. Absent/false-y means "not configured";
    * only an explicit `false` turns the gate off.
    */
   requireModelApproval?: boolean;
+}
+
+/** Drop empty/invalid entries so a cleared setting really clears the value. */
+function sanitizeModelDefaults(models?: ModelDefaults | null): ModelDefaults {
+  const clean: ModelDefaults = {};
+  for (const [agent, model] of Object.entries(models || {})) {
+    const normalized = normalizeModelId(model);
+    if (normalized) clean[agent as AgentId] = normalized;
+  }
+  return clean;
 }
 
 /** Raw snapshot reader; missing/corrupt file -> undefined. */
@@ -110,44 +134,47 @@ export function normalizeModelId(value?: string | null): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-/** Read the mirrored per-agent defaults (missing/corrupt file -> empty map). */
+/** Read the mirrored receiver-side defaults (missing/corrupt file -> empty map). */
 export function loadModelDefaults(dir: string = getBridgeHome()): ModelDefaults {
-  const file = path.join(dir, MODEL_CONFIG_FILENAME);
-  try {
-    if (!fs.existsSync(file)) return {};
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as ModelConfigFile;
-    const result: ModelDefaults = {};
-    for (const [agent, model] of Object.entries(parsed.models || {})) {
-      const normalized = normalizeModelId(model);
-      if (normalized) result[agent as AgentId] = normalized;
-    }
-    return result;
-  } catch {
-    return {};
-  }
+  return sanitizeModelDefaults(readModelConfigFile(dir)?.models);
 }
 
-/** Persist the per-agent defaults for every MCP process to read. */
+/** Read the mirrored sender-side defaults (missing/corrupt file -> empty map). */
+export function loadInitiatorModelDefaults(dir: string = getBridgeHome()): ModelDefaults {
+  return sanitizeModelDefaults(readModelConfigFile(dir)?.initiatorModels);
+}
+
+/**
+ * Persist the per-agent defaults for every MCP process to read.
+ *
+ * `options.initiatorModels` is written only when provided, so callers that only
+ * mirror the receiver settings never erase the sender settings (same sticky
+ * rule as the approval policy).
+ */
 export function saveModelDefaults(
   models: ModelDefaults,
   dir: string = getBridgeHome(),
-  options: { requireModelApproval?: boolean } = {},
+  options: { requireModelApproval?: boolean; initiatorModels?: ModelDefaults } = {},
 ): void {
   const file = path.join(dir, MODEL_CONFIG_FILENAME);
-  const clean: ModelDefaults = {};
-  for (const [agent, model] of Object.entries(models)) {
-    const normalized = normalizeModelId(model);
-    if (normalized) clean[agent as AgentId] = normalized;
-  }
+  const clean = sanitizeModelDefaults(models);
   try {
     fs.mkdirSync(dir, { recursive: true });
+    const previous = readModelConfigFile(dir);
     const payload: ModelConfigFile = { updatedAt: new Date().toISOString(), models: clean };
+    const initiatorModels =
+      options.initiatorModels !== undefined
+        ? sanitizeModelDefaults(options.initiatorModels)
+        : sanitizeModelDefaults(previous?.initiatorModels);
+    if (options.initiatorModels !== undefined || Object.keys(initiatorModels).length > 0) {
+      payload.initiatorModels = initiatorModels;
+    }
     // Keep the approval policy sticky: callers that only mirror the model
     // settings must not silently reset it.
     const nextPolicy =
       options.requireModelApproval !== undefined
         ? options.requireModelApproval
-        : readModelConfigFile(dir)?.requireModelApproval;
+        : previous?.requireModelApproval;
     if (nextPolicy !== undefined) payload.requireModelApproval = nextPolicy;
     fs.writeFileSync(file, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
   } catch (e: any) {
@@ -184,17 +211,24 @@ const configuredCache = new Map<string, { value?: string; at: number }>();
 const CONFIGURED_CACHE_TTL_MS = 2000;
 
 /**
- * The default model configured for an agent, or `undefined` when the agent
- * should use whatever model it ships with.
+ * The default model configured for an agent in one role, or `undefined` when the
+ * agent should use whatever model it ships with.
+ *
+ * `receiver` (the default) is the model a delegated task executes with;
+ * `initiator` is the model the agent runs on when it dispatches or reviews. They
+ * are stored separately so an agent can send to itself with a different model on
+ * each side.
  */
 export function resolveConfiguredModel(
   agent: AgentId,
   dir: string = getBridgeHome(),
+  role: ModelRole = 'receiver',
 ): string | undefined {
-  const key = `${dir}::${agent}`;
+  const key = `${dir}::${role}::${agent}`;
   const cached = configuredCache.get(key);
   if (cached && Date.now() - cached.at < CONFIGURED_CACHE_TTL_MS) return cached.value;
-  const value = loadModelDefaults(dir)[agent];
+  const defaults = role === 'initiator' ? loadInitiatorModelDefaults(dir) : loadModelDefaults(dir);
+  const value = defaults[agent];
   configuredCache.set(key, { value, at: Date.now() });
   return value;
 }
@@ -220,8 +254,9 @@ const INITIATOR_MODEL_ENV: Partial<Record<AgentId, string[]>> = {
  * Best-effort model of the *sender* agent for a task's routing badge.
  *
  * Precedence: explicit argument (the caller knows best) -> environment hint ->
- * the sender's configured default. The source is returned so the UI can be
- * honest about a value that was merely inferred.
+ * the sender-side configured default -> the receiver-side default (legacy
+ * fallback, before sender defaults existed). The source is returned so the UI
+ * can be honest about a value that was merely inferred.
  */
 export function resolveInitiatorModel(
   agent: AgentId,
@@ -235,6 +270,9 @@ export function resolveInitiatorModel(
     const fromEnv = normalizeModelId(process.env[name]);
     if (fromEnv) return { model: fromEnv, source: 'env' };
   }
+
+  const senderConfigured = resolveConfiguredModel(agent, dir, 'initiator');
+  if (senderConfigured) return { model: senderConfigured, source: 'sender-configured' };
 
   const configured = resolveConfiguredModel(agent, dir);
   if (configured) return { model: configured, source: 'configured' };

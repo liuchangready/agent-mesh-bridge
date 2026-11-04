@@ -11,8 +11,19 @@ export type AgentId =
 
 export type TargetAgentSelection = 'default' | AgentId;
 
-/** How the sender/receiver model recorded on a task was determined. */
-export type ModelResolutionSource = 'explicit' | 'env' | 'configured' | 'none';
+/**
+ * How the sender/receiver model recorded on a task was determined.
+ *
+ * `sender-configured` means the model came from the agent's own sender-side
+ * default (`agentMeshBridge.initiatorModels.*`), as opposed to `configured`,
+ * which is the receiver-side default (`agentMeshBridge.models.*`).
+ */
+export type ModelResolutionSource =
+  | 'explicit'
+  | 'env'
+  | 'sender-configured'
+  | 'configured'
+  | 'none';
 
 export type ThreadStatus =
   | 'queued'

@@ -108,21 +108,39 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     statusSub.iconPath = new vscode.ThemeIcon('pulse');
     subItems.push(statusSub);
 
-    // 1b. Configured model for this agent (click to change it)
-    const configuredModel = resolveConfiguredModel(info.id);
-    const modelSub = new AgentNodeItem(
-      `模型: ${configuredModel || 'Agent 默认'}`,
+    // 1b. Configured models for this agent (click either side to change it).
+    //     Receiver and sender defaults are independent: the same agent may run
+    //     on one model while executing delegated work and another while
+    //     dispatching/reviewing (notably when it sends a task to itself).
+    const receiverModel = resolveConfiguredModel(info.id, undefined, 'receiver');
+    const receiverSub = new AgentNodeItem(
+      `接收模型: ${receiverModel || 'Agent 默认'}`,
       vscode.TreeItemCollapsibleState.None,
     );
-    modelSub.description = '点击选择可用模型';
-    modelSub.iconPath = new vscode.ThemeIcon('chip');
-    modelSub.contextValue = 'agent_model';
-    modelSub.command = {
+    receiverSub.description = '被派发任务时执行使用 · 点击选择';
+    receiverSub.iconPath = new vscode.ThemeIcon('arrow-down');
+    receiverSub.contextValue = 'agent_model';
+    receiverSub.command = {
       command: 'agent-mesh-bridge.selectAgentModel',
-      title: 'Select Model',
-      arguments: [item],
+      title: 'Select Receiver Model',
+      arguments: [item, 'receiver'],
     };
-    subItems.push(modelSub);
+    subItems.push(receiverSub);
+
+    const initiatorModel = resolveConfiguredModel(info.id, undefined, 'initiator');
+    const initiatorSub = new AgentNodeItem(
+      `下发模型: ${initiatorModel || 'Agent 默认'}`,
+      vscode.TreeItemCollapsibleState.None,
+    );
+    initiatorSub.description = '作为下发者/检视者运行时使用 · 点击选择';
+    initiatorSub.iconPath = new vscode.ThemeIcon('arrow-up');
+    initiatorSub.contextValue = 'agent_model';
+    initiatorSub.command = {
+      command: 'agent-mesh-bridge.selectAgentModel',
+      title: 'Select Sender Model',
+      arguments: [item, 'initiator'],
+    };
+    subItems.push(initiatorSub);
 
     // 2. Rate limit / Exhaustion recovery time (if exhausted or has rateLimit info)
     if (info.rateLimit && (info.status === 'exhausted' || info.rateLimit.isExhausted)) {
