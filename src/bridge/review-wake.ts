@@ -1,4 +1,10 @@
-import { AgentId, DelegationThread, RateLimitInfo, ReviewWakeState } from './types';
+import {
+  AgentId,
+  DelegationThread,
+  RateLimitInfo,
+  ReviewFailure,
+  ReviewWakeState,
+} from './types';
 
 /**
  * Reviewer wake-up failures and their automatic recovery.
@@ -202,4 +208,81 @@ export function describeReviewWake(state: ReviewWakeState): string {
 export function reviewBlockDependencyId(thread: DelegationThread): string | undefined {
   const id = thread.reviewBlocked?.waitingForThreadId;
   return typeof id === 'string' && id.trim() ? id.trim() : undefined;
+}
+
+export interface ReviewFailureInput {
+  kind: ReviewFailure['kind'];
+  reason: string;
+  /** Round whose review never happened; defaults to the current round. */
+  round?: number;
+  by?: string;
+  /** The wake plan that preceded the failure (kept for diagnostics). */
+  wake?: ReviewWakeState;
+}
+
+/**
+ * Record that this task's review failed, and make it terminal.
+ *
+ * `review_failed` says: the receiver delivered, but no reviewer reached a
+ * verdict and nothing automatic is still trying. It releases the global queue
+ * slot exactly like `failed` (see `isTaskUnfinished`) so a dead reviewer cannot
+ * stall the whole mesh, while the delivered work and its rounds stay intact for
+ * a later re-review / rework / approval. The reason is what the UI shows, so it
+ * must say WHY, not just that the wake stopped.
+ *
+ * A task is only marked failed while it is actually waiting for a review. A
+ * completed task is never downgraded (a late failure report must not undo an
+ * approval), and a task that has since been reworked / paused / resumed is not
+ * waiting for a reviewer either — a stale wake failure must not overwrite that.
+ */
+export function applyReviewFailure(thread: DelegationThread, input: ReviewFailureInput): boolean {
+  if (thread.status !== 'waiting_review') return false;
+  const now = new Date().toISOString();
+  const reason =
+    String(input.reason || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 500) || 'review ended without a verdict';
+  thread.status = 'review_failed';
+  thread.reviewFailure = {
+    kind: input.kind,
+    reason,
+    at: now,
+    round: input.round ?? (thread.currentRound || 1),
+    ...(input.by ? { by: input.by } : {}),
+    agent: thread.initiatorAgent,
+    ...(input.wake ? { wake: input.wake } : {}),
+  };
+  if (input.wake) thread.reviewWake = input.wake;
+  thread.updatedAt = now;
+  // The summary line is what MCP callers see first; keep the cause there.
+  thread.summary.lastOutputSnippet = `[Review failed] ${reason}`.slice(0, 150);
+  return true;
+}
+
+/**
+ * Re-open a failed review so a reviewer can be woken again.
+ *
+ * Used by the explicit re-review path (manual wake / queued wake replay) and by
+ * `request_rework`-style recovery: the task goes back to `waiting_review` (thus
+ * re-occupies its queue slot) and the failed wake plan is dropped. The failure
+ * record is deliberately KEPT as audit history.
+ */
+export function reopenFailedReview(thread: DelegationThread): boolean {
+  if (thread.status !== 'review_failed') return false;
+  thread.status = 'waiting_review';
+  thread.reviewWake = undefined;
+  thread.updatedAt = new Date().toISOString();
+  return true;
+}
+
+/** Human-readable review-failure line for the tree/detail panel. */
+export function describeReviewFailure(thread: DelegationThread): string | undefined {
+  const failure = thread.reviewFailure;
+  if (!failure) return undefined;
+  const kind =
+    failure.kind === 'unresolvable_park'
+      ? '检视挂起在无法观测的依赖上'
+      : '检视唤醒自动重试已耗尽';
+  return `${kind}：${failure.reason}`;
 }

@@ -31,6 +31,7 @@ export type ThreadStatus =
   | 'waiting_review'
   | 'reworking'
   | 'paused'
+  | 'review_failed'
   | 'completed'
   | 'failed';
 
@@ -465,6 +466,35 @@ export interface ReviewBlockInfo {
   by: string;
 }
 
+/**
+ * Why a review ended with no verdict at all.
+ *
+ * `review_failed` is a TERMINAL lifecycle status: the receiver delivered, but no
+ * reviewer ever produced a verdict (the wake died, the retry budget ran out, or
+ * the review was parked on a dependency nothing in the mesh can observe). It is
+ * kept separate from `failed` because the delivered work may be perfectly good 鈥? * only the review is missing 鈥?and separate from `waiting_review` because no
+ * reviewer is working and nothing will ever move it without human action.
+ *
+ * Terminal semantics (identical to `failed` for scheduling): the task releases
+ * the global queue slot and no longer blocks the file-scope gate; re-review /
+ * request_rework / retry / approve all re-open it.
+ */
+export interface ReviewFailure {
+  /** `retries_exhausted`: the wake retry budget ran out. */
+  kind: 'retries_exhausted' | 'unresolvable_park';
+  /** Human-readable cause, shown in the task tree and detail panel. */
+  reason: string;
+  at: string;
+  /** Round whose review never happened. */
+  round: number;
+  /** Who recorded the failure: `watchdog`, `scheduler`, `callback`. */
+  by?: string;
+  /** Reviewer agent that never delivered a verdict. */
+  agent?: AgentId;
+  /** Snapshot of the failed wake plan that preceded this status. */
+  wake?: ReviewWakeState;
+}
+
 export interface DelegationThread {
   threadId: string; // e.g. "thread_20261016_163000_a7f9"
   title: string; // Brief title, e.g. "Fix TCP cursor drift"
@@ -556,6 +586,16 @@ export interface DelegationThread {
    * again the moment `waitingForThreadId` reaches a terminal state.
    */
   reviewBlocked?: ReviewBlockInfo;
+
+  /**
+   * Why the review never produced a verdict (`status === 'review_failed'`).
+   *
+   * Persisted separately from `reviewWake` because the wake plan is diagnostic
+   * (and may be cleared on recovery) while the failure reason is the record the
+   * user needs to understand why the task stopped. Kept after a later re-review
+   * or approval succeeds, as audit history.
+   */
+  reviewFailure?: ReviewFailure;
 
   /** MR handoff recorded by the caller after the task/batch is accepted. */
   mergeRequest?: MergeRequestInfo;
@@ -926,7 +966,26 @@ export function shouldResumeNativeSession(
  * forever; retrying it creates an unfinished task again.
  */
 export function isTaskUnfinished(thread: DelegationThread): boolean {
-  return thread.status !== 'completed' && thread.status !== 'failed';
+  return (
+    thread.status !== 'completed' &&
+    thread.status !== 'failed' &&
+    thread.status !== 'review_failed'
+  );
+}
+
+/**
+ * The newest completed work round (never an `approval` bookkeeping round).
+ *
+ * This is the only round a reviewer should inspect or log against: approval
+ * rounds carry no deliverable, and a stalled wake may name an older round than
+ * the one that was actually delivered last.
+ */
+export function latestCompletedWorkRound(
+  thread: DelegationThread,
+): DelegationRound | undefined {
+  return (thread.rounds || [])
+    .filter((round) => round.type !== 'approval' && round.status === 'completed')
+    .sort((a, b) => b.round - a.round)[0];
 }
 
 /** Oldest unfinished task (the queue head), or undefined when the mesh is idle. */
