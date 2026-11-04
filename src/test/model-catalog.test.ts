@@ -9,6 +9,7 @@ import {
   extractJsonObject,
   getBridgeHome,
   invalidateConfiguredModelCache,
+  loadInitiatorModelDefaults,
   loadModelDefaults,
   normalizeModelId,
   parseAgyModels,
@@ -166,6 +167,39 @@ test('Model catalog - defaults round-trip and drop empty values', () => {
   // A corrupt file must degrade to "no defaults" instead of throwing.
   fs.writeFileSync(path.join(dir, 'model-config.json'), '{not json', 'utf8');
   assert.deepStrictEqual(loadModelDefaults(dir), {});
+});
+
+test('Model catalog - receiver and sender defaults are independent and durable', () => {
+  const dir = makeTempDir('mesh-model-roles-');
+  saveModelDefaults({ codex: 'gpt-6-sol', deepseek_harness: 'deepseek-v4.1-flash' }, dir, {
+    initiatorModels: {
+      codex: ' gpt-6.1-pro ',
+      deepseek_harness: 'deepseek-v4.1-pro',
+      antigravity: '',
+    },
+  });
+
+  assert.strictEqual(resolveConfiguredModel('codex', dir, 'receiver'), 'gpt-6-sol');
+  assert.strictEqual(resolveConfiguredModel('codex', dir, 'initiator'), 'gpt-6.1-pro');
+  assert.strictEqual(resolveConfiguredModel('codex', dir), 'gpt-6-sol', 'default role is receiver');
+  assert.deepStrictEqual(loadInitiatorModelDefaults(dir), {
+    codex: 'gpt-6.1-pro',
+    deepseek_harness: 'deepseek-v4.1-pro',
+  });
+
+  // A receiver-only mirror (the legacy call shape) must not erase the sender side.
+  invalidateConfiguredModelCache();
+  saveModelDefaults({ codex: 'gpt-6-luna' }, dir);
+  assert.deepStrictEqual(loadInitiatorModelDefaults(dir), {
+    codex: 'gpt-6.1-pro',
+    deepseek_harness: 'deepseek-v4.1-pro',
+  });
+  assert.strictEqual(resolveConfiguredModel('codex', dir, 'initiator'), 'gpt-6.1-pro');
+
+  // Clearing the sender setting really clears it, while the receiver side stays.
+  saveModelDefaults({ codex: 'gpt-6-luna' }, dir, { initiatorModels: {} });
+  assert.deepStrictEqual(loadInitiatorModelDefaults(dir), {});
+  assert.deepStrictEqual(loadModelDefaults(dir), { codex: 'gpt-6-luna' });
 });
 
 test('Model catalog - resolveConfiguredModel memoizes the saved snapshot', () => {
@@ -425,6 +459,38 @@ test('Model routing - sender model resolution precedence', () => {
     });
     // ...and reports "none" when nothing is known at all.
     assert.deepStrictEqual(resolveInitiatorModel('antigravity', undefined, dir), { source: 'none' });
+  });
+});
+
+test('Model routing - the sender-side default wins over the receiver-side default', () => {
+  const dir = makeTempDir('mesh-routing-roles-');
+  // Sender side `pro`, receiver side `flash` — the two defaults are independent.
+  saveModelDefaults({ deepseek_harness: 'deepseek-v4.1-flash' }, dir, {
+    initiatorModels: { deepseek_harness: 'deepseek-v4.1-pro' },
+  });
+
+  withEnv({ DSH_MODEL: undefined, DEEPSEEK_MODEL: undefined }, () => {
+    invalidateConfiguredModelCache();
+    assert.deepStrictEqual(resolveInitiatorModel('deepseek_harness', undefined, dir), {
+      model: 'deepseek-v4.1-pro',
+      source: 'sender-configured',
+    });
+  });
+
+  // The live-session environment hint still outranks a configured default.
+  withEnv({ DSH_MODEL: 'deepseek-v4.1-live' }, () => {
+    assert.deepStrictEqual(resolveInitiatorModel('deepseek_harness', undefined, dir), {
+      model: 'deepseek-v4.1-live',
+      source: 'env',
+    });
+  });
+
+  // An agent with only a receiver-side default keeps the legacy fallback.
+  saveModelDefaults({ antigravity: 'gemini-3.8-flash-high' }, dir, { initiatorModels: {} });
+  invalidateConfiguredModelCache();
+  assert.deepStrictEqual(resolveInitiatorModel('antigravity', undefined, dir), {
+    model: 'gemini-3.8-flash-high',
+    source: 'configured',
   });
 });
 
