@@ -61,7 +61,6 @@ const makeThread = (): DelegationThread => ({
   receiverSessionCaptured: true,
   callerSessionId: 'caller-codex-session-1',
   workspacePath: process.cwd(),
-  expectedFiles: ['src/example.ts'],
   summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 1000 },
   rounds: [completedRound],
 });

@@ -14,6 +14,7 @@ import {
   nextRoundNumber,
   shouldResumeNativeSession,
   ThreadStatus,
+  isIsolatedTaskWorktree,
 } from './types';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -24,7 +25,6 @@ import { AgentDetector } from './agent-detector';
 import { AutonomousRunner } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
 import { TaskSupervisor } from './task-supervisor';
-import { findScopeConflicts, describeScopeConflict, ScopeConflict } from './file-scope';
 import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
 import { TaskExecutionOwner, TaskExecutionRegistration, TaskExecutionRegistry } from './task-execution-registry';
 import { QueueDrainer, QueuedExecution } from './queue-drainer';
@@ -35,6 +35,8 @@ import { ModelApprovalHandler } from './model-approval';
 import { TaskRetargetService, latestRetarget } from './task-retarget';
 import { appendCompactionProtocol, compactRoundBestEffort } from './context-compactor';
 import { readStoredRoundUsage } from './token-usage-collector';
+import { currentHead, changedFiles, commitTaskChanges } from './git-worktree';
+import { MergeCoordinator, MergeResult } from './merge-coordinator';
 import { assertCanExecute } from './agent-capabilities';
 
 export class ReworkController {
@@ -47,6 +49,10 @@ export class ReworkController {
   private queueDrainer: QueueDrainer;
   /** Moves a task to another agent/model when rework/retry/resume asks for it. */
   private readonly retargetService: TaskRetargetService;
+  private readonly mergeCoordinator: MergeCoordinator;
+  private readonly mergeWorkers = new Set<string>();
+  private readonly blockedMergeRetries = new Map<string, string>();
+  private mergeWatch?: NodeJS.Timeout;
 
   constructor(
     taskStore: TaskStore,
@@ -54,12 +60,22 @@ export class ReworkController {
     callbackManager: CallbackManager,
     detector?: AgentDetector,
     executionRegistry?: TaskExecutionRegistry,
+    residentMergeOwner = false,
   ) {
     this.taskStore = taskStore;
     this.runner = runner;
     this.callbackManager = callbackManager;
     this.detector = detector;
     this.storageDir = path.dirname(taskStore.getStoragePath());
+    this.mergeCoordinator = new MergeCoordinator(taskStore, this.storageDir, undefined, (thread) => {
+      const reviewRound = [...(thread.rounds || [])].reverse().find((round) => round.type !== 'approval');
+      if (reviewRound) void this.callbackManager.notifyCaller(thread, reviewRound);
+    });
+    if (residentMergeOwner) {
+      this.taskStore.on('changed', () => this.resumePendingMerges());
+      this.mergeWatch = setInterval(() => this.resumePendingMerges(), 1_000);
+      this.mergeWatch.unref();
+    }
     this.executionRegistry = executionRegistry || new TaskExecutionRegistry(this.storageDir);
     this.retargetService = new TaskRetargetService(taskStore);
     this.queueDrainer = new QueueDrainer(
@@ -68,6 +84,10 @@ export class ReworkController {
       () => TaskSupervisor.isSupervisorActive(),
       (target: QueuedExecution) => this.executeQueuedRound(target),
     );
+    if (residentMergeOwner) {
+      // Recover transactions already on disk once all controller services exist.
+      this.resumePendingMerges();
+    }
   }
 
   /** Answer model-switch confirmations raised by an executor switch. */
@@ -223,7 +243,7 @@ export class ReworkController {
     ) {
       const detected = this.detector.detectActiveSession(
         thread.initiatorAgent,
-        thread.workspacePath,
+        thread.worktree?.repositoryPath || thread.workspacePath,
         [thread.receiverSessionId],
       );
       if (detected) {
@@ -241,7 +261,6 @@ export class ReworkController {
 
     // Persist immediately
     this.taskStore.upsertTask(thread);
-
     // If TaskSupervisor is actively running (e.g. in VS Code extension host),
     // let it supervise execution persistently to prevent child processes from being killed when ephemeral MCP CLI exits.
     if (TaskSupervisor.isSupervisorActive()) {
@@ -443,6 +462,15 @@ export class ReworkController {
 
     if (thread.status !== 'paused') {
       throw new Error(`Cannot resume ${threadId}: task is ${thread.status}, not paused.`);
+    }
+    if (thread.worktree?.approvedCommit && thread.worktree.integration?.phase === 'waiting') {
+      if (this.retargetService.hasOverride(overrides)) {
+        throw new Error(`Cannot change the executor while resuming approved integration for ${threadId}.`);
+      }
+      thread.status = 'waiting_merge';
+      thread.updatedAt = new Date().toISOString();
+      this.taskStore.upsertTask(thread);
+      return [...thread.rounds].reverse().find((round) => round.type !== 'approval') || thread.rounds[thread.rounds.length - 1];
     }
     let pausedRound =
       [...thread.rounds].reverse().find((round) => round.status === 'paused') ||
@@ -713,7 +741,29 @@ export class ReworkController {
     }
 
     const nowIso = new Date().toISOString();
-    thread.status = 'completed';
+    let status: ApproveResult['status'] = 'COMPLETED';
+    if (isIsolatedTaskWorktree(thread.worktree)) {
+      const worktree = thread.worktree;
+      if (!worktree.headCommit) throw new Error(`Task ${thread.threadId} has no recorded task commit; it cannot be approved.`);
+      const head = currentHead(worktree.path);
+      if (head !== worktree.headCommit || changedFiles(worktree.path).length) {
+        throw new Error(`Task worktree changed after review began (approved candidate ${worktree.headCommit}, current HEAD ${head}); review the new state before approval.`);
+      }
+      if (head === worktree.baseCommit) {
+        worktree.integration = { phase: 'no_changes', sourceCommit: head, updatedAt: nowIso };
+        worktree.mergePending = false;
+        thread.status = 'completed';
+      } else {
+        worktree.approvedCommit = head;
+        worktree.integration = { phase: 'waiting', sourceCommit: head, updatedAt: nowIso };
+        worktree.mergePending = true;
+        thread.status = 'waiting_merge';
+        status = 'WAITING_MERGE';
+      }
+    } else {
+      // Legacy ledger entries retain their historical review lifecycle.
+      thread.status = 'completed';
+    }
     thread.updatedAt = nowIso;
 
     if (params.remarks) {
@@ -723,7 +773,7 @@ export class ReworkController {
         round: nextRoundNumber(thread),
         type: 'approval',
         prompt: params.remarks,
-        output: 'Task successfully approved and verified.',
+        output: status === 'WAITING_MERGE' ? 'Review approved; waiting for verified local integration.' : 'Task successfully approved and verified.',
         durationMs: 0,
         status: 'completed',
         timestamp: nowIso,
@@ -735,15 +785,57 @@ export class ReworkController {
     }
 
     this.taskStore.upsertTask(thread);
-    try {
-      archiveCompletedTaskLogs(thread, path.dirname(this.taskStore.getStoragePath()));
-    } catch {}
+    if (status === 'COMPLETED') {
+      try { archiveCompletedTaskLogs(thread, path.dirname(this.taskStore.getStoragePath())); } catch {}
+    }
 
     return {
       threadId: thread.threadId,
-      status: 'COMPLETED',
-      message: `Task ${thread.threadId} successfully approved and archived.`,
+      status,
+      message: status === 'WAITING_MERGE'
+        ? `Task ${thread.threadId} is approved at ${thread.worktree?.approvedCommit}; local integration and combined validation are running asynchronously.`
+        : `Task ${thread.threadId} successfully approved and archived.`,
     };
+  }
+
+  public mergeApproved(threadId: string): Promise<MergeResult> {
+    return this.mergeCoordinator.mergeApproved(threadId);
+  }
+
+  public resumePendingMerges(): void {
+    this.taskStore.loadFromDisk();
+    for (const thread of this.taskStore.getAllTasks()) {
+      if (thread.status !== 'waiting_merge') continue;
+      const blockedAt = this.blockedMergeRetries.get(thread.threadId);
+      if (blockedAt && blockedAt === thread.updatedAt) continue;
+      if (blockedAt) this.blockedMergeRetries.delete(thread.threadId);
+      if (this.mergeWorkers.has(thread.threadId)) continue;
+      this.mergeWorkers.add(thread.threadId);
+      void this.mergeApproved(thread.threadId).catch((error: any) => {
+        if (this.mergeCoordinator.hasLandedCandidate(thread.threadId)) {
+          const latest = this.taskStore.getTask(thread.threadId);
+          if (latest) this.blockedMergeRetries.set(thread.threadId, latest.updatedAt);
+          console.error(`[ReworkController] Target ref is updated for ${thread.threadId}, but its durable ledger record still needs recovery: ${error?.message || error}`);
+          return;
+        }
+        const latest = this.taskStore.getTask(thread.threadId);
+        if (latest?.status !== 'waiting_merge' || !latest.worktree) return;
+        latest.status = 'waiting_review';
+        latest.worktree.approvedCommit = undefined;
+        const failure = `Merge coordinator failed: ${error?.message || error}`;
+        latest.worktree.integration = { ...latest.worktree.integration, phase: 'validation_failed', error: failure, updatedAt: new Date().toISOString() };
+        latest.summary.lastOutputSnippet = failure;
+        try { this.taskStore.upsertTask(latest); }
+        catch (persistError: any) { console.error(`[ReworkController] Could not persist merge failure for ${thread.threadId}: ${persistError?.message || persistError}`); }
+        const reviewRound = [...(latest.rounds || [])].reverse().find((round) => round.type !== 'approval');
+        if (reviewRound) void this.callbackManager.notifyCaller(latest, reviewRound);
+      }).finally(() => this.mergeWorkers.delete(thread.threadId));
+    }
+  }
+
+  public dispose(): void {
+    if (this.mergeWatch) clearInterval(this.mergeWatch);
+    this.mergeWatch = undefined;
   }
 
   private async executeReworkBackground(
@@ -757,12 +849,6 @@ export class ReworkController {
       return;
     }
     this.taskStore.loadFromDisk();
-    const scopeConflict = findScopeConflicts(thread, this.taskStore.getAllTasks());
-    if (scopeConflict) {
-      this.markQueued(thread, undefined, describeScopeConflict(scopeConflict), scopeConflict);
-      this.queueDrainer.schedule(1_500);
-      return;
-    }
 
     const roleLock = new TaskRoleLock(this.storageDir);
     const roleLease = roleLock.tryAcquire(thread.threadId, 'developer');
@@ -787,13 +873,6 @@ export class ReworkController {
     }
     thread = latest;
 
-    const freshScopeConflict = findScopeConflicts(thread, this.taskStore.getAllTasks());
-    if (freshScopeConflict) {
-      roleLock.release(roleLease);
-      this.markQueued(thread, undefined, describeScopeConflict(freshScopeConflict), freshScopeConflict);
-      this.queueDrainer.schedule(1_500);
-      return;
-    }
 
     const gatePolicy = concurrencyPolicy();
     if (gatePolicy.enabled) {
@@ -821,7 +900,6 @@ export class ReworkController {
     try {
       const current = thread;
       current.status = isRework ? 'reworking' : 'running';
-      current.scopeBlockedBy = undefined;
       current.summary.lastOutputSnippet = 'Executing in background...';
       if (current.targetAgent === 'claude_code' && !isRework) {
         current.receiverSessionCaptured = true;
@@ -834,7 +912,7 @@ export class ReworkController {
       );
 
       let result;
-      const scopeBefore = captureWorkspaceSnapshot(thread.workspacePath);
+      const workspaceBefore = captureWorkspaceSnapshot(thread.workspacePath);
       // Rework rounds used to run without a per-round stdio log, so the "raw
       // execution log" existed only for dispatch/supervisor rounds. Capture it
       // here too: `get_round_raw_log` must not silently return "not captured".
@@ -887,7 +965,7 @@ export class ReworkController {
       }
 
       const touchedFiles = diffWorkspaceSnapshots(
-        scopeBefore,
+        workspaceBefore,
         captureWorkspaceSnapshot(thread.workspacePath),
       );
 
@@ -908,7 +986,26 @@ export class ReworkController {
       const responseOk = result.assessment
         ? result.assessment.success
         : result.exitCode === 0;
-      const isSuccess = !interruption && !pausedByControl && responseOk;
+      let isSuccess = !interruption && !pausedByControl && responseOk;
+      if (isSuccess && isIsolatedTaskWorktree(latest.worktree)) {
+        try {
+          latest.worktree.headCommit = commitTaskChanges(latest.worktree, `Agent work ${latest.threadId} round ${roundNumber}`);
+          latest.worktree.integration = { phase: latest.worktree.headCommit === latest.worktree.baseCommit ? 'no_changes' : 'ready', sourceCommit: latest.worktree.headCommit, updatedAt: new Date().toISOString() };
+        } catch (error: any) {
+          result.error = `Could not create the task delivery commit: ${error?.message || error}`;
+          result.exitCode = 1;
+          isSuccess = false;
+        }
+      }
+      if (!isSuccess && isIsolatedTaskWorktree(latest.worktree)) {
+        try {
+          const head = currentHead(latest.worktree.path);
+          if (head !== latest.worktree.baseCommit || changedFiles(latest.worktree.path).length) {
+            latest.worktree.headCommit = head;
+            latest.worktree.integration = { phase: 'ready', sourceCommit: head, updatedAt: new Date().toISOString() };
+          }
+        } catch {}
+      }
       const finalRoundStatus = isPaused ? 'paused' : isSuccess ? 'completed' : 'failed';
       const finalThreadStatus = isPaused ? 'paused' : isSuccess ? 'waiting_review' : 'failed';
 
@@ -1017,7 +1114,6 @@ export class ReworkController {
     thread: DelegationThread,
     owner?: TaskExecutionOwner,
     detail?: string,
-    scopeConflict?: ScopeConflict,
   ): void {
     // Never rewrite another process's live execution or role state as queued.
     if (this.executionRegistry.getOwner(thread.threadId)) return;
@@ -1041,13 +1137,7 @@ export class ReworkController {
       (owner
         ? `Queued: waiting for task ${owner.threadId} round ${owner.round}.`
         : 'Queued: waiting for an execution slot.');
-    const nextBlock = scopeConflict
-      ? { threadId: scopeConflict.threadId, title: scopeConflict.title, files: scopeConflict.files }
-      : undefined;
-    const blockChanged =
-      JSON.stringify(fresh.scopeBlockedBy || null) !== JSON.stringify(nextBlock || null);
-    fresh.scopeBlockedBy = nextBlock;
-    if (fresh.status === 'queued' && fresh.summary.lastOutputSnippet === message && !blockChanged) {
+    if (fresh.status === 'queued' && fresh.summary.lastOutputSnippet === message) {
       return;
     }
 

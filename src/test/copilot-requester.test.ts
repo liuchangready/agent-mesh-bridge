@@ -3,6 +3,13 @@ import assert from 'node:assert/strict';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { execFileSync } from 'child_process';
+
+function initRepository(root: string): void {
+  execFileSync('git', ['init', root], { windowsHide: true, stdio: 'pipe' });
+  execFileSync('git', ['-C', root, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--allow-empty', '-m', 'Initial'], { windowsHide: true, stdio: 'pipe' });
+}
+
 import { assertCanExecute, EXECUTABLE_AGENTS } from '../bridge/agent-capabilities';
 import { MCPServer } from '../bridge/mcp-server';
 import { AsyncDispatcher } from '../bridge/async-dispatcher';
@@ -213,6 +220,7 @@ test('Copilot terminal notification is host-bound and deduplicated per thread an
 
 test('requester source and submission retry key are present in the first persisted task record', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-copilot-ledger-'));
+  initRepository(root);
   const store = new TaskStore(root);
   const wasActive = TaskSupervisor.isSupervisorActive;
   TaskSupervisor.isSupervisorActive = (() => true) as typeof TaskSupervisor.isSupervisorActive;
@@ -220,7 +228,7 @@ test('requester source and submission retry key are present in the first persist
     const dispatcher = new AsyncDispatcher(store, { resolveActiveAgent: async () => ({ agent: 'codex', mode: 'auto', reason: 'test' }) } as any, {} as any, {} as any);
     const result = await dispatcher.dispatchTask({
       targetAgent: 'codex', initiatorAgent: 'claude_code', title: 'copilot source test',
-      prompt: 'brief', workspacePath: root, allowNoScope: true, requireScope: true,
+      prompt: 'brief', workspacePath: root,
       requesterContext: {
         agent: 'vscode_chat', submissionId: 'retry-key-0001', fingerprint: 'sha256-test',
         binding: { kind: 'vscode-copilot', hostInstanceId: 'host-test', workspaceUri: 'file:///workspace', nativeWakeSupported: false, notificationDelivery: 'vscode-ui' },
@@ -351,6 +359,7 @@ test('real MCP facade submission persists once, retries by submissionId, and rec
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-copilot-facade-store-'));
   const workspace = path.join(root, 'workspace');
   fs.mkdirSync(workspace);
+  initRepository(workspace);
   const bindingFile = path.join(root, 'host.json');
   const keys = ['MESH_MCP_PROFILE', 'MESH_COPILOT_BINDING_FILE', 'MESH_COPILOT_WORKSPACE_PATH', 'MESH_COPILOT_WORKSPACE_URI', 'MESH_COPILOT_WORKSPACE_AUTHORITY', 'MESH_COPILOT_HOST_ID', 'MESH_COPILOT_REVIEWER', 'MESH_TASK_RECEIVER', 'MESH_TASK_THREAD_ID', 'MESH_TASK_ROUND'];
   const oldEnv = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
@@ -368,7 +377,7 @@ test('real MCP facade submission persists once, retries by submissionId, and rec
     writeBinding();
     const dispatcher = new AsyncDispatcher(store, { resolveActiveAgent: async () => ({ agent: 'codex', mode: 'auto', reason: 'mock' }) } as any, runner as any, {} as any);
     const server = new MCPServer(dispatcher, {} as any, store, {} as any, {} as any, runner as any);
-    const args = (submissionId: string) => ({ submissionId, title: 'same request', prompt: 'same prompt', targetAgent: 'codex', allowNoScope: true });
+    const args = (submissionId: string) => ({ submissionId, title: 'same request', prompt: 'same prompt', targetAgent: 'codex' });
 
     TaskSupervisor.isSupervisorActive = (() => false) as typeof TaskSupervisor.isSupervisorActive;
     await assert.rejects(server.handleToolCall('submit_mesh_task', args('recover-key-0001')), /reviewer host to be active/);

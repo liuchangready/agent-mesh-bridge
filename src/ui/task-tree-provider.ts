@@ -69,6 +69,10 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
         statusLabel =
           thread.status === 'reworking' ? `Reworking (${roundText})` : `Running (${roundText})`;
         break;
+      case 'waiting_merge':
+        iconName = 'git-merge';
+        statusLabel = 'Waiting for verified integration';
+        break;
       case 'waiting_review':
         iconName = 'eye';
         statusLabel = `In-Review (${roundText})`;
@@ -113,9 +117,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
       thread.rounds && thread.rounds.length > 0 ? thread.rounds[thread.rounds.length - 1] : undefined;
     const repeatBadge =
       latestRound?.repeatOfRound !== undefined ? ` · ↻重复R${latestRound.repeatOfRound}` : '';
-    const scopeBadge = thread.scopeBlockedBy
-      ? ` · ⛔scope 等 ${thread.scopeBlockedBy.threadId}`
-      : '';
     // A stalled review is actionable: the caller was woken but never reviewed
     // (429 / expired session), and nothing else can move this task. The record is
     // per-round, so a rework that is still being reviewed shows nothing.
@@ -141,7 +142,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
 
     // A review the caller parked with `blocked: true` is NOT a review still in
     // progress: the verdict was "hold until a dependency lands". Keep that
-    // state visible while allowing unrelated tasks to run; only scope conflicts
+    // state visible while allowing unrelated tasks to run; only explicitly configured limits
     // or an explicitly configured concurrency limit can delay them.
     const reviewBlocked =
       thread.status === 'waiting_review' && thread.reviewBlocked ? thread.reviewBlocked : undefined;
@@ -169,13 +170,15 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
         ? ` · ${tokenSummary.isPartialOrEstimated ? '~' : ''}${formatTokenCount(tokenSummary.totalTokens)} tok`
         : '';
 
-    const description = `${statusLabel} · ${durationText}${modelBadge}${flowBadge}${archiveBadge}${tokenBadge}${repeatBadge}${scopeBadge}${reviewBadge}${blockedBadge}${reviewFailureBadge}`;
+    const description = `${statusLabel} · ${durationText}${modelBadge}${flowBadge}${archiveBadge}${tokenBadge}${repeatBadge}${reviewBadge}${blockedBadge}${reviewFailureBadge}`;
 
     const item = new TaskTreeItem(label, vscode.TreeItemCollapsibleState.Collapsed, thread);
     item.description = description;
     item.iconPath = new vscode.ThemeIcon(iconName);
     item.contextValue =
-      thread.status === 'waiting_review'
+      thread.status === 'waiting_merge'
+        ? 'waiting_merge'
+        : thread.status === 'waiting_review'
         ? // A healthy review needs no manual wake: only a recorded wake failure
           // exposes the "re-review" action (see the menu `when` clause). A
           // parked review gets its own value so the user can release the park.

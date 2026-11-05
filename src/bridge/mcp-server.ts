@@ -76,7 +76,6 @@ const CONTROL_TOOLS = new Set([
   'resume_task',
   'retry_task',
   'retarget_task',
-  'allow_scope_overlap',
   'delete_task',
   'record_merge_request',
 ]);
@@ -404,45 +403,6 @@ export class MCPServer {
               type: 'string',
               description: 'Workspace root path (defaults to current working directory).',
             },
-            worktree: {
-              type: 'object',
-              description:
-                'Declare that workspacePath is a TEMPORARY git worktree (created with `git worktree add`), not the shared checkout. ' +
-                'The bridge then records the merge-back obligation: the task cannot be deleted until record_merge_request is called ' +
-                '(delete_task force:true overrides). Omit this for the normal workspace.',
-              properties: {
-                mainPath: {
-                  type: 'string',
-                  description:
-                    'Absolute path of the main checkout this worktree has to merge back into.',
-                },
-                branch: {
-                  type: 'string',
-                  description: 'Branch the worktree was created from (recorded for the merge audit).',
-                },
-                baseCommit: {
-                  type: 'string',
-                  description: 'Commit the worktree was created from (recorded for the merge audit).',
-                },
-              },
-              required: ['mainPath'],
-            },
-            expectedFiles: {
-              type: 'array',
-              items: { type: 'string' },
-              description:
-                'Concrete code file paths this task will modify (e.g. ["src/service/Foo.ts", "lib/parser.ts"]). REQUIRED: the bridge refuses to start a task on a file another open task already declared or actually changed, and it cannot enforce that without your scope. Do NOT pass folders, trailing slashes, or glob patterns (rejected). Pass allowNoScope: true only if the task touches no workspace file.',
-            },
-            allowNoScope: {
-              type: 'boolean',
-              description:
-                'Explicitly declare that this task modifies no workspace file, skipping the scope requirement. Omit when you pass expectedFiles.',
-            },
-            allowScopeOverlap: {
-              type: 'boolean',
-              description:
-                'Accept running on top of files another open task already changed (use only when you know the two edits do not conflict, e.g. the earlier task was already committed).',
-            },
             model: {
               type: 'string',
               description:
@@ -475,7 +435,7 @@ export class MCPServer {
               required: ['threadId', 'token'],
             },
           },
-          required: ['title', 'prompt', 'expectedFiles'],
+          required: ['title', 'prompt'],
         },
       },
       {
@@ -512,7 +472,7 @@ export class MCPServer {
             targetAgent: {
               type: 'string',
               description:
-                'Optional: deliver THIS rework to a different agent. The task keeps its thread, history and file scope; the previous agent\'s native session cannot be resumed, so the round starts a fresh one. May be the task\'s initiator only for a dedicated-review task whose reviewer model differs from the new receiver model.',
+                'Optional: deliver THIS rework to a different agent. The task keeps its thread, history and isolated worktree; the previous agent\'s native session cannot be resumed, so the round starts a fresh one. May be the task\'s initiator only for a dedicated-review task whose reviewer model differs from the new receiver model.',
             },
             model: {
               type: 'string',
@@ -531,7 +491,7 @@ export class MCPServer {
       {
         name: 'approve_task',
         description:
-          'Approve the delegated task when satisfied, marking it completed and archiving the thread.',
+          'Approve the reviewed task commit. Code changes enter waiting_merge until serialized local integration and combined validation succeed; no-change tasks complete immediately.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -629,7 +589,7 @@ export class MCPServer {
       {
         name: 'retarget_task',
         description:
-          'Move an existing task to another executor: another agent and/or another model, keeping the same thread, round history and file scope. Works on queued, paused, failed and waiting_review tasks; refuses while a round is in flight (pause first) and on completed tasks. Switching the agent starts a fresh native session because the previous agent\'s session cannot be resumed. Model policy: omitted model keeps the current one (or uses the new agent\'s configured default); a non-default model requires modelRequestedByUser: true and the user\'s click consent in VS Code.',
+          'Move an existing task to another executor: another agent and/or another model, keeping the same thread, round history and isolated worktree. Works on queued, paused, failed and waiting_review tasks; refuses while a round is in flight (pause first) and on completed tasks. Switching the agent starts a fresh native session because the previous agent\'s session cannot be resumed. Model policy: omitted model keeps the current one (or uses the new agent\'s configured default); a non-default model requires modelRequestedByUser: true and the user\'s click consent in VS Code.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -662,31 +622,12 @@ export class MCPServer {
         },
       },
       {
-        name: 'allow_scope_overlap',
-        description:
-          'Override the file-scope gate for a queued task: allow it to run even though another open task already changed some of the same files. Only use it when the overlap is genuinely safe (e.g. the earlier task was already committed or its change is unrelated).',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            threadId: {
-              type: 'string',
-              description: 'Task thread ID to unblock.',
-            },
-            reason: {
-              type: 'string',
-              description: 'Why the overlap is safe (recorded for audit).',
-            },
-          },
-          required: ['threadId'],
-        },
-      },
-      {
         name: 'delete_task',
         description:
           'Permanently delete a task. A running agent process is stopped first; the deletion reason is written to the tombstone log. ' +
           "The receiver's native conversation (Claude Code / Codex / Antigravity / DeepSeek Harness session files) is cleaned up as well — " +
           'best effort: a conversation that can no longer be found is not an error. The caller/initiator session is never deleted. ' +
-          'A completed task that ran in a temporary worktree is REFUSED until its work is merged back: call record_merge_request first, or pass force: true to discard the worktree output deliberately.',
+          'A task with unmerged worktree output is REFUSED unless force: true explicitly discards it. A remote merge request record never counts as local integration.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -701,7 +642,7 @@ export class MCPServer {
             force: {
               type: 'boolean',
               description:
-                'Delete even though the task has an unmerged worktree (its output will be lost). Omit to be refused until the merge request is recorded.',
+                'Delete even though task work remains unmerged (the worktree output will be lost).',
             },
           },
           required: ['threadId', 'reason'],
@@ -1002,8 +943,7 @@ export class MCPServer {
    * environment — Codex passes ONLY the `env` table from `config.toml`, and
    * DeepSeek Harness scrubs inherited variables — so the environment markers
    * never arrive there. Without the pid fallback the reviewer's `dispatch_task`
-   * falls through to a normal dispatch, is rejected for a missing
-   * `expectedFiles`, and the task dies with "the reviewer turn ended without
+   * falls through to a normal dispatch and the task dies with "the reviewer turn ended without
    * calling dispatch_task" while the developer never starts.
    */
   private resolveReviewerBootstrapIdentity(args?: any):
@@ -1079,8 +1019,7 @@ export class MCPServer {
     const hasBrief =
       (typeof args.title === 'string' && args.title.trim() !== '') ||
       (typeof args.prompt === 'string' && args.prompt.trim() !== '') ||
-      (Array.isArray(args.expectedFiles) && args.expectedFiles.length > 0) ||
-      args.allowNoScope === true;
+      false;
     return !hasBrief;
   }
 
@@ -1276,7 +1215,7 @@ export class MCPServer {
       if (!allowed.has(name)) throw new Error(`Tool ${name} is not available in the Copilot requester profile.`);
       this.assertCopilotBinding();
       const allowedArgs: Record<string, string[]> = {
-        submit_mesh_task: ['title', 'prompt', 'targetAgent', 'workspacePath', 'worktree', 'expectedFiles', 'allowNoScope', 'model', 'modelRequestedByUser', 'submissionId'],
+        submit_mesh_task: ['title', 'prompt', 'targetAgent', 'workspacePath', 'model', 'modelRequestedByUser', 'submissionId'],
         query_agent_mesh_status: [],
         list_agent_models: ['targetAgent', 'forceRefresh'],
         get_task_summary: ['threadId'],
@@ -1322,13 +1261,6 @@ export class MCPServer {
           prompt: args.prompt,
           callerSessionId: args.callerSessionId,
           workspacePath: args.workspacePath,
-          worktree: args.worktree,
-          expectedFiles: args.expectedFiles,
-          allowNoScope: args.allowNoScope === true,
-          allowScopeOverlap: args.allowScopeOverlap === true,
-          // Agent callers must declare a scope; that is what makes the
-          // file-ownership gate enforceable for tasks dispatched over MCP.
-          requireScope: true,
           model: args.model,
           modelRequestedByUser: args.modelRequestedByUser === true,
           initiatorModel: args.initiatorModel,
@@ -1383,8 +1315,7 @@ export class MCPServer {
           threadId: args.threadId,
           remarks: args.remarks,
         });
-        new TaskRoleLock().releaseIfRole(args.threadId, 'reviewer');
-        // The task is closed: no polling to discourage anymore.
+        // The reviewer decision is recorded. A code task may still be waiting for local integration.
         this.pollGuard.forget(args.threadId);
         return result;
       }
@@ -1413,25 +1344,6 @@ export class MCPServer {
         return result;
       }
 
-      case 'allow_scope_overlap': {
-        const thread = this.taskStore.getTask(args.threadId);
-        if (!thread) {
-          throw new Error(`Task thread not found: ${args.threadId}`);
-        }
-        thread.scopeOverride = true;
-        thread.scopeBlockedBy = undefined;
-        thread.updatedAt = new Date().toISOString();
-        this.taskStore.upsertTask(thread);
-        return {
-          threadId: args.threadId,
-          status: 'SCOPE_OVERRIDE',
-          message:
-            `Task ${args.threadId} may now run on files owned by other open tasks` +
-            `${args.reason ? ` (reason: ${args.reason})` : ''}. ` +
-            `The queue advances on its own; you will be woken when the round finishes.`,
-        };
-      }
-
       case 'retry_task': {
         const retried = await this.reworkController.retryFailedRound(args.threadId, {
           targetAgent: args.targetAgent,
@@ -1457,7 +1369,7 @@ export class MCPServer {
       }
 
       case 'delete_task': {
-        const deleted = this.taskControl.deleteTask(
+        const deleted = await this.taskControl.deleteTask(
           args.threadId,
           args.reason,
           'agent',
@@ -1942,8 +1854,7 @@ export class MCPServer {
     const requestedWorkspace = args.workspacePath ? path.resolve(binding.workspacePath, args.workspacePath) : binding.workspacePath;
     const fingerprint = crypto.createHash('sha256').update(JSON.stringify({
       title: args.title, prompt: args.prompt, targetAgent: args.targetAgent || 'default',
-      workspacePath: requestedWorkspace, expectedFiles: args.expectedFiles || [],
-      allowNoScope: args.allowNoScope === true, worktree: args.worktree,
+      workspacePath: requestedWorkspace,
       model: args.model, modelRequestedByUser: args.modelRequestedByUser === true,
     })).digest('hex');
     const releaseSubmissionLock = await this.acquireCopilotSubmissionLock(`${binding.workspaceUri}\0${args.submissionId}`);
@@ -1965,16 +1876,6 @@ export class MCPServer {
       if (!fs.existsSync(candidate)) throw new Error('workspacePath does not exist inside the bound workspace.');
       workspacePath = fs.realpathSync(candidate);
     }
-    const worktree = args.worktree ? { ...args.worktree } : undefined;
-    if (worktree?.mainPath) {
-      const mainPath = fs.realpathSync(worktree.mainPath);
-      const rootPrefix = binding.workspacePath.endsWith(path.sep) ? binding.workspacePath : binding.workspacePath + path.sep;
-      const comparePath = (value: string) => process.platform === 'win32' ? value.toLowerCase() : value;
-      if (comparePath(mainPath) !== comparePath(binding.workspacePath) && !comparePath(mainPath).startsWith(comparePath(rootPrefix))) {
-        throw new Error('worktree.mainPath must be inside the workspace bound to this Copilot host.');
-      }
-      worktree.mainPath = mainPath;
-    }
     const rootPrefix = binding.workspacePath.endsWith(path.sep) ? binding.workspacePath : binding.workspacePath + path.sep;
     const compare = (value: string) => process.platform === 'win32' ? value.toLowerCase() : value;
     if (compare(workspacePath) !== compare(binding.workspacePath) && !compare(workspacePath).startsWith(compare(rootPrefix))) {
@@ -1983,8 +1884,6 @@ export class MCPServer {
     const submission = this.dispatcher.dispatchTask({
       targetAgent: args.targetAgent || 'default', initiatorAgent: reviewer,
       title: args.title, prompt: args.prompt, workspacePath,
-      worktree, expectedFiles: args.expectedFiles,
-      allowNoScope: args.allowNoScope === true, requireScope: true,
       model: args.model, modelRequestedByUser: args.modelRequestedByUser === true,
       reviewFlow: 'dedicated',
       requesterContext: {

@@ -122,8 +122,6 @@ export function projectCopilotTaskDetails(
     historyTruncated: rounds.length > visibleRounds.length || visibleRounds.some((round) =>
       (round.prompt || '').length > MAX_TEXT || (round.output || '').length > MAX_TEXT,
     ),
-    expectedFiles: (task.expectedFiles || []).slice(0, MAX_FILES).map((file) => file.slice(0, 300)),
-    expectedFilesTruncated: (task.expectedFiles || []).length > MAX_FILES,
     tokenUsage: projectCopilotTokenUsage(tokenUsage),
     archived: !!task.archivedAt,
     finalSummary: finalSummary ? {

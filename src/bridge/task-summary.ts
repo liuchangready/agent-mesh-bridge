@@ -477,7 +477,7 @@ export function selectTasksToArchive(
     .filter(
       (thread) =>
         isTerminalThreadStatus(thread.status) &&
-        // A completed worktree task whose MR is not recorded still owns the only
+        // A worktree task whose output is not locally integrated still owns the only
         // surviving diff context; archiving it would discard the evidence.
         !isMergePending(thread),
     );

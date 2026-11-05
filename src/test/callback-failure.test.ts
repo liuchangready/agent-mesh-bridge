@@ -52,7 +52,6 @@ describe('CallbackManager failure wake-ups', () => {
     receiverSessionCaptured: true,
     callerSessionId: 'caller-codex-session-1',
     workspacePath: process.cwd(),
-    expectedFiles: [],
     summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 857_740 },
     rounds: [
       { ...failedRound(), round: 1, type: 'initial' },

@@ -10,6 +10,7 @@ import { AgentDetector } from './agent-detector';
 import {
   DelegationThread,
   DelegationRound,
+  isIsolatedTaskWorktree,
   ThreadStatus,
   findInFlightRound,
   getInFlightRounds,
@@ -17,12 +18,6 @@ import {
   isUserInterruption,
   shouldResumeNativeSession,
 } from './types';
-import {
-  findFileConflicts,
-  findScopeConflicts,
-  describeScopeConflict,
-  ScopeConflict,
-} from './file-scope';
 import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
 import { TaskExecutionOwner, TaskExecutionRegistration, TaskExecutionRegistry } from './task-execution-registry';
 import { ConcurrencyPolicy, concurrencyPolicy } from './bridge-policy';
@@ -35,6 +30,7 @@ import {
   readTextFilePaged,
   roundExecutionLogPath,
 } from './round-log';
+import { commitTaskChanges, changedFiles, currentHead } from './git-worktree';
 
 /** `get_recent_logs` reads a bounded tail, not a whole multi-megabyte log. */
 const RECENT_LOG_EXCERPT_BYTES = 512 * 1024;
@@ -282,12 +278,6 @@ export class TaskSupervisor extends EventEmitter {
       const roleOwner = roleLock.getOwner(thread.threadId);
       if (roleOwner) continue;
 
-      const scopeConflict = findScopeConflicts(thread, allTasks);
-      if (scopeConflict) {
-        this.markQueued(thread, undefined, describeScopeConflict(scopeConflict), scopeConflict);
-        continue;
-      }
-
       if (isReviewerBootstrapPending(thread)) continue;
       if (policy.enabled) {
         const owners = this.executionRegistry.listOwners();
@@ -323,7 +313,6 @@ export class TaskSupervisor extends EventEmitter {
     thread: DelegationThread,
     owner?: TaskExecutionOwner,
     detail?: string,
-    scopeConflict?: ScopeConflict,
   ): void {
     if (this.executionRegistry.getOwner(thread.threadId)) return;
     const roleOwner = new TaskRoleLock(this.storageDir).getOwner(thread.threadId);
@@ -343,12 +332,7 @@ export class TaskSupervisor extends EventEmitter {
     const message = detail || (owner
       ? `Queued: waiting for task ${owner.threadId} round ${owner.round}.`
       : 'Queued: waiting for an execution slot.');
-    const nextBlock = scopeConflict
-      ? { threadId: scopeConflict.threadId, title: scopeConflict.title, files: scopeConflict.files }
-      : undefined;
-    const blockChanged = JSON.stringify(fresh.scopeBlockedBy || null) !== JSON.stringify(nextBlock || null);
-    fresh.scopeBlockedBy = nextBlock;
-    if (fresh.status === 'queued' && fresh.summary.lastOutputSnippet === message && !blockChanged) return;
+    if (fresh.status === 'queued' && fresh.summary.lastOutputSnippet === message) return;
     fresh.status = 'queued';
     fresh.summary.lastOutputSnippet = message;
     this.taskStore.upsertTask(fresh);
@@ -410,13 +394,6 @@ export class TaskSupervisor extends EventEmitter {
     }
     fresh = latest;
 
-    const scopeConflict = findScopeConflicts(fresh, this.taskStore.getAllTasks());
-    if (scopeConflict) {
-      roleLock.release(roleLease);
-      this.markQueued(fresh, undefined, describeScopeConflict(scopeConflict), scopeConflict);
-      return Promise.resolve();
-    }
-
     const gatePolicy = concurrencyPolicy();
     if (gatePolicy.enabled) {
       const owners = this.executionRegistry.listOwners();
@@ -448,7 +425,6 @@ export class TaskSupervisor extends EventEmitter {
 
     try {
       latest.status = round.type === 'rework' ? 'reworking' : 'running';
-      latest.scopeBlockedBy = undefined;
       latest.summary.lastOutputSnippet = 'Executing in background...';
       this.taskStore.upsertTask(latest);
     } catch (error) {
@@ -518,7 +494,7 @@ export class TaskSupervisor extends EventEmitter {
       let result: RunResult;
       // Baseline before the agent starts: the diff afterwards attributes exactly
       // which files this round changed.
-      const scopeBefore = captureWorkspaceSnapshot(thread.workspacePath);
+      const workspaceBefore = captureWorkspaceSnapshot(thread.workspacePath);
       try {
         result = await this.runner.execute({
           agent: thread.targetAgent,
@@ -569,7 +545,7 @@ export class TaskSupervisor extends EventEmitter {
       }
 
       const touchedFiles = diffWorkspaceSnapshots(
-        scopeBefore,
+        workspaceBefore,
         captureWorkspaceSnapshot(thread.workspacePath),
       );
 
@@ -591,7 +567,26 @@ export class TaskSupervisor extends EventEmitter {
       const responseOk = result.assessment
         ? result.assessment.success
         : result.exitCode === 0;
-      const isSuccess = !interruption && !pausedByControl && responseOk;
+      let isSuccess = !interruption && !pausedByControl && responseOk;
+      if (isSuccess && isIsolatedTaskWorktree(currentThread.worktree)) {
+        try {
+          currentThread.worktree.headCommit = commitTaskChanges(currentThread.worktree, `Agent work ${currentThread.threadId} round ${roundNumber}`);
+          currentThread.worktree.integration = { phase: currentThread.worktree.headCommit === currentThread.worktree.baseCommit ? 'no_changes' : 'ready', sourceCommit: currentThread.worktree.headCommit, updatedAt: new Date().toISOString() };
+        } catch (error: any) {
+          result.error = `Could not create the task delivery commit: ${error?.message || error}`;
+          result.exitCode = 1;
+          isSuccess = false;
+        }
+      }
+      if (!isSuccess && isIsolatedTaskWorktree(currentThread.worktree)) {
+        try {
+          const head = currentHead(currentThread.worktree.path);
+          if (head !== currentThread.worktree.baseCommit || changedFiles(currentThread.worktree.path).length) {
+            currentThread.worktree.headCommit = head;
+            currentThread.worktree.integration = { phase: 'ready', sourceCommit: head, updatedAt: new Date().toISOString() };
+          }
+        } catch {}
+      }
       const finalRoundStatus = isPaused ? 'paused' : isSuccess ? 'completed' : 'failed';
       const finalThreadStatus = isPaused ? 'paused' : isSuccess ? 'waiting_review' : 'failed';
       const nativeSessionId = result.actualSessionId || currentThread.receiverSessionId;

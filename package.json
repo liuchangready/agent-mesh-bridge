@@ -367,7 +367,7 @@
         "agentMeshBridge.concurrency.enabled": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Apply the configured best-effort concurrency limits when enabled. **OFF (default) means unlimited concurrency**, not single-flight. Tasks in the same workspace may overlap when their declared file scopes do not conflict. Scope checks, one active role per task, one active round per task, and pause/delete cancellation remain in force. Scope measurements use git snapshots and may observe changes from other concurrently running tasks."
+          "markdownDescription": "Apply the configured best-effort concurrency limits when enabled. **OFF (default) means unlimited concurrency**, not single-flight. Every new task runs in its own Git worktree and branch, so tasks from the same repository may edit the same files concurrently. One active role and one active round per task remain enforced; local integration is serialized by a mesh-wide lock."
         },
         "agentMeshBridge.concurrency.maxConcurrentTasks": {
           "type": "number",

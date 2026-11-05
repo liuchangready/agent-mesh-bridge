@@ -119,7 +119,6 @@ export class CallbackManager extends EventEmitter {
    * Dispatches proactive notification callback to caller agent to resume original turn.
    */
   public async notifyCaller(thread: DelegationThread, round: DelegationRound): Promise<boolean> {
-    const initiator = thread.initiatorAgent;
     const callerSessionId = this.resolveCallerSession(thread);
     // A wake may be planned for an older round than the one actually delivered
     // last. Always review/report the newest completed WORK round, so a stale plan
@@ -391,7 +390,7 @@ export class CallbackManager extends EventEmitter {
     }
 
     if ((!callerSessionId || !isValidSessionId(callerSessionId)) && this.detector) {
-      callerSessionId = this.detector.detectActiveSession(initiator, thread.workspacePath, [
+      callerSessionId = this.detector.detectActiveSession(initiator, thread.worktree?.repositoryPath || thread.workspacePath, [
         thread.receiverSessionId,
       ]);
       if (callerSessionId) {
@@ -764,7 +763,7 @@ export class CallbackManager extends EventEmitter {
       }
     }
 
-    if (target.status === 'completed') {
+    if (target.status === 'completed' || target.status === 'waiting_merge') {
       if (target.reviewWake?.round === round.round) {
         target.reviewWake = undefined;
         target.updatedAt = new Date().toISOString();

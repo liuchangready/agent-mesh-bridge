@@ -10,12 +10,20 @@ import {
 } from './native-session-cleanup';
 import { TaskStore } from './task-store';
 import { removeTaskArtifacts } from './task-summary';
+import { removeTaskWorktree } from './git-worktree';
+import { changedFiles, currentHead } from './git-worktree';
+import { gitOutput } from './git-worktree';
+import { MeshFileLock } from './merge-coordinator';
+import { TaskRoleLock } from './task-role-lock';
+import { killPidTree } from './platform';
 import {
   DelegationRound,
   DelegationThread,
   TaskInterruption,
   appendInterruption,
   findInFlightRound,
+  isMergePending,
+  isIsolatedTaskWorktree,
 } from './types';
 
 export interface TaskControlResult {
@@ -45,6 +53,7 @@ export class TaskControlService {
   private readonly executionRegistry: TaskExecutionRegistry;
   private readonly storageDir: string;
   private readonly sessionCleanup: (thread: DelegationThread) => NativeSessionCleanupResult;
+  private readonly mergeLock: MeshFileLock;
 
   constructor(
     taskStore: TaskStore,
@@ -52,6 +61,7 @@ export class TaskControlService {
     cancellationRegistry?: CancellationRegistry,
     storageDir?: string,
     sessionCleanup?: (thread: DelegationThread) => NativeSessionCleanupResult,
+    mergeLock?: MeshFileLock,
   ) {
     this.taskStore = taskStore;
     this.runner = runner;
@@ -59,6 +69,7 @@ export class TaskControlService {
     this.cancellationRegistry = cancellationRegistry || new CancellationRegistry(this.storageDir);
     this.executionRegistry = new TaskExecutionRegistry(this.storageDir);
     this.sessionCleanup = sessionCleanup || ((thread) => cleanupThreadNativeSessions(thread));
+    this.mergeLock = mergeLock || new MeshFileLock();
   }
 
   /**
@@ -102,6 +113,7 @@ export class TaskControlService {
     };
 
     const round = this.resolveCurrentRound(thread);
+    const pausingMerge = thread.status === 'waiting_merge';
     if (thread.status === 'paused') {
       // Idempotent, but still publish cancellation and stop this task's child.
       this.cancellationRegistry.request(threadId, 'pause', normalizedReason, by);
@@ -121,7 +133,7 @@ export class TaskControlService {
     thread.updatedAt = now;
     thread.summary.lastOutputSnippet = `Paused: ${normalizedReason}`;
     appendInterruption(thread, interruption);
-    if (round) {
+    if (round && !pausingMerge) {
       round.status = 'paused';
       round.interruption = interruption;
     }
@@ -145,36 +157,50 @@ export class TaskControlService {
 
   /**
    * Permanently delete a task. Active children are stopped first; the ledger
-   * entry is removed and a tombstone (with the reason) is appended to
-   * `deleted_tasks.log` so the stop reason is not silently lost.
-   *
-   * The receiver's native conversations are removed as well (best effort: a
-   * conversation that no longer exists is not an error). The caller's own
-   * session is never touched — it is shared with later tasks.
-   *
-   * Merge gate: a task that ran in a temporary worktree and was completed
-   * without a recorded merge request is refused by default — deleting it would
-   * throw away work that only exists in the throwaway worktree. The caller must
-   * record the MR first (the normal path) or pass `force: true` deliberately.
+   * entry is removed and a tombstone records the deletion reason.
+   * Local integration, not MR metadata, decides whether unmerged task output
+   * can be discarded without an explicit force.
    */
-  public deleteTask(
+  public async deleteTask(
     threadId: string,
     reason: string,
     by: string = 'user',
     force: boolean = false,
-  ): TaskControlResult {
+  ): Promise<TaskControlResult> {
     this.taskStore.loadFromDisk();
     const thread = this.taskStore.getTask(threadId);
     if (!thread) {
       throw new Error(`Task thread not found: ${threadId}`);
     }
 
-    if (thread.worktree && !thread.mergeRequest && !force) {
+    const hasUnmergedOutput = (candidate: DelegationThread): boolean => !!candidate.worktree && (() => {
+      try {
+        const worktree = candidate.worktree!;
+        const head = currentHead(worktree.path);
+        const dirty = changedFiles(worktree.path).length > 0;
+        const phase = worktree.integration?.phase;
+        if ((phase === 'merged' || phase === 'no_changes') && !dirty) {
+          const expected = phase === 'merged' ? worktree.approvedCommit : worktree.baseCommit;
+          if (expected && head === expected) return false;
+          // A ref may have landed before its ledger write. The transaction is
+          // trusted only when the target contains that exact candidate and the
+          // task worktree still matches its approved source.
+          const txPath = path.join(this.storageDir, 'merge-transactions', `${candidate.threadId}.json`);
+          const tx = JSON.parse(fs.readFileSync(txPath, 'utf8'));
+          const repo = worktree.repositoryPath || worktree.mainPath;
+          const target = gitOutput(repo, ['rev-parse', '--verify', `${worktree.targetRef}^{commit}`]);
+          const integrated = tx.candidateCommit && (target === tx.candidateCommit || gitOutput(repo, ['merge-base', '--is-ancestor', tx.candidateCommit, target]) === '');
+          if (integrated && head === tx.sourceCommit) return false;
+        }
+        return dirty || (!!worktree.baseCommit && head !== worktree.baseCommit) ||
+          !!worktree.approvedCommit || isMergePending(thread);
+      } catch { return true; }
+    })();
+    const worktreeHasUnmergedOutput = hasUnmergedOutput(thread);
+    if (worktreeHasUnmergedOutput && !force) {
       throw new Error(
-        `Refusing to delete task ${threadId}: its worktree ${thread.worktree.path} ` +
-          `has not been merged back to ${thread.worktree.mainPath} yet. ` +
-          `Record the merge request first (record_merge_request with url/branch/commit), ` +
-          `or pass force: true to delete anyway — the worktree output would be lost.`,
+        `Refusing to delete task ${threadId}: its approved work has not been integrated locally. ` +
+          `Wait for integration or pass force: true to discard the unmerged worktree output.`,
       );
     }
 
@@ -184,19 +210,52 @@ export class TaskControlService {
       thread.status === 'reworking' ||
       thread.status === 'queued' ||
       thread.status === 'paused' ||
-      !!findInFlightRound(thread);
+      thread.status === 'waiting_merge' ||
+      !!findInFlightRound(thread) ||
+      !!new TaskRoleLock(this.storageDir).getOwner(threadId)?.childPid ||
+      this.executionRegistry.listOwners().some((owner) => owner.threadId === threadId && !!owner.childPid);
 
     if (active) {
       this.cancellationRegistry.request(threadId, 'delete', normalizedReason, by);
       this.runner?.cancelThread(threadId, 'delete', normalizedReason, by);
       this.executionRegistry.killOrphanChild(threadId, true);
+      const reviewerChild = new TaskRoleLock(this.storageDir).getOwner(threadId)?.childPid;
+      if (reviewerChild) { try { killPidTree(reviewerChild); } catch {} }
+      thread.status = 'paused';
+      thread.updatedAt = new Date().toISOString();
+      thread.summary.lastOutputSnippet = `Deleting: ${normalizedReason}`;
+      try { this.taskStore.upsertTask(thread); }
+      catch (error) { throw new Error(`Could not persist deletion intent for ${threadId}: ${(error as Error).message}`, { cause: error }); }
+      await this.waitForThreadChildren(threadId);
     }
 
-    this.taskStore.deleteTask(threadId);
+    // Serialize final cleanup with ref updates and their durable ledger write.
+    if (isIsolatedTaskWorktree(thread.worktree)) {
+      const release = await this.mergeLock.acquire();
+      if (!release) throw new Error(`Deletion of ${threadId} was cancelled while waiting for integration to stop.`);
+      try {
+        this.taskStore.loadFromDisk();
+        const latest = this.taskStore.getTask(threadId);
+        if (latest?.status === 'completed' && latest.worktree?.integration?.phase === 'merged') {
+          thread.status = latest.status;
+          thread.worktree = latest.worktree;
+        }
+        if (latest && hasUnmergedOutput(latest) && !force) {
+          throw new Error(`Refusing to delete task ${threadId}: its approved work has not been integrated locally. Wait for integration or pass force: true to discard the unmerged worktree output.`);
+        }
+        this.appendTombstone(thread, normalizedReason, by, undefined, force);
+        this.taskStore.deleteTask(threadId);
+      } finally { release(); }
+    } else {
+      this.appendTombstone(thread, normalizedReason, by, undefined, force);
+      this.taskStore.deleteTask(threadId);
+    }
+
     // Everything the bridge itself stored for this task: per-round logs, output
     // archives, reviewer logs and a pending bootstrap token. The ledger entry is
     // already gone, so a cleanup failure can never resurrect the task.
     removeTaskArtifacts(threadId, this.storageDir);
+    if (thread.worktree) removeTaskWorktree(thread.worktree);
 
     // Clean up the receiver's native conversation(s) only after the ledger entry
     // is gone: a cleanup failure must never leave a "deleted but still listed"
@@ -214,6 +273,23 @@ export class TaskControlService {
         (cleanupNote ? ` Cleaned: ${cleanupNote}.` : ''),
       nativeSessions,
     };
+  }
+
+  private async waitForThreadChildren(threadId: string): Promise<void> {
+    const roles = new TaskRoleLock(this.storageDir);
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      this.executionRegistry.killOrphanChild(threadId, true);
+      const executionLive = this.executionRegistry.listOwners().some((owner) => owner.threadId === threadId);
+      const roleChild = roles.getOwner(threadId)?.childPid;
+      let roleLive = false;
+      if (roleChild) {
+        try { process.kill(roleChild, 0); roleLive = true; } catch (error) { roleLive = (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+      }
+      if (!executionLive && !roleLive) return;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error(`Timed out waiting for task ${threadId} processes to exit; its worktree and ledger were retained.`);
   }
 
   /** Run the injected cleaner, swallowing anything it might still throw. */
@@ -270,11 +346,17 @@ export class TaskControlService {
             }
           : undefined,
       };
-      fs.appendFileSync(
-        path.join(this.storageDir, 'deleted_tasks.log'),
-        JSON.stringify(record) + '\n',
-        'utf8',
-      );
-    } catch {}
+      const file = path.join(this.storageDir, 'deleted_tasks.log');
+      const prior = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean) : [];
+      const retained = prior.filter((line) => { try { return JSON.parse(line).threadId !== thread.threadId; } catch { return true; } });
+      const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
+      const fd = fs.openSync(temp, 'w');
+      try { fs.writeFileSync(fd, `${retained.join('\n')}${retained.length ? '\n' : ''}${JSON.stringify(record)}\n`, 'utf8'); fs.fsyncSync(fd); }
+      finally { fs.closeSync(fd); }
+      fs.renameSync(temp, file);
+      if (process.platform !== 'win32') { const dirFd = fs.openSync(this.storageDir, 'r'); try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); } }
+    } catch (error) {
+      throw new Error(`Could not persist deletion tombstone for ${thread.threadId}: ${(error as Error)?.message || error}`, { cause: error });
+    }
   }
 }

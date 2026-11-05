@@ -19,7 +19,7 @@ import { TaskDetailPanel } from './ui/detail-panel';
 import { ModelApprovalService } from './ui/model-approval-service';
 import { TaskRetargetService } from './bridge/task-retarget';
 import { TaskRoleLock } from './bridge/task-role-lock';
-import { AgentId, isValidSessionId } from './bridge/types';
+import { AgentId, isValidSessionId, isMergePending } from './bridge/types';
 import { TaskSupervisor } from './bridge/task-supervisor';
 import { TaskControlService } from './bridge/task-control';
 import { TaskArchiveService } from './bridge/task-archive';
@@ -482,7 +482,9 @@ export function activate(context: vscode.ExtensionContext) {
     callbackManager,
     detector,
     executionRegistry,
+    true,
   );
+  context.subscriptions.push({ dispose: () => reworkController.dispose() });
   const taskControl = new TaskControlService(taskStore, runner);
   const configSync = new ConfigSyncService(undefined, dshProvider);
   configSync.setAgentMcpEnv(agentMcpEnvFor(dshProvider));
@@ -508,6 +510,7 @@ export function activate(context: vscode.ExtensionContext) {
       supervisor.checkPendingTasks();
     },
   });
+  reworkController.resumePendingMerges();
   reviewerBootstrap.start();
   context.subscriptions.push({ dispose: () => reviewerBootstrap.stop() });
 
@@ -745,8 +748,8 @@ export function activate(context: vscode.ExtensionContext) {
     const thread = taskStore.getTask(threadId);
     const title = thread ? thread.title : threadId;
     const worktree = thread?.worktree;
-    const mergeGate = !!worktree && !thread?.mergeRequest;
-    const running = !!thread && (thread.status === 'running' || thread.status === 'reworking');
+    const mergeGate = !!thread && isMergePending(thread);
+    const running = !!thread && (thread.status === 'running' || thread.status === 'reworking' || thread.status === 'waiting_merge');
 
     const details = [
       force ? `确定要【强制删除】任务【${title}】吗？` : `确定要永久删除任务【${title}】吗？`,
@@ -770,8 +773,7 @@ export function activate(context: vscode.ExtensionContext) {
     if (confirm !== confirmLabel) return;
 
     if (!force && mergeGate) {
-      // Recommend the merge request first, but keep the escape hatch one click
-      // away: the normal command must not dead-end on a worktree task.
+      // Local integration, not a remote MR URL, protects this output.
       const escalate = await vscode.window.showWarningMessage(
         `任务【${title}】有未合并的 worktree 输出。推荐先 record_merge_request 再删除；` +
           '若确认放弃这些改动，可以强制删除。',
@@ -791,7 +793,7 @@ export function activate(context: vscode.ExtensionContext) {
     if (reason === undefined) return;
 
     try {
-      const result = taskControl.deleteTask(threadId, reason, 'user', force);
+      const result = await taskControl.deleteTask(threadId, reason, 'user', force);
       vscode.window.showInformationMessage(result.message);
       taskStore.loadFromDisk();
       activeTreeProvider.refresh();

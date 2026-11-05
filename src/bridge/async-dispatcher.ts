@@ -1,7 +1,6 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import {
   AgentId,
   DelegationThread,
@@ -9,8 +8,8 @@ import {
   DispatchTaskParams,
   DispatchResult,
   DispatchStatus,
-  DispatchWorktreeSpec,
   WorktreeInfo,
+  isIsolatedTaskWorktree,
   getModelRouting,
   findInFlightRound,
   isReviewerBootstrapPending,
@@ -27,12 +26,7 @@ import { ActiveAgentResolver } from './active-agent-resolver';
 import { AutonomousRunner, RunResult } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
 import { TaskSupervisor } from './task-supervisor';
-import {
-  validateExpectedFiles,
-  findScopeConflicts,
-  describeScopeConflict,
-  ScopeConflict,
-} from './file-scope';
+import { resolveGitRepository, createTaskWorktree, commitTaskChanges, changedFiles, currentHead } from './git-worktree';
 import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
 import { TaskExecutionOwner, TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 import { QueueDrainer, QueuedExecution } from './queue-drainer';
@@ -106,43 +100,10 @@ export class AsyncDispatcher {
   /**
    * Dispatches a new task asynchronously and non-blockingly.
    */
-  /**
-   * Validate the caller's "this workspace is a temporary worktree" declaration.
-   *
-   * Without `mainPath` the bridge cannot tell a throwaway checkout from a real
-   * workspace, and the merge gate would silently never fire — the exact failure
-   * mode this parameter exists to prevent. `path` is the task's workspacePath, so
-   * passing the same directory twice is a caller mistake, not a valid worktree.
-   */
-  private resolveWorktreeSpec(
-    spec: DispatchWorktreeSpec | undefined,
-    workspacePath: string,
-  ): WorktreeInfo | undefined {
-    if (!spec) return undefined;
-    if (!spec.mainPath || !String(spec.mainPath).trim()) {
-      throw new Error(
-        'worktree.mainPath is required when worktree is set: name the main checkout ' +
-          'this temporary worktree has to merge back into.',
-      );
-    }
-    const worktreePath = path.resolve(workspacePath);
-    const mainPath = path.resolve(spec.mainPath);
-    if (worktreePath.toLowerCase() === mainPath.toLowerCase()) {
-      throw new Error(
-        `worktree.mainPath must differ from workspacePath (both resolve to ${worktreePath}). ` +
-          'Pass the temporary worktree as workspacePath and the main checkout as worktree.mainPath.',
-      );
-    }
-    return {
-      path: worktreePath,
-      mainPath,
-      ...(spec.branch ? { branch: spec.branch } : {}),
-      ...(spec.baseCommit ? { baseCommit: spec.baseCommit } : {}),
-      mergePending: false,
-    };
-  }
-
   public async dispatchTask(params: DispatchTaskParams): Promise<DispatchResult> {
+    if (!params.title?.trim() || !params.prompt?.trim()) {
+      throw new Error('A task title and prompt are required for a normal dispatch.');
+    }
     let targetAgent: AgentId;
 
     if (!params.targetAgent || params.targetAgent === 'default') {
@@ -187,41 +148,14 @@ export class AsyncDispatcher {
     const threadId = this.generateThreadId(now);
     const receiverSessionId = crypto.randomUUID();
     const nowIso = now.toISOString();
-    const workspacePath = params.workspacePath || process.cwd();
-    // Throws before anything is persisted when the declaration is unusable, so a
-    // bad worktree spec can never create a task whose output cannot be merged.
-    const worktree = this.resolveWorktreeSpec(params.worktree, workspacePath);
-
-    // expectedFiles is a lock scope, so it must be narrow: concrete code files
-    // only. Folders/globs would block unrelated sibling work.
-    const expectedFilesValidation = validateExpectedFiles(params.expectedFiles, workspacePath);
-    if (!expectedFilesValidation.ok) {
-      throw new Error(
-        `Invalid expectedFiles for task "${params.title}": ${expectedFilesValidation.errors.join(' ')} ` +
-          `Use concrete code file paths (e.g. ["src/service/foo.ts"]), never folders or glob patterns.`,
-      );
-    }
-    // A declared scope is what lets the bridge refuse to start this task on a
-    // file another open task already changed. Callers that genuinely touch no
-    // workspace file must say so explicitly instead of silently omitting it.
-    if (
-      expectedFilesValidation.files.length === 0 &&
-      params.requireScope === true &&
-      !params.allowNoScope
-    ) {
-      throw new Error(
-        `dispatch_task requires expectedFiles for task "${params.title}": list the concrete code files this ` +
-          `task will modify (e.g. ["engine/src/main/kotlin/Foo.kt"]) so two tasks cannot edit the same file. ` +
-          `If the task touches no workspace file, pass allowNoScope: true.`,
-      );
-    }
+    const repositoryPath = path.resolve(params.workspacePath || process.cwd());
 
     let callerSessionId =
       params.callerSessionId && isValidSessionId(params.callerSessionId)
         ? params.callerSessionId
         : undefined;
     if (!callerSessionId && this.detector && !params.requesterContext) {
-      callerSessionId = this.detector.detectActiveSession(initiatorAgent, workspacePath, [
+      callerSessionId = this.detector.detectActiveSession(initiatorAgent, repositoryPath, [
         receiverSessionId,
       ]);
       if (callerSessionId) {
@@ -241,10 +175,6 @@ export class AsyncDispatcher {
     };
 
     this.taskStore.loadFromDisk();
-    const allKnownTasks = this.taskStore.getAllTasks();
-    // The scope gate also looks at accepted-but-unmerged tasks: their edits are
-    // still in the working tree even though they no longer hold the queue.
-    const scopePeers = allKnownTasks.filter((t) => t.threadId !== threadId);
 
     // Record both ends of the model routing: the model the sender is on (best
     // effort) and the model the receiver will execute with. Pinning the receiver
@@ -293,6 +223,12 @@ export class AsyncDispatcher {
       }
     }
 
+    this.taskStore.loadFromDisk();
+    if (!this.taskStore.canAcceptTask()) {
+      throw new Error('The task ledger is full and every stored task contains active, unmerged, or otherwise non-evictable work. Merge or explicitly delete retained tasks before dispatching another.');
+    }
+    const worktree: WorktreeInfo = createTaskWorktree(resolveGitRepository(repositoryPath, this.storageDir), threadId, this.storageDir);
+    const workspacePath = worktree.path;
     const tempCandidate: DelegationThread = {
       threadId,
       title: params.title || 'Untitled Delegation Task',
@@ -329,9 +265,6 @@ export class AsyncDispatcher {
       targetModel,
       modelNotice,
       modelApproval: modelResolution.approval,
-      expectedFiles:
-        expectedFilesValidation.files.length > 0 ? expectedFilesValidation.files : undefined,
-      scopeOverride: params.allowScopeOverlap ? true : undefined,
       summary: {
         lastPromptSnippet: (params.prompt || '').slice(0, 100),
         lastOutputSnippet:
@@ -343,26 +276,16 @@ export class AsyncDispatcher {
       rounds: [round1],
     };
 
-    // Batch-level scope gate: refuse to schedule a task whose declared files are
-    // still owned by another open task (declared or actually touched).
-    const scopeConflict = findScopeConflicts(tempCandidate, scopePeers);
     const policy = concurrencyPolicy();
     const owners = policy.enabled ? this.executionRegistry.listOwners() : [];
     const globalSlotFull = policy.enabled && owners.length >= policy.maxConcurrentTasks;
     const agentSlots = policy.enabled ? owners.filter((owner) => owner.agent === targetAgent).length : 0;
     const agentSlotFull = policy.enabled && agentSlots >= policy.maxConcurrentPerAgent;
     const capacityFull = globalSlotFull || agentSlotFull;
-    const isQueued = !!scopeConflict || capacityFull;
+    const isQueued = capacityFull;
 
     let queueDetail = '';
-    if (scopeConflict) {
-      tempCandidate.scopeBlockedBy = {
-        threadId: scopeConflict.threadId,
-        title: scopeConflict.title,
-        files: scopeConflict.files,
-      };
-      queueDetail = describeScopeConflict(scopeConflict);
-    } else if (agentSlotFull) {
+    if (agentSlotFull) {
       queueDetail =
         `Queued: agent ${targetAgent} already occupies ${agentSlots}/${policy.maxConcurrentPerAgent} ` +
         `of its concurrent slots; waiting for one of its running tasks to finish.`;
@@ -503,21 +426,7 @@ export class AsyncDispatcher {
       this.queueDrainer.schedule(1_500);
       return;
     }
-    // Batch-level scope gate: never start a round on files another open task is
-    // still holding (declared or measured). Checked before any lease is taken so
-    // a blocked task cannot sit on the global slot.
     this.taskStore.loadFromDisk();
-    const scopeConflict = findScopeConflicts(thread, this.taskStore.getAllTasks());
-    if (scopeConflict) {
-      this.markThreadQueued(
-        thread,
-        undefined,
-        describeScopeConflict(scopeConflict),
-        scopeConflict,
-      );
-      this.queueDrainer.schedule(1_500);
-      return;
-    }
 
     // Per-task role exclusivity: the developer may only run after the reviewer
     // has handed off (request_rework/approve_task), and never while another
@@ -561,13 +470,6 @@ export class AsyncDispatcher {
       ) {
         return;
       }
-      const freshScopeConflict = findScopeConflicts(current, this.taskStore.getAllTasks());
-      if (freshScopeConflict) {
-        roleLock.release(roleLease);
-        this.markThreadQueued(current, undefined, describeScopeConflict(freshScopeConflict), freshScopeConflict);
-        this.queueDrainer.schedule(1_500);
-        return;
-      }
       if (policy.enabled) {
         const owners = this.executionRegistry.listOwners();
         const agentSlots = owners.filter((owner) => owner.agent === current.targetAgent).length;
@@ -595,7 +497,6 @@ export class AsyncDispatcher {
         return;
       }
       current.status = isRework ? 'reworking' : 'running';
-      current.scopeBlockedBy = undefined;
       current.summary.lastOutputSnippet = 'Executing in background...';
       if (thread.targetAgent === 'claude_code' && !isRework) {
         current.receiverSessionCaptured = true;
@@ -638,8 +539,8 @@ export class AsyncDispatcher {
       let result: RunResult;
       // Baseline right before the agent starts: the diff afterwards tells us
       // exactly which files this round changed, even if the caller declared
-      // nothing or the agent edited outside its declared scope.
-      const scopeBefore = captureWorkspaceSnapshot(thread.workspacePath);
+      // nothing or the agent edited files unrelated to its task.
+      const workspaceBefore = captureWorkspaceSnapshot(thread.workspacePath);
       try {
         result = await this.runner.execute({
           agent: thread.targetAgent,
@@ -688,7 +589,7 @@ export class AsyncDispatcher {
       // Attribute the files this round changed while the tree state is still
       // fresh (a pause between here and the finalize below must not lose it).
       const touchedFiles = diffWorkspaceSnapshots(
-        scopeBefore,
+        workspaceBefore,
         captureWorkspaceSnapshot(thread.workspacePath),
       );
 
@@ -709,7 +610,26 @@ export class AsyncDispatcher {
       const responseOk = result.assessment
         ? result.assessment.success
         : result.exitCode === 0;
-      const isSuccess = !interruption && !pausedByControl && responseOk;
+      let isSuccess = !interruption && !pausedByControl && responseOk;
+      if (isSuccess && isIsolatedTaskWorktree(latest.worktree)) {
+        try {
+          latest.worktree.headCommit = commitTaskChanges(latest.worktree, `Agent work ${latest.threadId} round ${roundNumber}`);
+          latest.worktree.integration = { phase: latest.worktree.headCommit === latest.worktree.baseCommit ? 'no_changes' : 'ready', sourceCommit: latest.worktree.headCommit, updatedAt: new Date().toISOString() };
+        } catch (error: any) {
+          result.error = `Could not create the task delivery commit: ${error?.message || error}`;
+          result.exitCode = 1;
+          isSuccess = false;
+        }
+      }
+      if (!isSuccess && isIsolatedTaskWorktree(latest.worktree)) {
+        try {
+          const head = currentHead(latest.worktree.path);
+          if (head !== latest.worktree.baseCommit || changedFiles(latest.worktree.path).length) {
+            latest.worktree.headCommit = head;
+            latest.worktree.integration = { phase: 'ready', sourceCommit: head, updatedAt: new Date().toISOString() };
+          }
+        } catch {}
+      }
       const finalRoundStatus = isPaused ? 'paused' : isSuccess ? 'completed' : 'failed';
       const finalThreadStatus = isPaused ? 'paused' : isSuccess ? 'waiting_review' : 'failed';
 
@@ -816,7 +736,6 @@ export class AsyncDispatcher {
     thread: DelegationThread,
     owner?: TaskExecutionOwner,
     detail?: string,
-    scopeConflict?: ScopeConflict,
   ): void {
     this.taskStore.loadFromDisk();
     const fresh = this.taskStore.getTask(thread.threadId);
@@ -837,14 +756,7 @@ export class AsyncDispatcher {
       (owner
         ? `Queued: Waiting for task ${owner.threadId} (round ${owner.round}) to finish.`
         : 'Queued: Waiting for a free execution slot.');
-    // Persist on the object that is actually written, not on the caller's copy.
-    const nextBlock = scopeConflict
-      ? { threadId: scopeConflict.threadId, title: scopeConflict.title, files: scopeConflict.files }
-      : undefined;
-    const blockChanged =
-      JSON.stringify(fresh.scopeBlockedBy || null) !== JSON.stringify(nextBlock || null);
-    fresh.scopeBlockedBy = nextBlock;
-    if (fresh.status === 'queued' && fresh.summary.lastOutputSnippet === message && !blockChanged) {
+    if (fresh.status === 'queued' && fresh.summary.lastOutputSnippet === message) {
       return;
     }
 

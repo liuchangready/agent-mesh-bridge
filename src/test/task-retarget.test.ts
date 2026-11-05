@@ -94,7 +94,6 @@ function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread
     receiverSessionCaptured: true,
     callerSessionId: 'caller-1',
     workspacePath: process.cwd(),
-    expectedFiles: ['engine/src/main/kotlin/Foo.kt'],
     summary: { lastPromptSnippet: 'p', lastOutputSnippet: 'o', totalDurationMs: 1 },
     rounds: [round],
     ...overrides,
@@ -166,10 +165,9 @@ describe('TaskRetargetService - switching a task executor', () => {
     assert.strictEqual(stored.targetModel, CODEX_DEFAULT);
     assert.notStrictEqual(stored.receiverSessionId, 'session-old');
     assert.strictEqual(stored.receiverSessionCaptured, false);
-    // History and scope survive the switch.
+    // History and worktree metadata survive the switch.
     assert.strictEqual(stored.rounds.length, 1);
     assert.strictEqual(stored.status, 'waiting_review');
-    assert.deepStrictEqual(stored.expectedFiles, ['engine/src/main/kotlin/Foo.kt']);
 
     const record = latestRetarget(stored)!;
     assert.strictEqual(record.fromAgent, 'deepseek_harness');

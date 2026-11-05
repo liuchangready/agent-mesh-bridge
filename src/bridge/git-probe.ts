@@ -5,11 +5,8 @@ import * as path from 'path';
 /**
  * Workspace change probe.
  *
- * `expectedFiles` is what a caller *claims* a task will touch. This module
- * measures what a round *actually* touched, so a later task can be blocked from
- * rewriting a file an earlier task already changed — even when the caller
- * declared nothing, and even when the agent edited something outside its
- * declared scope.
+ * This records observed working-tree changes for audit and delivery summaries.
+ * It is not an ownership signal and never participates in scheduling.
  *
  * The probe compares `git status --porcelain` snapshots taken right before and
  * right after the round. A file counts as touched when it appears for the first
