@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -12,6 +12,16 @@ import { createTaskWorktree, resolveGitRepository, commitTaskChanges, gitOutput 
 import { ReworkController } from '../bridge/rework-controller';
 import { TaskStore } from '../bridge/task-store';
 import { DelegationThread } from '../bridge/types';
+
+// Nested test merges must not contend with an outer production integration lock.
+const residentHome = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-resident-home-'));
+const mutableOs = createRequire(__filename)('os') as { homedir: typeof os.homedir };
+const originalHomedir = mutableOs.homedir;
+mutableOs.homedir = () => residentHome;
+after(() => {
+  mutableOs.homedir = originalHomedir;
+  fs.rmSync(residentHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+});
 
 const gitExe = process.env.MESH_GIT_PATH || (process.platform === 'win32' ? 'D:\\Git\\cmd\\git.exe' : 'git');
 process.env.MESH_GIT_PATH = gitExe;

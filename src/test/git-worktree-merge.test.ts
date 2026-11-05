@@ -613,7 +613,8 @@ test('ref-updated transaction recovers durable ledger failure and ledger_written
       try { process.kill(pid, 0); } catch { break; }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    fs.rmSync(root, { recursive: true, force: true });
+    // The last recovery helper can still be removing its channel files.
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   store.upsertTask(thread('thread_ledger_crash', worktree));
   const lock = new MeshFileLock(path.join(root, 'merge.lock'));

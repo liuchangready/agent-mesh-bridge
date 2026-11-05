@@ -68,6 +68,26 @@
     },
     "commands": [
       {
+        "command": "agent-mesh-bridge.refreshCopilotModels",
+        "title": "Copilot: Refresh VS Code Model Catalog"
+      },
+      {
+        "command": "agent-mesh-bridge.addCopilotModelGroup",
+        "title": "Copilot: Add Model Group"
+      },
+      {
+        "command": "agent-mesh-bridge.importCopilotModelGroups",
+        "title": "Copilot: Import Group Names from JSONC"
+      },
+      {
+        "command": "agent-mesh-bridge.manageCopilotModelGroup",
+        "title": "Copilot: Manage Model Group"
+      },
+      {
+        "command": "agent-mesh-bridge.callCopilotModel",
+        "title": "Copilot: Call Model"
+      },
+      {
         "command": "agent-mesh-bridge.refreshAgentStatus",
         "title": "Refresh Agent Nodes Status",
         "icon": "$(refresh)"
@@ -149,6 +169,16 @@
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "agent-mesh-bridge.refreshCopilotModels",
+          "when": "view == agent-mesh-bridge.agent-nodes",
+          "group": "navigation"
+        },
+        {
+          "command": "agent-mesh-bridge.addCopilotModelGroup",
+          "when": "view == agent-mesh-bridge.agent-nodes",
+          "group": "navigation"
+        },
         {
           "command": "agent-mesh-bridge.refreshAgentStatus",
           "when": "view == agent-mesh-bridge.agent-nodes",
