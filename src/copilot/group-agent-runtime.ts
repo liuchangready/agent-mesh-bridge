@@ -38,6 +38,13 @@ export interface GroupAgentRunResult {
   tokenUsage?: TokenUsageMetrics;
 }
 
+export class GroupAgentRuntimeError extends Error {
+  constructor(message: string, readonly usage: GroupProviderUsage | undefined, readonly modelRequests: number, readonly usageRequests: number) {
+    super(message);
+    this.name = 'GroupAgentRuntimeError';
+  }
+}
+
 export interface GroupAgentRuntimeOptions {
   bridgeHome: string;
   request: (messages: GroupMessage[], tools: GroupTool[], signal: AbortSignal) => Promise<GroupTurnResponse>;
@@ -139,6 +146,9 @@ export class GroupAgentRuntime {
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
     this.active.set(sessionId, controller);
+    let usage: GroupProviderUsage | undefined;
+    let modelRequests = 0;
+    let usageRequests = 0;
     try {
       if (this.sessions.hasUnresolvedIntent(sessionId))
         throw new Error('A previous tool call has an unknown outcome; inspect the task worktree before resuming this session.');
@@ -146,15 +156,12 @@ export class GroupAgentRuntime {
       const messages = this.readMessages(sessionId);
       const completedCalls = new Set<string>();
       const intents = new Set<string>();
-      let usage: GroupProviderUsage | undefined;
-      let modelRequests = 0;
-      let usageRequests = 0;
       const tools = role === 'bootstrap' ? BOOTSTRAP_TOOLS : role === 'reviewer' ? REVIEWER_TOOLS : GROUP_TOOLS;
       for (let turn = 0; turn < MAX_TURNS; turn++) {
         if (controller.signal.aborted) throw new Error('Group Agent run cancelled.');
+        modelRequests++;
         const response = await this.options.request(messages, tools, controller.signal);
         if (controller.signal.aborted) throw new Error('Group Agent run cancelled.');
-        modelRequests++;
         if (response.usage) {
           usageRequests++;
           usage = usage ? {
@@ -181,6 +188,7 @@ export class GroupAgentRuntime {
             throw new Error('Group Agent returned a duplicate tool call id.');
           if (Buffer.byteLength(JSON.stringify(call.arguments)) > 32 * 1024)
             throw new Error('Group Agent tool arguments exceed 32 KB.');
+          validateGroupToolCall(tools, call.name, call.arguments);
           intents.add(call.id);
           this.sessions.append(sessionId, { role: 'intent', callId: call.id, name: call.name, arguments: call.arguments });
           const isControl = role === 'bootstrap' || (role === 'reviewer' && ['request_rework', 'approve_task'].includes(call.name));
@@ -197,6 +205,10 @@ export class GroupAgentRuntime {
         }
       }
       throw new Error('Group Agent exceeded the tool-call turn limit.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (modelRequests || usage) throw new GroupAgentRuntimeError(message, usage, modelRequests, usageRequests);
+      throw error;
     } finally {
       signal?.removeEventListener('abort', abort);
       this.active.delete(sessionId);
@@ -348,4 +360,28 @@ export class GroupAgentRuntime {
       child.once('close', (code) => finish(terminationError, code));
     });
   }
+}
+
+function validateGroupToolCall(tools: GroupTool[], name: string, input: Record<string, unknown>): void {
+  const tool = tools.find((candidate) => candidate.name === name);
+  if (!tool) throw new Error(`Tool ${name} is not permitted for this Group Agent role.`);
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error(`Invalid arguments for ${name}.`);
+  const schema = tool.inputSchema as any;
+  const validate = (shape: any, value: Record<string, unknown> = input): boolean => {
+    const properties = shape.properties || {};
+    if ((shape.additionalProperties === false || Object.keys(properties).length > 0) && Object.keys(value).some((key) => !(key in properties))) return false;
+    if ((shape.required || []).some((key: string) => !(key in value))) return false;
+    for (const [key, child] of Object.entries(value)) {
+      const childShape = properties[key];
+      if (!childShape) continue;
+      if (childShape.type === 'string' && typeof child !== 'string') return false;
+      if (childShape.type === 'object') {
+        if (!child || typeof child !== 'object' || Array.isArray(child)) return false;
+        if (childShape.properties && !validate(childShape, child as Record<string, unknown>)) return false;
+      }
+    }
+    return true;
+  };
+  if (Array.isArray(schema.anyOf) ? !schema.anyOf.some((shape: any) => validate(shape)) : !validate(schema))
+    throw new Error(`Invalid arguments for ${name}.`);
 }

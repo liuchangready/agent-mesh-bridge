@@ -781,7 +781,24 @@ export class AutonomousRunner {
       timeout = setTimeout(checkTimeout, Math.min(1000, timeoutMs));
       timeout.unref?.();
       try {
+        if (options.taskThreadId && this.taskStore) {
+          const task = this.taskStore.getTask(options.taskThreadId);
+          if (!task) cancellation ||= { action: 'delete', reason: 'Task was deleted before Group Agent execution started', at: new Date().toISOString(), by: 'task_store' };
+          else if (options.taskRound !== undefined && task.currentRound !== options.taskRound)
+            throw new Error('The Group Agent round is no longer current.');
+        }
+        cancellation ||= options.taskThreadId ? this.checkPendingCancellation(options.taskThreadId, initialTaskExisted) : undefined;
+        if (cancellation) throw new Error(cancellation.reason);
+        if (aborter.signal.aborted) throw new Error('Group Agent execution was cancelled before it started.');
         const output = await this.groupAgentExecutor({ ...options, modelRef, extraEnv: { ...options.extraEnv, MESH_GROUP_RUN_ID: runId } }, aborter.signal);
+        cancellation ||= options.taskThreadId ? this.checkPendingCancellation(options.taskThreadId, initialTaskExisted) : undefined;
+        if (options.taskThreadId && this.taskStore) {
+          const task = this.taskStore.getTask(options.taskThreadId);
+          if (!task) cancellation ||= { action: 'delete', reason: 'Task was deleted before the Group Agent result was accepted', at: new Date().toISOString(), by: 'task_store' };
+          else if (options.taskRound !== undefined && task.currentRound !== options.taskRound)
+            throw new Error('The Group Agent round changed before its result was accepted.');
+        }
+        if (cancellation) aborter.abort(new Error(cancellation.reason));
         if (aborter.signal.aborted) throw new Error(timedOut ? 'Group Agent task timed out.' : cancellation?.reason || 'Group Agent task cancelled.');
         const text = output.text;
         const ended = new Date().toISOString();
@@ -811,20 +828,33 @@ export class AutonomousRunner {
       } catch (error) {
         if (options.taskThreadId) cancellation = this.consumeCancellation(options.taskThreadId) || cancellation;
         const ended = new Date().toISOString();
+        const interrupted: TaskInterruption | undefined = timedOut
+          ? { kind: 'timeout', reason: 'Group Agent task timed out.', at: ended, by: 'runner' }
+          : cancellation
+            ? { kind: cancellation.action === 'pause' ? 'paused' : cancellation.action === 'delete' ? 'deleted' : 'stopped', reason: cancellation.reason, at: cancellation.at, by: cancellation.by }
+            : aborter.signal.aborted
+              ? { kind: 'stopped', reason: error instanceof Error ? error.message : String(error), at: ended, by: 'runner' }
+              : undefined;
+        const failedUsage = (error as { tokenUsage?: TokenUsageMetrics; modelRequests?: number } | null)?.tokenUsage;
+        const tokenUsage = failedUsage
+          ? accumulateTokenUsage(options.previousTokenUsage, failedUsage)
+          : options.previousTokenUsage
+            ? { ...options.previousTokenUsage, partial: true, attempts: (options.previousTokenUsage.attempts ?? 1) + ((error as { modelRequests?: number } | null)?.modelRequests ?? 1), notes: [options.previousTokenUsage.notes, 'The interrupted execution returned no complete usage summary.'].filter(Boolean).join(' ') }
+            : undefined;
         return {
           exitCode: -1, stdout: '', stderr: '', extractedOutput: '',
           durationMs: Math.max(0, monotonicNowMs() - start),
           error: error instanceof Error ? error.message : String(error),
           transport: 'bridge-agent',
-          ...(options.previousTokenUsage ? { tokenUsage: { ...options.previousTokenUsage, partial: true,
-            notes: [options.previousTokenUsage.notes, 'The interrupted execution returned no usage summary.'].filter(Boolean).join(' ') } } : {}),
+          ...(interrupted ? { interruption: interrupted } : {}),
+          ...(tokenUsage ? { tokenUsage } : {}),
           assessment: {
-            transport: 'bridge-agent', success: false, errorCode: timedOut ? 'TIMEOUT' : cancellation?.action === 'pause' ? 'PAUSED' : cancellation?.action === 'delete' ? 'DELETED' : aborter.signal.aborted ? 'CANCELLED' : 'BRIDGE_AGENT_ERROR',
+            transport: 'bridge-agent', success: false, errorCode: interrupted ? interrupted.kind.toUpperCase() : 'BRIDGE_AGENT_ERROR',
             stream: { chunkCount: 0, stdoutBytes: 0, stderrBytes: 0, maxGapMs: 0, gapThresholdMs: DEFAULT_SILENCE_TIMEOUT_MS, hasActualOutput: false, continuous: false },
             exitCode: -1,
             runId, sessionId: options.receiverSessionId, finalEvent: false,
             toolCallsCompleted: 0, startedAt, completedAt: ended,
-            reason: cancellation?.reason || (error instanceof Error ? error.message : String(error)),
+            reason: interrupted?.reason || (error instanceof Error ? error.message : String(error)),
           },
         };
       } finally {

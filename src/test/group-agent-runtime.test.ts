@@ -4,7 +4,7 @@ import * as childProcess from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { GroupAgentRuntime, GroupTurnResponse } from '../copilot/group-agent-runtime';
+import { GroupAgentRuntime, GroupAgentRuntimeError, GroupTurnResponse } from '../copilot/group-agent-runtime';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { saveGroupAgentConfig, writeGroupAgentHost } from '../bridge/group-agent-registry';
 import { CancellationRegistry } from '../bridge/cancellation-registry';
@@ -186,6 +186,54 @@ test('GroupAgentRuntime exposes only reviewer or bootstrap control tools and sto
     }
 });
 
+test('GroupAgentRuntime rejects hidden and malformed tools against the active role before intent or side effects', async () => {
+    const cases: Array<{ role: 'developer' | 'receiver' | 'reviewer' | 'bootstrap'; name: string; args: Record<string, unknown>; pattern: RegExp }> = [
+      { role: 'reviewer', name: 'write_file', args: { path: 'reviewer-wrote.txt', content: 'unexpected' }, pattern: /not permitted/ },
+      { role: 'reviewer', name: 'run_command', args: { command: 'echo unexpected > reviewer-command.txt' }, pattern: /not permitted/ },
+      { role: 'bootstrap', name: 'read_file', args: { path: 'README.md' }, pattern: /not permitted/ },
+      { role: 'receiver', name: 'approve_task', args: { threadId: 'thread-x' }, pattern: /not permitted/ },
+      { role: 'receiver', name: 'dispatch_task', args: { reviewBootstrap: { threadId: 'thread-x', token: 'secret' } }, pattern: /not permitted/ },
+      { role: 'reviewer', name: 'request_rework', args: { threadId: 'thread-x', feedback: 'bad', forwardTo: 'codex' }, pattern: /invalid arguments/i },
+    ];
+    for (const [index, entry] of cases.entries()) {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-hidden-tool-'));
+      const cwd = path.join(root, 'workspace');
+      fs.mkdirSync(cwd);
+      let controls = 0;
+      const runtimeRole = entry.role === 'receiver' ? 'developer' : entry.role;
+      const runtime = new GroupAgentRuntime({ bridgeHome: root, controlTool: async () => { controls++; return 'controlled'; }, request: async (_messages, tools) => {
+        assert.equal(tools.some((tool) => tool.name === entry.name), runtimeRole === 'reviewer' && ['request_rework', 'approve_task'].includes(entry.name));
+        return { text: '', finishReason: 'tool_calls', toolCalls: [{ id: `hidden-${index}`, name: entry.name, arguments: entry.args }] };
+      } });
+      try {
+        await assert.rejects(runtime.run(`session_hidden_${index}`, cwd, 'run', undefined, runtimeRole), entry.pattern);
+        assert.equal(controls, 0);
+        assert.equal(fs.existsSync(path.join(cwd, 'reviewer-wrote.txt')), false);
+        assert.equal(fs.existsSync(path.join(cwd, 'reviewer-command.txt')), false);
+        assert.equal(runtime.sessions.read(`session_hidden_${index}`, 0, 20).some((event: any) => event.role === 'intent'), false);
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    }
+});
+
+test('GroupAgentRuntime errors retain usage already returned by earlier model turns', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-error-usage-'));
+    const cwd = path.join(root, 'workspace');
+    fs.mkdirSync(cwd);
+    const runtime = new GroupAgentRuntime({ bridgeHome: root, request: async () => ({ text: '', finishReason: 'tool_calls',
+      toolCalls: [{ id: 'bad-tool', name: 'hidden_unknown', arguments: {} }],
+      usage: { uncachedInputTokens: 8, cacheReadTokens: 2, cacheWriteTokens: 1, promptTokens: 11, outputTokens: 4, totalTokens: 15, nativeTotalTokens: 16 } }) });
+    try {
+      await assert.rejects(runtime.run('session_usage_failure', cwd, 'do work'), (error: unknown) => {
+        assert.ok(error instanceof GroupAgentRuntimeError);
+        assert.equal(error.modelRequests, 1);
+        assert.equal(error.usageRequests, 1);
+        assert.equal(error.usage?.promptTokens, 11);
+        assert.equal(error.usage?.nativeTotalTokens, 16);
+        return true;
+      });
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('Group Agent receiver admission uses the developer role and does not require sender readiness', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-admission-'));
     const oldHome = process.env.AGENT_MESH_BRIDGE_HOME;
@@ -284,6 +332,75 @@ test('Group Agent runner consumes cross-process pause before accepting an execut
       assert.equal(result.assessment?.errorCode, 'PAUSED');
       assert.equal(result.extractedOutput, '');
       assert.equal(new CancellationRegistry(root).peek('group-task-cancel'), undefined);
+    } finally {
+      if (oldHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME;
+      else process.env.AGENT_MESH_BRIDGE_HOME = oldHome;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('Group Agent runner rejects pause/delete already present before invoking the executor', async () => {
+    for (const action of ['pause', 'delete'] as const) {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), `mesh-group-pre-${action}-`));
+      const oldHome = process.env.AGENT_MESH_BRIDGE_HOME;
+      process.env.AGENT_MESH_BRIDGE_HOME = root;
+      const groupUuid = '11111111-2222-4333-8444-555555555558';
+      const agent = `copilot_group:${groupUuid}` as const;
+      const modelRef = { source: 'vscode-lm' as const, vendor: 'vendor-a', id: 'model-a' };
+      saveGroupAgentConfig({ version: 1, updatedAt: Date.now(), agents: [{ id: agent, groupId: groupUuid, name: 'Group',
+        source: 'vscode-lm', enabled: true, toolsAuthorized: true, receiverReady: true, initiatorReady: false,
+        revision: 1, receiverModel: modelRef }] }, root);
+      writeGroupAgentHost({ version: 1, hostInstanceId: 'host-one', generation: 1, pid: process.pid,
+        workspaceUri: 'file:///workspace', repositoryCommonDir: root, trusted: true, localDesktop: true, updatedAt: Date.now() }, root);
+      const registry = new CancellationRegistry(root);
+      registry.request(`task_precancel_${action}`, action, `${action} before run`, 'test');
+      const runner = new AutonomousRunner({} as any, 1000, registry);
+      let executorCalls = 0;
+      runner.setGroupAgentExecutor(async () => { executorCalls++; return { text: 'done', toolCallsCompleted: 0 }; });
+      try {
+        const result = await runner.execute({ agent, prompt: 'develop', isRework: false, receiverSessionId: `group-pre-${action}`,
+          cwd: root, modelRef, role: 'developer', timeoutMs: 500, taskThreadId: `task_precancel_${action}` });
+        assert.equal(executorCalls, 0);
+        assert.equal(result.assessment?.success, false);
+        assert.equal(result.interruption?.kind, action === 'pause' ? 'paused' : 'deleted');
+        assert.equal(result.assessment?.errorCode, action === 'pause' ? 'PAUSED' : 'DELETED');
+      } finally {
+        if (oldHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME;
+        else process.env.AGENT_MESH_BRIDGE_HOME = oldHome;
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+});
+
+test('Group Agent runner adds native usage from a failed execution to the previous round spend', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-resume-usage-'));
+    const oldHome = process.env.AGENT_MESH_BRIDGE_HOME;
+    process.env.AGENT_MESH_BRIDGE_HOME = root;
+    const groupUuid = '11111111-2222-4333-8444-555555555559';
+    const agent = `copilot_group:${groupUuid}` as const;
+    const modelRef = { source: 'vscode-lm' as const, vendor: 'vendor-a', id: 'model-a' };
+    saveGroupAgentConfig({ version: 1, updatedAt: Date.now(), agents: [{ id: agent, groupId: groupUuid, name: 'Group',
+      source: 'vscode-lm', enabled: true, toolsAuthorized: true, receiverReady: true, initiatorReady: false,
+      revision: 1, receiverModel: modelRef }] }, root);
+    writeGroupAgentHost({ version: 1, hostInstanceId: 'host-one', generation: 1, pid: process.pid,
+      workspaceUri: 'file:///workspace', repositoryCommonDir: root, trusted: true, localDesktop: true, updatedAt: Date.now() }, root);
+    const runner = new AutonomousRunner({} as any, 1000);
+    runner.setGroupAgentExecutor(async () => {
+      throw Object.assign(new Error('tool failed after model reply'), { modelRequests: 2, tokenUsage: {
+        uncachedInputTokens: 8, cacheReadTokens: 3, cacheWriteTokens: 0, promptTokens: 11, outputTokens: 4, totalTokens: 15,
+        agent, model: modelRef.id, source: 'native_reported' as const, available: true, partial: true, attempts: 2, collectedAt: new Date().toISOString(),
+      } });
+    });
+    const previousTokenUsage = { uncachedInputTokens: 5, cacheReadTokens: 2, cacheWriteTokens: 0, promptTokens: 7, outputTokens: 3, totalTokens: 10,
+      agent, model: modelRef.id, source: 'native_reported' as const, available: true, partial: false, attempts: 1, collectedAt: new Date().toISOString() };
+    try {
+      const result = await runner.execute({ agent, prompt: 'resume', isRework: true, receiverSessionId: 'group-session-usage',
+        cwd: root, modelRef, role: 'developer', timeoutMs: 500, previousTokenUsage });
+      assert.equal(result.assessment?.success, false);
+      assert.equal(result.tokenUsage?.promptTokens, 18);
+      assert.equal(result.tokenUsage?.outputTokens, 7);
+      assert.equal(result.tokenUsage?.attempts, 3);
+      assert.equal(result.tokenUsage?.partial, true);
     } finally {
       if (oldHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME;
       else process.env.AGENT_MESH_BRIDGE_HOME = oldHome;

@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { completeCompatibleChat, completeCompatibleTools, fetchCompatibleModels } from './compatible-model-client';
 import { CopilotModelGroup, CopilotModelGroups, HostModelRef, validateGroup } from './model-groups';
-import { GroupAgentRuntime, GroupAgentRunResult, GroupMessage } from './group-agent-runtime';
+import { GroupAgentRuntime, GroupAgentRunResult, GroupAgentRuntimeError, GroupMessage } from './group-agent-runtime';
 import { GroupModelRef, TokenUsageMetrics } from '../bridge/types';
 import { getBridgeHome } from '../bridge/model-catalog';
 import { saveGroupAgentConfig, loadGroupAgentConfig, loadGroupAgentHost, GroupAgentBinding } from '../bridge/group-agent-registry';
@@ -457,6 +457,26 @@ export class CopilotModelService implements vscode.Disposable {
         collectedAt,
       };
       return { ...result, tokenUsage };
+    } catch (error) {
+      if (error instanceof GroupAgentRuntimeError) {
+        const collectedAt = new Date().toISOString();
+        const tokenUsage: TokenUsageMetrics = {
+          uncachedInputTokens: error.usage?.uncachedInputTokens ?? 0,
+          cacheReadTokens: error.usage?.cacheReadTokens ?? 0,
+          cacheWriteTokens: error.usage?.cacheWriteTokens ?? 0,
+          promptTokens: error.usage?.promptTokens ?? 0,
+          outputTokens: error.usage?.outputTokens ?? 0,
+          totalTokens: error.usage?.totalTokens ?? 0,
+          ...(error.usage?.nativeTotalTokens !== undefined ? { nativeTotalTokens: error.usage.nativeTotalTokens } : {}),
+          agent: this.getGroupAgentId(groupId), model: modelRef.id,
+          source: error.usage ? 'native_reported' : 'unavailable', available: Boolean(error.usage),
+          partial: true, attempts: error.modelRequests,
+          notes: error.usageRequests < error.modelRequests ? 'Some model requests returned no native usage.' : 'Execution ended before a final response.',
+          collectedAt,
+        };
+        throw Object.assign(new Error(error.message), { tokenUsage, modelRequests: error.modelRequests });
+      }
+      throw error;
     } finally {
       subscription.dispose();
     }
