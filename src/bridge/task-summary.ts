@@ -131,6 +131,7 @@ export function buildFinalSummary(
     rounds: (thread.rounds || []).filter((r) => r.type !== 'approval').length,
     ...(mr ? { mergeRequest: mr } : {}),
     reviewerAgent: thread.initiatorAgent,
+    ...(thread.requesterAgent ? { requesterAgent: thread.requesterAgent } : {}),
     ...(thread.reviewerModel ? { reviewerModel: thread.reviewerModel } : {}),
     executorAgent: thread.targetAgent,
     ...(thread.targetModel ? { executorModel: thread.targetModel } : {}),

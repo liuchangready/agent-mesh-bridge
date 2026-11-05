@@ -7,6 +7,16 @@
 const path = require('path');
 const fs = require('fs');
 
+const profileIndex = process.argv.indexOf('--profile');
+if (profileIndex !== -1) {
+  const profile = process.argv[profileIndex + 1];
+  if (!['mesh-agent', 'copilot-requester'].includes(profile)) {
+    console.error('[agent-bridge-mcp] Unknown server profile.');
+    process.exit(2);
+  }
+  process.env.MESH_MCP_PROFILE = profile;
+}
+
 // Locate compiled bridge modules
 const outBridgeDir = path.resolve(__dirname, '..', 'out', 'bridge');
 

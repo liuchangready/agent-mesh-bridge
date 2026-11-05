@@ -459,9 +459,10 @@ export class ModelCatalog {
     if (agent === 'vscode_chat') {
       return {
         agent,
-        models: [{ id: 'builtin', label: 'VSCode Builtin Model' }],
+        models: [],
         source: 'builtin',
         updatedAt: new Date().toISOString(),
+        error: 'Requester only; the active Copilot model is not exposed by the supported API.',
       };
     }
 

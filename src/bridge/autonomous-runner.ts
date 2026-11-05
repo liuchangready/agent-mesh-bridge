@@ -26,6 +26,7 @@ import {
   CancellationRequest,
 } from './cancellation-registry';
 import type { TaskStore } from './task-store';
+import { assertCanExecute } from './agent-capabilities';
 
 /** Default silence watchdog: 10 minutes (long model reasoning is not a hang). */
 export const DEFAULT_SILENCE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -725,6 +726,7 @@ export class AutonomousRunner {
    * would silently resurrect a process the user asked to kill.
    */
   public async execute(options: RunOptions): Promise<RunResult> {
+    assertCanExecute(options.agent, 'run as an executor or reviewer');
     const maxRetries = options.maxRetries ?? 3;
     const baseBackoffMs = options.retryBackoffMs ?? 2000;
     const taskThreadId = options.taskThreadId;
