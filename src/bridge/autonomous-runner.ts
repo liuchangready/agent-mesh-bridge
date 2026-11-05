@@ -1012,7 +1012,17 @@ export class AutonomousRunner {
         return result;
       }
     } finally {
-      if (nativeLease && this.taskStore) new NativeSessionLock(path.dirname(this.taskStore.getStoragePath())).release(nativeLease);
+      if (nativeLease && this.taskStore) {
+        const lock = new NativeSessionLock(path.dirname(this.taskStore.getStoragePath()));
+        let released = false;
+        for (let attempt = 0; attempt < 2 && !released; attempt++) {
+          try { released = lock.release(nativeLease); }
+          catch (error: any) {
+            console.error(`[AutonomousRunner] Native session lease release is pending for ${taskThreadId}: ${error?.message || error}`);
+          }
+        }
+        if (!released) console.error(`[AutonomousRunner] Native session lease remains safely held for ${taskThreadId}; retry after owner-gate contention clears.`);
+      }
       if (preparationExecution) {
         if (preparationExecution.owned) preparationExecution.registry.end(preparationExecution.registration);
         preparationExecution.registry.dispose();
@@ -1362,6 +1372,8 @@ export class AutonomousRunner {
       let stdoutData = '';
       let stderrData = '';
       let isSettled = false;
+      let childBindingError: string | undefined;
+      let childCleanupError: string | undefined;
       let lastActivityMono = startMono;
       let watchdogTriggered = false;
       let maxTimerTriggered = false;
@@ -1442,19 +1454,6 @@ export class AutonomousRunner {
         try {
           child.stdin.end();
         } catch {}
-      }
-
-      // Publish the real agent PID to the execution lease: it outlives a crashed
-      // host on Windows, and the next round must not start on top of it.
-      if (child.pid) {
-        try {
-          options.onChildPid?.(child.pid);
-        } catch {}
-        child.once('exit', () => {
-          try {
-            options.onChildPid?.(undefined);
-          } catch {}
-        });
       }
 
       // Cross-process pause/delete: a control plane running elsewhere writes a
@@ -1617,6 +1616,7 @@ export class AutonomousRunner {
         const sessionLines = (sessionPartialLine + str).split(/\r?\n/);
         sessionPartialLine = sessionLines.pop() || '';
         for (const line of sessionLines) {
+          if (childBindingError) break;
           const sessionId = this.extractSessionId(line);
           if (!sessionId || sessionId === observedSessionId) continue;
           observedSessionId = sessionId;
@@ -1646,6 +1646,11 @@ export class AutonomousRunner {
 
       child.on('error', (err) => {
         if (isSettled) return;
+        if (child.pid && child.exitCode === null) {
+          childBindingError ||= `Native child lifecycle failed: ${err.message}`;
+          try { this.killProcess(child); } catch {}
+          return;
+        }
         isSettled = true;
         clearInterval(silenceInterval);
         clearInterval(maxTimer);
@@ -1680,6 +1685,10 @@ export class AutonomousRunner {
       child.on('close', (code) => {
         if (isSettled) return;
         isSettled = true;
+        if (child.pid) {
+          try { options.onChildPid?.(undefined); }
+          catch (error: any) { childCleanupError = String(error?.message || error); }
+        }
         // Pick up a suspension window that ended right at exit time (e.g. the
         // machine was asleep when the child's last output arrived).
         suspension.sync();
@@ -1694,7 +1703,7 @@ export class AutonomousRunner {
         const durationMs = Date.now() - startTime;
         const extracted = this.extractCleanOutput(stdoutData);
         const actualSessionId = this.extractSessionId(stdoutData);
-        if (actualSessionId && actualSessionId !== observedSessionId) {
+        if (!childBindingError && actualSessionId && actualSessionId !== observedSessionId) {
           try { options.onNativeSessionId?.(actualSessionId); }
           catch (captureError: any) { sessionCaptureError = String(captureError?.message || captureError); }
         }
@@ -1749,8 +1758,12 @@ export class AutonomousRunner {
           error = `Could not safely bind native session: ${sessionCaptureError}`;
           interruption = { kind: 'stopped', reason: error, at: new Date().toISOString(), by: 'bridge' };
         }
+        if (childBindingError || childCleanupError) {
+          error = `Could not safely maintain native child ownership: ${childBindingError || childCleanupError}`;
+          interruption = { kind: 'stopped', reason: error, at: new Date().toISOString(), by: 'bridge' };
+        }
 
-        const exitCode = cancellation ? -1 : (code ?? 0);
+        const exitCode = cancellation || childBindingError || childCleanupError ? -1 : (code ?? 0);
 
         let assessment = this.evaluateResponse({
           exitCode,
@@ -1833,6 +1846,16 @@ export class AutonomousRunner {
           model: effectiveModel,
         });
       });
+
+      // Install close/error handlers first. If durable PID binding fails, kill
+      // this child and let close record a failed round only after it has exited.
+      if (child.pid) {
+        try { options.onChildPid?.(child.pid); }
+        catch (error: any) {
+          childBindingError = String(error?.message || error);
+          try { this.killProcess(child); } catch {}
+        }
+      }
     });
   }
 

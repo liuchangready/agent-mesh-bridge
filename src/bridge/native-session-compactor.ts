@@ -44,19 +44,41 @@ export function resolveCodexProviderIdentity(
   const baseUrl = env.OPENAI_BASE_URL || env.CODEX_BASE_URL;
   if (baseUrl) return undefined;
   if (config === undefined) return undefined;
-  const lines = config.split(/\r?\n/).map((line) => line.replace(/\s+#.*$/, '').trim());
+  const lines = config.split(/\r?\n/).map((line) => line.trim());
   let section = '';
   let providerId: string | undefined;
   let providerBaseUrl: string | undefined;
   let hasCustomProviders = false;
   for (const line of lines) {
-    const table = line.match(/^\[model_providers\.([A-Za-z0-9_-]+)\]$/);
-    if (table) { section = table[1]; hasCustomProviders = true; continue; }
-    if (line.startsWith('[')) { section = '!other'; continue; }
-    const assignment = line.match(/^([A-Za-z0-9_-]+)\s*=\s*"([^"]*)"\s*$/);
-    if (!assignment) continue;
-    if (section === '' && assignment[1] === 'model_provider') providerId = assignment[2];
-    if (providerId && section === providerId && assignment[1] === 'base_url') providerBaseUrl = assignment[2];
+    if (!line || line.startsWith('#')) continue;
+    if (line.startsWith('[')) {
+      if (/^\[profiles?(?:\.|\])/.test(line)) return undefined;
+      if (line.startsWith('[model_providers.')) {
+        const table = line.match(/^\[model_providers\.([A-Za-z0-9_-]+)\]\s*(?:#.*)?$/);
+        if (!table) return undefined;
+        section = table[1]; hasCustomProviders = true; continue;
+      }
+      if (line.startsWith('[model_providers]')) return undefined;
+      section = '!other';
+      continue;
+    }
+    const key = line.match(/^(model_provider|base_url)\s*=/)?.[1];
+    if (!key) {
+      // Only a deliberately small TOML subset is understood here. If a route
+      // key is present in another legal spelling, do not certify a default.
+      if (/(?:model_provider|base_url)/i.test(line)) return undefined;
+      continue;
+    }
+    const value = line.match(/^(model_provider|base_url)\s*=\s*"([^"\\]*)"\s*(?:#.*)?$/);
+    if (!value) return undefined;
+    if (key === 'model_provider') {
+      if (section !== '') return undefined;
+      providerId = value[2];
+    } else if (section !== '!other' && section !== '') {
+      if (providerId && section === providerId) providerBaseUrl = value[2];
+    } else if (section === '') {
+      return undefined;
+    }
   }
   if (!providerId) {
     return hasCustomProviders ? undefined : { providerId: 'openai', providerRoute: 'subscription-default' };
@@ -288,49 +310,65 @@ export class NativeSessionCompactor {
     let warning: string | undefined;
     let recoveredUnknownOperation = false;
     if (latestOperation && ['unknown', 'interrupted'].includes(latestOperation.phase)) {
-      const activeExecution = ensureExecutionLease();
-      let recovered = false;
-      try {
-        const executable = agent === 'codex' ? this.detector.resolveExecutable('codex') : undefined;
-        recovered = !!executable && !!latestOperation.model && await this.codex.probeResume({
-          executable, sessionId: sessionId!, cwd: thread.worktree?.path || thread.workspacePath,
-          model: latestOperation.model || model || '', operationId: latestOperation.id,
-          role, cancelled: () => !!new CancellationRegistry(root).peek(threadId),
-          onChildPid: (pid) => {
-            new NativeSessionLock(root).attachChild(lease, pid, pid ? () => !!new CancellationRegistry(root).peek(threadId) : undefined);
-            activeExecution.registry.attachChildPid(pid, activeExecution.registration);
-            roleLock.attachChild(roleLease, pid);
-          },
-        });
-      } catch (error: any) {
-        warning = `Same-ID read-only recovery probe failed: ${String(error?.message || error).slice(0, 300)}`;
-      }
-      if (!recovered) {
-        releaseExecutionLease();
-        const reason = `Native session ${sessionId} could not be proven healthy after operation ${latestOperation.id}; compression was not replayed.`;
-        appendInterruption(thread, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' });
-        thread.status = 'paused';
-        this.store.upsertTask(thread);
-        new NativeSessionLock(root).release(lease);
-        return { sessionId, pauseReason: reason };
-      }
-      if (cursor) {
-        recoveredUnknownOperation = true;
-        cursor = {
-          ...cursor, recoveryVersion: cursor.recoveryVersion || latestOperation.id,
-          turnsSinceCompaction: 0, autoSuppressedOperationId: latestOperation.id,
-          turnCounterResetId: latestOperation.id,
-          revision: (cursor.revision || 0) + 1,
-        };
-        if (latestOperation.errorCode !== 'UNKNOWN_OPERATION_RECOVERED_READONLY') {
-          latestOperation.errorCode = 'UNKNOWN_OPERATION_RECOVERED_READONLY';
-          latestOperation.error = 'Same-ID read-only recovery succeeded. Automatic compaction is suppressed until the carried recovery document is delivered by a successful business turn.';
-          latestOperation.revision++;
+      const alreadyVerified = cursor?.recoveryVerifiedOperationId === latestOperation.id;
+      const alreadyDelivered = cursor?.recoveryVersion === latestOperation.id && cursor.recoveryDeliveredVersion === latestOperation.id;
+      if (alreadyVerified) {
+        if (!alreadyDelivered) {
+          recoveredUnknownOperation = true;
+          warning = 'The unknown native operation was already verified read-only; its pending recovery document will be carried without another probe or compaction.';
         }
-        thread.nativeSessionCompaction = { ...thread.nativeSessionCompaction, [role]: cursor };
-        this.store.upsertTask(thread);
+      } else {
+        const activeExecution = ensureExecutionLease();
+        let recovered = false;
+        try {
+          const executable = agent === 'codex' ? this.detector.resolveExecutable('codex') : undefined;
+          recovered = !!executable && !!latestOperation.model && await this.codex.probeResume({
+            executable, sessionId: sessionId!, cwd: thread.worktree?.path || thread.workspacePath,
+            model: latestOperation.model || model || '', operationId: latestOperation.id,
+            role, cancelled: () => !!new CancellationRegistry(root).peek(threadId),
+            onChildPid: (pid) => {
+              new NativeSessionLock(root).attachChild(lease, pid, pid ? () => !!new CancellationRegistry(root).peek(threadId) : undefined);
+              activeExecution.registry.attachChildPid(pid, activeExecution.registration);
+              roleLock.attachChild(roleLease, pid);
+            },
+          });
+        } catch (error: any) {
+          warning = `Same-ID read-only recovery probe failed: ${String(error?.message || error).slice(0, 300)}`;
+        }
+        if (!recovered) {
+          releaseExecutionLease();
+          const reason = `Native session ${sessionId} could not be proven healthy after operation ${latestOperation.id}; compression was not replayed.`;
+          appendInterruption(thread, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' });
+          thread.status = 'paused';
+          this.store.upsertTask(thread);
+          new NativeSessionLock(root).release(lease);
+          return { sessionId, pauseReason: reason };
+        }
+        if (cursor) {
+          cursor = {
+            ...cursor,
+            recoveryVersion: cursor.recoveryVersion || latestOperation.id,
+            recoveryVerifiedOperationId: latestOperation.id,
+            ...(alreadyDelivered ? {} : {
+              turnsSinceCompaction: 0,
+              autoSuppressedOperationId: latestOperation.id,
+              turnCounterResetId: latestOperation.id,
+            }),
+            revision: (cursor.revision || 0) + 1,
+          };
+          if (latestOperation.errorCode !== 'UNKNOWN_OPERATION_RECOVERED_READONLY') {
+            latestOperation.errorCode = 'UNKNOWN_OPERATION_RECOVERED_READONLY';
+            latestOperation.error = 'Same-ID read-only recovery succeeded. Automatic compaction is suppressed until the carried recovery document is delivered by a successful business turn.';
+            latestOperation.revision++;
+          }
+          thread.nativeSessionCompaction = { ...thread.nativeSessionCompaction, [role]: cursor };
+          this.store.upsertTask(thread);
+        }
+        if (!alreadyDelivered) {
+          recoveredUnknownOperation = true;
+          warning = 'Unknown native operation was recovered read-only; the pending recovery document will be carried and compaction is suppressed.';
+        }
       }
-      warning = 'Unknown native operation was recovered read-only; the pending recovery document will be carried and compaction is suppressed.';
     }
     const mode = readBridgePolicy(root).nativeSessionCompaction?.mode || 'off';
     const turns = cursor && cursor.sessionId === sessionId ? cursor.turnsSinceCompaction : 0;

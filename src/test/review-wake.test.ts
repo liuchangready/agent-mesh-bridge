@@ -3,6 +3,7 @@ import * as assert from 'node:assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+const childProcess = require('child_process') as typeof import('child_process');
 
 const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-review-wake-home-'));
 process.env.USERPROFILE = isolatedHome;
@@ -203,6 +204,62 @@ describe('CallbackManager records stalled reviewer wakes', () => {
     onChildPid?.(undefined);
     release?.();
     store.dispose();
+  });
+
+  test('reviewer launch binding and exit cleanup failures kill or fail safely without escaping callbacks', async () => {
+    const originalSpawn = childProcess.spawn;
+    try {
+      for (const failure of ['bind', 'clear'] as const) {
+        const { store, manager } = setup();
+        const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1';
+        const tempWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'reviewer-child-workspace-'));
+        const thread = makeThread({ threadId: `thread_reviewer_pid_${failure}`, initiatorAgent: 'antigravity',
+          reviewFlow: 'dedicated', reviewerSessionId: sessionId, reviewerSessionCaptured: true, workspacePath: tempWorkspace });
+        store.upsertTask(thread);
+        let launchedPid: number | undefined;
+        let actualClose = false;
+        let killed = false;
+        (childProcess as any).spawn = (_command: string, _args: string[], options: any) => {
+          const script = failure === 'bind'
+            ? 'process.stdout.write("temporary reviewer child\\n");setInterval(()=>{},1000)'
+            : 'process.stdout.write("temporary reviewer child\\n");process.exit(0)';
+          const child: any = originalSpawn(process.execPath, ['-e', script], options);
+          launchedPid = child.pid;
+          const kill = child.kill.bind(child);
+          child.kill = (...args: any[]) => { killed = true; return kill(...args); };
+          child.once('close', () => { actualClose = true; });
+          return child;
+        };
+        let finish!: () => void;
+        const finished = new Promise<void>((resolve) => { finish = resolve; });
+        let releaseCalls = 0;
+        const onChildPid = (pid: number | undefined) => {
+          if (pid) {
+            if (failure === 'bind') throw new Error('PID bind rejected');
+          } else if (failure === 'clear') throw new Error('PID clear rejected');
+        };
+        let started = false;
+        try { started = (manager as any).launchCaller(thread, sessionId, 'review prompt', thread.rounds[0], 'review', () => {
+          releaseCalls++;
+          finish();
+          if (failure === 'clear') throw new Error('release rejected');
+        }, (pid: number | undefined) => {
+          onChildPid(pid);
+          if (!pid && failure === 'clear') finish();
+        }); } finally { await finished; }
+        try {
+          assert.equal(started, true);
+          assert.ok(launchedPid);
+          assert.equal(actualClose, true, 'cleanup/finalization follows the child close event');
+          assert.equal(killed, failure === 'bind', 'a child whose PID could not be durably bound is stopped');
+          assert.equal(releaseCalls, 1);
+          const saved = store.getTask(thread.threadId)!;
+          assert.ok(saved.reviewWake, 'ownership failures become a recorded failed wake');
+          assert.match(saved.reviewWake!.lastError, /Native child ownership failed/);
+          assert.notEqual(saved.status, 'completed');
+        } finally { store.dispose(); fs.rmSync(tempWorkspace, { recursive: true, force: true }); }
+      }
+    } finally { (childProcess as any).spawn = originalSpawn; }
   });
 
   test('dedicated reviewer launch rechecks cancellation, deletion, retargeting, and missing session lease', async () => {

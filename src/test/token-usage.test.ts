@@ -395,6 +395,13 @@ describe('token usage - durability', () => {
     assert.equal((compactor as any).readCapabilityRecord(certifiedIdentity), 'certified');
     assert.equal((compactor as any).readCapabilityRecord(changedIdentity), 'needs_validation');
     assert.equal(resolveCodexProviderIdentity(undefined, {}), undefined, 'unreadable configuration is not treated as subscription default');
+    const routeOne = resolveCodexProviderIdentity('model_provider = "openai"\n[model_providers.openai]\nbase_url = "https://route-one.example/v1"', {});
+    const routeTwo = resolveCodexProviderIdentity('model_provider = "openai"\n[model_providers.openai]\nbase_url = "https://route-two.example/v1"', {});
+    assert.ok(routeOne && routeTwo);
+    assert.notEqual(routeOne.providerRoute, routeTwo.providerRoute, 'different configured endpoints cannot share a certified identity');
+    assert.equal(resolveCodexProviderIdentity("model_provider = 'openai'\n[model_providers.openai]\nbase_url = 'https://route-one.example/v1'", {}), undefined);
+    assert.equal(resolveCodexProviderIdentity('model_provider = "openai"\n[model_providers."openai"]\nbase_url = "https://route-one.example/v1"', {}), undefined);
+    assert.equal(resolveCodexProviderIdentity('"model_provider" = "openai"\n[model_providers.openai]\nbase_url = "https://route-one.example/v1"', {}), undefined);
   });
 
   const usage = (total: number): TokenUsageMetrics => ({
@@ -711,7 +718,7 @@ describe('token usage - durability', () => {
     assert.equal(second.recoveryVersion, 'unknown-recovery-op', 'retries keep carrying the original pending version');
     assert.equal(store.getTask(thread.threadId)!.nativeSessionCompaction!.developer!.lastOperationId, 'unknown-recovery-op');
     assert.equal(store.getTask(thread.threadId)!.nativeSessionCompaction!.developer!.turnsSinceCompaction, 0);
-    assert.equal(probes, 2);
+    assert.equal(probes, 1, 'a healthy same-ID recovery probe is persisted and not repeated on the next prepare');
     assert.equal(compactions, 0, 'unknown recovery never reissues compact before a successful business turn');
     new NativeSessionLock(dir).release(second.lease!);
     if (second.executionLease?.owned) second.executionLease.registry.end(second.executionLease.registration);
@@ -739,6 +746,41 @@ describe('token usage - durability', () => {
     assert.equal(compactCalls, 0);
     assert.equal(prepared.recoveryVersion, 'interrupted-op');
     assert.equal(store.getTask(thread.threadId)!.nativeSessionCompaction!.developer!.autoSuppressedOperationId, 'interrupted-op');
+    new NativeSessionLock(dir).release(prepared.lease!);
+    if (prepared.executionLease?.owned) prepared.executionLease.registry.end(prepared.executionLease.registration);
+    prepared.executionLease?.registry.dispose(); roleLock.release(roleLease);
+  });
+
+  test('a delivered unknown recovery can re-enter automatic compaction after four successful turns and reload', async () => {
+    const { store, dir } = makeStore();
+    const sessionId = '72c4a1cf-d335-43bb-8560-5cadd47371bc';
+    const thread = makeThread([{ round: 1, type: 'initial', prompt: 'full task brief', durationMs: 1, status: 'running', timestamp: new Date().toISOString() }]);
+    thread.status = 'running'; thread.targetAgent = 'codex'; thread.targetModel = 'gpt-6-luna';
+    thread.receiverSessionId = sessionId; thread.receiverSessionCaptured = true;
+    const logDir = getWorkerLogDir('codex', dir); fs.mkdirSync(logDir, { recursive: true });
+    const recoveryPath = path.join(logDir, 'unknown.recovery.json'); fs.writeFileSync(recoveryPath, '{"brief":"full task brief"}');
+    thread.rounds[0].nativeSessionCompactions = [{ id: 'unknown-delivered-op', role: 'developer', agent: 'codex', sessionId, model: 'gpt-6-luna', reason: 'turn_budget', phase: 'unknown', revision: 3, startedAt: new Date().toISOString(), recoveryPath, logPath: path.join(logDir, 'unknown.log') } as any];
+    thread.nativeSessionCompaction = { developer: { sessionId, lastOperationId: 'unknown-delivered-op', recoveryVersion: 'unknown-delivered-op', recoveryVerifiedOperationId: 'unknown-delivered-op', recoveryDeliveredVersion: 'unknown-delivered-op', autoSuppressedOperationId: 'unknown-delivered-op', turnsSinceCompaction: 0, revision: 4 } };
+    store.upsertTask(thread); saveBridgePolicy({ nativeSessionCompaction: { mode: 'auto' } }, dir);
+    const compactor = new NativeSessionCompactor(store, { resolveExecutable: () => process.execPath } as any, () => 'certified');
+    (compactor as any).capabilityIdentity = () => ({ agent: 'codex', executablePath: process.execPath, executableVersion: 'test', providerRoute: 'subscription-default', providerId: 'openai', model: 'gpt-6-luna' });
+    let probes = 0; let compactions = 0;
+    (compactor as any).codex = {
+      probeResume: async () => { probes++; return true; },
+      compact: async (request: any) => { compactions++; return { threadId: request.sessionId, nativeTurnId: 'new-native-turn', model: request.model, provider: 'test', processExitCode: 0, usage: undefined }; },
+    };
+    const staleBeforeDelivery = structuredClone(store.getTask(thread.threadId)!);
+    for (let index = 0; index < 4; index++) compactor.recordBusinessSuccess(thread.threadId, 'developer', sessionId, `success-${index}`, 'unknown-delivered-op');
+    store.upsertTask(staleBeforeDelivery);
+    store.loadFromDisk();
+    const afterReload = store.getTask(thread.threadId)!.nativeSessionCompaction!.developer!;
+    assert.equal(afterReload.recoveryDeliveredVersion, 'unknown-delivered-op');
+    assert.equal(afterReload.turnsSinceCompaction, 4);
+    const roleLock = new TaskRoleLock(dir); const roleLease = roleLock.tryAcquire(thread.threadId, 'developer')!;
+    const prepared = await compactor.prepareBeforeResume(thread.threadId, 'developer', 'gpt-6-luna');
+    assert.equal(probes, 0, 'a previously verified and delivered recovery is consumed without another probe');
+    assert.equal(compactions, 1, 'normal auto threshold applies after recovery delivery and four new turns');
+    assert.notEqual(store.getTask(thread.threadId)!.nativeSessionCompaction!.developer!.lastOperationId, 'unknown-delivered-op');
     new NativeSessionLock(dir).release(prepared.lease!);
     if (prepared.executionLease?.owned) prepared.executionLease.registry.end(prepared.executionLease.registration);
     prepared.executionLease?.registry.dispose(); roleLock.release(roleLease);

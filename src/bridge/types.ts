@@ -332,6 +332,7 @@ export interface NativeSessionCompactionCursor {
   turnsSinceCompaction: number;
   recoveryVersion?: string;
   recoveryDeliveredVersion?: string;
+  recoveryVerifiedOperationId?: string;
   autoDisabledReason?: string;
   autoSuppressedOperationId?: string;
   turnCounterResetId?: string;

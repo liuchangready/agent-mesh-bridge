@@ -209,6 +209,9 @@ function mergeNativeCursors(
     const chosen = (nextValid.revision || 0) >= (oldValid.revision || 0) ? nextValid : oldValid;
     const other = chosen === nextValid ? oldValid : nextValid;
     const sameRecovery = chosen.recoveryVersion === other.recoveryVersion;
+    const sameOperation = chosen.lastOperationId === other.lastOperationId;
+    const recoveryDelivered = sameRecovery &&
+      (oldValid.recoveryDeliveredVersion === chosen.recoveryVersion || nextValid.recoveryDeliveredVersion === chosen.recoveryVersion);
     merged[role] = {
         ...chosen,
         recentBusinessTurnIds: Array.from(new Set([...(oldValid.recentBusinessTurnIds || []), ...(nextValid.recentBusinessTurnIds || [])])).slice(-64),
@@ -219,10 +222,14 @@ function mergeNativeCursors(
         turnCounterResetId: chosen.turnCounterResetId,
         recoveryVersion: chosen.recoveryVersion || other.recoveryVersion,
         recoveryDeliveredVersion: sameRecovery
-          ? (oldValid.recoveryDeliveredVersion === chosen.recoveryVersion || nextValid.recoveryDeliveredVersion === chosen.recoveryVersion
-            ? chosen.recoveryVersion
-            : undefined)
+          ? (recoveryDelivered ? chosen.recoveryVersion : undefined)
           : chosen.recoveryDeliveredVersion,
+        recoveryVerifiedOperationId: sameOperation
+          ? chosen.recoveryVerifiedOperationId || other.recoveryVerifiedOperationId
+          : chosen.recoveryVerifiedOperationId,
+        autoSuppressedOperationId: recoveryDelivered
+          ? undefined
+          : chosen.autoSuppressedOperationId || other.autoSuppressedOperationId,
         autoDisabledReason: chosen.autoDisabledReason || other.autoDisabledReason,
       };
   }
