@@ -3,6 +3,8 @@ import { AgentDetector } from '../bridge/agent-detector';
 import { ActiveAgentResolver } from '../bridge/active-agent-resolver';
 import { AgentId, AgentInfo, AgentStatusType } from '../bridge/types';
 import { resolveConfiguredModel } from '../bridge/model-catalog';
+import { CopilotModelService } from '../copilot/model-service';
+import { CopilotModelGroup } from '../copilot/model-groups';
 
 export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem> {
   private _onDidChangeTreeData: vscode.EventEmitter<AgentNodeItem | undefined | void> =
@@ -13,10 +15,13 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
   private detector: AgentDetector;
   private resolver: ActiveAgentResolver;
   private cachedAgents: Record<AgentId, AgentInfo> | null = null;
+  private copilotModels?: CopilotModelService;
 
-  constructor(detector: AgentDetector, resolver: ActiveAgentResolver) {
+  constructor(detector: AgentDetector, resolver: ActiveAgentResolver, copilotModels?: CopilotModelService) {
     this.detector = detector;
     this.resolver = resolver;
+    this.copilotModels = copilotModels;
+    copilotModels?.onDidChange(() => this._onDidChangeTreeData.fire());
   }
 
   public async refresh(forceProbe: boolean = true): Promise<void> {
@@ -46,7 +51,9 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     for (const agentId of agentsList) {
       const info = this.cachedAgents[agentId] || (await this.detector.probeAgent(agentId));
       const isActive = activeResolution.agent === agentId;
-      items.push(this.createAgentNodeItem(info, isActive));
+      items.push(info.id === 'vscode_chat' && this.copilotModels
+        ? await this.createCopilotNodeItem(info, isActive)
+        : this.createAgentNodeItem(info, isActive));
     }
 
     return items;
@@ -218,6 +225,109 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     }
 
     item.subItems = subItems;
+    return item;
+  }
+
+  private async createCopilotNodeItem(info: AgentInfo, isActive: boolean): Promise<AgentNodeItem> {
+    const config = vscode.workspace.getConfiguration('agentMeshBridge.copilot');
+    const enabled = config.get<boolean>('enabled', false);
+    const reviewer = config.get<string>('reviewer', '') || 'not selected';
+    const activeBadge = isActive ? ' [active]' : '';
+    const item = new AgentNodeItem(`${info.name}${activeBadge}`, vscode.TreeItemCollapsibleState.Expanded, info);
+    item.description = `Requester: ${enabled ? 'enabled' : 'disabled'} · model access: unknown`;
+    item.iconPath = new vscode.ThemeIcon('hubot', new vscode.ThemeColor('descriptionForeground'));
+    item.contextValue = 'agent_node_copilot';
+    const children: AgentNodeItem[] = [];
+    const requester = new AgentNodeItem(`Requester: ${enabled ? 'enabled' : 'disabled'}`, vscode.TreeItemCollapsibleState.None);
+    requester.description = `Reviewer: ${reviewer} · this is independent of model calls`;
+    requester.iconPath = new vscode.ThemeIcon('comment-discussion');
+    children.push(requester);
+    const catalogState = this.copilotModels!.getHostState();
+    const catalog = new AgentNodeItem(`Host model catalog: ${catalogState}`, vscode.TreeItemCollapsibleState.None);
+    catalog.description = catalogState === 'available' ? `${this.copilotModels!.getHostModels().length} models` : catalogState === 'not-refreshed' ? 'Refresh to ask VS Code for available models' : '';
+    catalog.iconPath = new vscode.ThemeIcon('library');
+    children.push(catalog);
+    const auth = new AgentNodeItem('Copilot login and quota: unknown', vscode.TreeItemCollapsibleState.None);
+    auth.description = 'Bridge has no reliable independent signal for native Copilot login or quota.';
+    auth.iconPath = new vscode.ThemeIcon('question');
+    children.push(auth);
+    const lastCall = new AgentNodeItem(`Last model call: ${this.copilotModels!.getLastCall()}`, vscode.TreeItemCollapsibleState.None);
+    lastCall.iconPath = new vscode.ThemeIcon('history');
+    children.push(lastCall);
+
+    if (catalogState === 'available') {
+      const byVendor = new Map<string, vscode.LanguageModelChat[]>();
+      for (const model of this.copilotModels!.getHostModels()) {
+        const vendor = model.vendor || 'unknown';
+        byVendor.set(vendor, [...(byVendor.get(vendor) || []), model]);
+      }
+      for (const [vendor, models] of byVendor) {
+        const vendorNode = new AgentNodeItem(`Host models · ${vendor}`, vscode.TreeItemCollapsibleState.Collapsed);
+        vendorNode.subItems = models.map((model) => {
+          const child = new AgentNodeItem(model.name || model.id, vscode.TreeItemCollapsibleState.None);
+          child.description = `${vendor} · ${model.id}`;
+          child.iconPath = new vscode.ThemeIcon('symbol-misc');
+          return child;
+        });
+        children.push(vendorNode);
+      }
+    }
+
+    let groups: CopilotModelGroup[];
+    try { groups = this.copilotModels!.groups.getAll(); }
+    catch (error) {
+      const invalid = new AgentNodeItem('Custom groups: unavailable', vscode.TreeItemCollapsibleState.None);
+      invalid.description = error instanceof Error ? error.message : 'Stored group data is invalid; existing data was preserved.';
+      invalid.iconPath = new vscode.ThemeIcon('warning');
+      children.push(invalid);
+      groups = [];
+    }
+    for (const group of groups) {
+      const groupNode = new AgentNodeItem(group.name, vscode.TreeItemCollapsibleState.Collapsed);
+      const keyStatus = group.source === 'openai-compatible' ? await this.copilotModels!.getKeyStatus(group) : undefined;
+      groupNode.description = group.source === 'vscode-lm'
+        ? `VS Code models · ${group.models.length} bound${group.vendor ? ` · ${group.vendor}` : ''}`
+        : `Custom API · ${group.models.length} models · key ${keyStatus}`;
+      groupNode.iconPath = new vscode.ThemeIcon(group.source === 'vscode-lm' ? 'library' : 'cloud');
+      groupNode.contextValue = 'copilot_model_group';
+      groupNode.command = { command: 'agent-mesh-bridge.manageCopilotModelGroup', title: 'Manage Model Group', arguments: [group] };
+      if (group.source === 'vscode-lm') {
+        groupNode.subItems = group.models.map((ref) => {
+          const child = new AgentNodeItem(ref.id, vscode.TreeItemCollapsibleState.None);
+          child.description = ref.vendor;
+          child.contextValue = 'copilot_model';
+          child.iconPath = new vscode.ThemeIcon('symbol-misc');
+          child.command = {
+            command: 'agent-mesh-bridge.callCopilotModel',
+            title: 'Call Model',
+            arguments: [group, ref],
+          };
+          return child;
+        });
+      } else {
+        groupNode.subItems = group.models.map((model) => {
+          const child = new AgentNodeItem(model.name || model.id, vscode.TreeItemCollapsibleState.None);
+          child.description = model.id;
+          child.contextValue = 'copilot_model';
+          child.iconPath = new vscode.ThemeIcon('symbol-misc');
+          child.command = { command: 'agent-mesh-bridge.callCopilotModel', title: 'Call Model', arguments: [group, model.id] };
+          return child;
+        });
+      }
+      children.push(groupNode);
+    }
+    const actions = [
+      ['Refresh host model catalog', 'agent-mesh-bridge.refreshCopilotModels', 'refresh'],
+      ['Add model group', 'agent-mesh-bridge.addCopilotModelGroup', 'add'],
+      ['Import group names from JSONC', 'agent-mesh-bridge.importCopilotModelGroups', 'symbol-file'],
+    ] as const;
+    for (const [label, command, icon] of actions) {
+      const child = new AgentNodeItem(label, vscode.TreeItemCollapsibleState.None);
+      child.iconPath = new vscode.ThemeIcon(icon);
+      child.command = { command, title: label };
+      children.push(child);
+    }
+    item.subItems = children;
     return item;
   }
 
