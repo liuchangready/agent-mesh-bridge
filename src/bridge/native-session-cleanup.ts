@@ -95,6 +95,19 @@ export function collectThreadSessionRefs(thread: DelegationThread): NativeSessio
   };
 
   add(thread.targetAgent, thread.receiverSessionId);
+  // Dedicated review created its own reviewer conversation; it belongs to the
+  // task and is safe to delete. Only a CAPTURED reviewer session qualifies:
+  // before bootstrap confirms, `callerSessionId` still points at the requester's
+  // own chat, and deleting that would destroy the user's conversation. Never
+  // fall back to `callerSessionId`, and never delete a session that is still the
+  // requester's.
+  if (
+    thread.reviewFlow === 'dedicated' &&
+    thread.reviewerSessionId &&
+    thread.reviewerSessionId !== thread.requesterSessionId
+  ) {
+    add(thread.initiatorAgent, thread.reviewerSessionId);
+  }
   for (const retarget of thread.retargets || []) {
     add(retarget.fromAgent, retarget.previousReceiverSessionId);
   }

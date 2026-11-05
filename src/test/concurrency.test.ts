@@ -1,18 +1,14 @@
-import { test, describe, beforeEach, afterEach } from 'node:test';
+﻿import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
-// The mirrored policy and the supervisor heartbeat both live under the home
-// directory. Node's test runner executes each test FILE in its own process, so
-// redirecting the home here keeps this file's "concurrency is enabled" policy
-// from leaking into the other, concurrently running test files.
 const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-concurrency-home-'));
 process.env.USERPROFILE = isolatedHome;
 process.env.HOME = isolatedHome;
 
-import { ExecutionGate, normalizeWorkspaceKey } from '../bridge/execution-gate';
+import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import {
   DEFAULT_CONCURRENCY_POLICY,
   concurrencyPolicy,
@@ -22,16 +18,18 @@ import {
 import { TaskStore } from '../bridge/task-store';
 import { AgentDetector } from '../bridge/agent-detector';
 import { ActiveAgentResolver } from '../bridge/active-agent-resolver';
-import { AutonomousRunner, RunResult } from '../bridge/autonomous-runner';
+import { AutonomousRunner, RunOptions, RunResult } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
 import { AsyncDispatcher } from '../bridge/async-dispatcher';
-import { TaskControlService } from '../bridge/task-control';
-import { CancellationRegistry } from '../bridge/cancellation-registry';
 import { TaskSupervisor } from '../bridge/task-supervisor';
+import { ReworkController } from '../bridge/rework-controller';
 import { QueueDrainer } from '../bridge/queue-drainer';
 import { DelegationThread, pendingMerges } from '../bridge/types';
 
-/** Minimal valid thread; tests override only what they exercise. */
+function makeTempDir(prefix: string): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
 function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread {
   const now = new Date().toISOString();
   return {
@@ -46,621 +44,302 @@ function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread
     receiverSessionId: 'receiver-session-0001',
     workspacePath: os.tmpdir(),
     summary: { lastPromptSnippet: 'work', lastOutputSnippet: 'done', totalDurationMs: 1 },
-    rounds: [
-      {
-        round: 1,
-        type: 'initial',
-        prompt: 'work',
-        output: 'done',
-        status: 'completed',
-        durationMs: 1,
-        timestamp: now,
-      },
-    ],
+    rounds: [{ round: 1, type: 'initial', prompt: 'work', output: 'done', status: 'completed', durationMs: 1, timestamp: now }],
     ...overrides,
   };
 }
 
 const temporaryDirs: string[] = [];
-
-function makeTempDir(prefix: string): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+function trackedTempDir(prefix: string): string {
+  const dir = makeTempDir(prefix);
   temporaryDirs.push(dir);
   return dir;
 }
-
 afterEach(() => {
-  while (temporaryDirs.length > 0) {
-    const dir = temporaryDirs.pop()!;
-    try {
-      fs.rmSync(dir, { recursive: true, force: true });
-    } catch {}
+  while (temporaryDirs.length) fs.rmSync(temporaryDirs.pop()!, { recursive: true, force: true });
+});
+
+async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const until = Date.now() + timeoutMs;
+  while (Date.now() < until) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
-});
+  assert.ok(predicate(), 'condition did not become true before timeout');
+}
 
-describe('ExecutionGate - one lease per workspace', () => {
-  test('two different workspaces may execute at the same time', () => {
-    const storageDir = makeTempDir('agent-bridge-lease-');
-    const gate = new ExecutionGate(storageDir);
-    const workspaceA = path.join(storageDir, 'workspace-a');
-    const workspaceB = path.join(storageDir, 'workspace-b');
+function success(title?: string): RunResult {
+  return { exitCode: 0, stdout: 'done', stderr: '', extractedOutput: 'done', durationMs: 1 };
+}
 
-    const leaseA = gate.tryAcquire('thread_a', 1, workspaceA, 'codex');
-    const leaseB = gate.tryAcquire('thread_b', 1, workspaceB, 'antigravity');
+describe('bridge policy - optional best-effort concurrency limits', () => {
+  let root: string;
+  beforeEach(() => { root = trackedTempDir('agent-bridge-policy-'); });
 
-    assert.ok(leaseA, 'workspace A must get a lease');
-    assert.ok(leaseB, 'workspace B must get its own lease');
-    assert.notStrictEqual(
-      leaseA!.lockPath,
-      leaseB!.lockPath,
-      'each workspace must own a distinct lock file',
-    );
-    assert.match(leaseA!.lockPath.replace(/\\/g, '/'), /\/leases\/[0-9a-f]{16}\.lock$/);
-    assert.strictEqual(gate.countActive(), 2, 'two live leases');
-
-    const owners = gate.listOwners();
-    assert.strictEqual(owners.length, 2);
-    assert.deepStrictEqual(
-      owners.map((owner) => owner.workspace).sort(),
-      [normalizeWorkspaceKey(workspaceA), normalizeWorkspaceKey(workspaceB)].sort(),
-    );
-    assert.deepStrictEqual(
-      owners.map((owner) => owner.agent).sort(),
-      ['antigravity', 'codex'],
-    );
-
-    // A second lease for the SAME workspace is refused, whoever asks.
-    const sameWorkspace = new ExecutionGate(storageDir);
-    assert.strictEqual(
-      sameWorkspace.tryAcquire('thread_c', 1, workspaceA),
-      null,
-      'one task per workspace',
-    );
-
-    // Releasing one lease leaves the other one held.
-    gate.release(leaseA!);
-    assert.strictEqual(gate.isBusy(normalizeWorkspaceKey(workspaceA)), false);
-    assert.strictEqual(gate.isBusy(normalizeWorkspaceKey(workspaceB)), true);
-    assert.strictEqual(gate.countActive(), 1);
-    assert.strictEqual(gate.listOwners()[0].threadId, 'thread_b');
-
-    gate.release(leaseB!);
-    assert.strictEqual(gate.countActive(), 0);
+  test('disabled means no configured cap; getter shape and historical enabled semantics stay stable', () => {
+    assert.deepStrictEqual(concurrencyPolicy(root), DEFAULT_CONCURRENCY_POLICY);
+    assert.strictEqual(concurrencyPolicy(root).enabled, false);
+    saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 3, maxConcurrentPerAgent: 2 } }, root);
+    assert.deepStrictEqual(concurrencyPolicy(root), { enabled: true, maxConcurrentTasks: 3, maxConcurrentPerAgent: 2 });
+    saveBridgePolicy({ concurrency: { maxConcurrentTasks: 4 } }, root);
+    assert.deepStrictEqual(concurrencyPolicy(root), { enabled: true, maxConcurrentTasks: 4, maxConcurrentPerAgent: 2 });
+    assert.strictEqual(readBridgePolicy(root).concurrency?.enabled, true);
   });
 
-  test('without a workspace key the mesh-wide single flight is unchanged', () => {
-    const storageDir = makeTempDir('agent-bridge-lease-legacy-');
-    const first = new ExecutionGate(storageDir);
-    const second = new ExecutionGate(storageDir);
-
-    const lease = first.tryAcquire('thread_legacy', 1);
-    assert.ok(lease);
-    assert.strictEqual(lease!.lockPath, first.getLockFilePath(), 'legacy lock file');
-    assert.strictEqual(lease!.workspace, undefined);
-
-    assert.strictEqual(
-      second.tryAcquire('thread_legacy_2', 1),
-      null,
-      'a second workspace-less acquire is refused exactly as before',
-    );
-    assert.strictEqual(second.isBusy(), true);
-    assert.strictEqual(second.getOwner()?.threadId, 'thread_legacy');
-    assert.strictEqual(first.countActive(), 1);
-
-    first.release(lease!);
-    assert.strictEqual(second.isBusy(), false);
-    assert.strictEqual(second.countActive(), 0);
-    assert.ok(second.tryAcquire('thread_legacy_2', 1), 'the slot is free again');
-    second.release();
-    assert.strictEqual(second.countActive(), 0, 'release() without a lease clears this process');
-  });
-
-  test('attachChildPid targets the given lease and the orphan scan covers every lease', () => {
-    const storageDir = makeTempDir('agent-bridge-lease-child-');
-    const gate = new ExecutionGate(storageDir, { staleAfterMs: 60_000 });
-    const leaseA = gate.tryAcquire('thread_a', 1, path.join(storageDir, 'ws-a'));
-    const leaseB = gate.tryAcquire('thread_b', 1, path.join(storageDir, 'ws-b'));
-    assert.ok(leaseA && leaseB);
-
-    // Ambiguous without a lease (two are held), explicit with one.
-    gate.attachChildPid(4242);
-    assert.strictEqual(gate.getRawOwner(leaseA!.workspace)?.childPid, undefined);
-    gate.attachChildPid(4242, leaseA!);
-    assert.strictEqual(gate.getRawOwner(leaseA!.workspace)?.childPid, 4242);
-    assert.strictEqual(gate.getRawOwner(leaseB!.workspace)?.childPid, undefined);
-
-    gate.release(leaseA!);
-    gate.release(leaseB!);
+  test('invalid limits preserve prior values and only explicit true enables them', () => {
+    saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 3, maxConcurrentPerAgent: 2 } }, root);
+    saveBridgePolicy({ concurrency: { maxConcurrentTasks: -5, maxConcurrentPerAgent: Number.NaN } }, root);
+    assert.deepStrictEqual(concurrencyPolicy(root), { enabled: true, maxConcurrentTasks: 3, maxConcurrentPerAgent: 2 });
+    saveBridgePolicy({ concurrency: { enabled: false } }, root);
+    assert.strictEqual(concurrencyPolicy(root).enabled, false);
   });
 });
 
-describe('bridge policy - concurrency is opt-in', () => {
-  let policyRoot: string;
-
-  beforeEach(() => {
-    policyRoot = makeTempDir('agent-bridge-policy-');
-  });
-
-  test('defaults to disabled with 2 mesh slots and 1 slot per agent', () => {
-    assert.deepStrictEqual(concurrencyPolicy(policyRoot), {
-      enabled: false,
-      maxConcurrentTasks: 2,
-      maxConcurrentPerAgent: 1,
-    });
-    assert.deepStrictEqual(concurrencyPolicy(policyRoot), DEFAULT_CONCURRENCY_POLICY);
-  });
-
-  test('persists and reads the three fields back', () => {
-    saveBridgePolicy(
-      { concurrency: { enabled: true, maxConcurrentTasks: 3, maxConcurrentPerAgent: 2 } },
-      policyRoot,
-    );
-    assert.deepStrictEqual(concurrencyPolicy(policyRoot), {
-      enabled: true,
-      maxConcurrentTasks: 3,
-      maxConcurrentPerAgent: 2,
-    });
-    const raw = readBridgePolicy(policyRoot);
-    assert.strictEqual(raw.concurrency?.enabled, true);
-
-    // A partial patch keeps the untouched fields.
-    saveBridgePolicy({ concurrency: { maxConcurrentTasks: 4 } }, policyRoot);
-    assert.deepStrictEqual(concurrencyPolicy(policyRoot), {
-      enabled: true,
-      maxConcurrentTasks: 4,
-      maxConcurrentPerAgent: 2,
-    });
-  });
-
-  test('negative and non-finite slot counts are ignored, zero clamps to one', () => {
-    saveBridgePolicy(
-      { concurrency: { enabled: true, maxConcurrentTasks: 3, maxConcurrentPerAgent: 2 } },
-      policyRoot,
-    );
-
-    saveBridgePolicy(
-      { concurrency: { maxConcurrentTasks: -5, maxConcurrentPerAgent: Number.NaN } },
-      policyRoot,
-    );
-    assert.deepStrictEqual(concurrencyPolicy(policyRoot), {
-      enabled: true,
-      maxConcurrentTasks: 3,
-      maxConcurrentPerAgent: 2,
-    });
-
-    saveBridgePolicy({ concurrency: { maxConcurrentPerAgent: 0 } }, policyRoot);
-    assert.strictEqual(
-      concurrencyPolicy(policyRoot).maxConcurrentPerAgent,
-      1,
-      'a slot count can never be zero',
-    );
-  });
-
-  test('only an explicit true enables concurrency', () => {
-    saveBridgePolicy({ concurrency: { enabled: false } }, policyRoot);
-    assert.strictEqual(concurrencyPolicy(policyRoot).enabled, false);
-    saveBridgePolicy({ concurrency: {} }, policyRoot);
-    assert.strictEqual(concurrencyPolicy(policyRoot).enabled, false);
-  });
-});
-
-describe('AsyncDispatcher - workspace slots', () => {
+describe('AsyncDispatcher - independent scope admission', () => {
   let tempDir: string;
   let taskStore: TaskStore;
   let runner: AutonomousRunner;
   let callbackManager: CallbackManager;
-  let gate: ExecutionGate;
+  let registry: TaskExecutionRegistry;
   let dispatcher: AsyncDispatcher;
-  let workspaceA: string;
-  let workspaceB: string;
-  let releaseRounds: () => void;
+  let workspace: string;
+  let release: () => void;
+  let started: string[];
+  let active: number;
+  let maxActive: number;
 
   beforeEach(() => {
-    tempDir = makeTempDir('agent-bridge-dispatch-concurrency-');
-    workspaceA = path.join(tempDir, 'workspace-a');
-    workspaceB = path.join(tempDir, 'workspace-b');
-    fs.mkdirSync(workspaceA, { recursive: true });
-    fs.mkdirSync(workspaceB, { recursive: true });
-
+    tempDir = trackedTempDir('agent-bridge-dispatch-concurrency-');
+    workspace = path.join(tempDir, 'workspace');
+    fs.mkdirSync(workspace, { recursive: true });
     taskStore = new TaskStore(tempDir);
     const detector = new AgentDetector();
-    gate = new ExecutionGate(tempDir);
+    registry = new TaskExecutionRegistry(tempDir);
     runner = new AutonomousRunner(detector);
     callbackManager = new CallbackManager(detector);
     callbackManager.notifyCaller = async () => true;
     callbackManager.notifyCallerOfFailure = async () => false;
-
-    // Every round waits for the test: the assertions are about which tasks the
-    // dispatcher starts, not about what the agents do.
-    let release: () => void = () => {};
-    const held = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    releaseRounds = release;
-    runner.execute = async (): Promise<RunResult> => {
-      await held;
-      return {
-        exitCode: 0,
-        stdout: 'done',
-        stderr: '',
-        extractedOutput: 'done',
-        durationMs: 1,
-      };
+    let releaseAll: () => void = () => {};
+    const held = new Promise<void>((resolve) => { releaseAll = resolve; });
+    release = releaseAll;
+    started = [];
+    active = 0;
+    maxActive = 0;
+    runner.execute = async (options: RunOptions): Promise<RunResult> => {
+      started.push(options.title || 'unnamed');
+      active++;
+      maxActive = Math.max(maxActive, active);
+      try { await held; return success(options.title); }
+      finally { active--; }
     };
-
-    dispatcher = new AsyncDispatcher(
-      taskStore,
-      new ActiveAgentResolver(detector),
-      runner,
-      callbackManager,
-      detector,
-      gate,
-    );
+    dispatcher = new AsyncDispatcher(taskStore, new ActiveAgentResolver(detector), runner, callbackManager, detector, registry);
   });
 
   afterEach(async () => {
-    // Let the held rounds finish so their timers/intervals cannot outlive the
-    // test, then drop the storage directory.
-    releaseRounds();
+    release();
     await new Promise((resolve) => setTimeout(resolve, 150));
+    (dispatcher as any).queueDrainer?.dispose?.();
+    registry.dispose();
     taskStore.dispose();
   });
 
-  test('concurrency disabled: a second task is queued even in another workspace', async () => {
+  test('two disjoint tasks in one workspace overlap; a conflicting candidate queues without stopping later work', async () => {
     saveBridgePolicy({ concurrency: { enabled: false } });
-
-    const first = await dispatcher.dispatchTask({
-      targetAgent: 'codex',
-      title: 'Workspace A task',
-      prompt: 'edit a',
-      workspacePath: workspaceA,
-      expectedFiles: ['src/a.ts'],
-    });
+    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'A', prompt: 'edit a', workspacePath: workspace, expectedFiles: ['src/a.ts'] });
     assert.strictEqual(first.status, 'DISPATCHED');
+    await waitFor(() => started.length === 1);
 
-    const second = await dispatcher.dispatchTask({
-      targetAgent: 'antigravity',
-      title: 'Workspace B task',
-      prompt: 'edit b',
-      workspacePath: workspaceB,
-      expectedFiles: ['src/b.ts'],
-    });
-    assert.strictEqual(second.status, 'QUEUED', 'single flight is mesh-wide, not per workspace');
-    assert.strictEqual(taskStore.getTask(second.threadId)?.status, 'queued');
-    assert.strictEqual(gate.countActive(), 1, 'only one lease may exist');
-    assert.match(second.message, /strictly one at a time/);
+    const conflict = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'B conflict', prompt: 'edit a too', workspacePath: workspace, expectedFiles: ['src/a.ts'] });
+    assert.strictEqual(conflict.status, 'QUEUED');
+
+    const disjoint = await dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'C disjoint', prompt: 'edit c', workspacePath: workspace, expectedFiles: ['src/c.ts'] });
+    assert.strictEqual(disjoint.status, 'DISPATCHED', disjoint.message);
+    await waitFor(() => started.length === 2);
+    assert.strictEqual(maxActive, 2, 'the runner promises overlap in wall time, not merely in dispatcher return statuses');
+    assert.deepStrictEqual(started.slice().sort(), ['A', 'C disjoint']);
+    assert.strictEqual(taskStore.getTask(conflict.threadId)?.status, 'queued');
   });
 
-  test('concurrency enabled: different workspaces dispatch together, same agent still caps', async () => {
-    saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 2 } });
+  test('an old execution.lock record does not block a new independent task', async () => {
+    const legacy = { token: 'legacy', pid: process.pid, threadId: 'old-thread', round: 1, acquiredAt: Date.now(), updatedAt: Date.now() };
+    fs.writeFileSync(path.join(tempDir, 'execution.lock'), JSON.stringify(legacy));
+    saveBridgePolicy({ concurrency: { enabled: false } });
+    const task = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Independent', prompt: 'edit', workspacePath: workspace, expectedFiles: ['src/independent.ts'] });
+    assert.strictEqual(task.status, 'DISPATCHED');
+    await waitFor(() => started.length === 1);
+    assert.strictEqual(taskStore.getTask(task.threadId)?.status, 'running');
+    assert.ok(registry.getOwner(task.threadId));
+  });
 
-    const first = await dispatcher.dispatchTask({
-      targetAgent: 'codex',
-      title: 'Workspace A task',
-      prompt: 'edit a',
-      workspacePath: workspaceA,
-      expectedFiles: ['src/a.ts'],
-    });
+  test('enabled limits queue only after observed registrations reach the cap', async () => {
+    saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 1, maxConcurrentPerAgent: 2 } });
+    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Limited A', prompt: 'a', workspacePath: workspace, expectedFiles: ['src/a.ts'] });
     assert.strictEqual(first.status, 'DISPATCHED');
-    assert.strictEqual(gate.countActive(), 1);
+    await waitFor(() => started.length === 1);
+    const second = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Limited B', prompt: 'b', workspacePath: workspace, expectedFiles: ['src/b.ts'] });
+    assert.strictEqual(second.status, 'QUEUED');
+    assert.match(second.message, /limit reached/i);
+  });
 
-    const second = await dispatcher.dispatchTask({
-      targetAgent: 'antigravity',
-      title: 'Workspace B task',
-      prompt: 'edit b',
-      workspacePath: workspaceB,
-      expectedFiles: ['src/b.ts'],
-    });
-    assert.strictEqual(second.status, 'DISPATCHED', second.message);
-    assert.strictEqual(gate.countActive(), 2);
-    assert.strictEqual(taskStore.getTask(first.threadId)?.status, 'running');
-    assert.strictEqual(taskStore.getTask(second.threadId)?.status, 'running');
+  test('a per-agent cap skips only that agent and still starts a different agent candidate', async () => {
+    saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 3, maxConcurrentPerAgent: 1 } });
+    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Codex active', prompt: 'a', workspacePath: workspace, expectedFiles: ['src/a.ts'] });
+    assert.strictEqual(first.status, 'DISPATCHED');
+    await waitFor(() => started.length === 1);
 
-    // A third workspace is free, but `codex` already occupies its only slot.
-    const workspaceC = path.join(tempDir, 'workspace-c');
-    fs.mkdirSync(workspaceC, { recursive: true });
-    const third = await dispatcher.dispatchTask({
-      targetAgent: 'codex',
-      title: 'Workspace C task',
-      prompt: 'edit c',
-      workspacePath: workspaceC,
-      expectedFiles: ['src/c.ts'],
+    const sameAgent = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Codex queued', prompt: 'b', workspacePath: workspace, expectedFiles: ['src/b.ts'] });
+    assert.strictEqual(sameAgent.status, 'QUEUED');
+    assert.match(sameAgent.message, /agent codex/i);
+
+    const otherAgent = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Other agent', prompt: 'c', workspacePath: workspace, expectedFiles: ['src/c.ts'] });
+    assert.strictEqual(otherAgent.status, 'DISPATCHED', otherAgent.message);
+    await waitFor(() => started.length === 2);
+    assert.deepStrictEqual(started.slice().sort(), ['Codex active', 'Other agent']);
+    assert.strictEqual(maxActive, 2);
+  });
+
+  test('delayed queue marking cannot resurrect deleted or overwrite paused/completed tasks', () => {
+    saveBridgePolicy({ concurrency: { enabled: false } });
+    const supervisor = new TaskSupervisor(taskStore, runner, callbackManager, undefined, registry);
+    const rework = new ReworkController(taskStore, runner, callbackManager, undefined, registry);
+    const markers: Array<(stale: DelegationThread) => void> = [
+      (stale) => (dispatcher as any).markThreadQueued(stale, undefined, 'stale cap result'),
+      (stale) => (supervisor as any).markQueued(stale, undefined, 'stale scope result'),
+      (stale) => (rework as any).markQueued(stale, undefined, 'stale scope result'),
+    ];
+
+    try {
+      for (const [markerIndex, markQueued] of markers.entries()) {
+        for (const terminalState of ['paused', 'completed', 'deleted'] as const) {
+          const threadId = `thread_delayed_queue_${markerIndex}_${terminalState}`;
+          const stale = makePendingThread(threadId, workspace, new Date().toISOString(), `src/${threadId}.ts`);
+          taskStore.upsertTask(stale);
+          if (terminalState === 'deleted') taskStore.deleteTask(threadId);
+          else {
+            const latest = taskStore.getTask(threadId)!;
+            latest.status = terminalState;
+            taskStore.upsertTask(latest);
+          }
+
+          markQueued(stale);
+          const latest = taskStore.getTask(threadId);
+          if (terminalState === 'deleted') assert.strictEqual(latest, undefined, `${threadId} must stay deleted`);
+          else assert.strictEqual(latest?.status, terminalState, `${threadId} must retain its newer lifecycle state`);
+        }
+      }
+    } finally {
+      (rework as any).queueDrainer?.dispose?.();
+      supervisor.dispose();
+    }
+  });
+});
+
+function makePendingThread(threadId: string, workspacePath: string, createdAt: string, scope: string): DelegationThread {
+  return makeThread({
+    threadId, title: threadId, status: 'running', workspacePath, createdAt, updatedAt: createdAt,
+    expectedFiles: [scope], currentRound: 1,
+    rounds: [{ round: 1, type: 'initial', prompt: 'work ' + threadId, status: 'running', durationMs: 0, timestamp: createdAt }],
+  });
+}
+
+describe('QueueDrainer - scan every runnable candidate', () => {
+  test('paused, waiting review, blocked and bootstrap-pending tasks do not hide later candidates', async () => {
+    const dir = trackedTempDir('agent-bridge-drainer-');
+    const store = new TaskStore(dir);
+    const registry = new TaskExecutionRegistry(dir);
+    const workspace = path.join(dir, 'ws');
+    const old = '2026-11-01T00:00:00.000Z';
+    store.upsertTask(makePendingThread('paused', workspace, old, 'src/paused.ts') as any);
+    store.upsertTask(makePendingThread('review', workspace, old, 'src/review.ts') as any);
+    store.upsertTask(makePendingThread('blocked', workspace, old, 'src/blocked.ts') as any);
+    store.upsertTask(makePendingThread('bootstrap', workspace, old, 'src/bootstrap.ts') as any);
+    store.upsertTask(makePendingThread('ready', workspace, old, 'src/ready.ts') as any);
+    const paused = store.getTask('paused')!; paused.status = 'paused'; store.upsertTask(paused);
+    const review = store.getTask('review')!; review.status = 'waiting_review'; store.upsertTask(review);
+    const blocked = store.getTask('blocked')!; blocked.status = 'waiting_review'; blocked.reviewBlocked = { reason: 'dependency', at: old } as any; store.upsertTask(blocked);
+    const bootstrap = store.getTask('bootstrap')!; bootstrap.reviewFlow = 'dedicated'; bootstrap.reviewBootstrap = { phase: 'pending', attempts: 0 }; store.upsertTask(bootstrap);
+
+    const started: string[] = [];
+    const drainer = new QueueDrainer(store, registry, () => false, async (target) => {
+      started.push(target.thread.threadId);
+      registry.begin(target.thread.threadId, target.round.round, target.thread.targetAgent, target.thread.workspacePath);
     });
-    assert.strictEqual(third.status, 'QUEUED');
-    assert.strictEqual(taskStore.getTask(third.threadId)?.status, 'queued');
-    assert.match(third.message, /agent codex/i);
-    assert.match(third.message, /concurrent slots/i);
+    await drainer.drain();
+    assert.deepStrictEqual(started, ['ready']);
+    drainer.dispose(); registry.dispose(); store.dispose();
+  });
+
+  test('disabled limits allow all disjoint same-workspace candidates; enabled limits are best-effort admission', async () => {
+    const dir = trackedTempDir('agent-bridge-drainer-cap-');
+    const store = new TaskStore(dir);
+    const registry = new TaskExecutionRegistry(dir);
+    const ws = path.join(dir, 'ws');
+    const when = '2026-11-01T00:00:00.000Z';
+    store.upsertTask(makePendingThread('a', ws, when, 'src/a.ts'));
+    store.upsertTask(makePendingThread('b', ws, when, 'src/b.ts'));
+    saveBridgePolicy({ concurrency: { enabled: false } });
+    const started: string[] = [];
+    const drainer = new QueueDrainer(store, registry, () => false, async (target) => {
+      started.push(target.thread.threadId);
+      registry.begin(target.thread.threadId, target.round.round, target.thread.targetAgent, ws);
+    });
+    await drainer.drain();
+    assert.deepStrictEqual(started, ['a', 'b']);
+    drainer.dispose(); registry.dispose(); store.dispose();
+  });
+});
+
+describe('TaskSupervisor - same-workspace overlap and same-thread exclusion', () => {
+  test('two disjoint same-workspace tasks run at once; duplicate scheduling starts one thread once', async () => {
+    saveBridgePolicy({ concurrency: { enabled: false } });
+    const dir = trackedTempDir('agent-bridge-supervisor-overlap-');
+    const store = new TaskStore(dir);
+    const registry = new TaskExecutionRegistry(dir);
+    const detector = new AgentDetector();
+    const runner = new AutonomousRunner(detector);
+    let release: () => void = () => {};
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    const starts: string[] = [];
+    runner.execute = async (options: RunOptions) => { starts.push(options.taskThreadId || ''); await barrier; return success(options.title); };
+    const callback = new CallbackManager(detector);
+    callback.notifyCaller = async () => true;
+    callback.notifyCallerOfFailure = async () => false;
+    const supervisor = new TaskSupervisor(store, runner, callback, detector, registry);
+    const ws = path.join(dir, 'ws');
+    const when = new Date().toISOString();
+    const a = makePendingThread('thread_a', ws, when, 'src/a.ts');
+    const b = makePendingThread('thread_b', ws, when, 'src/b.ts');
+    store.upsertTask(a); store.upsertTask(b);
+    supervisor.checkPendingTasks();
+    await waitFor(() => starts.length === 2);
+    assert.deepStrictEqual(starts.slice().sort(), ['thread_a', 'thread_b']);
+    assert.strictEqual(registry.listOwners().length, 2);
+
+    const same = makePendingThread('thread_same', ws, when, 'src/same.ts');
+    store.upsertTask(same);
+    const sameRound = same.rounds[0];
+    const sameRuns = [
+      supervisor.executeThreadRound(same, sameRound),
+      supervisor.executeThreadRound(same, sameRound),
+    ];
+    await waitFor(() => starts.filter((id) => id === 'thread_same').length === 1);
+    assert.strictEqual(starts.filter((id) => id === 'thread_same').length, 1, 'role/round admission rejects duplicate schedule');
+    assert.strictEqual(store.getTask('thread_same')?.status, 'running', 'losing admission must not rewrite it as queued');
+
+    release();
+    await Promise.all(sameRuns);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    supervisor.dispose(); registry.dispose(); store.dispose();
   });
 });
 
 describe('merge gate - pendingMerges', () => {
   test('only completed worktree tasks without a merge request, oldest first', () => {
-    const older = makeThread({
-      threadId: 'thread_old',
-      createdAt: '2026-10-01T00:00:00.000Z',
-      worktree: { path: 'D:/wt/old', mainPath: 'D:/repo' },
-    });
-    const newer = makeThread({
-      threadId: 'thread_new',
-      createdAt: '2026-10-02T00:00:00.000Z',
-      worktree: { path: 'D:/wt/new', mainPath: 'D:/repo' },
-    });
-    const merged = makeThread({
-      threadId: 'thread_merged',
-      createdAt: '2026-10-03T00:00:00.000Z',
-      worktree: { path: 'D:/wt/merged', mainPath: 'D:/repo', mergePending: true },
-      mergeRequest: {
-        url: 'https://example.com/mr/1',
-        status: 'synced',
-        updatedAt: '2026-10-03T00:00:00.000Z',
-      },
-    });
-    const noWorktree = makeThread({
-      threadId: 'thread_plain',
-      createdAt: '2026-10-04T00:00:00.000Z',
-    });
-    const stillRunning = makeThread({
-      threadId: 'thread_running',
-      createdAt: '2026-10-05T00:00:00.000Z',
-      status: 'running',
-      worktree: { path: 'D:/wt/running', mainPath: 'D:/repo' },
-    });
-
-    const pending = pendingMerges([newer, noWorktree, merged, older, stillRunning]);
-    assert.deepStrictEqual(
-      pending.map((task) => task.threadId),
-      ['thread_old', 'thread_new'],
-      'a merge request, a missing worktree and a non-completed task are all excluded',
-    );
-  });
-});
-
-describe('merge gate - delete refuses an unmerged worktree', () => {
-  let tempDir: string;
-  let taskStore: TaskStore;
-
-  beforeEach(() => {
-    tempDir = makeTempDir('agent-bridge-merge-gate-');
-    taskStore = new TaskStore(tempDir);
-  });
-
-  afterEach(() => {
-    taskStore.dispose();
-  });
-
-  const control = () =>
-    new TaskControlService(taskStore, undefined, new CancellationRegistry(tempDir), tempDir);
-
-  const worktreeThread = () =>
-    makeThread({
-      threadId: 'thread_worktree',
-      workspacePath: tempDir,
-      worktree: { path: path.join(tempDir, 'wt'), mainPath: tempDir, branch: 'feat/x' },
-    });
-
-  test('completed worktree task raises mergePending and is refused until forced', () => {
-    taskStore.upsertTask(worktreeThread());
-    const stored = taskStore.getTask('thread_worktree')!;
-    assert.strictEqual(stored.worktree?.mergePending, true, 'completion raises the merge gate');
-    assert.strictEqual(pendingMerges(taskStore.getAllTasks()).length, 1);
-
-    assert.throws(
-      () => control().deleteTask('thread_worktree', 'cleanup', 'user'),
-      /worktree/i,
-      'an unmerged worktree must not be deleted silently',
-    );
-    assert.ok(taskStore.getTask('thread_worktree'), 'the refused deletion keeps the task');
-    assert.strictEqual(
-      fs.existsSync(path.join(tempDir, 'deleted_tasks.log')),
-      false,
-      'a refused deletion writes no tombstone',
-    );
-
-    const forced = control().deleteTask('thread_worktree', 'discard', 'user', true);
-    assert.strictEqual(forced.status, 'DELETED');
-    assert.strictEqual(taskStore.getTask('thread_worktree'), undefined);
-    const tombstone = fs.readFileSync(path.join(tempDir, 'deleted_tasks.log'), 'utf8');
-    assert.match(tombstone, /thread_worktree/);
-  });
-
-  test('recording the merge request clears the gate and allows a normal delete', () => {
-    taskStore.upsertTask(worktreeThread());
-    assert.strictEqual(pendingMerges(taskStore.getAllTasks()).length, 1);
-
-    taskStore.recordMergeRequest('thread_worktree', {
-      url: 'https://example.com/mr/7',
-      branch: 'feat/x',
-      commit: 'abcdef1',
-      remote: 'origin',
-      status: 'synced',
-      updatedAt: new Date().toISOString(),
-      by: 'codex',
-    });
-
-    const afterMerge = taskStore.getTask('thread_worktree')!;
-    assert.strictEqual(afterMerge.worktree?.mergePending, false);
-    assert.strictEqual(pendingMerges(taskStore.getAllTasks()).length, 0);
-
-    const result = control().deleteTask('thread_worktree', 'merged and closed', 'user');
-    assert.strictEqual(result.status, 'DELETED');
-    assert.strictEqual(taskStore.getTask('thread_worktree'), undefined);
-  });
-
-  test('a normal (non-worktree) task is still deleted without force', () => {
-    taskStore.upsertTask(makeThread({ threadId: 'thread_plain', workspacePath: tempDir }));
-    const result = control().deleteTask('thread_plain', 'duplicate', 'user');
-    assert.strictEqual(result.status, 'DELETED');
-    assert.strictEqual(taskStore.getTask('thread_plain'), undefined);
-  });
-});
-
-/** A queued/running task with one round in flight, created `ageMs` ago. */
-function makePendingThread(
-  threadId: string,
-  title: string,
-  workspacePath: string,
-  ageMs: number,
-  status: 'queued' | 'running' = 'queued',
-): DelegationThread {
-  const createdAt = new Date(Date.now() - ageMs).toISOString();
-  return makeThread({
-    threadId,
-    title,
-    status,
-    workspacePath,
-    createdAt,
-    updatedAt: createdAt,
-    rounds: [
-      {
-        round: 1,
-        type: 'initial',
-        prompt: `work for ${threadId}`,
-        status: 'running',
-        durationMs: 0,
-        timestamp: createdAt,
-      },
-    ],
-  });
-}
-
-describe('QueueDrainer - one queue per workspace', () => {
-  let tempDir: string;
-  let taskStore: TaskStore;
-  let gate: ExecutionGate;
-  let workspaceA: string;
-  let workspaceB: string;
-  let workspaceC: string;
-
-  beforeEach(() => {
-    tempDir = makeTempDir('agent-bridge-drainer-');
-    taskStore = new TaskStore(tempDir);
-    gate = new ExecutionGate(tempDir);
-    workspaceA = path.join(tempDir, 'ws-a');
-    workspaceB = path.join(tempDir, 'ws-b');
-    workspaceC = path.join(tempDir, 'ws-c');
-    for (const dir of [workspaceA, workspaceB, workspaceC]) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-
-    taskStore.upsertTask(makePendingThread('thread_a1', 'A1', workspaceA, 3000));
-    taskStore.upsertTask(makePendingThread('thread_a2', 'A2', workspaceA, 1000));
-    taskStore.upsertTask(makePendingThread('thread_b1', 'B1', workspaceB, 2000));
-    taskStore.upsertTask(makePendingThread('thread_c1', 'C1', workspaceC, 500));
-  });
-
-  afterEach(() => {
-    gate.release();
-    taskStore.dispose();
-  });
-
-  test('disabled: exactly the single global head starts', async () => {
-    saveBridgePolicy({ concurrency: { enabled: false } });
-    const started: string[] = [];
-    const drainer = new QueueDrainer(taskStore, gate, () => false, async (target) => {
-      started.push(target.thread.threadId);
-    });
-
-    await drainer.drain();
-    assert.deepStrictEqual(started, ['thread_a1'], 'one task at a time, mesh-wide');
-  });
-
-  test('enabled: per-workspace heads start up to the mesh-wide cap', async () => {
-    saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 2 } });
-    const started: string[] = [];
-    const drainer = new QueueDrainer(taskStore, gate, () => false, async (target) => {
-      started.push(target.thread.threadId);
-      gate.tryAcquire(
-        target.thread.threadId,
-        target.round.round,
-        normalizeWorkspaceKey(target.thread.workspacePath),
-        target.thread.targetAgent,
-      );
-    });
-
-    await drainer.drain();
-    assert.deepStrictEqual(
-      started,
-      ['thread_a1', 'thread_b1'],
-      'oldest head of each workspace, stopping at the mesh-wide cap',
-    );
-    assert.strictEqual(gate.countActive(), 2);
-
-    // Tasks that already hold their workspace lease must never be re-entered:
-    // raising the cap starts the remaining workspace, not A/B again.
-    saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 3 } });
-    await drainer.drain();
-    assert.deepStrictEqual(started, ['thread_a1', 'thread_b1', 'thread_c1']);
-    assert.strictEqual(gate.countActive(), 3);
-  });
-});
-
-describe('TaskSupervisor - concurrency partitions the queue by workspace', () => {
-  let tempDir: string;
-  let taskStore: TaskStore;
-  let gate: ExecutionGate;
-  let supervisor: TaskSupervisor;
-  let workspaceA: string;
-  let workspaceB: string;
-  let releaseRounds: () => void;
-
-  beforeEach(() => {
-    tempDir = makeTempDir('agent-bridge-supervisor-concurrency-');
-    taskStore = new TaskStore(tempDir);
-    gate = new ExecutionGate(tempDir);
-    workspaceA = path.join(tempDir, 'ws-a');
-    workspaceB = path.join(tempDir, 'ws-b');
-    fs.mkdirSync(workspaceA, { recursive: true });
-    fs.mkdirSync(workspaceB, { recursive: true });
-
-    let release: () => void = () => {};
-    const held = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    releaseRounds = release;
-
-    const detector = new AgentDetector();
-    const runner = new AutonomousRunner(detector);
-    (runner as any).execute = async (): Promise<RunResult> => {
-      await held;
-      return {
-        exitCode: 0,
-        stdout: 'done',
-        stderr: '',
-        extractedOutput: 'done',
-        durationMs: 1,
-      };
-    };
-    const callbackManager = new CallbackManager(detector);
-    callbackManager.notifyCaller = async () => true;
-    callbackManager.notifyCallerOfFailure = async () => false;
-    supervisor = new TaskSupervisor(taskStore, runner, callbackManager, detector, gate);
-  });
-
-  afterEach(async () => {
-    releaseRounds();
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    supervisor.dispose();
-    gate.release();
-    taskStore.dispose();
-  });
-
-  test('two workspaces run at once; a younger same-workspace task stays queued', () => {
-    // Both tasks execute on the same agent, so the per-agent cap is raised too;
-    // what is under test here is the per-workspace partition.
-    saveBridgePolicy({
-      concurrency: { enabled: true, maxConcurrentTasks: 2, maxConcurrentPerAgent: 2 },
-    });
-
-    taskStore.upsertTask(makePendingThread('thread_a1', 'A1', workspaceA, 3000, 'running'));
-    taskStore.upsertTask(makePendingThread('thread_b1', 'B1', workspaceB, 2000, 'running'));
-    taskStore.upsertTask(makePendingThread('thread_a2', 'A2', workspaceA, 1000, 'running'));
-
-    supervisor.checkPendingTasks();
-
-    assert.strictEqual(supervisor.isExecuting('thread_a1'), true);
-    assert.strictEqual(supervisor.isExecuting('thread_b1'), true);
-    assert.strictEqual(supervisor.isExecuting('thread_a2'), false);
-    assert.strictEqual(gate.countActive(), 2, 'one lease per workspace');
-    assert.strictEqual(taskStore.getTask('thread_a2')?.status, 'queued');
+    const older = makeThread({ threadId: 'thread_old', createdAt: '2026-10-01T00:00:00.000Z', worktree: { path: 'D:/wt/old', mainPath: 'D:/repo' } });
+    const newer = makeThread({ threadId: 'thread_new', createdAt: '2026-10-02T00:00:00.000Z', worktree: { path: 'D:/wt/new', mainPath: 'D:/repo' } });
+    const merged = makeThread({ threadId: 'thread_merged', createdAt: '2026-10-03T00:00:00.000Z', worktree: { path: 'D:/wt/merged', mainPath: 'D:/repo', mergePending: true }, mergeRequest: { url: 'https://example.com/mr/1', status: 'synced', updatedAt: '2026-10-03T00:00:00.000Z' } });
+    const noWorktree = makeThread({ threadId: 'thread_plain', createdAt: '2026-10-04T00:00:00.000Z' });
+    const stillRunning = makeThread({ threadId: 'thread_running', createdAt: '2026-10-05T00:00:00.000Z', status: 'running', worktree: { path: 'D:/wt/running', mainPath: 'D:/repo' } });
+    assert.deepStrictEqual(pendingMerges([newer, noWorktree, merged, older, stillRunning]).map((task) => task.threadId), ['thread_old', 'thread_new']);
   });
 });

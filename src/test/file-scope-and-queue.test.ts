@@ -25,7 +25,7 @@ import { AutonomousRunner, RunOptions, RunResult } from '../bridge/autonomous-ru
 import { CallbackManager } from '../bridge/callback-manager';
 import { AsyncDispatcher } from '../bridge/async-dispatcher';
 import { TaskSupervisor } from '../bridge/task-supervisor';
-import { ExecutionGate } from '../bridge/execution-gate';
+import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { DelegationThread } from '../bridge/types';
 
 describe('File Scope and Conflict Queueing Tests', () => {
@@ -188,7 +188,7 @@ describe('File Scope and Conflict Queueing Tests', () => {
 
       // Both components share the same lock file, which is scoped to this
       // test's temp directory instead of the real home directory.
-      const gate = new ExecutionGate(tempDir);
+      const gate = new TaskExecutionRegistry(tempDir);
       supervisor = new TaskSupervisor(taskStore, runner, callbackManager, detector, gate);
       // Fast stream sync interval for testing (30ms instead of 30,000ms)
       supervisor.setStreamSyncIntervalMs(30);
@@ -242,12 +242,9 @@ describe('File Scope and Conflict Queueing Tests', () => {
       assert.strictEqual(taskStore.count(), 0, 'invalid scopes must not create a ledger entry');
     });
 
-    test('should queue whole tasks until the current task is completed (task-level FIFO)', async () => {
-      let taskAResolve: () => void = () => {};
-      const taskAPromise = new Promise<void>((resolve) => {
-        taskAResolve = resolve;
-      });
-
+    test('scope conflicts queue only overlapping work while disjoint work runs', async () => {
+      let releaseAll: () => void = () => {};
+      const held = new Promise<void>((resolve) => { releaseAll = resolve; });
       const startOrder: string[] = [];
       let inFlight = 0;
       let maxInFlight = 0;
@@ -257,11 +254,7 @@ describe('File Scope and Conflict Queueing Tests', () => {
         inFlight++;
         maxInFlight = Math.max(maxInFlight, inFlight);
         try {
-          if (options.title?.includes('Task A')) {
-            await taskAPromise;
-          } else {
-            await new Promise((r) => setTimeout(r, 20));
-          }
+          await held;
           return {
             exitCode: 0,
             stdout: `Finished ${options.title}`,
@@ -274,105 +267,54 @@ describe('File Scope and Conflict Queueing Tests', () => {
         }
       };
 
-      // 1. Dispatch Task A with MenuScreen.kt
-      const resA = await dispatcher.dispatchTask({
+      const taskA = await dispatcher.dispatchTask({
         targetAgent: 'antigravity',
         title: 'Task A (MenuScreen)',
         prompt: 'Refactor MenuScreen.kt',
         expectedFiles: ['presentation/menu/MenuScreen.kt'],
       });
-      assert.strictEqual(resA.status, 'DISPATCHED');
+      assert.strictEqual(taskA.status, 'DISPATCHED');
 
-      // 2. Task B conflicts on files AND must wait for A to finish.
-      const resB = await dispatcher.dispatchTask({
-        targetAgent: 'antigravity',
-        title: 'Task B (MenuScreen Conflicting)',
-        prompt: 'Add shortcut to MenuScreen.kt',
+      const conflict = await dispatcher.dispatchTask({
+        targetAgent: 'codex',
+        title: 'Task B (MenuScreen conflict)',
+        prompt: 'Change the same file',
         expectedFiles: ['presentation/menu/MenuScreen.kt'],
       });
-      assert.strictEqual(resB.status, 'QUEUED');
-      const threadB = taskStore.getTask(resB.threadId);
-      assert.strictEqual(threadB?.status, 'queued');
-      assert.match(
-        threadB?.summary.lastOutputSnippet || '',
-        // Either wording is accurate: the task is queued behind Task A, and the
-        // scope gate names the same owner plus the overlapping file.
-        /one at a time|Waiting for (conflicting )?task|Queued \(scope\)/,
-      );
+      assert.strictEqual(conflict.status, 'QUEUED');
 
-      // 3. Task C touches disjoint files, but it must STILL be queued: the rule
-      // is one task at a time, not merely "no overlapping file edits".
-      const resC = await dispatcher.dispatchTask({
-        targetAgent: 'antigravity',
-        title: 'Task C (TableBoardRenderer Disjoint)',
+      const disjoint = await dispatcher.dispatchTask({
+        targetAgent: 'claude_code',
+        title: 'Task C (disjoint)',
         prompt: 'Extract TableBoardRenderer.kt',
         expectedFiles: ['presentation/render/TableBoardRenderer.kt'],
       });
-      assert.strictEqual(resC.status, 'QUEUED');
-      assert.strictEqual(taskStore.getTask(resC.threadId)?.status, 'queued');
+      assert.strictEqual(disjoint.status, 'DISPATCHED', disjoint.message);
 
-      // 4. Release Task A. A goes to waiting_review, but B and C must remain
-      // queued until A is actually completed/approved.
-      taskAResolve();
-
-      const waitFor = async (threadId: string, status: string, timeoutMs = 3_000) => {
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
-          if (taskStore.getTask(threadId)?.status === status) return;
-          await new Promise((r) => setTimeout(r, 25));
-        }
+      const waitForStarts = async (count: number) => {
+        const deadline = Date.now() + 2_000;
+        while (Date.now() < deadline && startOrder.length < count) await new Promise((r) => setTimeout(r, 10));
+        assert.strictEqual(startOrder.length, count);
       };
+      await waitForStarts(2);
+      assert.deepStrictEqual(startOrder.slice().sort(), ['Task A (MenuScreen)', 'Task C (disjoint)']);
+      assert.strictEqual(maxInFlight, 2, 'same-workspace disjoint tasks must overlap in the runner');
 
-      await waitFor(resA.threadId, 'waiting_review');
-      assert.strictEqual(taskStore.getTask(resA.threadId)?.status, 'waiting_review');
-      assert.strictEqual(taskStore.getTask(resB.threadId)?.status, 'queued');
-      assert.strictEqual(taskStore.getTask(resC.threadId)?.status, 'queued');
-      assert.deepStrictEqual(startOrder, ['Task A (MenuScreen)']);
-
-      // 5. Complete A and收口 its MR -> B may start. A's uncommitted edits on
-      // MenuScreen.kt keep owning that file until the merge request is recorded,
-      // so approval alone must NOT release B onto the same file.
-      taskStore.updateRound(resA.threadId, 1, { status: 'completed' }, 'completed');
-      supervisor.checkPendingTasks();
-      await new Promise((r) => setTimeout(r, 120));
-      assert.strictEqual(
-        taskStore.getTask(resB.threadId)?.status,
-        'queued',
-        'an accepted but unmerged task keeps owning its files',
-      );
-
-      taskStore.recordMergeRequest(resA.threadId, {
-        url: 'https://example.com/mr/1',
-        branch: 'feature/menu',
-        commit: 'abc1234',
-        remote: 'origin',
-        status: 'synced',
-        summary: 'MenuScreen refactor merged',
-        updatedAt: new Date().toISOString(),
-        by: 'codex',
-      });
-      supervisor.checkPendingTasks();
-      await waitFor(resB.threadId, 'waiting_review');
-      assert.strictEqual(taskStore.getTask(resB.threadId)?.status, 'waiting_review');
-      assert.strictEqual(taskStore.getTask(resC.threadId)?.status, 'queued');
-      assert.deepStrictEqual(startOrder, [
-        'Task A (MenuScreen)',
-        'Task B (MenuScreen Conflicting)',
+      releaseAll();
+      const waitForStatus = async (threadId: string, status: string) => {
+        const deadline = Date.now() + 3_000;
+        while (Date.now() < deadline && taskStore.getTask(threadId)?.status !== status) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        assert.strictEqual(taskStore.getTask(threadId)?.status, status);
+      };
+      await Promise.all([
+        waitForStatus(taskA.threadId, 'waiting_review'),
+        waitForStatus(disjoint.threadId, 'waiting_review'),
       ]);
-
-      // 6. Complete B -> C may start.
-      taskStore.updateRound(resB.threadId, 1, { status: 'completed' }, 'completed');
-      supervisor.checkPendingTasks();
-      await waitFor(resC.threadId, 'waiting_review');
-      assert.strictEqual(taskStore.getTask(resC.threadId)?.status, 'waiting_review');
-      assert.deepStrictEqual(startOrder, [
-        'Task A (MenuScreen)',
-        'Task B (MenuScreen Conflicting)',
-        'Task C (TableBoardRenderer Disjoint)',
-      ]);
-      assert.strictEqual(maxInFlight, 1, 'no two agent processes may run concurrently');
+      assert.strictEqual(taskStore.getTask(conflict.threadId)?.status, 'queued');
+      assert.deepStrictEqual(startOrder.length, 2, 'the waiting-review owner keeps only the overlapping candidate queued');
     });
-
     test('should sync live output stream periodically (30s stream sync)', async () => {
       runner.execute = async (options: RunOptions): Promise<RunResult> => {
         // Emit chunks over time
@@ -474,4 +416,3 @@ describe('File Scope and Conflict Queueing Tests', () => {
     });
   });
 });
-

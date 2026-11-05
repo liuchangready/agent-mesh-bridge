@@ -12,6 +12,15 @@ import {
   appendInterruption,
   isMergePending,
 } from './types';
+import {
+  archiveCompletedTaskLogs,
+  archiveThreadData,
+  buildFinalSummary,
+  ensureFinalSummary,
+  isTerminalThreadStatus,
+  removeTaskArtifacts,
+} from './task-summary';
+import { cleanupThreadNativeSessions } from './native-session-cleanup';
 
 export const MAX_STORED_TASKS = 1000;
 
@@ -446,6 +455,9 @@ export class TaskStore extends EventEmitter {
     if (isMergePending(thread) && thread.worktree) {
       thread.worktree.mergePending = true;
     }
+    // Terminal tasks carry a deterministic read-only digest. It is what survives
+    // archival and what `get_task_summary` answers long after rounds are gone.
+    ensureFinalSummary(thread);
     this.tasks.set(thread.threadId, thread);
     this.persistThread(thread);
     this.enforceCapacity();
@@ -627,7 +639,55 @@ export class TaskStore extends EventEmitter {
       : mergeRequest.commit
         ? `MR commit: ${mergeRequest.commit}`
         : `MR: ${mergeRequest.status}`;
+    // A task may be accepted before its MR is recorded: refresh the digest so the
+    // archived summary carries the MR pointer too. An ARCHIVED task has no rounds
+    // left, so rebuilding would erase the digest — merge the pointer instead.
+    if (thread.finalSummary) {
+      if (thread.archivedAt) {
+        thread.finalSummary = {
+          ...thread.finalSummary,
+          mergeRequest: thread.mergeRequest,
+        };
+      } else {
+        const rebuilt = buildFinalSummary(thread, thread.mergeRequest);
+        rebuilt.at = thread.finalSummary.at;
+        thread.finalSummary = rebuilt;
+      }
+    }
     this.saveToDisk();
+    return thread;
+  }
+
+  /**
+   * Archive one terminal task in place.
+   *
+   * Keeps the task row, model/agent metadata, MR and the final digest; drops the
+   * rounds, session ids and per-round logs. Native CLI histories are left alone
+   * (that is `delete_task`'s job).
+   */
+  public archiveTask(threadId: string): DelegationThread | undefined {
+    this.ensureUpToDate();
+    const thread = this.tasks.get(threadId);
+    if (!thread || thread.archivedAt || !isTerminalThreadStatus(thread.status)) return undefined;
+    // Read the session ids BEFORE they are stripped: archival is the "keep only
+    // the summary" boundary, so the native conversations and bridge logs are
+    // removed now. Best-effort: a missing conversation is not an error.
+    try {
+      cleanupThreadNativeSessions(thread);
+    } catch {}
+    try {
+      archiveCompletedTaskLogs(thread, this.storageDir);
+    } catch {}
+    if (!archiveThreadData(thread)) return undefined;
+    this.tasks.set(threadId, thread);
+    this.persistThread(thread);
+    removeTaskArtifacts(threadId, this.storageDir, {
+      keepArchive: true,
+      targetAgent: thread.targetAgent,
+      initiatorAgent: thread.initiatorAgent,
+    });
+    this.writeAggregate();
+    this.emit('changed', Array.from(this.tasks.values()));
     return thread;
   }
 
@@ -638,11 +698,17 @@ export class TaskStore extends EventEmitter {
    */
   public deleteTask(threadId: string): boolean {
     this.ensureUpToDate();
+    const thread = this.tasks.get(threadId);
     const existed = this.tasks.delete(threadId);
     if (existed) {
       try {
         fs.unlinkSync(this.threadFilePath(threadId));
       } catch {}
+      removeTaskArtifacts(threadId, this.storageDir, {
+        keepArchive: false,
+        targetAgent: thread?.targetAgent,
+        initiatorAgent: thread?.initiatorAgent,
+      });
       this.knownMtimes.delete(path.basename(this.threadFilePath(threadId)));
       this.writeAggregate();
       this.emit('changed', Array.from(this.tasks.values()));

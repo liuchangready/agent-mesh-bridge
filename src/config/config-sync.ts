@@ -146,7 +146,7 @@ export class ConfigSyncService {
       }
 
       config.mcpServers['agent-mesh-bridge'] = {
-        command: 'node',
+        command: resolveNodeCommand(),
         args: [this.mcpScriptPath, '--caller', 'claude_code'],
         env: {
           MESH_CALLER_AGENT: 'claude_code',
@@ -237,7 +237,7 @@ export class ConfigSyncService {
       MESH_CALLER_AGENT: 'codex',
       ...this.agentMcpEnv,
     });
-    const mcpBlock = `\n\n[mcp_servers.agent-mesh-bridge]\ncommand = "node"\nargs = ["${normalizedScriptPath}", "--caller", "codex"]\nenv = ${codexEnv}\n`;
+    const mcpBlock = `\n\n[mcp_servers.agent-mesh-bridge]\ncommand = "${resolveNodeCommand().replace(/\\/g, '/')}"\nargs = ["${normalizedScriptPath}", "--caller", "codex"]\nenv = ${codexEnv}\n`;
 
     fs.writeFileSync(tomlPath, cleanToml + mcpBlock, 'utf8');
 
@@ -254,7 +254,7 @@ export class ConfigSyncService {
       }
       if (!config.mcpServers) config.mcpServers = {};
       config.mcpServers['agent-mesh-bridge'] = {
-        command: 'node',
+        command: resolveNodeCommand(),
         args: [this.mcpScriptPath, '--caller', 'codex'],
         env: { MESH_CALLER_AGENT: 'codex', ...this.agentMcpEnv },
       };
@@ -291,7 +291,7 @@ export class ConfigSyncService {
     }
 
     config.mcpServers['agent-mesh-bridge'] = {
-      command: 'node',
+      command: resolveNodeCommand(),
       args: [this.mcpScriptPath, '--caller', 'antigravity'],
       env: {
         MESH_CALLER_AGENT: 'antigravity',

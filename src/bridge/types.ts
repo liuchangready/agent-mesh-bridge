@@ -11,8 +11,19 @@ export type AgentId =
 
 export type TargetAgentSelection = 'default' | AgentId;
 
-/** How the sender/receiver model recorded on a task was determined. */
-export type ModelResolutionSource = 'explicit' | 'env' | 'configured' | 'none';
+/**
+ * How the sender/receiver model recorded on a task was determined.
+ *
+ * `sender-configured` means the model came from the agent's own sender-side
+ * default (`agentMeshBridge.initiatorModels.*`), as opposed to `configured`,
+ * which is the receiver-side default (`agentMeshBridge.models.*`).
+ */
+export type ModelResolutionSource =
+  | 'explicit'
+  | 'env'
+  | 'sender-configured'
+  | 'configured'
+  | 'none';
 
 export type ThreadStatus =
   | 'queued'
@@ -20,6 +31,7 @@ export type ThreadStatus =
   | 'waiting_review'
   | 'reworking'
   | 'paused'
+  | 'review_failed'
   | 'completed'
   | 'failed';
 
@@ -369,6 +381,71 @@ export interface ThreadSummary {
 }
 
 /**
+ * Which review topology a task was created with.
+ *
+ * `legacy` (and an absent field) resumes the requester's own conversation for
+ * review, exactly as the bridge always did. `dedicated` gives the task its own
+ * bridge-created reviewer conversation, which dispatches the task and later
+ * receives the developer report. Existing threads never migrate automatically.
+ */
+export type ReviewFlow = 'legacy' | 'dedicated';
+
+/** Lifecycle of the dedicated reviewer's bootstrap (dispatch) turn. */
+export type ReviewBootstrapPhase =
+  | 'pending'
+  | 'launching'
+  | 'awaiting_dispatch'
+  | 'confirmed'
+  | 'failed';
+
+/**
+ * State of the dedicated reviewer conversation before the developer may start.
+ *
+ * The reviewer conversation is launched by the bridge in a FRESH native session;
+ * its first turn only calls `dispatch_task` with a one-time bootstrap token. The
+ * developer round starts only after the token confirms, the reviewer process
+ * has exited, and its native session id has been durably captured. Other tasks
+ * may run concurrently when scope and configured limits permit.
+ */
+export interface ReviewerBootstrapState {
+  phase: ReviewBootstrapPhase;
+  /** Reviewer bootstrap attempts spent so far. */
+  attempts: number;
+  launchedAt?: string;
+  lastError?: string;
+  /** Native reviewer conversation id captured from the bootstrap turn. */
+  reviewerSessionId?: string;
+}
+
+/**
+ * Read-only terminal summary kept on the task, and the ONLY payload surviving
+ * archival.
+ *
+ * It is deterministic (built from the ledger, never by an extra model turn), so
+ * `get_task_summary` can answer after the rounds/logs/native sessions are gone.
+ */
+export interface TaskFinalSummary {
+  kind: 'completed' | 'failed' | 'review_failed';
+  at: string;
+  title: string;
+  /** Reviewer's approval remarks (completed) or the terminal error (failed). */
+  verdict?: string;
+  /** Bounded human-readable digest. */
+  summary: string;
+  changedFiles?: string[];
+  error?: string;
+  rounds: number;
+  mergeRequest?: MergeRequestInfo;
+  reviewerAgent?: AgentId;
+  reviewerModel?: string;
+  executorAgent: AgentId;
+  executorModel?: string;
+  totalTokens?: number;
+  promptTokens?: number;
+  outputTokens?: number;
+}
+
+/**
  * Metadata for a task that ran in a temporary git worktree.
  *
  * `mergePending` means "this task produced work that is not on the main line
@@ -454,6 +531,36 @@ export interface ReviewBlockInfo {
   by: string;
 }
 
+/**
+ * Why a review ended with no verdict at all.
+ *
+ * `review_failed` is a TERMINAL lifecycle status: the receiver delivered, but no
+ * reviewer ever produced a verdict (the wake died, the retry budget ran out, or
+ * the review was parked on a dependency nothing in the mesh can observe). It is
+ * kept separate from `failed` because the delivered work may be perfectly good —
+ * only the review is missing — and separate from `waiting_review` because no
+ * reviewer is working and nothing will ever move it without human action.
+ *
+ * Terminal semantics (identical to `failed` for scheduling): the task releases
+ * the global queue slot and no longer blocks the file-scope gate; re-review /
+ * request_rework / retry / approve all re-open it.
+ */
+export interface ReviewFailure {
+  /** `retries_exhausted`: the wake retry budget ran out. */
+  kind: 'retries_exhausted' | 'unresolvable_park';
+  /** Human-readable cause, shown in the task tree and detail panel. */
+  reason: string;
+  at: string;
+  /** Round whose review never happened. */
+  round: number;
+  /** Who recorded the failure: `watchdog`, `scheduler`, `callback`. */
+  by?: string;
+  /** Reviewer agent that never delivered a verdict. */
+  agent?: AgentId;
+  /** Snapshot of the failed wake plan that preceded this status. */
+  wake?: ReviewWakeState;
+}
+
 export interface DelegationThread {
   threadId: string; // e.g. "thread_20261016_163000_a7f9"
   title: string; // Brief title, e.g. "Fix TCP cursor drift"
@@ -476,12 +583,53 @@ export interface DelegationThread {
   workspacePath: string; // Working directory
 
   /**
+   * Review topology pinned when the task was created (see `ReviewFlow`).
+   * Absent on legacy ledger entries, which must keep the old caller-review path.
+   */
+  reviewFlow?: ReviewFlow;
+
+  /**
+   * Dedicated-reviewer mode only: the conversation that asked for the task.
+   * It never reviews and is never resumed by the bridge; kept for audit/UI.
+   */
+  requesterSessionId?: string;
+  requesterAgent?: AgentId;
+  requesterModel?: string;
+  requesterModelSource?: ModelResolutionSource;
+
+  /**
+   * Dedicated-reviewer mode only: the model the reviewer conversation runs on
+   * (sender-side default), pinned at dispatch so the reviewer never silently
+   * drifts to another model.
+   */
+  reviewerModel?: string;
+  reviewerModelSource?: ModelResolutionSource;
+
+  /**
+   * Dedicated-reviewer mode only: native id of the reviewer conversation once
+   * the bootstrap turn emitted it. `callerSessionId` mirrors this value so the
+   * existing wake path resumes the reviewer conversation.
+   */
+  reviewerSessionId?: string;
+  reviewerSessionCaptured?: boolean;
+
+  /** Dedicated-reviewer bootstrap state (undefined for legacy tasks). */
+  reviewBootstrap?: ReviewerBootstrapState;
+
+  /** Read-only terminal digest, written once the task reaches completed/failed. */
+  finalSummary?: TaskFinalSummary;
+
+  /** Set when the task was archived: rounds/logs/session ids are gone. */
+  archivedAt?: string;
+
+  /**
    * Model the sender (initiator) was running when it dispatched the task.
    *
    * The bridge cannot always introspect another agent's live session, so this is
    * best-effort: an explicit `initiatorModel`, then an agent-specific env hint,
-   * then the initiator's configured default model. `initiatorModelSource` says
-   * which of those produced the value.
+   * then the initiator's sender-side configured default, then (legacy) its
+   * receiver-side default. `initiatorModelSource` says which of those produced
+   * the value.
    */
   initiatorModel?: string;
   initiatorModelSource?: ModelResolutionSource;
@@ -545,6 +693,16 @@ export interface DelegationThread {
    * again the moment `waitingForThreadId` reaches a terminal state.
    */
   reviewBlocked?: ReviewBlockInfo;
+
+  /**
+   * Why the review never produced a verdict (`status === 'review_failed'`).
+   *
+   * Persisted separately from `reviewWake` because the wake plan is diagnostic
+   * (and may be cleared on recovery) while the failure reason is the record the
+   * user needs to understand why the task stopped. Kept after a later re-review
+   * or approval succeeds, as audit history.
+   */
+  reviewFailure?: ReviewFailure;
 
   /** MR handoff recorded by the caller after the task/batch is accepted. */
   mergeRequest?: MergeRequestInfo;
@@ -618,6 +776,12 @@ export interface DispatchTaskParams {
   expectedFiles?: string[];
   /** Caller confirms this task touches no workspace file (or refuses to declare). */
   allowNoScope?: boolean;
+  /**
+   * Override the review topology for this task (tests/internal callers only).
+   * Omitted = mirrored policy (`bridge-policy.json`), falling back to legacy
+   * when no extension host/supervisor is alive to run the reviewer bootstrap.
+   */
+  reviewFlow?: ReviewFlow;
   /** Caller accepts running on top of files another open task already changed. */
   allowScopeOverlap?: boolean;
   /**
@@ -635,7 +799,11 @@ export interface DispatchTaskParams {
   requireScope?: boolean;
 }
 
-export type DispatchStatus = 'DISPATCHED' | 'QUEUED';
+/**
+ * `REVIEWER_STARTING`: the task row exists, but the dedicated reviewer
+ * conversation is still bootstrapping; the developer starts after it dispatches.
+ */
+export type DispatchStatus = 'DISPATCHED' | 'QUEUED' | 'REVIEWER_STARTING';
 
 /** Outcome of a user confirmation for switching a receiver model. */
 export type ModelApprovalStatus = 'approved' | 'use_default' | 'cancelled' | 'timeout';
@@ -909,16 +1077,63 @@ export function shouldResumeNativeSession(
  * Task-level queue occupancy.
  *
  * A task occupies the one global task slot until it reaches a terminal state:
- * `completed` (approved) or `failed`. `waiting_review` and `paused` are still
- * unfinished tasks and MUST block every other task, not just developer rounds.
- * `failed` is terminal for queue purposes so old failures cannot block the mesh
- * forever; retrying it creates an unfinished task again.
+ * `completed`, `failed` or `review_failed`. `waiting_review` and `paused` are
+ * still unfinished tasks and MUST block every other task, not just developer
+ * rounds. `failed` and `review_failed` are terminal for queue purposes so old
+ * failures cannot block the mesh forever; retrying/re-reviewing either one
+ * creates an unfinished task again.
  */
 export function isTaskUnfinished(thread: DelegationThread): boolean {
-  return thread.status !== 'completed' && thread.status !== 'failed';
+  return (
+    thread.status !== 'completed' &&
+    thread.status !== 'failed' &&
+    thread.status !== 'review_failed'
+  );
 }
 
-/** Oldest unfinished task (the queue head), or undefined when the mesh is idle. */
+/**
+ * The newest completed work round (never an `approval` bookkeeping round).
+ *
+ * This is the only round a reviewer should inspect or log against: approval
+ * rounds carry no deliverable, and a stalled wake may name an older round than
+ * the one that was actually delivered last.
+ */
+export function latestCompletedWorkRound(
+  thread: DelegationThread,
+): DelegationRound | undefined {
+  return (thread.rounds || [])
+    .filter((round) => round.type !== 'approval' && round.status === 'completed')
+    .sort((a, b) => b.round - a.round)[0];
+}
+
+/**
+ * A dedicated task may not execute its developer round until its reviewer
+ * bootstrap has dispatched. Legacy tasks never have a bootstrap state.
+ *
+ * Pending/launching are not ready. A confirmed bootstrap also remains pending
+ * until the reviewer session id is durably captured for the developer handoff.
+ * A failed bootstrap is terminal: its one-shot token is gone and it is never
+ * selected as an executable developer candidate.
+ */
+export function isReviewerBootstrapPending(thread: DelegationThread): boolean {
+  if (!thread || thread.reviewFlow !== 'dedicated') return false;
+  const phase = thread.reviewBootstrap?.phase;
+  // Any state other than a captured, canonical handoff must block developer
+  // admission, including terminal bootstrap failure.
+  if (phase !== 'confirmed') return true;
+  return !(
+    thread.reviewerSessionCaptured === true &&
+    isValidSessionId(thread.reviewerSessionId) &&
+    isValidSessionId(thread.callerSessionId) &&
+    thread.callerSessionId === thread.reviewerSessionId
+  );
+}
+
+/**
+ * Legacy compatibility helper. Runtime scheduling must not use a global FIFO
+ * queue head: candidates are admitted independently subject to scope, role,
+ * per-thread round, bootstrap handoff, and optional concurrency limits.
+ */
 export function findQueueHead(tasks: DelegationThread[]): DelegationThread | undefined {
   return tasks
     .filter(isTaskUnfinished)

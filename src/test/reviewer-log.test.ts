@@ -9,10 +9,11 @@ import {
   createReviewerLogWriter,
   listReviewerLogRounds,
   readReviewerLogTail,
+  resolveReviewerLogRound,
   reviewerLogPath,
   statReviewerLog,
 } from '../bridge/reviewer-log';
-import { roundExecutionLogPath } from '../bridge/round-log';
+import { getReviewerLogDir, roundExecutionLogPath } from '../bridge/round-log';
 
 function makeRoot(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-reviewer-log-'));
@@ -39,7 +40,7 @@ describe('Reviewer log artifact', () => {
     const root = makeRoot();
     try {
       const file = reviewerLogPath('../evil/thread', 0, root);
-      assert.strictEqual(path.dirname(file), path.join(root, 'logs'));
+      assert.strictEqual(path.dirname(file), getReviewerLogDir(undefined, root));
       assert.ok(!file.includes('..'));
       assert.ok(path.basename(file).includes('evil_thread_round_1'));
       assert.ok(path.basename(file).endsWith(REVIEWER_LOG_SUFFIX));
@@ -165,6 +166,28 @@ describe('Reviewer log artifact', () => {
       fs.writeFileSync(roundExecutionLogPath('thread_e', 9, root), 'receiver bytes');
 
       assert.deepStrictEqual(listReviewerLogRounds('thread_e', root), [7, 3, 1]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('falls back to the newest reviewer log when the requested round has none', () => {
+    const root = makeRoot();
+    try {
+      const writer = createReviewerLogWriter('thread_f', 4, { agent: 'codex' }, { root });
+      writer.write('live reviewer output');
+      writer.close();
+
+      assert.deepStrictEqual(resolveReviewerLogRound('thread_f', 4, root), {
+        round: 4,
+        fallback: false,
+      });
+      // The ledger moved to round 5, but the wake was planned for round 4.
+      assert.deepStrictEqual(resolveReviewerLogRound('thread_f', 5, root), {
+        round: 4,
+        fallback: true,
+      });
+      assert.strictEqual(resolveReviewerLogRound('thread_missing', 5, root), undefined);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

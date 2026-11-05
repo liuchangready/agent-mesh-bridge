@@ -16,9 +16,19 @@ import { CallbackManager } from '../bridge/callback-manager';
 import { AsyncDispatcher } from '../bridge/async-dispatcher';
 import { ReworkController } from '../bridge/rework-controller';
 import { MCPServer } from '../bridge/mcp-server';
-import { ExecutionGate } from '../bridge/execution-gate';
+import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { TaskRoleLock } from '../bridge/task-role-lock';
 import { roundOutputArchivePath } from '../bridge/round-log';
+import {
+  getBridgeHome,
+  invalidateConfiguredModelCache,
+  saveModelDefaults,
+} from '../bridge/model-catalog';
+import {
+  clearReviewerBootstrapToken,
+  readReviewerBootstrapToken,
+  writeReviewerBootstrapToken,
+} from '../bridge/reviewer-bootstrap';
 import { DelegationRound } from '../bridge/types';
 
 describe('MCPServer Protocol Tests', () => {
@@ -50,7 +60,7 @@ describe('MCPServer Protocol Tests', () => {
     callbackManager.notifyCaller = async () => true;
     // Never spawn a real caller CLI from a protocol test.
     callbackManager.notifyCallerOfFailure = async () => false;
-    const gate = new ExecutionGate(tempDir);
+    const gate = new TaskExecutionRegistry(tempDir);
     dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector, gate);
     reworkController = new ReworkController(taskStore, runner, callbackManager, detector, gate);
     mcpServer = new MCPServer(dispatcher, reworkController, taskStore, detector, resolver, runner);
@@ -124,7 +134,96 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(toolNames.includes('get_task_token_usage'));
     assert.ok(toolNames.includes('get_reviewer_log'));
     assert.ok(toolNames.includes('list_agent_models'));
-    assert.strictEqual(toolNames.length, 19);
+    assert.ok(toolNames.includes('get_task_summary'));
+    assert.strictEqual(toolNames.length, 20);
+  });
+
+  test('list_agent_models reports the receiver and sender defaults separately', async () => {
+    const call = async (name: string, args: any) =>
+      mcpServer.handleRpcMessage({
+        jsonrpc: '2.0',
+        id: 62,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      });
+    const payload = (res: any) => JSON.parse(res.result.content[0].text);
+
+    const home = getBridgeHome();
+    // Sender and receiver defaults are independent per agent (self-dispatch is
+    // rejected, so this only pins how each side is reported).
+    saveModelDefaults({ deepseek_harness: 'deepseek-v4.1-flash' }, home, {
+      initiatorModels: { deepseek_harness: 'deepseek-v4.1-pro' },
+    });
+    invalidateConfiguredModelCache();
+    // Skip live CLI/provider discovery: the payload contract is what this test pins.
+    (mcpServer as any).modelCatalog = {
+      getAll: async () => ({
+        deepseek_harness: {
+          agent: 'deepseek_harness',
+          models: [
+            { id: 'deepseek-v4.1-pro' },
+            { id: 'deepseek-v4.1-flash' },
+          ],
+          source: 'config',
+          updatedAt: new Date().toISOString(),
+        },
+      }),
+    };
+
+    try {
+      const result = payload(await call('list_agent_models', { targetAgent: 'deepseek_harness' }));
+      const dsh = result.agents.deepseek_harness;
+      assert.strictEqual(dsh.configuredModel, 'deepseek-v4.1-flash');
+      assert.strictEqual(dsh.initiatorModel, 'deepseek-v4.1-pro');
+      // The receiver default still leads the catalogue and is tagged in place.
+      assert.strictEqual(dsh.models[0].id, 'deepseek-v4.1-flash');
+      assert.match(dsh.models[0].hint, /configured default/);
+      assert.match(result.hint, /sender-side default/);
+    } finally {
+      saveModelDefaults({}, home, { initiatorModels: {} });
+      invalidateConfiguredModelCache();
+    }
+  });
+
+  test('get_task_summary survives archival with the read-only digest', async () => {
+    const call = async (name: string, args: any) =>
+      mcpServer.handleRpcMessage({
+        jsonrpc: '2.0',
+        id: 63,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      });
+    const payload = (res: any) => JSON.parse(res.result.content[0].text);
+
+    const dispatched = payload(
+      await call('dispatch_task', {
+        targetAgent: 'claude_code',
+        title: 'Summarise me',
+        prompt: 'do the work',
+        allowNoScope: true,
+      }),
+    );
+    await waitForStatus(dispatched.threadId, 'waiting_review');
+    // A review decision requires the reviewer role, exactly like a real wake.
+    const lease = new TaskRoleLock().tryAcquire(dispatched.threadId, 'reviewer');
+    assert.ok(lease);
+    payload(await call('approve_task', { threadId: dispatched.threadId, remarks: 'LGTM' }));
+
+    const before = payload(await call('get_task_summary', { threadId: dispatched.threadId }));
+    assert.strictEqual(before.archived, false);
+    assert.strictEqual(before.finalSummary.kind, 'completed');
+    assert.match(before.finalSummary.verdict || '', /LGTM/);
+
+    // Archiving drops the rounds but keeps the digest queryable.
+    assert.ok(taskStore.archiveTask(dispatched.threadId));
+    const after = payload(await call('get_task_summary', { threadId: dispatched.threadId }));
+    assert.strictEqual(after.archived, true);
+    assert.strictEqual(after.finalSummary.kind, 'completed');
+    assert.match(after.finalSummary.summary, /审阅通过/);
+
+    const details = payload(await call('get_thread_details', { threadId: dispatched.threadId }));
+    assert.strictEqual(details.archived, true);
+    assert.deepStrictEqual(details.rounds, []);
   });
 
   test('serves the reviewer side of a round and reports a missing log honestly', async () => {
@@ -896,4 +995,206 @@ describe('MCPServer Protocol Tests', () => {
     assert.strictEqual(after.scopeOverride, true);
     assert.strictEqual(after.scopeBlockedBy, undefined);
   });
+
+  test('rejects self-dispatch instead of parking a task that can never be reviewed', async () => {
+    const call = async (name: string, args: any) =>
+      mcpServer.handleRpcMessage({
+        jsonrpc: '2.0',
+        id: 72,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      });
+
+    // A caller naming itself as the receiver used to create a task whose review
+    // callback could never be delivered (the caller session is busy running the
+    // round). It must be an error, and nothing may reach the ledger.
+    const rejected = await call('dispatch_task', {
+      targetAgent: 'codex',
+      initiatorAgent: 'codex',
+      title: 'Self dispatch',
+      prompt: 'do the work',
+      allowNoScope: true,
+    });
+    assert.ok(rejected.error, 'a self-dispatch must be an error, not a queued task');
+    assert.match(
+      String(rejected.error.message),
+      /self-dispatch requires the dedicated reviewer flow/,
+    );
+    assert.strictEqual(taskStore.getAllTasks().length, 0);
+
+    // The synchronous call follows the same rule, using the caller identity the
+    // bridge injects into each agent's MCP process.
+    const previous = process.env.MESH_CALLER_AGENT;
+    process.env.MESH_CALLER_AGENT = 'codex';
+    try {
+      const invoked = await call('invoke_agent', { targetAgent: 'codex', prompt: 'say hi' });
+      assert.ok(invoked.error);
+      assert.match(String(invoked.error.message), /cannot send work to itself/);
+    } finally {
+      if (previous === undefined) delete process.env.MESH_CALLER_AGENT;
+      else process.env.MESH_CALLER_AGENT = previous;
+    }
+});
+  test('reviewer bootstrap confirms the prepared task instead of creating a new one', async () => {
+    const home = getBridgeHome();
+    const threadId = 'thread_bootstrap_confirm';
+    const token = 'bootstrap-token-1';
+    taskStore.upsertTask({
+      threadId,
+      title: 'Prepared task',
+      initiatorAgent: 'codex',
+      targetAgent: 'claude_code',
+      status: 'queued',
+      currentRound: 1,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      receiverSessionId: 'receiver-bootstrap-1',
+      workspacePath: tempDir,
+      reviewFlow: 'dedicated',
+      requesterSessionId: 'requester-1',
+      reviewerModel: 'gpt-6-pro',
+      targetModel: 'sonnet',
+      reviewBootstrap: { phase: 'pending', attempts: 0 },
+      expectedFiles: [],
+      summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
+      rounds: [
+        {
+          round: 1,
+          type: 'initial',
+          prompt: 'do it',
+          status: 'running',
+          durationMs: 0,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+    });
+    assert.strictEqual(
+      writeReviewerBootstrapToken(
+        { threadId, token, agent: 'codex', createdAt: new Date().toISOString() },
+        home,
+      ),
+      true,
+    );
+
+    const prevBootstrap = process.env.MESH_REVIEW_BOOTSTRAP;
+    const prevToken = process.env.MESH_REVIEW_BOOTSTRAP_TOKEN;
+    const prevThread = process.env.MESH_REVIEW_THREAD_ID;
+    const prevCaller = process.env.MESH_CALLER_AGENT;
+    process.env.MESH_REVIEW_BOOTSTRAP = '1';
+    process.env.MESH_REVIEW_BOOTSTRAP_TOKEN = token;
+    process.env.MESH_REVIEW_THREAD_ID = threadId;
+    process.env.MESH_CALLER_AGENT = 'codex';
+    try {
+      const res = await mcpServer.handleRpcMessage({
+        jsonrpc: '2.0',
+        id: 90,
+        method: 'tools/call',
+        params: { name: 'dispatch_task', arguments: {} },
+      });
+      assert.ok(res.result, JSON.stringify(res));
+      const payload = JSON.parse(res.result.content[0].text);
+      assert.strictEqual(payload.status, 'DISPATCHED');
+      assert.strictEqual(payload.threadId, threadId);
+      assert.strictEqual(taskStore.getAllTasks().length, 1, 'no second task was created');
+
+      const stored = taskStore.getTask(threadId)!;
+      assert.strictEqual(stored.reviewBootstrap?.phase, 'confirmed');
+      assert.strictEqual(stored.status, 'queued');
+      assert.strictEqual(readReviewerBootstrapToken(threadId, home), undefined);
+    } finally {
+      if (prevBootstrap === undefined) delete process.env.MESH_REVIEW_BOOTSTRAP;
+      else process.env.MESH_REVIEW_BOOTSTRAP = prevBootstrap;
+      if (prevToken === undefined) delete process.env.MESH_REVIEW_BOOTSTRAP_TOKEN;
+      else process.env.MESH_REVIEW_BOOTSTRAP_TOKEN = prevToken;
+      if (prevThread === undefined) delete process.env.MESH_REVIEW_THREAD_ID;
+      else process.env.MESH_REVIEW_THREAD_ID = prevThread;
+      if (prevCaller === undefined) delete process.env.MESH_CALLER_AGENT;
+      else process.env.MESH_CALLER_AGENT = prevCaller;
+      clearReviewerBootstrapToken(threadId, home);
+    }
+  });
+
+  test('reviewer bootstrap still confirms when the host scrubs the MCP server environment', async () => {
+    // Codex passes ONLY the `env` table from config.toml to the MCP servers it
+    // spawns, and DeepSeek Harness scrubs inherited variables: MESH_REVIEW_*
+    // never arrives. The launched reviewer pid must identify the process instead.
+    const home = getBridgeHome();
+    const threadId = 'thread_bootstrap_host_pid';
+    taskStore.upsertTask({
+      threadId,
+      title: 'Prepared task behind a closed-env host',
+      initiatorAgent: 'codex',
+      targetAgent: 'claude_code',
+      status: 'queued',
+      currentRound: 1,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      receiverSessionId: 'receiver-bootstrap-pid',
+      workspacePath: tempDir,
+      reviewFlow: 'dedicated',
+      requesterSessionId: 'requester-pid',
+      reviewerModel: 'gpt-6-pro',
+      targetModel: 'sonnet',
+      reviewBootstrap: { phase: 'pending', attempts: 0 },
+      expectedFiles: [],
+      summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
+      rounds: [
+        {
+          round: 1,
+          type: 'initial',
+          prompt: 'do it',
+          status: 'running',
+          durationMs: 0,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+    });
+    assert.strictEqual(
+      writeReviewerBootstrapToken(
+        {
+          threadId,
+          token: 'bootstrap-token-pid',
+          agent: 'codex',
+          createdAt: new Date().toISOString(),
+          hostPid: process.ppid,
+        },
+        home,
+      ),
+      true,
+    );
+
+    const saved = ['MESH_REVIEW_BOOTSTRAP', 'MESH_REVIEW_BOOTSTRAP_TOKEN', 'MESH_REVIEW_THREAD_ID'].map(
+      (name) => [name, process.env[name]] as [string, string | undefined],
+    );
+    for (const [name] of saved) delete process.env[name];
+    const prevCaller = process.env.MESH_CALLER_AGENT;
+    process.env.MESH_CALLER_AGENT = 'codex';
+    try {
+      const res = await mcpServer.handleRpcMessage({
+        jsonrpc: '2.0',
+        id: 91,
+        method: 'tools/call',
+        params: { name: 'dispatch_task', arguments: {} },
+      });
+      assert.ok(res.result, JSON.stringify(res));
+      const payload = JSON.parse(res.result.content[0].text);
+      assert.strictEqual(payload.status, 'DISPATCHED');
+      assert.strictEqual(payload.threadId, threadId);
+      assert.strictEqual(taskStore.getAllTasks().length, 1, 'no second task was created');
+
+      const stored = taskStore.getTask(threadId)!;
+      assert.strictEqual(stored.reviewBootstrap?.phase, 'confirmed');
+      assert.strictEqual(stored.status, 'queued');
+      assert.strictEqual(readReviewerBootstrapToken(threadId, home), undefined);
+    } finally {
+      for (const [name, value] of saved) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      if (prevCaller === undefined) delete process.env.MESH_CALLER_AGENT;
+      else process.env.MESH_CALLER_AGENT = prevCaller;
+      clearReviewerBootstrapToken(threadId, home);
+    }
+  });
+
 });

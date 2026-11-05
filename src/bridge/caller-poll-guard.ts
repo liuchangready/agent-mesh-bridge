@@ -13,8 +13,8 @@
  * erroring (an error would break legitimate checks, e.g. a user asking "how is
  * it going?"):
  *
- *  - the first read of a self-dispatched thread at a given progress returns the
- *    full payload;
+ *  - the first read of a thread this process dispatched at a given progress
+ *    returns the full payload;
  *  - an identical second read at the SAME progress returns a short status-only
  *    payload plus the stop instruction;
  *  - any real progress (new round, status change, round finishing) restores the

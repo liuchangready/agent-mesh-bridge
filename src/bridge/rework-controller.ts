@@ -9,7 +9,7 @@ import {
   isValidSessionId,
   describeRoundInFlight,
   findInFlightRound,
-  isTaskUnfinished,
+  isReviewerBootstrapPending,
   isUserInterruption,
   nextRoundNumber,
   shouldResumeNativeSession,
@@ -18,6 +18,7 @@ import {
 import * as fs from 'fs';
 import * as path from 'path';
 import { roundExecutionLogPath } from './round-log';
+import { archiveCompletedTaskLogs } from './task-summary';
 import { TaskStore } from './task-store';
 import { AgentDetector } from './agent-detector';
 import { AutonomousRunner } from './autonomous-runner';
@@ -25,10 +26,11 @@ import { CallbackManager } from './callback-manager';
 import { TaskSupervisor } from './task-supervisor';
 import { findScopeConflicts, describeScopeConflict, ScopeConflict } from './file-scope';
 import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
-import { ExecutionGate, ExecutionOwner, normalizeWorkspaceKey } from './execution-gate';
+import { TaskExecutionOwner, TaskExecutionRegistration, TaskExecutionRegistry } from './task-execution-registry';
 import { QueueDrainer, QueuedExecution } from './queue-drainer';
 import { concurrencyPolicy } from './bridge-policy';
 import { TaskRoleLock } from './task-role-lock';
+import { readReviewerBootstrapToken } from './reviewer-bootstrap';
 import { ModelApprovalHandler } from './model-approval';
 import { TaskRetargetService, latestRetarget } from './task-retarget';
 import { appendCompactionProtocol, compactRoundBestEffort } from './context-compactor';
@@ -39,7 +41,8 @@ export class ReworkController {
   private runner: AutonomousRunner;
   private callbackManager: CallbackManager;
   private detector?: AgentDetector;
-  private executionGate: ExecutionGate;
+  private executionRegistry: TaskExecutionRegistry;
+  private readonly storageDir: string;
   private queueDrainer: QueueDrainer;
   /** Moves a task to another agent/model when rework/retry/resume asks for it. */
   private readonly retargetService: TaskRetargetService;
@@ -49,17 +52,18 @@ export class ReworkController {
     runner: AutonomousRunner,
     callbackManager: CallbackManager,
     detector?: AgentDetector,
-    executionGate?: ExecutionGate,
+    executionRegistry?: TaskExecutionRegistry,
   ) {
     this.taskStore = taskStore;
     this.runner = runner;
     this.callbackManager = callbackManager;
     this.detector = detector;
-    this.executionGate = executionGate || new ExecutionGate();
+    this.storageDir = path.dirname(taskStore.getStoragePath());
+    this.executionRegistry = executionRegistry || new TaskExecutionRegistry(this.storageDir);
     this.retargetService = new TaskRetargetService(taskStore);
     this.queueDrainer = new QueueDrainer(
       this.taskStore,
-      this.executionGate,
+      this.executionRegistry,
       () => TaskSupervisor.isSupervisorActive(),
       (target: QueuedExecution) => this.executeQueuedRound(target),
     );
@@ -104,10 +108,22 @@ export class ReworkController {
     }
     // `completed` is terminal: a stale reviewer must not resurrect an archived
     // task by submitting a late rework.
-    if (thread.status === 'completed') {
+    if (thread.status === 'completed' || thread.archivedAt) {
       throw new Error(
         `Cannot request rework: thread ${params.threadId} is already approved and archived. ` +
           `Dispatch a new task if the work has to continue.`,
+      );
+    }
+    if (thread.status === 'paused') {
+      throw new Error(`Cannot request rework: task ${params.threadId} is paused; resume it first.`);
+    }
+    this.assertDedicatedReviewerReady(thread, 'request rework');
+    if (
+      thread.reviewFlow === 'dedicated' && params.callerSessionId &&
+      params.callerSessionId !== thread.reviewerSessionId
+    ) {
+      throw new Error(
+        `Cannot request rework: dedicated reviewer session is fixed to ${thread.reviewerSessionId}.`,
       );
     }
 
@@ -131,6 +147,7 @@ export class ReworkController {
         throw new Error(`Task thread not found after retarget: ${params.threadId}`);
       }
       thread = reloaded;
+      this.assertReworkStillEligible(thread, params);
       retarget = outcome.status === 'RETARGETED' ? latestRetarget(thread) : retarget;
     }
 
@@ -192,7 +209,11 @@ export class ReworkController {
     thread.status = resumesNativeSession ? 'reworking' : 'running';
     thread.interruption = undefined;
     thread.updatedAt = nowIso;
-    if (params.callerSessionId && isValidSessionId(params.callerSessionId)) {
+    if (thread.reviewFlow === 'dedicated') {
+      // Dedicated review always resumes the captured reviewer conversation.
+      // MCP-supplied ids and detector guesses cannot rebind that identity.
+      thread.callerSessionId = thread.reviewerSessionId;
+    } else if (params.callerSessionId && isValidSessionId(params.callerSessionId)) {
       thread.callerSessionId = params.callerSessionId;
     } else if (
       (!thread.callerSessionId || !isValidSessionId(thread.callerSessionId)) &&
@@ -269,31 +290,65 @@ export class ReworkController {
     threadId: string,
     overrides: ExecutorOverride = {},
   ): Promise<DelegationRound> {
-    await this.applyExecutorOverride(threadId, overrides, 'retry_task: executor switch');
     this.taskStore.loadFromDisk();
-    const thread = this.taskStore.getTask(threadId);
+    let thread = this.taskStore.getTask(threadId);
     if (!thread) {
       throw new Error(`Task thread not found: ${threadId}`);
     }
 
+    if (thread.archivedAt || thread.status === 'completed') {
+      throw new Error(`Cannot retry task ${threadId}: completed or archived tasks are immutable.`);
+    }
+    const inFlightBeforeRetarget = findInFlightRound(thread);
+    if (inFlightBeforeRetarget) {
+      throw new Error(`Cannot retry round: ${describeRoundInFlight(thread, inFlightBeforeRetarget)}`);
+    }
+    this.assertDedicatedReviewerReady(thread, 'retry failed round');
+
+    if (thread.status !== 'failed' && thread.status !== 'review_failed') {
+      throw new Error(
+        `Cannot retry task ${threadId} while it is ${thread.status}; retry is only for a failed task's current failed round.`,
+      );
+    }
+
+    const candidateRound = latestWorkRound(thread);
+    if (!candidateRound || candidateRound.status !== 'failed') {
+      throw new Error(
+        `No current failed execution round found for task ${threadId}. ` +
+          (thread.status === 'review_failed'
+            ? 'The delivered work is awaiting an explicit reviewer recovery; use wakeUpCaller to review it.'
+            : 'Only the latest failed execution round can be retried.'),
+      );
+    }
+
+    await this.applyExecutorOverride(threadId, overrides, 'retry_task: executor switch');
+    this.taskStore.loadFromDisk();
+    thread = this.taskStore.getTask(threadId);
+    if (!thread) throw new Error(`Task thread not found after retarget: ${threadId}`);
+    const inFlightAfterRetarget = findInFlightRound(thread);
+    if (inFlightAfterRetarget) {
+      throw new Error(`Cannot retry round: ${describeRoundInFlight(thread, inFlightAfterRetarget)}`);
+    }
+    if (thread.archivedAt || thread.status === 'completed') {
+      throw new Error(`Cannot retry task ${threadId}: it became completed or archived during retarget.`);
+    }
+    this.assertDedicatedReviewerReady(thread, 'retry failed round');
+    if (thread.status !== 'failed' && thread.status !== 'review_failed') {
+      throw new Error(`Cannot retry task ${threadId}: it became ${thread.status} during retarget.`);
+    }
+    const refreshedRound = latestWorkRound(thread);
+    if (
+      !refreshedRound || refreshedRound.round !== candidateRound.round ||
+      refreshedRound.status !== 'failed'
+    ) {
+      throw new Error(`Cannot retry task ${threadId}: latest failed round changed during retarget.`);
+    }
     if (!thread.receiverSessionId) {
       throw new Error(`Cannot retry: thread ${threadId} is missing receiverSessionId.`);
     }
-
-    const failedRound =
-      [...thread.rounds].reverse().find((r) => r.status === 'failed') ||
-      thread.rounds[thread.rounds.length - 1];
-
-    if (!failedRound) {
-      throw new Error(`No failed round found to retry for thread ${threadId}`);
-    }
+    const failedRound = refreshedRound;
 
     // Same invariant: retrying must not overlap another in-flight round.
-    const inFlight = findInFlightRound(thread);
-    if (inFlight) {
-      throw new Error(`Cannot retry round: ${describeRoundInFlight(thread, inFlight)}`);
-    }
-
     const isRework = shouldResumeNativeSession(thread, failedRound);
     const nowIso = new Date().toISOString();
     failedRound.status = 'running';
@@ -349,19 +404,74 @@ export class ReworkController {
     threadId: string,
     overrides: ExecutorOverride = {},
   ): Promise<DelegationRound> {
-    await this.applyExecutorOverride(threadId, overrides, 'resume_task: executor switch');
     this.taskStore.loadFromDisk();
-    const thread = this.taskStore.getTask(threadId);
+    let thread = this.taskStore.getTask(threadId);
     if (!thread) {
       throw new Error(`Task thread not found: ${threadId}`);
     }
 
-    const pausedRound =
+    if (thread.archivedAt) {
+      throw new Error(`Cannot resume archived task ${threadId}; its rounds and sessions were archived.`);
+    }
+
+    // A failed reviewer bootstrap has no safe resumable handoff: its token or
+    // native session may have been lost, so resuming would leave a
+    // task that can never run (and, before the pump guard, one that oscillated
+    // `running` ↔ `queued` on every poll).
+    if (thread.reviewBootstrap?.phase === 'failed') {
+      throw new Error(
+        `Cannot resume ${threadId}: its dedicated reviewer bootstrap failed. The original ` +
+          `reviewer session/token cannot be safely inferred; restore that handoff through an ` +
+          `explicit same-thread recovery before resuming. The task was left unchanged.`,
+      );
+    }
+
+    const resumingBootstrap =
+      thread.reviewFlow === 'dedicated' &&
+      isReviewerBootstrapPending(thread) &&
+      !(thread.reviewBootstrap?.phase === 'confirmed' && thread.reviewerSessionCaptured === true);
+    if (!resumingBootstrap) this.assertDedicatedReviewerReady(thread, 'resume task');
+    if (resumingBootstrap && this.retargetService.hasOverride(overrides)) {
+      throw new Error(
+        `Cannot retarget ${threadId} while its reviewer bootstrap is pending; resume the same reviewer session and token first.`,
+      );
+    }
+
+    if (thread.status !== 'paused') {
+      throw new Error(`Cannot resume ${threadId}: task is ${thread.status}, not paused.`);
+    }
+    let pausedRound =
       [...thread.rounds].reverse().find((round) => round.status === 'paused') ||
-      (thread.status === 'paused' ? thread.rounds[thread.rounds.length - 1] : undefined);
-    if (!pausedRound) {
+      thread.rounds[thread.rounds.length - 1];
+    if (!pausedRound || pausedRound.status !== 'paused') {
       throw new Error(`No paused round found for thread ${threadId}.`);
     }
+    const resumeRoundNumber = pausedRound.round;
+    const inFlightBeforeRetarget = findInFlightRound(thread);
+    if (inFlightBeforeRetarget) {
+      throw new Error(`Cannot resume paused task: ${describeRoundInFlight(thread, inFlightBeforeRetarget)}`);
+    }
+
+    await this.applyExecutorOverride(threadId, overrides, 'resume_task: executor switch');
+    this.taskStore.loadFromDisk();
+    const afterRetarget = this.taskStore.getTask(threadId);
+    if (!afterRetarget) throw new Error(`Task thread not found after retarget: ${threadId}`);
+    if (afterRetarget.archivedAt || afterRetarget.status !== 'paused') {
+      throw new Error(`Cannot resume ${threadId}: task changed state during retarget.`);
+    }
+    if (afterRetarget.reviewBootstrap?.phase === 'failed') {
+      throw new Error(`Cannot resume ${threadId}: its dedicated reviewer bootstrap failed during retarget.`);
+    }
+    if (afterRetarget.reviewFlow === 'dedicated' && !resumingBootstrap) {
+      this.assertDedicatedReviewerReady(afterRetarget, 'resume task');
+    }
+    const afterRetargetRound =
+      [...afterRetarget.rounds].reverse().find((round) => round.round === resumeRoundNumber);
+    if (!afterRetargetRound || afterRetargetRound.status !== 'paused') {
+      throw new Error(`Cannot resume ${threadId}: paused round changed during retarget.`);
+    }
+    thread = afterRetarget;
+    pausedRound = afterRetargetRound;
 
     const inFlight = findInFlightRound(thread);
     if (inFlight) {
@@ -386,12 +496,63 @@ export class ReworkController {
       }
     }
 
+    // The bootstrap runner may have completed while resume was waiting for its
+    // execution record to clear. Always continue from its persisted session and
+    // phase instead of the pre-wait task snapshot.
+    this.taskStore.loadFromDisk();
+    const latest = this.taskStore.getTask(threadId);
+    if (!latest) throw new Error(`Task thread not found: ${threadId}`);
+    if (latest.status !== 'paused') {
+      throw new Error(`Cannot resume ${threadId}: task is now ${latest.status}, not paused.`);
+    }
+    thread = latest;
+    pausedRound = thread.rounds.find((round) => round.round === resumeRoundNumber)!;
+    if (!pausedRound || pausedRound.status !== 'paused') {
+      throw new Error(`Cannot resume ${threadId}: paused round changed while waiting for shutdown.`);
+    }
+
     // A stale pause/delete request must not immediately kill the resumed run.
     // The runner owns both channels — the cancellation file it polls and the
     // pause it remembers in memory — so clearing through it is the only way to
     // cover a pause that landed before any child existed and was therefore never
     // consumed by a settling round.
     this.runner.clearPendingCancellation(threadId);
+
+    // A dedicated reviewer bootstrap is the first role in the task. Resume its
+    // paused placeholder round and return it to the bootstrap scheduler; never
+    // start the developer before a reviewer session has been confirmed/persisted.
+    if (thread.reviewFlow === 'dedicated' && isReviewerBootstrapPending(thread)) {
+      const nowIso = new Date().toISOString();
+      pausedRound.status = 'running';
+      pausedRound.error = undefined;
+      pausedRound.interruption = undefined;
+      pausedRound.timestamp = nowIso;
+      thread.currentRound = Math.max(thread.currentRound || 1, pausedRound.round);
+      thread.status = 'queued';
+      thread.interruption = undefined;
+      thread.updatedAt = nowIso;
+      thread.summary.lastPromptSnippet = (pausedRound.prompt || '').slice(0, 100);
+      thread.summary.lastOutputSnippet = 'Resuming the dedicated reviewer bootstrap...';
+      const previousBootstrap = thread.reviewBootstrap || { phase: 'pending' as const, attempts: 0 };
+      const existingToken = readReviewerBootstrapToken(threadId, this.storageDir);
+      if (!existingToken) {
+        const reason = previousBootstrap.phase === 'confirmed' && !thread.reviewerSessionCaptured
+          ? 'The one-time reviewer token is unavailable and its native session was never captured; the original reviewer session cannot be resumed safely.'
+          : 'The original reviewer bootstrap token is missing, so a replacement token or session cannot be created safely.';
+        thread.status = 'failed';
+        pausedRound.status = 'failed';
+        pausedRound.error = reason;
+        thread.reviewBootstrap = { ...previousBootstrap, phase: 'failed', lastError: reason };
+        thread.updatedAt = nowIso;
+        thread.summary.lastOutputSnippet = `[Reviewer bootstrap failed] ${reason}`;
+        this.taskStore.upsertTask(thread);
+        return pausedRound;
+      }
+      thread.reviewBootstrap = { ...previousBootstrap, phase: 'pending', lastError: undefined };
+      this.taskStore.upsertTask(thread);
+      if (thread.status === 'queued') this.queueDrainer.schedule(100);
+      return pausedRound;
+    }
 
     const isRework = shouldResumeNativeSession(thread, pausedRound);
     const nowIso = new Date().toISOString();
@@ -429,6 +590,35 @@ export class ReworkController {
     }
 
     return pausedRound;
+  }
+
+  private assertDedicatedReviewerReady(thread: DelegationThread, operation: string): void {
+    if (thread.reviewFlow === 'dedicated' && isReviewerBootstrapPending(thread)) {
+      const phase = thread.reviewBootstrap?.phase || 'missing';
+      throw new Error(
+        `Cannot ${operation} for ${thread.threadId}: dedicated reviewer bootstrap is ${phase} ` +
+          `or its captured reviewer session is invalid. Complete or safely resume the existing ` +
+          `reviewer handoff in this thread before starting developer work.`,
+      );
+    }
+  }
+
+  private assertReworkStillEligible(thread: DelegationThread, params: RequestReworkParams): void {
+    if (thread.archivedAt || thread.status === 'completed') {
+      throw new Error(`Cannot request rework: task ${thread.threadId} became completed or archived during retarget.`);
+    }
+    if (thread.status === 'paused') {
+      throw new Error(`Cannot request rework: task ${thread.threadId} became paused during retarget.`);
+    }
+    this.assertDedicatedReviewerReady(thread, 'request rework');
+    if (
+      thread.reviewFlow === 'dedicated' &&
+      (!isValidSessionId(thread.reviewerSessionId) ||
+        thread.callerSessionId !== thread.reviewerSessionId ||
+        (params.callerSessionId && params.callerSessionId !== thread.reviewerSessionId))
+    ) {
+      throw new Error(`Cannot request rework: dedicated reviewer session changed during retarget.`);
+    }
   }
 
   /**
@@ -541,6 +731,9 @@ export class ReworkController {
     }
 
     this.taskStore.upsertTask(thread);
+    try {
+      archiveCompletedTaskLogs(thread, path.dirname(this.taskStore.getStoragePath()));
+    } catch {}
 
     return {
       threadId: thread.threadId,
@@ -555,8 +748,10 @@ export class ReworkController {
     feedback: string,
     isRework: boolean = true,
   ): Promise<void> {
-    // Batch-level scope gate: a rework/retry round must not start on files that
-    // another open task still owns, otherwise it would rewrite their work.
+    if (this.executionRegistry.getOwner(thread.threadId)) {
+      this.queueDrainer.schedule(1_500);
+      return;
+    }
     this.taskStore.loadFromDisk();
     const scopeConflict = findScopeConflicts(thread, this.taskStore.getAllTasks());
     if (scopeConflict) {
@@ -565,66 +760,70 @@ export class ReworkController {
       return;
     }
 
-    // A reviewer decision creates the next developer round, but the developer
-    // must not start until the reviewer role has handed off. This also blocks
-    // a second reviewer/developer process for the same task.
-    const roleLock = new TaskRoleLock();
+    const roleLock = new TaskRoleLock(this.storageDir);
     const roleLease = roleLock.tryAcquire(thread.threadId, 'developer');
     if (!roleLease) {
-      const owner = roleLock.getOwner(thread.threadId);
-      this.markQueued(
-        thread,
-        undefined,
-        owner?.role === 'reviewer'
-          ? 'Queued: Reviewer is still active; developer starts after review handoff.'
-          : `Queued: ${roleLock.describe(owner)} is active; a task may only have one role at a time.`,
-      );
       this.queueDrainer.schedule(1_500);
       return;
     }
 
-    // Cross-process execution slot: the workspace-scoped lease when concurrency
-    // is enabled, the historical mesh-wide one otherwise.
-    const gatePolicy = concurrencyPolicy();
-    const workspaceKey = gatePolicy.enabled
-      ? normalizeWorkspaceKey(thread.workspacePath)
-      : undefined;
-    const lease = this.executionGate.tryAcquire(
-      thread.threadId,
-      roundNumber,
-      workspaceKey,
-      thread.targetAgent,
-    );
-    if (!lease) {
+    let registration: TaskExecutionRegistration | undefined;
+    this.taskStore.loadFromDisk();
+    const latest = this.taskStore.getTask(thread.threadId);
+    const latestRound = latest?.rounds.filter((entry) => entry.round === roundNumber).slice(-1)[0];
+    if (
+      !latest || latest.status === 'paused' || latest.status === 'waiting_review' ||
+      latest.status === 'completed' || latest.status === 'failed' || latest.status === 'review_failed' ||
+      latest.targetAgent !== thread.targetAgent || !latestRound || latestRound.status !== 'running' ||
+      latestRound.prompt !== feedback || findInFlightRound(latest)?.round !== roundNumber ||
+      isReviewerBootstrapPending(latest)
+    ) {
       roleLock.release(roleLease);
-      const owner = this.executionGate.getOwner(workspaceKey);
-      if (owner?.threadId !== thread.threadId) {
-        this.markQueued(thread, owner);
-      }
+      return;
+    }
+    thread = latest;
+
+    const freshScopeConflict = findScopeConflicts(thread, this.taskStore.getAllTasks());
+    if (freshScopeConflict) {
+      roleLock.release(roleLease);
+      this.markQueued(thread, undefined, describeScopeConflict(freshScopeConflict), freshScopeConflict);
       this.queueDrainer.schedule(1_500);
+      return;
+    }
+
+    const gatePolicy = concurrencyPolicy();
+    if (gatePolicy.enabled) {
+      const owners = this.executionRegistry.listOwners();
+      const agentSlots = owners.filter((owner) => owner.agent === thread.targetAgent).length;
+      if (owners.length >= gatePolicy.maxConcurrentTasks || agentSlots >= gatePolicy.maxConcurrentPerAgent) {
+        roleLock.release(roleLease);
+        this.markQueued(thread, undefined, this.describeConcurrencyBlocked(thread.targetAgent, gatePolicy));
+        this.queueDrainer.schedule(1_500);
+        return;
+      }
+    }
+    try {
+      registration = this.executionRegistry.begin(thread.threadId, roundNumber, thread.targetAgent, thread.workspacePath);
+    } catch (error: any) {
+      roleLock.release(roleLease);
+      latest.status = 'failed';
+      latestRound.status = 'failed';
+      latestRound.error = `Could not register task execution: ${error?.message || error}`;
+      latest.updatedAt = new Date().toISOString();
+      this.taskStore.upsertTask(latest);
       return;
     }
 
     try {
-      this.taskStore.loadFromDisk();
-      const stored = this.taskStore.getTask(thread.threadId);
-      if (!stored) {
-        console.warn(
-          `[ReworkController] Task ${thread.threadId} was deleted before round ${roundNumber} started.`,
-        );
-        return;
-      }
-      const current = stored;
+      const current = thread;
       current.status = isRework ? 'reworking' : 'running';
       current.scopeBlockedBy = undefined;
       current.summary.lastOutputSnippet = 'Executing in background...';
-      if (thread.targetAgent === 'claude_code' && !isRework) {
-        // Claude's preassigned --session-id is the native session id.
+      if (current.targetAgent === 'claude_code' && !isRework) {
         current.receiverSessionCaptured = true;
       }
       this.taskStore.upsertTask(current);
       thread = current;
-
       console.log(
         `[ReworkController] ${isRework ? 'Resuming' : 'Starting'} session ${thread.receiverSessionId} for ` +
           `${thread.targetAgent} (Round ${roundNumber})`,
@@ -639,6 +838,7 @@ export class ReworkController {
         thread.threadId,
         roundNumber,
         path.dirname(this.taskStore.getStoragePath()),
+        thread.targetAgent,
       );
       try {
         fs.mkdirSync(path.dirname(roundLogPath), { recursive: true });
@@ -656,9 +856,10 @@ export class ReworkController {
           taskRound: roundNumber,
           model: thread.targetModel,
           previousTokenUsage: readStoredRoundUsage(this.taskStore, thread.threadId, roundNumber),
-          // Record the real agent child so a crashed host cannot leave an orphan
-          // editing the workspace while the next task starts.
-          onChildPid: (pid) => this.executionGate.attachChildPid(pid, lease),
+          onChildPid: (pid) => {
+            if (registration) this.executionRegistry.attachChildPid(pid, registration);
+            roleLock.attachChild(roleLease, pid);
+          },
           onStdoutChunk: (chunk: string) => {
             try {
               fs.appendFileSync(roundLogPath, chunk, 'utf8');
@@ -769,7 +970,7 @@ export class ReworkController {
         }
       }
     } finally {
-      this.executionGate.release(lease);
+      if (registration) this.executionRegistry.end(registration);
       roleLock.release(roleLease);
       this.queueDrainer.schedule(50);
     }
@@ -784,61 +985,81 @@ export class ReworkController {
     );
   }
 
-  /** True when another thread (or another process) is executing a round. */
-  private isGloballyBusy(excludeThreadId: string, workspacePath?: string): boolean {
+  /** A user-enabled count cap is advisory; disabled means unlimited execution. */
+  private isGloballyBusy(excludeThreadId: string, _workspacePath?: string): boolean {
     const policy = concurrencyPolicy();
-    const workspaceKey = policy.enabled ? normalizeWorkspaceKey(workspacePath) : undefined;
-    const owner = this.executionGate.getOwner(workspaceKey);
-    if (owner && owner.threadId !== excludeThreadId) return true;
-    if (policy.enabled && this.executionGate.countActive() >= policy.maxConcurrentTasks) {
-      return true;
-    }
-
-    return this.taskStore
-      .getAllTasks()
-      .some(
-        (thread) =>
-          thread.threadId !== excludeThreadId &&
-          isTaskUnfinished(thread) &&
-          // Concurrency is partitioned by workspace: a task in another workspace
-          // holds a different slot and must not queue this rework round.
-          (!policy.enabled || normalizeWorkspaceKey(thread.workspacePath) === workspaceKey),
-      );
+    if (!policy.enabled) return false;
+    const owners = this.executionRegistry.listOwners().filter((owner) => owner.threadId !== excludeThreadId);
+    if (owners.length >= policy.maxConcurrentTasks) return true;
+    const thread = this.taskStore.getTask(excludeThreadId);
+    return owners.filter((owner) => owner.agent === thread?.targetAgent).length >= policy.maxConcurrentPerAgent;
   }
 
-  /** The live lease owner relevant to this task's slot (workspace-scoped when on). */
-  private workspaceOwner(thread: DelegationThread): ExecutionOwner | undefined {
-    const policy = concurrencyPolicy();
-    return this.executionGate.getOwner(
-      policy.enabled ? normalizeWorkspaceKey(thread.workspacePath) : undefined,
-    );
+  /** Current execution record for the given task, if any. */
+  private workspaceOwner(thread: DelegationThread): TaskExecutionOwner | undefined {
+    return this.executionRegistry.getOwner(thread.threadId);
+  }
+
+  private describeConcurrencyBlocked(targetAgent: string, policy: ReturnType<typeof concurrencyPolicy>): string {
+    const owners = this.executionRegistry.listOwners();
+    const sameAgent = owners.filter((owner) => owner.agent === targetAgent).length;
+    if (owners.length >= policy.maxConcurrentTasks) {
+      return `Queued: active execution limit reached (${owners.length}/${policy.maxConcurrentTasks}); waiting for a free execution record.`;
+    }
+    return `Queued: agent ${targetAgent} has ${sameAgent}/${policy.maxConcurrentPerAgent} active executions; waiting for one to finish.`;
   }
 
   private markQueued(
     thread: DelegationThread,
-    owner?: ExecutionOwner,
+    owner?: TaskExecutionOwner,
     detail?: string,
     scopeConflict?: ScopeConflict,
   ): void {
+    // Never rewrite another process's live execution or role state as queued.
+    if (this.executionRegistry.getOwner(thread.threadId)) return;
+    if (new TaskRoleLock(this.storageDir).getOwner(thread.threadId)) return;
+
+    this.taskStore.loadFromDisk();
+    const fresh = this.taskStore.getTask(thread.threadId);
+    const candidateRound = findInFlightRound(thread);
+    const freshRound = fresh ? findInFlightRound(fresh) : undefined;
+    if (
+      !fresh ||
+      (fresh.status !== 'queued' && fresh.status !== 'running' && fresh.status !== 'reworking') ||
+      fresh.targetAgent !== thread.targetAgent ||
+      fresh.reviewBlocked ||
+      isReviewerBootstrapPending(fresh) ||
+      !candidateRound || freshRound?.round !== candidateRound.round || freshRound.prompt !== candidateRound.prompt
+    ) return;
+
     const message =
       detail ||
       (owner
-        ? `Queued: Waiting for task ${owner.threadId} (round ${owner.round}) to finish; tasks execute strictly one at a time.`
-        : 'Queued: Waiting for the current task to finish; tasks execute strictly one at a time.');
+        ? `Queued: waiting for task ${owner.threadId} round ${owner.round}.`
+        : 'Queued: waiting for an execution slot.');
     const nextBlock = scopeConflict
       ? { threadId: scopeConflict.threadId, title: scopeConflict.title, files: scopeConflict.files }
       : undefined;
     const blockChanged =
-      JSON.stringify(thread.scopeBlockedBy || null) !== JSON.stringify(nextBlock || null);
-    thread.scopeBlockedBy = nextBlock;
-    if (thread.status === 'queued' && thread.summary.lastOutputSnippet === message && !blockChanged) {
+      JSON.stringify(fresh.scopeBlockedBy || null) !== JSON.stringify(nextBlock || null);
+    fresh.scopeBlockedBy = nextBlock;
+    if (fresh.status === 'queued' && fresh.summary.lastOutputSnippet === message && !blockChanged) {
       return;
     }
 
-    thread.status = 'queued';
-    thread.summary.lastOutputSnippet = message;
-    this.taskStore.upsertTask(thread);
+    fresh.status = 'queued';
+    fresh.summary.lastOutputSnippet = message;
+    this.taskStore.upsertTask(fresh);
   }
+}
+
+function latestWorkRound(thread: DelegationThread): DelegationRound | undefined {
+  return (thread.rounds || [])
+    .filter((round) => round.type !== 'approval')
+    .reduce<DelegationRound | undefined>(
+      (latest, round) => !latest || round.round >= latest.round ? round : latest,
+      undefined,
+    );
 }
 
 /**

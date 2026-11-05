@@ -15,7 +15,7 @@ import { ActiveAgentResolver } from '../bridge/active-agent-resolver';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
 import { AsyncDispatcher } from '../bridge/async-dispatcher';
-import { ExecutionGate } from '../bridge/execution-gate';
+import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { TaskControlService } from '../bridge/task-control';
 import { DelegationThread, pendingMerges } from '../bridge/types';
 
@@ -81,7 +81,7 @@ describe('Worktree dispatch declaration', () => {
     const callbackManager = new CallbackManager(detector, tempDir);
     callbackManager.notifyCaller = async () => true;
     callbackManager.notifyCallerOfFailure = async () => false;
-    const gate = new ExecutionGate(tempDir);
+    const gate = new TaskExecutionRegistry(tempDir);
     dispatcher = new AsyncDispatcher(store, resolver, runner, callbackManager, detector, gate);
   });
 

@@ -16,9 +16,11 @@ import { ReviewWakeScheduler, ReviewWakeSchedulerOptions } from '../bridge/revie
 import {
   REVIEW_WAKE_MAX_AUTO_RETRIES,
   REVIEW_WAKE_RESET_GRACE_MS,
+  applyReviewFailure,
   buildReviewWakeState,
+  reopenFailedReview,
 } from '../bridge/review-wake';
-import { DelegationRound, DelegationThread } from '../bridge/types';
+import { DelegationRound, DelegationThread, isTaskUnfinished } from '../bridge/types';
 import { TaskRoleLock } from '../bridge/task-role-lock';
 
 describe('Review wake failure policy', () => {
@@ -284,6 +286,58 @@ describe('ReviewWakeScheduler', () => {
     store.dispose();
   });
 
+  test('retries against the newest completed work round, never an approval round', async () => {
+    const nowMs = Date.parse('2026-10-23T12:00:00.000Z');
+    const { store, scheduler, launches } = setup(nowMs);
+    const thread = makeThread({
+      round: 6,
+      autoRetryAt: new Date(nowMs - 1_000).toISOString(),
+    });
+    thread.currentRound = 6;
+    thread.rounds = [
+      {
+        round: 1,
+        type: 'initial',
+        prompt: 'implement',
+        status: 'completed',
+        durationMs: 1_000,
+        timestamp: '2026-10-23T10:10:00.000Z',
+        output: 'round 1',
+      },
+      {
+        round: 5,
+        type: 'rework',
+        prompt: 'round 5',
+        status: 'completed',
+        durationMs: 1_000,
+        timestamp: '2026-10-23T11:00:00.000Z',
+        output: 'round 5',
+      },
+      {
+        round: 6,
+        type: 'approval',
+        prompt: 'approved',
+        status: 'completed',
+        durationMs: 0,
+        timestamp: '2026-10-23T11:30:00.000Z',
+      },
+    ];
+    store.upsertTask(thread);
+
+    try {
+      await scheduler.runDue();
+
+      assert.deepStrictEqual(
+        launches,
+        [{ threadId: 'thread_review_wake_sched', round: 5 }],
+        'an approval round is bookkeeping and must never be reviewed',
+      );
+    } finally {
+      scheduler.dispose();
+      store.dispose();
+    }
+  });
+
   test('does not fire a planned retry while a reviewer is already running', async () => {
     const nowMs = Date.parse('2026-10-23T12:00:00.000Z');
     const { store, scheduler, launches } = setup(nowMs, { isReviewerActive: () => true });
@@ -366,7 +420,12 @@ describe('ReviewWakeScheduler', () => {
 
     assert.strictEqual(launched, 0);
     assert.strictEqual(launches.length, 0);
-    assert.strictEqual(store.getTask('thread_review_wake_sched')!.reviewWake!.gaveUp, true);
+    const stored = store.getTask('thread_review_wake_sched')!;
+    assert.strictEqual(stored.reviewWake!.gaveUp, true);
+    // Exhausted retries are a terminal review failure, not a silent wait.
+    assert.strictEqual(stored.status, 'review_failed');
+    assert.strictEqual(stored.reviewFailure?.kind, 'retries_exhausted');
+    assert.match(stored.reviewFailure?.reason || '', /429 Too Many Requests/);
     scheduler.dispose();
     store.dispose();
   });
@@ -495,6 +554,11 @@ describe('ReviewWakeScheduler', () => {
       assert.strictEqual(stalled.reviewWake!.gaveUp, true, 'no auto retry for a dead park');
       assert.strictEqual(stalled.reviewWake!.autoRetryAt, undefined);
       assert.strictEqual(stalled.reviewBlocked, undefined, 'the dead park must be cleared');
+      // `review_failed` is the visible terminal status, and the caller's own
+      // parked reason must survive in the failure record.
+      assert.strictEqual(stalled.status, 'review_failed');
+      assert.strictEqual(stalled.reviewFailure?.kind, 'unresolvable_park');
+      assert.match(stalled.reviewFailure?.reason || '', /blocked on the full batch/);
 
       // Terminal: the scheduler must not keep waking a caller that will re-block.
       advance(61_000);
@@ -524,6 +588,40 @@ describe('ReviewWakeScheduler', () => {
       assert.match(stalled.reviewWake!.lastError, /已不在账本/);
       assert.strictEqual(stalled.reviewWake!.gaveUp, true);
       assert.strictEqual(stalled.reviewBlocked, undefined);
+      assert.strictEqual(stalled.status, 'review_failed');
+      assert.strictEqual(stalled.reviewFailure?.kind, 'unresolvable_park');
+      assert.match(stalled.reviewFailure?.reason || '', /thread_deleted_dependency/);
+      scheduler.dispose();
+      store.dispose();
+    });
+
+    test('heals a pre-existing gave-up wake into the terminal review_failed status', async () => {
+      const nowMs = Date.parse('2026-10-23T12:00:00.000Z');
+      const { store, scheduler } = setup(nowMs, {
+        stallTimeoutMs: 10 * 60_000,
+        isReviewerActive: () => false,
+      });
+      const thread = staleThread(nowMs);
+      // Exactly the ledger shape written before `review_failed` existed: the
+      // review already gave up, but the task is still `waiting_review` forever.
+      thread.reviewWake = {
+        round: 1,
+        attempts: 1,
+        lastAttemptAt: new Date(nowMs - 30 * 60_000).toISOString(),
+        lastError: '已挂起但未记录 waitingForThreadId：没有可等待的依赖线程',
+        gaveUp: true,
+        autoRetryAttempts: 0,
+      };
+      store.upsertTask(thread);
+
+      assert.strictEqual(await scheduler.runWatchdog(), 1);
+
+      const healed = store.getTask('thread_review_wake_sched')!;
+      assert.strictEqual(healed.status, 'review_failed');
+      assert.strictEqual(healed.reviewFailure?.kind, 'unresolvable_park');
+      assert.match(healed.reviewFailure?.reason || '', /waitingForThreadId/);
+      // Idempotent: once terminal, the watchdog does not touch it again.
+      assert.strictEqual(await scheduler.runWatchdog(), 0);
       scheduler.dispose();
       store.dispose();
     });
@@ -545,5 +643,70 @@ describe('ReviewWakeScheduler', () => {
       scheduler.dispose();
       store.dispose();
     });
+  });
+});
+
+describe('review_failed lifecycle status', () => {
+  const baseThread = (): DelegationThread => ({
+    threadId: 'thread_review_failed_1',
+    title: 'Review failed task',
+    initiatorAgent: 'codex',
+    targetAgent: 'deepseek_harness',
+    status: 'waiting_review',
+    currentRound: 3,
+    createdAt: '2026-10-23T10:00:00.000Z',
+    updatedAt: '2026-10-23T11:00:00.000Z',
+    receiverSessionId: 'session-receiver-1',
+    callerSessionId: 'caller-session-1',
+    workspacePath: os.tmpdir(),
+    summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 1_000 },
+    rounds: [],
+  });
+
+  test('records a non-empty cause and releases the task queue slot', () => {
+    const thread = baseThread();
+    assert.strictEqual(isTaskUnfinished(thread), true, 'waiting_review still owns the slot');
+
+    const changed = applyReviewFailure(thread, {
+      kind: 'unresolvable_park',
+      reason: '等待外部 Client 控制投影修复\n（没有可等待的 thread）',
+      by: 'watchdog',
+    });
+
+    assert.strictEqual(changed, true);
+    assert.strictEqual(thread.status, 'review_failed');
+    assert.strictEqual(thread.reviewFailure?.kind, 'unresolvable_park');
+    // The reason is normalized (newlines folded), never dropped.
+    assert.match(thread.reviewFailure?.reason || '', /外部 Client 控制投影修复/);
+    assert.doesNotMatch(thread.reviewFailure?.reason || '', /\n/);
+    assert.strictEqual(thread.reviewFailure?.round, 3);
+    assert.match(thread.summary.lastOutputSnippet, /Review failed/);
+    assert.strictEqual(isTaskUnfinished(thread), false, 'terminal tasks release the slot');
+  });
+
+  test('never downgrades a task that is no longer waiting for review', () => {
+    for (const status of ['completed', 'reworking', 'paused', 'queued'] as const) {
+      const thread = baseThread();
+      thread.status = status;
+      assert.strictEqual(
+        applyReviewFailure(thread, { kind: 'retries_exhausted', reason: 'late failure' }),
+        false,
+        `a stale wake failure must not overwrite ${status}`,
+      );
+      assert.strictEqual(thread.status, status);
+      assert.strictEqual(thread.reviewFailure, undefined);
+    }
+  });
+
+  test('re-opening returns to waiting_review and keeps the failure as history', () => {
+    const thread = baseThread();
+    applyReviewFailure(thread, { kind: 'retries_exhausted', reason: '唤醒重试耗尽' });
+
+    assert.strictEqual(reopenFailedReview(thread), true);
+    assert.strictEqual(thread.status, 'waiting_review');
+    assert.strictEqual(thread.reviewWake, undefined);
+    assert.strictEqual(thread.reviewFailure?.reason, '唤醒重试耗尽', 'audit history is kept');
+    assert.strictEqual(isTaskUnfinished(thread), true, 'a re-opened review owns the slot again');
+    assert.strictEqual(reopenFailedReview(thread), false, 'idempotent for non-failed tasks');
   });
 });

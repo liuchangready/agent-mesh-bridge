@@ -21,6 +21,81 @@ export const BRIDGE_HOME_DIRNAME = '.agent-mesh-bridge';
 export const ROUND_OUTPUT_ARCHIVE_SUFFIX = '.output.md';
 export const ROUND_EXECUTION_LOG_SUFFIX = '.log';
 
+export const WORKER_LOG_DIRNAME = 'worker_log';
+export const REVIEWER_LOG_DIRNAME = 'reviewer_log';
+export const ARCHIVE_DIRNAME = 'Archive';
+
+function readPolicySnapshot(root?: string): any {
+  try {
+    const file = path.join(bridgeHomeDir(root), 'bridge-policy.json');
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file, 'utf8'));
+    }
+  } catch {}
+  return {};
+}
+
+/**
+ * Resolve the base log directory for an agent (or default mesh log directory).
+ *
+ * Checks in order:
+ *  1. agent-specific directory in bridge-policy.json (e.g. logDirectories.codex);
+ *  2. default directory in bridge-policy.json (logDirectories.default);
+ *  3. ~/.agent-mesh-bridge/logs (or <root>/logs).
+ */
+export function resolveAgentLogBaseDir(
+  agent?: string,
+  root?: string,
+  overridePolicy?: any,
+): string {
+  const policy = overridePolicy || readPolicySnapshot(root);
+  const normalizedAgent = agent ? String(agent).replace(/-/g, '_') : undefined;
+  if (
+    normalizedAgent &&
+    policy?.logDirectories &&
+    typeof policy.logDirectories[normalizedAgent] === 'string'
+  ) {
+    const custom = policy.logDirectories[normalizedAgent].trim();
+    if (custom) return custom;
+  }
+  if (policy?.logDirectories && typeof policy.logDirectories.default === 'string') {
+    const customDefault = policy.logDirectories.default.trim();
+    if (customDefault) return customDefault;
+  }
+  return bridgeLogsDir(root);
+}
+
+/** Ensure the three subdirectories (worker_log, reviewer_log, Archive) exist. */
+export function ensureAgentLogDirs(agent?: string, root?: string): {
+  baseDir: string;
+  workerLogDir: string;
+  reviewerLogDir: string;
+  archiveDir: string;
+} {
+  const baseDir = resolveAgentLogBaseDir(agent, root);
+  const workerLogDir = path.join(baseDir, WORKER_LOG_DIRNAME);
+  const reviewerLogDir = path.join(baseDir, REVIEWER_LOG_DIRNAME);
+  const archiveDir = path.join(baseDir, ARCHIVE_DIRNAME);
+  try {
+    fs.mkdirSync(workerLogDir, { recursive: true });
+    fs.mkdirSync(reviewerLogDir, { recursive: true });
+    fs.mkdirSync(archiveDir, { recursive: true });
+  } catch {}
+  return { baseDir, workerLogDir, reviewerLogDir, archiveDir };
+}
+
+export function getWorkerLogDir(agent?: string, root?: string): string {
+  return ensureAgentLogDirs(agent, root).workerLogDir;
+}
+
+export function getReviewerLogDir(agent?: string, root?: string): string {
+  return ensureAgentLogDirs(agent, root).reviewerLogDir;
+}
+
+export function getArchiveLogDir(agent?: string, root?: string): string {
+  return ensureAgentLogDirs(agent, root).archiveDir;
+}
+
 /** Default page size for `get_round_raw_log` (never dump a 1.6MB log at once). */
 export const DEFAULT_RAW_LOG_BYTES = 20_000;
 /** Absolute ceiling for one `get_round_raw_log` call. */
@@ -51,15 +126,55 @@ function artifactBase(threadId: string, round: number): string {
   return `${safeThreadIdPart(threadId)}_round_${safeRound}`;
 }
 
-export function roundExecutionLogPath(threadId: string, round: number, root?: string): string {
-  return path.join(bridgeLogsDir(root), `${artifactBase(threadId, round)}.log`);
+export function roundExecutionLogPath(
+  threadId: string,
+  round: number,
+  root?: string,
+  agent?: string,
+): string {
+  return path.join(getWorkerLogDir(agent, root), `${artifactBase(threadId, round)}.log`);
 }
 
-export function roundOutputArchivePath(threadId: string, round: number, root?: string): string {
+export function roundOutputArchivePath(
+  threadId: string,
+  round: number,
+  root?: string,
+  agent?: string,
+): string {
   return path.join(
-    bridgeLogsDir(root),
+    getWorkerLogDir(agent, root),
     `${artifactBase(threadId, round)}${ROUND_OUTPUT_ARCHIVE_SUFFIX}`,
   );
+}
+
+export function findExistingExecutionLog(
+  threadId: string,
+  round: number,
+  options: { root?: string; agent?: string } = {},
+): string | undefined {
+  const safeRound = Number.isFinite(round) ? Math.max(1, Math.floor(round)) : 1;
+  const candidates: Array<string | undefined> = [
+    roundExecutionLogPath(threadId, round, options.root, options.agent),
+    roundExecutionLogPath(threadId, round, options.root),
+    path.join(bridgeLogsDir(options.root), `${artifactBase(threadId, round)}.log`),
+  ];
+  return resolveExistingArtifactPath(candidates);
+}
+
+export function findExistingOutputArchive(
+  threadId: string,
+  round: number,
+  options: { root?: string; agent?: string } = {},
+): string | undefined {
+  const candidates: Array<string | undefined> = [
+    roundOutputArchivePath(threadId, round, options.root, options.agent),
+    roundOutputArchivePath(threadId, round, options.root),
+    path.join(
+      bridgeLogsDir(options.root),
+      `${artifactBase(threadId, round)}${ROUND_OUTPUT_ARCHIVE_SUFFIX}`,
+    ),
+  ];
+  return resolveExistingArtifactPath(candidates);
 }
 
 export interface RoundArtifact {
@@ -71,29 +186,46 @@ export interface RoundArtifact {
   mtimeMs: number;
 }
 
-/** Every artifact recorded under `logs/` for one task, ordered by round. */
-export function listRoundArtifacts(threadId: string, root?: string): RoundArtifact[] {
-  const dir = bridgeLogsDir(root);
-  if (!fs.existsSync(dir)) return [];
+/** Every artifact recorded under worker_log/ or legacy logs/ for one task, ordered by round. */
+export function listRoundArtifacts(
+  threadId: string,
+  root?: string,
+  agent?: string,
+): RoundArtifact[] {
+  const dirs = new Set<string>();
+  dirs.add(getWorkerLogDir(agent, root));
+  dirs.add(getWorkerLogDir(undefined, root));
+  dirs.add(bridgeLogsDir(root));
+
   const prefix = `${safeThreadIdPart(threadId)}_round_`;
-  const found: RoundArtifact[] = [];
-  for (const name of fs.readdirSync(dir)) {
-    if (!name.startsWith(prefix)) continue;
-    const match = /_round_(\d+)(\.log|\.output\.md)$/.exec(name);
-    if (!match) continue;
-    const full = path.join(dir, name);
+  const map = new Map<string, RoundArtifact>();
+
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir)) continue;
     try {
-      const stat = fs.statSync(full);
-      found.push({
-        round: Number(match[1]),
-        kind: match[2] === '.log' ? 'execution' : 'output',
-        path: full,
-        sizeBytes: stat.size,
-        mtimeMs: stat.mtimeMs,
-      });
+      for (const name of fs.readdirSync(dir)) {
+        if (!name.startsWith(prefix)) continue;
+        const match = /_round_(\d+)(\.log|\.output\.md)$/.exec(name);
+        if (!match) continue;
+        const round = Number(match[1]);
+        const kind: 'execution' | 'output' = match[2] === '.log' ? 'execution' : 'output';
+        const key = `${round}:${kind}`;
+        if (map.has(key)) continue;
+        const full = path.join(dir, name);
+        try {
+          const stat = fs.statSync(full);
+          map.set(key, {
+            round,
+            kind,
+            path: full,
+            sizeBytes: stat.size,
+            mtimeMs: stat.mtimeMs,
+          });
+        } catch {}
+      }
     } catch {}
   }
-  return found.sort((a, b) => a.round - b.round || a.kind.localeCompare(b.kind));
+  return Array.from(map.values()).sort((a, b) => a.round - b.round || a.kind.localeCompare(b.kind));
 }
 
 /**
@@ -104,8 +236,9 @@ export function listRoundArtifacts(threadId: string, root?: string): RoundArtifa
 export function findLatestExecutionLog(
   threadId: string,
   root?: string,
+  agent?: string,
 ): RoundArtifact | undefined {
-  const logs = listRoundArtifacts(threadId, root).filter((a) => a.kind === 'execution');
+  const logs = listRoundArtifacts(threadId, root, agent).filter((a) => a.kind === 'execution');
   if (logs.length === 0) return undefined;
   return logs.reduce((a, b) => (b.round > a.round ? b : a));
 }

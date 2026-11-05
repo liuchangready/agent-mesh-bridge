@@ -12,8 +12,20 @@ import { TaskControlService } from './task-control';
 import { TaskRetargetService } from './task-retarget';
 import { CallerPollGuard, progressSignature } from './caller-poll-guard';
 import { TaskRoleLock } from './task-role-lock';
-import { ModelCatalog, annotateConfiguredModel, loadModelDefaults } from './model-catalog';
+import {
+  ModelCatalog,
+  annotateConfiguredModel,
+  loadInitiatorModelDefaults,
+  loadModelDefaults,
+} from './model-catalog';
 import { resolveDispatchModel } from './model-approval';
+import { buildFinalSummary, isTerminalThreadStatus } from './task-summary';
+import {
+  clearReviewerBootstrapToken,
+  findReviewerBootstrapByHostPid,
+  findSolePendingBootstrap,
+  readReviewerBootstrapToken,
+} from './reviewer-bootstrap';
 import {
   AgentId,
   DelegationRound,
@@ -24,12 +36,18 @@ import {
 import {
   DEFAULT_RAW_LOG_BYTES,
   MAX_RAW_LOG_BYTES,
+  findExistingExecutionLog,
+  findExistingOutputArchive,
   readTextFilePaged,
   resolveExistingArtifactPath,
   roundExecutionLogPath,
   roundOutputArchivePath,
 } from './round-log';
-import { listReviewerLogRounds, reviewerLogPath } from './reviewer-log';
+import {
+  findExistingReviewerLog,
+  listReviewerLogRounds,
+  reviewerLogPath,
+} from './reviewer-log';
 import { aggregateThreadTokenUsage } from './token-usage-collector';
 
 /** Older non-compacted rounds are excerpted to this many characters. */
@@ -101,14 +119,20 @@ export class MCPServer {
   }
 
   private resolveRoundOutputArchive(threadId: string, round: number): string | undefined {
+    const thread = this.taskStore.getTask(threadId);
     return resolveExistingArtifactPath([
+      findExistingOutputArchive(threadId, round, { root: this.storeRoot(), agent: thread?.targetAgent }),
+      roundOutputArchivePath(threadId, round, this.storeRoot(), thread?.targetAgent),
       roundOutputArchivePath(threadId, round, this.storeRoot()),
       roundOutputArchivePath(threadId, round),
     ]);
   }
 
   private resolveRoundExecutionLog(threadId: string, round: number): string | undefined {
+    const thread = this.taskStore.getTask(threadId);
     return resolveExistingArtifactPath([
+      findExistingExecutionLog(threadId, round, { root: this.storeRoot(), agent: thread?.targetAgent }),
+      roundExecutionLogPath(threadId, round, this.storeRoot(), thread?.targetAgent),
       roundExecutionLogPath(threadId, round, this.storeRoot()),
       roundExecutionLogPath(threadId, round),
     ]);
@@ -281,10 +305,12 @@ export class MCPServer {
     );
     const offsetBytes = Math.max(0, Number(args?.offsetBytes) || 0);
 
-    const found = [
-      reviewerLogPath(threadId, round, this.storeRoot()),
+    const thread = this.taskStore.getTask(threadId);
+    const found = resolveExistingArtifactPath([
+      findExistingReviewerLog(threadId, round, { root: this.storeRoot(), agent: thread?.initiatorAgent }),
+      reviewerLogPath(threadId, round, this.storeRoot(), thread?.initiatorAgent),
       reviewerLogPath(threadId, round),
-    ].find((candidate) => fs.existsSync(candidate));
+    ]);
 
     if (!found) {
       return {
@@ -335,6 +361,10 @@ export class MCPServer {
           'After this call returns you MUST end your turn immediately and wait for the callback: the bridge wakes your native session when the round finishes, whether it succeeds or fails. ' +
           'Do NOT poll `get_thread_details` / `get_recent_logs` / `list_recent_tasks` to watch the task — that keeps the user paying for a turn that has nothing left to do, and repeated reads at unchanged progress are answered with a short `repeatPoll` stub instead of the details. ' +
           'A `QUEUED` result is normal and needs no action: the task starts on its own when the queue frees up. ' +
+          'You may also dispatch to your own agent identity: new tasks run through a DEDICATED reviewer ' +
+          'conversation, so the task gets its own reviewer instead of resuming this busy session. Same-agent dispatch ' +
+          'requires reviewFlow=dedicated (the bridge default) plus a sender-side reviewer model that differs from the ' +
+          'receiver model (`initiatorModels.<agent>` vs `models.<agent>`); the legacy review flow refuses it. ' +
           'This tool is unavailable while this agent is itself executing a delegated task (receivers must not forward work).',
         inputSchema: {
           type: 'object',
@@ -343,7 +373,7 @@ export class MCPServer {
               type: 'string',
               enum: ['default', 'codex', 'claude_code', 'antigravity', 'deepseek_harness'],
               description:
-                'Target agent to execute the task. Defaults to "default" (auto-detected).',
+                'Target agent to execute the task. Defaults to "default" (auto-detected). May be your own agent identity: same-agent dispatch runs under the dedicated reviewer flow and requires a reviewer model that differs from the executor model.',
             },
             initiatorAgent: {
               type: 'string',
@@ -421,7 +451,23 @@ export class MCPServer {
             initiatorModel: {
               type: 'string',
               description:
-                'The model YOU (the caller) are currently running on, recorded as the task\'s sender model so the ledger shows "sender model -> receiver model". Omit to let the bridge infer it from the environment or your configured default.',
+                'The model YOU (the caller) are currently running on, recorded as the task\'s sender model so the ledger shows "sender model -> receiver model". Omit to let the bridge infer it from the environment or, failing that, from the SENDER-side configured default for your agent (configured separately from the receiver-side default via the "Agent Bridge: Select Model for Agent" command).',
+            },
+            reviewBootstrap: {
+              type: 'object',
+              description:
+                'Reviewer-only, one-time bootstrap credential. A dedicated reviewer conversation receives it in its prompt and must echo it here when it dispatches the prepared task; it identifies the reviewer when the host does not forward MESH_REVIEW_* and the launched pid cannot be matched. Never pass it for an ordinary dispatch.',
+              properties: {
+                threadId: {
+                  type: 'string',
+                  description: 'The prepared task this reviewer conversation belongs to.',
+                },
+                token: {
+                  type: 'string',
+                  description: 'The one-time token from the bootstrap prompt.',
+                },
+              },
+              required: ['threadId', 'token'],
             },
           },
           required: ['title', 'prompt', 'expectedFiles'],
@@ -461,7 +507,7 @@ export class MCPServer {
             targetAgent: {
               type: 'string',
               description:
-                'Optional: deliver THIS rework to a different agent. The task keeps its thread, history and file scope; the previous agent\'s native session cannot be resumed, so the round starts a fresh one.',
+                'Optional: deliver THIS rework to a different agent. The task keeps its thread, history and file scope; the previous agent\'s native session cannot be resumed, so the round starts a fresh one. May be the task\'s initiator only for a dedicated-review task whose reviewer model differs from the new receiver model.',
             },
             model: {
               type: 'string',
@@ -529,7 +575,7 @@ export class MCPServer {
             targetAgent: {
               type: 'string',
               description:
-                'Optional: resume on a different agent. The previous native session cannot follow a new agent, so the round starts a fresh one.',
+                'Optional: resume on a different agent. The previous native session cannot follow a new agent, so the round starts a fresh one. May be the task\'s initiator only for a dedicated-review task whose reviewer model differs from the receiver model.',
             },
             model: {
               type: 'string',
@@ -559,7 +605,7 @@ export class MCPServer {
             targetAgent: {
               type: 'string',
               description:
-                'Optional: retry on a different agent (fresh native session; the old session cannot be resumed by another agent).',
+                'Optional: retry on a different agent (fresh native session; the old session cannot be resumed by another agent). May be the task\'s initiator only for a dedicated-review task whose reviewer model differs from the receiver model.',
             },
             model: {
               type: 'string',
@@ -589,7 +635,8 @@ export class MCPServer {
             targetAgent: {
               type: 'string',
               enum: ['antigravity', 'codex', 'claude_code', 'deepseek_harness'],
-              description: 'New receiver agent. Omit to keep the current agent and change only the model.',
+              description:
+                'New receiver agent. Omit to keep the current agent and change only the model. May be the task\'s initiator for a dedicated-review task, where a separate reviewer conversation inspects the result; the reviewer model must differ from this receiver model.',
             },
             model: {
               type: 'string',
@@ -699,6 +746,7 @@ export class MCPServer {
                 'active',
                 'running',
                 'waiting_review',
+                'review_failed',
                 'reworking',
                 'paused',
                 'completed',
@@ -729,6 +777,22 @@ export class MCPServer {
               type: 'boolean',
               description:
                 'Return every round verbatim plus the recent execution log. Defaults to false; keep it false unless the compacted view is genuinely insufficient.',
+            },
+          },
+          required: ['threadId'],
+        },
+      },
+      {
+        name: 'get_task_summary',
+        description:
+          'Read the read-only terminal summary of a task. A task that reaches completed or failed gets a deterministic digest (verdict, changed files, error, round count, MR, token totals); once the task is archived this digest is the ONLY conversation payload that survives, so use this tool instead of get_thread_details for old tasks. ' +
+          'While a task is still running the summary is null and the tool reports the live status.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            threadId: {
+              type: 'string',
+              description: 'The task thread ID whose summary should be read.',
             },
           },
           required: ['threadId'],
@@ -832,7 +896,7 @@ export class MCPServer {
       {
         name: 'list_agent_models',
         description:
-          'List the models each agent can run, including the model currently configured as that agent\'s default. The configured default is returned as `configuredModel` and as the FIRST entry of `models`, tagged "configured default" — that is the model a task runs on unless the user explicitly names another one. Results are cached; pass forceRefresh to re-probe the CLIs and provider endpoints.',
+          'List the models each agent can run, including the models configured as that agent\'s defaults. `configuredModel` is the RECEIVER-side default (what delegated tasks execute with) and is also the FIRST entry of `models`, tagged "configured default" — that is the model a task runs on unless the user explicitly names another one. `initiatorModel` is the separate SENDER-side default (what that agent runs on when it dispatches or reviews), so the two sides stay independent — and because an agent may dispatch to itself, the sender-side model is what keeps the reviewer from being the executor. Results are cached; pass forceRefresh to re-probe the CLIs and provider endpoints.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -903,6 +967,208 @@ export class MCPServer {
   }
 
   /**
+   * Identify the reviewer bootstrap this MCP server belongs to, if any.
+   *
+   * Primary channel: the `MESH_REVIEW_*` markers in the process environment.
+   * Fallback: the pid of the CLI process that launched this server, matched
+   * against the launch records written by ReviewerBootstrapService.
+   *
+   * The fallback is not cosmetic. A host may spawn its MCP servers with a closed
+   * environment — Codex passes ONLY the `env` table from `config.toml`, and
+   * DeepSeek Harness scrubs inherited variables — so the environment markers
+   * never arrive there. Without the pid fallback the reviewer's `dispatch_task`
+   * falls through to a normal dispatch, is rejected for a missing
+   * `expectedFiles`, and the task dies with "the reviewer turn ended without
+   * calling dispatch_task" while the developer never starts.
+   */
+  private resolveReviewerBootstrapIdentity(args?: any):
+    | { threadId: string; token?: string; hostPid?: number }
+    | null {
+    // Channel 1 (deterministic): the bootstrap prompt carries the one-time
+    // credential, so the reviewer can echo it even when the host scrubs the
+    // environment AND the launched pid cannot be matched (a host that brokers
+    // its MCP servers through an intermediate process).
+    const explicit = args && typeof args === 'object' ? (args as any).reviewBootstrap : undefined;
+    if (
+      explicit &&
+      typeof explicit === 'object' &&
+      typeof explicit.threadId === 'string' &&
+      explicit.threadId.trim() &&
+      typeof explicit.token === 'string' &&
+      explicit.token.trim()
+    ) {
+      return { threadId: explicit.threadId.trim(), token: explicit.token.trim() };
+    }
+
+    // Channel 2: inherited environment, for hosts that do forward it.
+    const bootstrapping = process.env.MESH_REVIEW_BOOTSTRAP === '1';
+    const envThreadId = (process.env.MESH_REVIEW_THREAD_ID || '').trim();
+    const envToken = (process.env.MESH_REVIEW_BOOTSTRAP_TOKEN || '').trim();
+    if (bootstrapping && envThreadId && envToken) {
+      return { threadId: envThreadId, token: envToken };
+    }
+
+    // Channel 3: the pid of the reviewer CLI the bridge launched. Environment
+    // independent, but only correct when this server really is a direct child
+    // of that CLI.
+    const byHostPid = findReviewerBootstrapByHostPid(process.ppid);
+    if (byHostPid?.hostPid) {
+      return { threadId: byHostPid.threadId, hostPid: byHostPid.hostPid };
+    }
+
+    // Channel 4 (last resort): a call without a task brief can only be a
+    // reviewer claiming its prepared task. Exactly one pending bootstrap for
+    // this caller agent (preferably in this working directory) is unambiguous.
+    if (this.looksLikeBootstrapAttempt(args)) {
+      const sole = findSolePendingBootstrap({
+        agent: (process.env.MESH_CALLER_AGENT || '').trim() || undefined,
+        workspacePath: process.cwd(),
+        taskStore: this.taskStore,
+      });
+      if (sole) {
+        console.warn(
+          `[Agent Mesh Bridge] Reviewer bootstrap for ${sole.threadId} claimed by agent/workspace match: ` +
+            `ppid ${process.ppid} matched no launch record.`,
+        );
+        return { threadId: sole.threadId, token: sole.token };
+      }
+      console.warn(
+        `[Agent Mesh Bridge] dispatch_task arrived with no task brief and no reviewer credential ` +
+          `(ppid=${process.ppid}, caller=${process.env.MESH_CALLER_AGENT || 'unknown'}, cwd=${process.cwd()}); ` +
+          `treated as an ordinary dispatch.`,
+      );
+    }
+
+    if (bootstrapping) {
+      throw new Error(
+        'Reviewer bootstrap environment is incomplete (MESH_REVIEW_THREAD_ID / MESH_REVIEW_BOOTSTRAP_TOKEN), ' +
+          'and this process does not match any pending reviewer launch record.',
+      );
+    }
+    return null;
+  }
+
+  /** A bootstrap call carries no task brief: the ledger holds it. */
+  private looksLikeBootstrapAttempt(args: any): boolean {
+    if (!args || typeof args !== 'object') return true;
+    const hasBrief =
+      (typeof args.title === 'string' && args.title.trim() !== '') ||
+      (typeof args.prompt === 'string' && args.prompt.trim() !== '') ||
+      (Array.isArray(args.expectedFiles) && args.expectedFiles.length > 0) ||
+      args.allowNoScope === true;
+    return !hasBrief;
+  }
+
+  /**
+   * Confirm the prepared task for a dedicated reviewer conversation.
+   *
+   * The reviewer proves its identity either with the one-time token from its
+   * environment or — when the host does not forward that environment — with the
+   * pid of the CLI process the bridge launched it as. The business brief always
+   * comes from the ledger, never from the model's arguments.
+   * Confirmation only marks the task runnable — the developer starts after the
+   * bootstrap service has persisted the native reviewer session.
+   */
+  private confirmReviewerBootstrap(
+    threadId: string,
+    credential: { token?: string; hostPid?: number },
+  ): any {
+    this.taskStore.loadFromDisk();
+    let thread = this.taskStore.getTask(threadId);
+    if (!thread) {
+      throw new Error(`Reviewer bootstrap thread not found: ${threadId}`);
+    }
+    if (thread.status !== 'queued') {
+      throw new Error(
+        `Reviewer bootstrap for ${threadId} cannot confirm while task status is "${thread.status}". ` +
+          `Only a queued task may be dispatched; resume it after a pause or retry after a failure.`,
+      );
+    }
+    if (thread.reviewFlow !== 'dedicated') {
+      throw new Error(
+        `Thread ${threadId} is not a dedicated reviewer task; refusing bootstrap dispatch.`,
+      );
+    }
+    const phase = thread.reviewBootstrap?.phase;
+    if (phase === 'confirmed') {
+      throw new Error(`Thread ${threadId} was already dispatched by its reviewer.`);
+    }
+    if (phase === 'failed') {
+      throw new Error(
+        `Thread ${threadId} failed its reviewer bootstrap; it cannot be dispatched anymore.`,
+      );
+    }
+    const record = readReviewerBootstrapToken(threadId);
+    if (!record) {
+      throw new Error(
+        `Reviewer bootstrap token for ${threadId} is missing or was already consumed; ` +
+          `the reviewer cannot dispatch this task again.`,
+      );
+    }
+    if (credential.token) {
+      if (record.token !== credential.token) {
+        throw new Error(
+          `Reviewer bootstrap token mismatch for ${threadId}: this process is not the task's reviewer.`,
+        );
+      }
+    } else if (credential.hostPid) {
+      if (record.hostPid !== credential.hostPid) {
+        throw new Error(
+          `Reviewer bootstrap process mismatch for ${threadId}: this process was not launched as that task's reviewer.`,
+        );
+      }
+    } else {
+      throw new Error(`Reviewer bootstrap credential missing for ${threadId}.`);
+    }
+    if (record.agent !== thread.initiatorAgent) {
+      throw new Error(
+        `Reviewer bootstrap agent mismatch for ${threadId}: expected ${thread.initiatorAgent}.`,
+      );
+    }
+
+    // Re-read immediately before consuming the credential. A pause/delete may
+    // have arrived from another bridge process while the launch record was
+    // being validated; in that case leave the one-shot token available for a
+    // later explicit resume.
+    this.taskStore.loadFromDisk();
+    const latest = this.taskStore.getTask(threadId);
+    if (!latest || latest.status !== 'queued') {
+      throw new Error(
+        `Reviewer bootstrap for ${threadId} was stopped before confirmation; ` +
+          `the task is ${latest?.status || 'deleted'} and its token was not consumed.`,
+      );
+    }
+    thread = latest;
+
+    clearReviewerBootstrapToken(threadId);
+    thread.reviewBootstrap = {
+      ...(thread.reviewBootstrap || { phase: 'pending', attempts: 0 }),
+      phase: 'confirmed',
+    };
+    thread.status = 'queued';
+    thread.summary.lastOutputSnippet =
+      'Reviewer dispatched the task; waiting for the bootstrap process to persist its native session.';
+    this.taskStore.upsertTask(thread);
+
+    const stopInstruction =
+      'STOP NOW — the task is dispatched. End your turn immediately; the bridge resumes THIS ' +
+      'reviewer conversation when the developer report is ready. Do not poll.';
+    const routing = getModelRouting(thread);
+    return {
+      threadId,
+      receiverSessionId: thread.receiverSessionId,
+      targetAgent: thread.targetAgent,
+      status: 'DISPATCHED',
+      message:
+        `nextAction=END_TURN_AND_WAIT_FOR_CALLBACK. ${stopInstruction} ` +
+        `Task ${threadId} confirmed by its dedicated reviewer. Model routing: ${routing.text}.`,
+      modelRouting: routing,
+      nextAction: 'END_TURN_AND_WAIT_FOR_CALLBACK',
+      stopInstruction,
+    };
+  }
+
+  /**
    * A review decision is only valid while the task is in its reviewer role.
    * This blocks a stale reviewer process (one that already handed off) from
    * approving or reopening the task later.
@@ -914,6 +1180,14 @@ export class MCPServer {
         `[Agent Mesh Bridge] Refusing review action for thread ${threadId}: ` +
           `no active reviewer role is held. A task accepts review decisions only from its current reviewer turn; ` +
           `finish or re-wake the same task instead of acting from a stale reviewer process.`,
+      );
+    }
+    const ownSession = (process.env.MESH_REVIEW_SESSION_ID || '').trim();
+    if (ownSession && owner.conversationId && ownSession !== owner.conversationId) {
+      throw new Error(
+        `[Agent Mesh Bridge] Refusing review action for thread ${threadId}: this process is ` +
+          `conversation ${ownSession}, but the reviewer role belongs to ${owner.conversationId}. ` +
+          `A task accepts decisions only from its dedicated reviewer conversation.`,
       );
     }
   }
@@ -973,6 +1247,14 @@ export class MCPServer {
 
     switch (name) {
       case 'dispatch_task': {
+        // Dedicated reviewer bootstrap: this process is the fresh reviewer
+        // conversation. Its one job is to confirm the prepared task; business
+        // arguments are ignored so the brief cannot drift.
+        const bootstrap = this.resolveReviewerBootstrapIdentity(args);
+        if (bootstrap) {
+          return this.confirmReviewerBootstrap(bootstrap.threadId, bootstrap);
+        }
+
         const callerFromEnv = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
         const initiatorAgent =
           args.initiatorAgent && args.initiatorAgent !== 'default'
@@ -1169,6 +1451,10 @@ export class MCPServer {
         return tasks.map((task) => ({
           ...task,
           modelRouting: getModelRouting(task),
+          archived: !!task.archivedAt,
+          // Archived tasks keep only the digest; surface it directly so a list
+          // remains useful without a second call.
+          finalSummary: task.finalSummary?.summary || null,
           tokenUsage: aggregateThreadTokenUsage(task.rounds || []),
         }));
       }
@@ -1263,6 +1549,14 @@ export class MCPServer {
         return {
           ...task,
           rounds: projected,
+          ...(task.archivedAt
+            ? {
+                archived: true,
+                archivedHint:
+                  'This task is archived: its rounds, logs and native session ids were removed. ' +
+                  'Use get_task_summary for the retained digest.',
+              }
+            : {}),
           modelRouting: getModelRouting(task),
           // Derived on read: a stored aggregate could be rolled back by a
           // stale process writing an old copy of the task.
@@ -1279,6 +1573,40 @@ export class MCPServer {
           fullHistoryHint:
             'Older rounds are condensed or excerpted. Use get_round_raw_log for one round, ' +
             'or includeRawLogs: true for the complete history (large).',
+        };
+      }
+
+      case 'get_task_summary': {
+        const task = this.taskStore.getTask(args.threadId);
+        if (!task) {
+          throw new Error(`Thread not found: ${args.threadId}`);
+        }
+        const summary =
+          task.finalSummary ||
+          (isTerminalThreadStatus(task.status) ? buildFinalSummary(task) : undefined);
+        return {
+          threadId: task.threadId,
+          title: task.title,
+          status: task.status,
+          archived: !!task.archivedAt,
+          ...(task.archivedAt ? { archivedAt: task.archivedAt } : {}),
+          createdAt: task.createdAt,
+          updatedAt: task.updatedAt,
+          reviewFlow: task.reviewFlow || 'legacy',
+          initiatorAgent: task.initiatorAgent,
+          targetAgent: task.targetAgent,
+          requesterModel: task.requesterModel || task.initiatorModel,
+          reviewerModel: task.reviewerModel,
+          targetModel: task.targetModel,
+          mergeRequest: task.mergeRequest,
+          finalSummary: summary || null,
+          ...(summary
+            ? {}
+            : {
+                hint:
+                  'The task is still running (or was created before summaries existed); ' +
+                  'the read-only digest is written once it reaches completed/failed/review_failed.',
+              }),
         };
       }
 
@@ -1309,6 +1637,7 @@ export class MCPServer {
       case 'list_agent_models': {
         const all = await this.modelCatalog.getAll(!!args.forceRefresh);
         const defaults = loadModelDefaults();
+        const initiatorDefaults = loadInitiatorModelDefaults();
         const requested: AgentId[] =
           args.targetAgent && args.targetAgent !== 'all'
             ? [args.targetAgent as AgentId]
@@ -1324,7 +1653,11 @@ export class MCPServer {
             // catalogue a caller that only skims the head would otherwise pin
             // whichever id the provider happened to list first.
             configuredModel,
-            // `models` also carries it first, tagged in place.
+            // Sender-side default, configured separately: the model this agent
+            // runs on when it dispatches/reviews, which may differ from what it
+            // executes delegated tasks with on another agent.
+            initiatorModel: initiatorDefaults[agent] || null,
+            // `models` also carries the receiver default first, tagged in place.
             models: annotateConfiguredModel(catalog.models, configuredModel),
             source: catalog.source,
             updatedAt: catalog.updatedAt,
@@ -1335,10 +1668,11 @@ export class MCPServer {
           agents,
           hint:
             'Omit `model` in dispatch_task/invoke_agent unless the user explicitly named a model: ' +
-            'the task then uses configuredModel (listed first, tagged "configured default"). ' +
+            'the task then uses configuredModel (listed first, tagged "configured default"), the receiver-side default. ' +
+            '`initiatorModel` in this payload is the separate sender-side default of that agent (used when it dispatches/reviews). ' +
             'If the user did name a different model, pass it together with modelRequestedByUser: true — ' +
             'VS Code then asks the user to confirm the switch, and without that click the task runs on ' +
-            'the configured default instead. Change the default with the ' +
+            'the configured default instead. Change either default with the ' +
             '"Agent Bridge: Select Model for Agent" command in VS Code.',
         };
       }
@@ -1356,6 +1690,19 @@ export class MCPServer {
         // unless the caller declares an explicit user request that the user then
         // confirms in VS Code.
         const callerAgent = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
+
+        // This is the SYNCHRONOUS path, and only it is refused for a self-call:
+        // the invocation nests the agent inside its own turn (and a caller that
+        // is also reviewing a task would resume the busy session). Asynchronous
+        // `dispatch_task` to the same agent is allowed under the dedicated
+        // reviewer flow (AGENTS.md §22).
+        if (callerAgent && agent === callerAgent) {
+          throw new Error(
+            `Refusing to invoke ${agent} from itself: an agent cannot send work to itself through the synchronous ` +
+              `invoke_agent path. Use dispatch_task for a same-agent asynchronous task (dedicated reviewer flow), ` +
+              `or choose a different target agent.`,
+          );
+        }
         const modelResolution = await resolveDispatchModel({
           targetAgent: agent,
           requestedModel: args.model,

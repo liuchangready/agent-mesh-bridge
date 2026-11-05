@@ -72,6 +72,53 @@ describe('file-scope gate - one file belongs to one task', () => {
     assert.strictEqual(conflict!.threadId, 'thread_a');
   });
 
+  test('a younger running task that touched a file blocks an older queued resume candidate', () => {
+    const olderCandidate = makeThread({
+      threadId: 'thread_old_candidate',
+      status: 'queued',
+      createdAt: ANCIENT,
+      expectedFiles: ['src/shared/Changed.kt'],
+    });
+    const youngerOwner = makeThread({
+      threadId: 'thread_young_owner',
+      status: 'running',
+      createdAt: RECENT,
+      expectedFiles: [],
+      rounds: [completedRound(['src/shared/Changed.kt'])],
+    });
+
+    const conflict = findScopeConflicts(olderCandidate, [youngerOwner], NOW);
+    assert.strictEqual(conflict?.threadId, 'thread_young_owner');
+    assert.deepStrictEqual(conflict?.files, ['src/shared/Changed.kt']);
+  });
+
+  test('untouched queued peers use stable one-way order, while paused/review owners ignore age', () => {
+    const oldQueued = makeThread({
+      threadId: 'thread_a_old', status: 'queued', createdAt: ANCIENT,
+      expectedFiles: ['src/shared/Order.kt'],
+    });
+    const youngQueued = makeThread({
+      threadId: 'thread_z_young', status: 'queued', createdAt: RECENT,
+      expectedFiles: ['src/shared/Order.kt'],
+    });
+    assert.strictEqual(findScopeConflicts(oldQueued, [youngQueued], NOW), undefined);
+    assert.strictEqual(findScopeConflicts(youngQueued, [oldQueued], NOW)?.threadId, oldQueued.threadId);
+
+    for (const status of ['paused', 'waiting_review'] as const) {
+      const parkedOwner = makeThread({
+        threadId: 'thread_parked_' + status,
+        status,
+        createdAt: RECENT,
+        expectedFiles: ['src/shared/Order.kt'],
+      });
+      assert.strictEqual(
+        findScopeConflicts(oldQueued, [parkedOwner], NOW)?.threadId,
+        parkedOwner.threadId,
+        status + ' work continues owning its declared scope regardless of age',
+      );
+    }
+  });
+
   test('releases the files once the owner is收口 with a merge request', () => {
     const candidate = makeThread({ threadId: 'thread_b', expectedFiles: ['src/shared/Foo.kt'] });
     const owner = makeThread({

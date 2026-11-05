@@ -19,6 +19,7 @@ import {
   getDshCandidatePaths,
   queryDshVersion,
 } from './deepseek-harness';
+import { extractCodexThreadId } from './codex-session';
 
 export class AgentDetector {
   private customPaths: Partial<Record<AgentId, string>> = {};
@@ -489,8 +490,11 @@ export class AgentDetector {
           const files = this.findRecentFilesRecursive(sessionsDir, 3);
           files.sort((a, b) => b.mtime - a.mtime);
           for (const item of files) {
-            const base = path.basename(item.file, path.extname(item.file));
-            if (!excludeSet.has(base)) {
+            const rawBase = path.basename(item.file, path.extname(item.file));
+            // A rollout file name is not a session id: store the thread UUID so
+            // the ledger does not depend on which Codex build is installed.
+            const base = extractCodexThreadId(rawBase);
+            if (!excludeSet.has(base) && !excludeSet.has(rawBase)) {
               return base;
             }
           }

@@ -82,7 +82,9 @@ function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread
   return {
     threadId: 'thread_retarget_1',
     title: '统一码牌千术',
-    initiatorAgent: 'codex',
+    // The reviewer must differ from every executor these tests switch to:
+    // a task may never run on its own initiator (AGENTS.md §22).
+    initiatorAgent: 'claude_code',
     targetAgent: 'deepseek_harness',
     status: 'waiting_review',
     currentRound: 1,
@@ -256,6 +258,65 @@ describe('TaskRetargetService - switching a task executor', () => {
     assert.strictEqual(stored.retargets, undefined);
   });
 
+  test('an approval result cannot overwrite a task completed while the dialog was open', async () => {
+    taskStore.upsertTask(makeThread());
+    let beginApproval!: () => void;
+    let resolveApproval!: (decision: ModelApprovalDecision) => void;
+    const approvalStarted = new Promise<void>((resolve) => { beginApproval = resolve; });
+    service.setModelApprovalHandler((request) => {
+      beginApproval();
+      return new Promise((resolve) => { resolveApproval = resolve; });
+    });
+
+    const retargeting = service.retargetTask({
+      threadId: 'thread_retarget_1',
+      model: OTHER,
+      modelRequestedByUser: true,
+    });
+    await approvalStarted;
+    const completed = taskStore.getTask('thread_retarget_1')!;
+    completed.status = 'completed';
+    taskStore.upsertTask(completed);
+    resolveApproval({ id: 'approved-during-completion', status: 'approved', at: new Date().toISOString() });
+
+    await assert.rejects(retargeting, /state changed while model approval was pending/i);
+    const stored = taskStore.getTask('thread_retarget_1')!;
+    assert.strictEqual(stored.status, 'completed');
+    assert.strictEqual(stored.targetAgent, 'deepseek_harness');
+    assert.strictEqual(stored.receiverSessionId, 'session-old');
+    assert.strictEqual(stored.retargets, undefined);
+  });
+
+  test('an approval result cannot overwrite a task paused while the dialog was open', async () => {
+    taskStore.upsertTask(makeThread());
+    let beginApproval!: () => void;
+    let resolveApproval!: (decision: ModelApprovalDecision) => void;
+    const approvalStarted = new Promise<void>((resolve) => { beginApproval = resolve; });
+    service.setModelApprovalHandler((request) => {
+      beginApproval();
+      return new Promise((resolve) => { resolveApproval = resolve; });
+    });
+
+    const retargeting = service.retargetTask({
+      threadId: 'thread_retarget_1',
+      model: OTHER,
+      modelRequestedByUser: true,
+    });
+    await approvalStarted;
+    const paused = taskStore.getTask('thread_retarget_1')!;
+    paused.status = 'paused';
+    paused.rounds[0].status = 'paused';
+    taskStore.upsertTask(paused);
+    resolveApproval({ id: 'approved-during-pause', status: 'approved', at: new Date().toISOString() });
+
+    await assert.rejects(retargeting, /state changed while model approval was pending/i);
+    const stored = taskStore.getTask('thread_retarget_1')!;
+    assert.strictEqual(stored.status, 'paused');
+    assert.strictEqual(stored.targetAgent, 'deepseek_harness');
+    assert.strictEqual(stored.receiverSessionId, 'session-old');
+    assert.strictEqual(stored.retargets, undefined);
+  });
+
   test('refuses while a round is still in flight', async () => {
     taskStore.upsertTask(
       makeThread({
@@ -297,15 +358,39 @@ describe('TaskRetargetService - switching a task executor', () => {
       taskStore.upsertTask(makeThread({ threadId, status }));
       const res = await service.retargetTask({
         threadId,
-        targetAgent: 'claude_code',
+        targetAgent: 'codex',
         reason: 'move off DeepSeek',
       });
       assert.strictEqual(res.status, 'RETARGETED');
       const stored = taskStore.getTask(threadId)!;
       // The task keeps its parked status; only the executor changed.
       assert.strictEqual(stored.status, status);
-      assert.strictEqual(stored.targetAgent, 'claude_code');
+      assert.strictEqual(stored.targetAgent, 'codex');
       assert.ok(stored.retargets && stored.retargets.length === 1);
     }
+  });
+
+  test('refuses to hand a legacy task to its own initiator (self-review deadlock)', async () => {
+    taskStore.upsertTask(makeThread());
+    service.setModelApprovalHandler(async () => {
+      throw new Error('a rejected self-dispatch must not ask the user for a model');
+    });
+
+    await assert.rejects(
+      () =>
+        service.retargetTask({
+          threadId: 'thread_retarget_1',
+          targetAgent: 'claude_code',
+          reason: 'run it on the reviewer',
+        }),
+      /legacy review flow/i,
+    );
+
+    // Nothing moved: no executor change, no session reset, no retarget record.
+    const stored = taskStore.getTask('thread_retarget_1')!;
+    assert.strictEqual(stored.targetAgent, 'deepseek_harness');
+    assert.strictEqual(stored.receiverSessionId, 'session-old');
+    assert.strictEqual(stored.receiverSessionCaptured, true);
+    assert.strictEqual(stored.retargets, undefined);
   });
 });

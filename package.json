@@ -2,7 +2,7 @@
   "name": "agent-mesh-bridge",
   "displayName": "Agent Mesh Bridge",
   "description": "Peer-to-Peer Multi-Agent Bridge connecting Google Antigravity, OpenAI Codex, Anthropic Claude Code, and DeepSeek Harness in VSCode",
-  "version": "1.1.0",
+  "version": "1.2.15",
   "publisher": "agent-mesh",
   "author": "Antigravity Team",
   "license": "MIT",
@@ -83,7 +83,7 @@
       },
       {
         "command": "agent-mesh-bridge.selectAgentModel",
-        "title": "Agent Bridge: Select Model for Agent / 选择默认模型",
+        "title": "Agent Bridge: Select Model for Agent / 选择默认模型（接收者/下发者）",
         "icon": "$(chip)"
       },
       {
@@ -116,6 +116,11 @@
       {
         "command": "agent-mesh-bridge.deleteTask",
         "title": "Delete Task / 删除任务",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "agent-mesh-bridge.deleteTaskForce",
+        "title": "Force Delete Task / 强制删除任务（丢弃未合并的 worktree 输出）",
         "icon": "$(trash)"
       },
       {
@@ -218,8 +223,13 @@
           "group": "1_actions"
         },
         {
+          "command": "agent-mesh-bridge.deleteTaskForce",
+          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "group": "1_actions"
+        },
+        {
           "command": "agent-mesh-bridge.wakeUpCaller",
-          "when": "(viewItem == waiting_review_stalled || viewItem == waiting_review_blocked) && (view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks)",
+          "when": "(viewItem == waiting_review_stalled || viewItem == waiting_review_blocked || viewItem == review_failed) && (view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks)",
           "group": "1_actions"
         }
       ]
@@ -242,22 +252,72 @@
         "agentMeshBridge.models.antigravity": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Default model for Google Antigravity (forwarded as `agy --model`). Leave empty to keep the agent's own default. Run **Agent Bridge: Select Model for Agent** to choose from the models reported by `agy models`."
+          "markdownDescription": "**Receiver-side** default model for Google Antigravity: the model it executes delegated tasks with (forwarded as `agy --model`). Leave empty to keep the agent's own default. Run **Agent Bridge: Select Model for Agent** to choose from the models reported by `agy models`."
         },
         "agentMeshBridge.models.codex": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Default model for OpenAI Codex (forwarded as `codex -c model=\"...\"`, so it also applies to resumed sessions). Leave empty to keep the agent's own default. Run **Agent Bridge: Select Model for Agent** to choose from the models reported by `codex debug models`."
+          "markdownDescription": "**Receiver-side** default model for OpenAI Codex: the model it executes delegated tasks with (forwarded as `codex -c model=\"...\"`, so it also applies to resumed sessions). Leave empty to keep the agent's own default. Run **Agent Bridge: Select Model for Agent** to choose from the models reported by `codex debug models`."
         },
         "agentMeshBridge.models.claudeCode": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Default model for Anthropic Claude Code (forwarded as `claude --model`). Accepts an alias such as `sonnet`/`opus`/`haiku` or a full model id. Leave empty to keep the agent's own default."
+          "markdownDescription": "**Receiver-side** default model for Anthropic Claude Code: the model it executes delegated tasks with (forwarded as `claude --model`). Accepts an alias such as `sonnet`/`opus`/`haiku` or a full model id. Leave empty to keep the agent's own default."
         },
         "agentMeshBridge.models.deepseekHarness": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Default model for bridge-launched DeepSeek Harness runs. DSH has no `--model` flag, so each run receives a generated profile overlay; this requires a configured provider route (`#agentMeshBridge.deepseekHarness.provider#`). Leave empty to keep the route's own model."
+          "markdownDescription": "**Receiver-side** default model for bridge-launched DeepSeek Harness runs. DSH has no `--model` flag, so each run receives a generated profile overlay; this requires a configured provider route (`#agentMeshBridge.deepseekHarness.provider#`). Leave empty to keep the route's own model."
+        },
+        "agentMeshBridge.initiatorModels.antigravity": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "**Sender-side** default model for Google Antigravity: the model its review/wake-up runs use after it dispatched a task (forwarded as `agy --model`). Configured separately from the receiver-side model so an agent's review runs can use a different model than the tasks it delegates. Leave empty to keep the agent's own model; the task ledger then reports the receiver-side default for the sender badge when one is set."
+        },
+        "agentMeshBridge.initiatorModels.codex": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "**Sender-side** default model for OpenAI Codex: the model its review/wake-up runs use after it dispatched a task (forwarded as the global `codex -c model=\"...\"`, valid for `exec resume` too). Configured separately from the receiver-side model so an agent's review runs can use a different model than the tasks it delegates. Leave empty to keep the agent's own model; the task ledger then reports the receiver-side default for the sender badge when one is set."
+        },
+        "agentMeshBridge.initiatorModels.claudeCode": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "**Sender-side** default model for Anthropic Claude Code: the model its review/wake-up runs use after it dispatched a task (forwarded as `claude --model`). Configured separately from the receiver-side model so an agent's review runs can use a different model than the tasks it delegates. Leave empty to keep the agent's own model; the task ledger then reports the receiver-side default for the sender badge when one is set."
+        },
+        "agentMeshBridge.initiatorModels.deepseekHarness": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "**Sender-side** default model for DeepSeek Harness: the model its review/wake-up runs use after it dispatched a task (applied as a one-run profile overlay, like receiver rounds). Configured separately from the receiver-side model, so DSH can review as `pro` while the tasks it delegates to other agents run on their own models. Leave empty to keep the agent's own model; the task ledger then reports the receiver-side default for the sender badge when one is set."
+        },
+        "agentMeshBridge.logDirectories.default": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Default base directory for storing agent execution and review logs. When empty, defaults to `~/.agent-mesh-bridge/logs`. Contains `worker_log/`, `reviewer_log/`, and `Archive/` subdirectories."
+        },
+        "agentMeshBridge.logDirectories.antigravity": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Custom base log storage directory for **Google Antigravity**. Contains `worker_log/` (raw and compacted execution logs), `reviewer_log/` (review logs), and `Archive/` (compressed task archives)."
+        },
+        "agentMeshBridge.logDirectories.codex": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Custom base log storage directory for **OpenAI Codex**. Contains `worker_log/`, `reviewer_log/`, and `Archive/` subdirectories."
+        },
+        "agentMeshBridge.logDirectories.claudeCode": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Custom base log storage directory for **Anthropic Claude Code**. Contains `worker_log/`, `reviewer_log/`, and `Archive/` subdirectories."
+        },
+        "agentMeshBridge.logDirectories.deepseekHarness": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Custom base log storage directory for **DeepSeek Harness**. Contains `worker_log/`, `reviewer_log/`, and `Archive/` subdirectories."
         },
         "agentMeshBridge.requireModelApproval": {
           "type": "boolean",
@@ -269,27 +329,42 @@
           "default": 1000,
           "description": "Maximum number of tasks stored in the persistent delegation ledger."
         },
+        "agentMeshBridge.archive.keepRecentTasks": {
+          "type": "number",
+          "default": 20,
+          "minimum": 1,
+          "markdownDescription": "How many newest tasks stay **hot** in the ledger. Older tasks that already reached `completed`/`failed` are auto-archived: only their read-only terminal summary (and lightweight metadata) is kept, while round prompts/outputs, reviewer logs, execution logs and native session ids are removed from the bridge. Set a large value to disable archival in practice. Bridge-side only: native CLI conversations are **not** deleted by archival (use **Delete Task** for the full purge)."
+        },
         "agentMeshBridge.contextCompaction": {
           "type": "boolean",
           "default": true,
           "markdownDescription": "Condense the previous round's bulky output once a later round has completed (lagged compaction). The current round always stays verbatim for review; the exact original is archived under `~/.agent-mesh-bridge/logs/` and remains readable with `get_round_raw_log`. Turn this off to keep every round verbatim in the ledger."
         },
+        "agentMeshBridge.reviewFlow": {
+          "type": "string",
+          "enum": [
+            "dedicated",
+            "legacy"
+          ],
+          "default": "dedicated",
+          "markdownDescription": "How NEW tasks are reviewed. `dedicated` (default): the bridge starts a fresh reviewer conversation which dispatches the task and later reviews the developer report; this allows the same agent on both ends as long as the reviewer and executor models differ. `legacy`: resume the requester's own conversation for review (the old behaviour, kept as a rollback switch). Existing tasks never change topology."
+        },
         "agentMeshBridge.concurrency.enabled": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Allow more than one delegated task round to run at the same time, one per workspace, up to `#agentMeshBridge.concurrency.maxConcurrentTasks#` mesh-wide. **OFF by default**: the mesh stays strictly single-flight (one round at a time). Even when ON, two tasks in the SAME workspace never overlap, and the file-scope gate, the single-task role lock and pause/delete cancellation are unchanged."
+          "markdownDescription": "Apply the configured best-effort concurrency limits when enabled. **OFF (default) means unlimited concurrency**, not single-flight. Tasks in the same workspace may overlap when their declared file scopes do not conflict. Scope checks, one active role per task, one active round per task, and pause/delete cancellation remain in force. Scope measurements use git snapshots and may observe changes from other concurrently running tasks."
         },
         "agentMeshBridge.concurrency.maxConcurrentTasks": {
           "type": "number",
           "default": 2,
           "minimum": 1,
-          "description": "Mesh-wide execution slots used when concurrency is enabled (each slot executes one task in one workspace). Ignored while concurrency is off."
+          "description": "Best-effort mesh-wide active task limit when concurrency is enabled. Ignored while concurrency is off. Counts are observed across processes but are not reserved atomically, so short-lived limit overshoots are possible."
         },
         "agentMeshBridge.concurrency.maxConcurrentPerAgent": {
           "type": "number",
           "default": 1,
           "minimum": 1,
-          "description": "How many task rounds a single agent may execute at the same time when concurrency is enabled. Ignored while concurrency is off."
+          "description": "Best-effort active task limit per agent when concurrency is enabled. Ignored while concurrency is off. Counts are observed across processes but are not reserved atomically, so short-lived limit overshoots are possible."
         },
         "agentMeshBridge.taskTimeoutMinutes": {
           "type": "number",
@@ -300,7 +375,7 @@
           "type": "number",
           "default": 10,
           "minimum": 1,
-          "markdownDescription": "How long a task may stay in `waiting_review` with **no live reviewer process** before the bridge treats the review as stalled: it records the failure (so the task shows \"检视卡住\" and exposes **Re-Review**) and schedules an automatic re-wake. Raise this if your reviewer's test runs routinely take longer than 10 minutes."
+          "markdownDescription": "How long a task may stay in `waiting_review` with **no live reviewer process** before the bridge treats the review as stalled: it records the failure (so the task shows \"检视卡住\" and exposes **Re-Review**) and schedules an automatic re-wake. Raise this if your reviewer's test runs routinely take longer than 10 minutes. When the automatic retry budget is exhausted, or the review is parked on a dependency the bridge cannot observe, the task becomes the terminal `review_failed` status (which releases its queue slot) with the concrete reason shown in the task tree and detail panel."
         },
         "agentMeshBridge.antigravityPath": {
           "type": "string",
