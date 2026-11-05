@@ -178,7 +178,7 @@ export class AgentDetector {
         candidates = this.getDeepSeekHarnessCandidatePaths();
         break;
       case 'vscode_chat':
-        return 'vscode_internal';
+        return null;
     }
 
     // Only a path that can actually be launched here counts as installed: on
@@ -203,18 +203,16 @@ export class AgentDetector {
       claude_code: 'Anthropic Claude Code',
       codex: 'OpenAI Codex',
       deepseek_harness: 'DeepSeek Harness',
-      vscode_chat: 'VSCode Copilot/Chat',
+      vscode_chat: 'GitHub Copilot · VS Code',
     };
 
     if (agent === 'vscode_chat') {
       const info: AgentInfo = {
         id: 'vscode_chat',
         name: names.vscode_chat,
-        status: 'online',
-        available: true,
-        executablePath: 'builtin',
-        authDetails: 'Builtin VSCode Session',
-        statusDetails: 'Ready',
+        status: 'offline',
+        available: false,
+        statusDetails: 'Requester only · Copilot sign-in and model status unknown',
         lastChecked: new Date().toISOString(),
       };
       this.cache[agent] = { info, timestamp: Date.now() };

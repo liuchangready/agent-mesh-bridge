@@ -39,6 +39,7 @@ import {
   ModelApprovalHandler,
   resolveDispatchModel,
 } from './model-approval';
+import { assertCanExecute } from './agent-capabilities';
 
 export class AsyncDispatcher {
   private taskStore: TaskStore;
@@ -111,6 +112,7 @@ export class AsyncDispatcher {
     } else {
       targetAgent = params.targetAgent;
     }
+    assertCanExecute(targetAgent, 'receive delegated work');
 
     const callerFromEnv = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
     // Who is speaking for itself here. `undefined` means the caller identity is
@@ -121,7 +123,12 @@ export class AsyncDispatcher {
     // Review topology is pinned per task. Dedicated needs a long-lived host to
     // launch the reviewer bootstrap, so a standalone MCP process falls back to
     // legacy instead of creating a task nobody could dispatch.
-    const reviewFlow = resolveReviewFlow(params.reviewFlow, readBridgePolicy().reviewFlow);
+    const reviewFlow = params.requesterContext
+      ? 'dedicated'
+      : resolveReviewFlow(params.reviewFlow, readBridgePolicy().reviewFlow);
+    if (params.requesterContext && !TaskSupervisor.isSupervisorActive()) {
+      throw new Error('Copilot submissions require the local VS Code reviewer host to be active.');
+    }
 
     // Same-agent dispatch is allowed ONLY with the dedicated reviewer: the
     // reviewer gets its own fresh conversation, so it can never collide with the
@@ -147,7 +154,7 @@ export class AsyncDispatcher {
       params.callerSessionId && isValidSessionId(params.callerSessionId)
         ? params.callerSessionId
         : undefined;
-    if (!callerSessionId && this.detector) {
+    if (!callerSessionId && this.detector && !params.requesterContext) {
       callerSessionId = this.detector.detectActiveSession(initiatorAgent, repositoryPath, [
         receiverSessionId,
       ]);
@@ -236,9 +243,16 @@ export class AsyncDispatcher {
         ? {
             reviewFlow,
             requesterSessionId: callerSessionId,
-            requesterAgent: initiatorAgent,
-            requesterModel: initiatorModel.model,
-            requesterModelSource: initiatorModel.source,
+            requesterAgent: params.requesterContext?.agent || initiatorAgent,
+            requesterModel: params.requesterContext ? undefined : initiatorModel.model,
+            requesterModelSource: params.requesterContext ? 'none' : initiatorModel.source,
+            ...(params.requesterContext
+              ? {
+                  requesterBinding: params.requesterContext.binding,
+                  requesterSubmissionId: params.requesterContext.submissionId,
+                  requesterSubmissionFingerprint: params.requesterContext.fingerprint,
+                }
+              : {}),
             reviewerModel,
             reviewerModelSource: reviewerModel ? ('sender-configured' as const) : ('none' as const),
             reviewBootstrap: { phase: 'pending' as const, attempts: 0 },

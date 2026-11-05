@@ -437,6 +437,7 @@ export interface TaskFinalSummary {
   rounds: number;
   mergeRequest?: MergeRequestInfo;
   reviewerAgent?: AgentId;
+  requesterAgent?: AgentId;
   reviewerModel?: string;
   executorAgent: AgentId;
   executorModel?: string;
@@ -601,6 +602,16 @@ export interface DelegationThread {
   requesterAgent?: AgentId;
   requesterModel?: string;
   requesterModelSource?: ModelResolutionSource;
+  requesterBinding?: {
+    kind: 'vscode-copilot';
+    hostInstanceId: string;
+    workspaceUri: string;
+    nativeWakeSupported: false;
+    notificationDelivery: 'vscode-ui';
+  };
+  /** Transport retry key, stored in the same per-thread atomic ledger record. */
+  requesterSubmissionId?: string;
+  requesterSubmissionFingerprint?: string;
 
   /**
    * Dedicated-reviewer mode only: the model the reviewer conversation runs on
@@ -759,6 +770,13 @@ export interface DispatchTaskParams {
    * when no extension host/supervisor is alive to run the reviewer bootstrap.
    */
   reviewFlow?: ReviewFlow;
+  /** Trusted host-only metadata; never accepted in an MCP tool schema. */
+  requesterContext?: {
+    agent: 'vscode_chat';
+    binding: NonNullable<DelegationThread['requesterBinding']>;
+    submissionId: string;
+    fingerprint: string;
+  };
 }
 
 /**

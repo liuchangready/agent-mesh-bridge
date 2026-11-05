@@ -40,7 +40,7 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     }
 
     const activeResolution = await this.resolver.resolveActiveAgent();
-    const agentsList: AgentId[] = ['antigravity', 'codex', 'claude_code', 'deepseek_harness'];
+    const agentsList: AgentId[] = ['antigravity', 'codex', 'claude_code', 'deepseek_harness', 'vscode_chat'];
 
     const items: AgentNodeItem[] = [];
     for (const agentId of agentsList) {
@@ -85,16 +85,21 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
         break;
     }
 
+    if (info.id === 'vscode_chat') {
+      statusText = 'Requester only · Copilot login/model unknown';
+      iconName = 'info';
+      iconColor = new vscode.ThemeColor('descriptionForeground');
+    }
     const item = new AgentNodeItem(
       `${info.name}${activeBadge}`,
       vscode.TreeItemCollapsibleState.Expanded,
       info,
     );
 
-    item.description = statusText;
+    item.description = info.id === 'vscode_chat' ? 'Requester only · Copilot login/model unknown' : statusText;
     const themeIcon = new vscode.ThemeIcon(iconName, iconColor);
     item.iconPath = themeIcon;
-    item.contextValue = `agent_node_${info.status}`;
+    item.contextValue = info.id === 'vscode_chat' ? 'agent_node_requester_only' : `agent_node_${info.status}`;
 
     // Sub-items
     const subItems: AgentNodeItem[] = [];
@@ -112,6 +117,7 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     //     Receiver and sender defaults are independent: the same agent may run
     //     on one model while executing delegated work and another while
     //     dispatching/reviewing (notably when it sends a task to itself).
+    if (info.id !== 'vscode_chat') {
     const receiverModel = resolveConfiguredModel(info.id, undefined, 'receiver');
     const receiverSub = new AgentNodeItem(
       `接收模型: ${receiverModel || 'Agent 默认'}`,
@@ -141,6 +147,12 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
       arguments: [item, 'initiator'],
     };
     subItems.push(initiatorSub);
+    } else {
+      const capability = new AgentNodeItem('Requester only · not an executor or reviewer', vscode.TreeItemCollapsibleState.None);
+      capability.description = 'GitHub Copilot sign-in and current model are unknown to the Bridge.';
+      capability.iconPath = new vscode.ThemeIcon('info');
+      subItems.push(capability);
+    }
 
     // 2. Rate limit / Exhaustion recovery time (if exhausted or has rateLimit info)
     if (info.rateLimit && (info.status === 'exhausted' || info.rateLimit.isExhausted)) {

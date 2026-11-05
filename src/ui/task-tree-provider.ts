@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { TaskStore } from '../bridge/task-store';
 import { DelegationThread, describeModelRouting, getModelRouting } from '../bridge/types';
 import { aggregateThreadTokenUsage, formatTokenCount } from '../bridge/token-usage-collector';
+import { isCopilotRequester } from '../copilot/copilot-projection';
 
 export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
   private _onDidChangeTreeData: vscode.EventEmitter<TaskTreeItem | undefined | void> =
@@ -45,7 +46,11 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
   }
 
   private createTaskTreeItem(thread: DelegationThread): TaskTreeItem {
-    const fromAbbr = this.formatAgentAbbr(thread.initiatorAgent);
+    const fromAbbr = thread.requesterAgent && !isCopilotRequester(thread)
+      ? `${this.formatAgentAbbr(thread.requesterAgent)} · reviewer ${this.formatAgentAbbr(thread.initiatorAgent)}`
+      : isCopilotRequester(thread)
+        ? `Copilot · reviewer ${this.formatAgentAbbr(thread.initiatorAgent)}`
+      : this.formatAgentAbbr(thread.initiatorAgent);
     const toAbbr = this.formatAgentAbbr(thread.targetAgent);
     const label = `[${fromAbbr} ➔ ${toAbbr}] ${thread.title}`;
 

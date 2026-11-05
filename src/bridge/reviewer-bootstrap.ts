@@ -29,6 +29,7 @@ import { TaskRoleLock } from './task-role-lock';
 import { TaskStore } from './task-store';
 import { bootstrapDir } from './task-summary';
 import { reviewerBootstrapLogPath } from './reviewer-log';
+import { assertCanExecute } from './agent-capabilities';
 import {
   DelegationThread,
   ReviewFlow,
@@ -374,6 +375,7 @@ export class ReviewerBootstrapService {
 
   /** Launch the fresh reviewer conversation and wait for its bootstrap turn. */
   private async launch(thread: DelegationThread): Promise<void> {
+    assertCanExecute(thread.initiatorAgent, 'bootstrap as a reviewer');
     const store = this.deps.taskStore;
     const root = this.deps.storageDir || path.dirname(store.getStoragePath());
     store.loadFromDisk();

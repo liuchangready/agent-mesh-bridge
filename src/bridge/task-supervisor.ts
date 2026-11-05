@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { EventEmitter } from 'events';
 import { TaskStore } from './task-store';
+import { assertCanExecute } from './agent-capabilities';
 import { AutonomousRunner, RunResult } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
 import { AgentDetector } from './agent-detector';
@@ -337,6 +338,7 @@ export class TaskSupervisor extends EventEmitter {
     this.taskStore.upsertTask(fresh);
   }
   public executeThreadRound(thread: DelegationThread, round: DelegationRound): Promise<void> {
+    assertCanExecute(thread.targetAgent, 'run a scheduled task round');
     if (this.activeTasks.has(thread.threadId)) {
       return this.activeTasks.get(thread.threadId)!;
     }

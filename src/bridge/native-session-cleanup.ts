@@ -84,7 +84,7 @@ export function collectThreadSessionRefs(thread: DelegationThread): NativeSessio
   const seen = new Set<string>();
 
   const add = (agent: AgentId, sessionId?: string | null) => {
-    // `vscode_chat` runs inside the editor and has no session store of its own.
+    // No supported API lets the bridge identify or clean up a native Copilot chat.
     if (agent === 'vscode_chat') return;
     const safe = toSafeSessionId(sessionId);
     if (!safe) return;
@@ -179,7 +179,7 @@ function cleanupSession(
         cleanupDshSession(home, env, ref.sessionId, entry);
         break;
       default:
-        // `vscode_chat` has no session store the bridge can reach.
+        // The bridge has no supported Copilot session cleanup contract.
         break;
     }
   } catch (e: any) {

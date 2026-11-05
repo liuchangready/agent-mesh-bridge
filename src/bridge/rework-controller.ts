@@ -37,6 +37,7 @@ import { appendCompactionProtocol, compactRoundBestEffort } from './context-comp
 import { readStoredRoundUsage } from './token-usage-collector';
 import { currentHead, changedFiles, commitTaskChanges } from './git-worktree';
 import { MergeCoordinator, MergeResult } from './merge-coordinator';
+import { assertCanExecute } from './agent-capabilities';
 
 export class ReworkController {
   private taskStore: TaskStore;
@@ -138,6 +139,7 @@ export class ReworkController {
       throw new Error(`Cannot request rework: task ${params.threadId} is paused; resume it first.`);
     }
     this.assertDedicatedReviewerReady(thread, 'request rework');
+    assertCanExecute(params.targetAgent || thread.targetAgent, 'receive rework');
     if (
       thread.reviewFlow === 'dedicated' && params.callerSessionId &&
       params.callerSessionId !== thread.reviewerSessionId
@@ -314,6 +316,7 @@ export class ReworkController {
     if (!thread) {
       throw new Error(`Task thread not found: ${threadId}`);
     }
+    assertCanExecute(overrides.targetAgent || thread.targetAgent, 'receive retried work');
 
     if (thread.archivedAt || thread.status === 'completed') {
       throw new Error(`Cannot retry task ${threadId}: completed or archived tasks are immutable.`);
@@ -428,6 +431,7 @@ export class ReworkController {
     if (!thread) {
       throw new Error(`Task thread not found: ${threadId}`);
     }
+    assertCanExecute(overrides.targetAgent || thread.targetAgent, 'resume work');
 
     if (thread.archivedAt) {
       throw new Error(`Cannot resume archived task ${threadId}; its rounds and sessions were archived.`);

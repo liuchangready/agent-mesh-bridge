@@ -26,6 +26,7 @@ import { applyReviewFailure, buildReviewWakeState, reopenFailedReview } from './
 import { detectRateLimitSignal } from './autonomous-runner';
 import { ReviewerLogWriter, createReviewerLogWriter } from './reviewer-log';
 import { cachedCodexResumeSupport, codexResumeArgument, extractCodexThreadId } from './codex-session';
+import { assertCanExecute } from './agent-capabilities';
 
 /**
  * How many times one task may wake its caller about failures.
@@ -419,6 +420,7 @@ export class CallbackManager extends EventEmitter {
     release: () => void,
     onChildPid?: (pid: number | undefined) => void,
   ): boolean {
+    assertCanExecute(thread.initiatorAgent, 'resume as a reviewer');
     const initiator = thread.initiatorAgent;
     const cwd = thread.workspacePath || process.cwd();
     // Wake the caller on its SENDER-side default model, which is configured
