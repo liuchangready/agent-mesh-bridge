@@ -159,6 +159,16 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'expectedFiles'));
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'allowNoScope'));
     assert.strictEqual(toolNames.length, 19);
+    assert.ok(dispatch.inputSchema.properties.modelRef, 'dispatch schema must expose the structured Group modelRef');
+  });
+
+  test('tools/call forwards structured modelRef into dispatcher validation', async () => {
+    const response = await mcpServer.handleRpcMessage({ jsonrpc: '2.0', id: 603, method: 'tools/call', params: {
+      name: 'dispatch_task', arguments: { targetAgent: 'codex', reviewFlow: 'legacy', title: 'Invalid structured route', prompt: 'run',
+        modelRef: { source: 'vscode-lm', vendor: 'vendor-test', id: 'model-test' } },
+    } });
+    assert.match(response.error.message, /structured Group Agent modelRef cannot be used for a CLI target/);
+    assert.equal(taskStore.getAllTasks().length, 0);
   });
 
   test('list_agent_models reports the receiver and sender defaults separately', async () => {

@@ -102,6 +102,41 @@ test('two broker processes racing for one request produce one durable run claim'
   }
 });
 
+test('concurrent publishers and result writers cannot replace an existing run or final response', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-mailbox-publish-race-'));
+  const oldHome = process.env.AGENT_MESH_BRIDGE_HOME;
+  process.env.AGENT_MESH_BRIDGE_HOME = root;
+  const host = { version: 1 as const, hostInstanceId: 'host-publish-race', generation: 6, pid: process.pid,
+    workspaceUri: 'file:///workspace', repositoryCommonDir: root, trusted: true as const, localDesktop: true as const, updatedAt: Date.now() };
+  const agent = 'copilot_group:11111111-2222-4333-8444-55555555555f' as const;
+  const modelRef = { source: 'vscode-lm' as const, vendor: 'vendor-publish', id: 'model-publish' };
+  const request = { runId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', threadId: 'thread_publish_race', round: 1,
+    role: 'developer' as const, agent, sessionId: 'session-publish-race', worktree: root, prompt: 'race', modelRef,
+    bindingSnapshot: { agentId: agent, revision: 1, source: 'vscode-lm' as const, modelRef }, isRework: false, timeoutMs: 5000 };
+  writeGroupAgentHost(host, root);
+  try {
+    const mailboxPath = JSON.stringify(path.resolve(__dirname, '../bridge/group-agent-mailbox.js'));
+    const runScript = `const m=require(${mailboxPath});const r=require(${JSON.stringify(path.resolve(__dirname, '../bridge/group-agent-registry.js'))});m.publishGroupAgentRun(${JSON.stringify(request)},r.loadGroupAgentHost());`;
+    const launch = (script: string) => childProcess.spawn(process.execPath, ['-e', script], { cwd: process.cwd(), env: { ...process.env, AGENT_MESH_BRIDGE_HOME: root }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const finish = (child: childProcess.ChildProcess) => new Promise<void>((resolve, reject) => {
+      let stderr = ''; child.stderr?.setEncoding('utf8').on('data', (chunk) => stderr += chunk);
+      child.once('error', reject); child.once('exit', (code) => code === 0 ? resolve() : reject(new Error(stderr)));
+    });
+    const publishers = [launch(runScript), launch(runScript)];
+    await Promise.all(publishers.map(finish));
+    const claimed = claimGroupAgentRuns(host, root);
+    assert.equal(claimed.length, 1);
+    const resultScript = `const m=require(${mailboxPath});m.publishGroupAgentResult(${JSON.stringify(request.runId)},${host.generation},{text:'one final',toolCallsCompleted:1,modelRequests:1});`;
+    await Promise.all([finish(launch(resultScript)), finish(launch(resultScript))]);
+    const response = JSON.parse(fs.readFileSync(path.join(root, 'group-agent-mailbox', 'responses', `${request.runId}.json`), 'utf8'));
+    assert.equal(response.result.text, 'one final');
+    assert.equal(groupAgentRunState(request.runId, root), 'terminal');
+  } finally {
+    if (oldHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME; else process.env.AGENT_MESH_BRIDGE_HOME = oldHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('mailbox client rejects a structurally inconsistent native usage result', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-mailbox-invalid-result-'));
   const oldHome = process.env.AGENT_MESH_BRIDGE_HOME;

@@ -4,6 +4,7 @@ import { randomUUID } from 'crypto';
 import { getBridgeHome } from './model-catalog';
 import { GroupAgentHost, isGroupAgentId, loadGroupAgentHost } from './group-agent-registry';
 import { DelegationThread, GroupAgentBindingSnapshot, GroupModelRef, TokenUsageMetrics } from './types';
+import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
 
 const MAX_REQUEST_BYTES = 128 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
@@ -62,8 +63,11 @@ function atomicWrite(file: string, value: unknown, exclusive = false): void {
   const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   fs.writeFileSync(temp, raw, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
   try {
-    if (exclusive && fs.existsSync(file)) throw Object.assign(new Error('Mailbox record already exists.'), { code: 'EEXIST' });
-    fs.renameSync(temp, file);
+    if (exclusive) {
+      // Linking a fully-written same-directory temp file publishes it atomically and never replaces an existing run record.
+      fs.linkSync(temp, file);
+      fs.unlinkSync(temp);
+    } else fs.renameSync(temp, file);
   } catch (error) {
     try { fs.unlinkSync(temp); } catch {}
     throw error;
@@ -117,7 +121,14 @@ function writeRunState(runId: string, state: 'accepted' | 'running' | 'terminal'
   const dir = path.join(ensure(root).states, runId);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const file = path.join(dir, `${state}.json`);
-  if (!fs.existsSync(file)) atomicWrite(file, { version: 1, runId, state, at: Date.now() }, true);
+  if (!fs.existsSync(file)) {
+    try { atomicWrite(file, { version: 1, runId, state, at: Date.now() }, true); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const existing = readJson<{ version: number; runId: string; state: string }>(file, 4096);
+      if (existing.version !== 1 || existing.runId !== runId || existing.state !== state) throw error;
+    }
+  }
 }
 
 export function groupAgentRunState(runId: string, root?: string): 'accepted' | 'running' | 'terminal' | 'unknown' | undefined {
@@ -202,7 +213,7 @@ export function publishGroupAgentResult(runIdValue: string, hostGeneration: numb
   if (result && !validResult(result)) throw new Error('Invalid Group Agent mailbox result.');
   const record = { version: 1, runId, hostGeneration, sequence: 1, completedAt: Date.now(), ...(result ? { result } : {}), ...(error ? { error: error.slice(0, 4000) } : {}) };
   if (Buffer.byteLength(JSON.stringify(record)) > MAX_RESPONSE_BYTES) throw new Error('Group Agent mailbox response exceeds its size limit.');
-  if (!fs.existsSync(file)) atomicWrite(file, record, true);
+  writeMailboxResponse(file, record);
   writeRunState(runId, 'terminal', root);
 }
 
@@ -213,8 +224,19 @@ export function publishGroupAgentFailure(runIdValue: string, hostGeneration: num
   const record = { version: 1, runId, hostGeneration, sequence: 1, completedAt: Date.now(), failure };
   if (Buffer.byteLength(JSON.stringify(record)) > MAX_RESPONSE_BYTES) throw new Error('Group Agent mailbox response exceeds its size limit.');
   const file = path.join(dirs.responses, `${runId}.json`);
-  if (!fs.existsSync(file)) atomicWrite(file, record, true);
+  writeMailboxResponse(file, record);
   writeRunState(runId, 'terminal', root);
+}
+
+function writeMailboxResponse(file: string, record: Record<string, unknown>): void {
+  try { atomicWrite(file, record, true); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    const existing = readJson<Record<string, unknown>>(file, MAX_RESPONSE_BYTES);
+    const candidate = { ...record, completedAt: existing.completedAt };
+    if (!(require('util').isDeepStrictEqual(existing, candidate)))
+      throw new Error('A conflicting final result already exists for this Group Agent run.');
+  }
 }
 
 export function cancelUnclaimedGroupAgentRun(runIdValue: string, reason: string, root?: string): boolean {
@@ -314,7 +336,11 @@ export class GroupAgentMailboxClient {
     const dirs = ensure(this.root);
     let pidSequence = 0;
     let stoppingAt: number | undefined;
+    const suspension = new HostSuspensionGuard({ tickMs: 100 });
+    suspension.start();
+    try {
     while (true) {
+        suspension.sync();
         const state = groupAgentRunState(runId, this.root);
         if (state === 'unknown') throw Object.assign(new Error('The Group Agent run stopped with an unknown outcome; inspect the worktree before retrying.'), { code: 'GROUP_AGENT_OUTCOME_UNKNOWN', interruption: { kind: 'paused', reason: 'The previous Group Agent executor could not confirm shutdown.', at: new Date().toISOString(), by: 'group-agent-mailbox' } });
         const currentHost = loadGroupAgentHost(this.root);
@@ -323,8 +349,9 @@ export class GroupAgentMailboxClient {
           const reason = generationChanged ? 'The Group Agent host generation changed; resume this task after the prior run has stopped.' : String(signal.reason || 'Group Agent run cancelled.');
           if (cancelUnclaimedGroupAgentRun(runId, reason, this.root)) throw Object.assign(new Error(reason), { interruption: { kind: /delete/i.test(reason) ? 'deleted' : 'paused', reason, at: new Date().toISOString(), by: 'group-agent-mailbox' } });
           publishGroupAgentCancel(runId, reason, this.root);
-          stoppingAt ??= Date.now();
-          if (Date.now() - stoppingAt >= 15_000) {
+          const activeNow = monotonicNowMs() - suspension.totalSuspendedMs();
+          stoppingAt ??= activeNow;
+          if (activeNow - stoppingAt >= 15_000) {
             markGroupAgentRunUnknown(runId, 'Cancellation was not acknowledged by the host executor.', this.root);
             throw Object.assign(new Error('Group Agent cancellation was not acknowledged; outcome is unknown and this session cannot be resumed safely.'), { code: 'GROUP_AGENT_OUTCOME_UNKNOWN', interruption: { kind: 'paused', reason: 'Executor stop was not confirmed.', at: new Date().toISOString(), by: 'group-agent-mailbox' } });
           }
@@ -354,6 +381,7 @@ export class GroupAgentMailboxClient {
           if (response.error) throw new Error(response.error);
           if (!validResult(response.result)) throw new Error('The Group Agent mailbox response has no valid result.');
           if (generationChanged) throw Object.assign(new Error('A late result from the previous Group Agent host generation was rejected.'), { code: 'GROUP_AGENT_STALE_GENERATION', interruption: { kind: 'paused', reason: 'Host generation changed before the result could be accepted.', at: new Date().toISOString(), by: 'group-agent-mailbox' } });
+          if (signal.aborted) throw Object.assign(new Error(String(signal.reason || 'Group Agent run cancelled before result acceptance.')), { interruption: { kind: 'paused', reason: String(signal.reason || 'Group Agent run cancelled before result acceptance.'), at: new Date().toISOString(), by: 'mailbox-client' } });
           return response.result;
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') { /* wait for host response */ }
@@ -361,6 +389,9 @@ export class GroupAgentMailboxClient {
         }
         await new Promise((resolve) => setTimeout(resolve, 100));
         }
+    }
+    } finally {
+      suspension.stop();
     }
   }
 }

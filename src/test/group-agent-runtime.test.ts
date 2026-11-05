@@ -8,6 +8,7 @@ import { GroupAgentRuntime, GroupAgentRuntimeError, GroupTurnResponse } from '..
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { saveGroupAgentConfig, writeGroupAgentHost } from '../bridge/group-agent-registry';
 import { CancellationRegistry } from '../bridge/cancellation-registry';
+import { assertGroupModelReady } from '../bridge/agent-capabilities';
 
 function git(cwd: string, ...args: string[]): string {
   return childProcess.execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -266,6 +267,30 @@ test('Group Agent receiver admission uses the developer role and does not requir
       else process.env.AGENT_MESH_BRIDGE_HOME = oldHome;
       fs.rmSync(root, { recursive: true, force: true });
     }
+});
+
+test('an approved but unprobed Group member model is still rejected at receiver admission', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-model-admission-'));
+  const oldHome = process.env.AGENT_MESH_BRIDGE_HOME;
+  process.env.AGENT_MESH_BRIDGE_HOME = root;
+  const groupUuid = '11111111-2222-4333-8444-555555555556';
+  const agent = `copilot_group:${groupUuid}` as const;
+  const ready = { source: 'vscode-lm' as const, vendor: 'vendor-a', id: 'ready-model' };
+  const unprobed = { source: 'vscode-lm' as const, vendor: 'vendor-a', id: 'other-member' };
+  saveGroupAgentConfig({ version: 1, updatedAt: Date.now(), agents: [{ id: agent, groupId: groupUuid, name: 'Group',
+    source: 'vscode-lm', enabled: true, toolsAuthorized: true, receiverReady: true, initiatorReady: false, revision: 1,
+    receiverModel: ready, models: [ready, unprobed] }] }, root);
+  writeGroupAgentHost({ version: 1, hostInstanceId: 'host-capability', generation: 1, pid: process.pid,
+    workspaceUri: 'file:///workspace', repositoryCommonDir: root, trusted: true, localDesktop: true, updatedAt: Date.now() }, root);
+  try {
+    assertGroupModelReady(agent, 'receiver', ready);
+    assert.throws(() => assertGroupModelReady(agent, 'receiver', unprobed), /no current receiver structured-tool probe/);
+    assert.throws(() => assertGroupModelReady(agent, 'receiver', { ...ready, vendor: 'another-vendor' }), /no current receiver structured-tool probe/);
+  } finally {
+    if (oldHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME;
+    else process.env.AGENT_MESH_BRIDGE_HOME = oldHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('Group Agent runner waits for executor shutdown on timeout and rejects a late final result', async () => {

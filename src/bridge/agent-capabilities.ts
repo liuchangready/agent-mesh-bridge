@@ -1,4 +1,4 @@
-import { AgentId, CliAgentId } from './types';
+import { AgentId, CliAgentId, GroupModelRef } from './types';
 import { isGroupAgentId, loadGroupAgentConfig, loadGroupAgentHost } from './group-agent-registry';
 
 export const EXECUTABLE_AGENTS = [
@@ -9,6 +9,19 @@ export const EXECUTABLE_AGENTS = [
 ] as const;
 export type ExecutableAgentId = (typeof EXECUTABLE_AGENTS)[number];
 export type AgentTaskRole = 'receiver' | 'initiator';
+
+export function assertGroupModelReady(agent: AgentId, role: AgentTaskRole, modelRef: GroupModelRef): void {
+  if (!isGroupAgentId(agent)) throw new Error(`Structured modelRef is only valid for a Group Agent, not ${agent}.`);
+  const binding = loadGroupAgentConfig()?.agents.find((entry) => entry.id === agent);
+  const configured = role === 'receiver' ? binding?.receiverModel : binding?.initiatorModel;
+  const ready = role === 'receiver' ? binding?.receiverReady : binding?.initiatorReady;
+  const same = configured?.source === modelRef.source && configured.id === modelRef.id &&
+    (configured.source === 'vscode-lm'
+      ? modelRef.source === 'vscode-lm' && configured.vendor === modelRef.vendor
+      : modelRef.source === 'openai-compatible' && configured.origin === modelRef.origin && configured.bindingRevision === modelRef.bindingRevision);
+  if (!binding?.enabled || !binding.toolsAuthorized || !ready || !same || !loadGroupAgentHost())
+    throw new Error(`Group Agent ${agent} model ${modelRef.source === 'vscode-lm' ? `${modelRef.vendor}/${modelRef.id}` : `${modelRef.id} (${modelRef.origin})`} has no current ${role} structured-tool probe and authorization. Select it for that role and complete the explicit capability check first.`);
+}
 
 export function canExecute(agent: AgentId): agent is ExecutableAgentId {
   return (EXECUTABLE_AGENTS as readonly string[]).includes(agent);

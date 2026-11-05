@@ -42,7 +42,7 @@ import {
   resolveDispatchGroupModelRef,
   resolveDispatchModel,
 } from './model-approval';
-import { assertCanExecute } from './agent-capabilities';
+import { assertCanExecute, assertGroupModelReady } from './agent-capabilities';
 import { isGroupAgentId, loadGroupAgentConfig } from './group-agent-registry';
 
 export class AsyncDispatcher {
@@ -112,7 +112,7 @@ export class AsyncDispatcher {
 
     if (!params.targetAgent || params.targetAgent === 'default') {
       const configuredGroupReceiver = loadGroupAgentConfig()?.defaultAgent;
-      if (configuredGroupReceiver) targetAgent = configuredGroupReceiver as AgentId;
+      if (configuredGroupReceiver && configuredGroupReceiver !== 'auto') targetAgent = configuredGroupReceiver as AgentId;
       else {
         const resolved = await this.resolver.resolveActiveAgent();
         targetAgent = resolved.agent;
@@ -202,13 +202,15 @@ export class AsyncDispatcher {
       const entry = loadGroupAgentConfig()?.agents.find((item) => item.id === targetAgent);
       if (!entry?.receiverModel || !entry.enabled || !entry.toolsAuthorized) throw new Error('The Group Agent has no enabled receiver model binding.');
       if (params.model) throw new Error('Group Agent model selection requires a structured modelRef; CLI model strings remain supported for CLI agents.');
-      if (params.modelRef && !entry.models?.some((member) => member.source === params.modelRef!.source && member.id === params.modelRef!.id &&
-          (member.source === 'vscode-lm' ? params.modelRef!.source === 'vscode-lm' && member.vendor === params.modelRef!.vendor : params.modelRef!.source === 'openai-compatible' && member.origin === params.modelRef!.origin && params.modelRef!.bindingRevision === member.bindingRevision)))
+      const sameRef = (left: GroupModelRef, right: GroupModelRef) => left.source === right.source && left.id === right.id &&
+        (left.source === 'vscode-lm' ? right.source === 'vscode-lm' && left.vendor === right.vendor : right.source === 'openai-compatible' && left.origin === right.origin && left.bindingRevision === right.bindingRevision);
+      if (params.modelRef && !sameRef(params.modelRef, entry.receiverModel) && !entry.models?.some((member) => sameRef(member, params.modelRef!)))
         throw new Error('The selected structured Group Agent modelRef is not a current member of this group binding.');
       if (entry.receiverModel.source === 'vscode-lm' && entry.source !== 'vscode-lm')
         throw new Error('The selected model source does not match this Group Agent.');
       if (entry.receiverModel.source === 'openai-compatible' && (entry.source !== 'openai-compatible' || entry.receiverModel.origin !== entry.baseUrl && entry.receiverModel.origin !== (entry.baseUrl ? new URL(entry.baseUrl).origin : '')))
         throw new Error('The selected endpoint model does not match this Group Agent origin.');
+      assertGroupModelReady(targetAgent, 'receiver', params.modelRef || entry.receiverModel);
       const groupResolution = await resolveDispatchGroupModelRef({
         targetAgent, requestedModelRef: params.modelRef, defaultModelRef: entry.receiverModel,
         requestedByUser: params.modelRequestedByUser === true, initiatorAgent, title: params.title,
@@ -217,7 +219,9 @@ export class AsyncDispatcher {
       targetModelRef = groupResolution.modelRef;
       modelResolution = { model: targetModelRef?.id, notice: groupResolution.notice, approval: groupResolution.approval };
       if (!targetModelRef) throw new Error('The user selected the Group Agent default, but that binding is no longer configured.');
+      assertGroupModelReady(targetAgent, 'receiver', targetModelRef);
     } else {
+      if (params.modelRef) throw new Error('A structured Group Agent modelRef cannot be used for a CLI target.');
       modelResolution = await resolveDispatchModel({
         targetAgent, requestedModel: params.model,
         requestedByUser: params.modelRequestedByUser === true,

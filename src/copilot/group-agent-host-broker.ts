@@ -7,6 +7,7 @@ import { GroupAgentHost, loadGroupAgentHost } from '../bridge/group-agent-regist
 import { TaskRoleLock } from '../bridge/task-role-lock';
 import { DelegationThread, isValidSessionId } from '../bridge/types';
 import { TaskStore } from '../bridge/task-store';
+import { assertGroupModelReady } from '../bridge/agent-capabilities';
 import {
   GroupAgentMailboxFailure, GroupAgentMailboxRequest, claimGroupAgentRuns, hasGroupAgentCancel, hasUnsettledGroupAgentRun,
   publishGroupAgentFailure, publishGroupAgentPid, publishGroupAgentResult,
@@ -82,6 +83,7 @@ export class GroupAgentHostBroker implements vscode.Disposable {
         JSON.stringify(request.modelRef) !== JSON.stringify(expectedModel) ||
         JSON.stringify(request.bindingSnapshot.modelRef) !== JSON.stringify(expectedModel))
       throw new Error('Group Agent request does not match the task’s pinned Agent and model snapshot.');
+    assertGroupModelReady(request.agent, initiator ? 'initiator' : 'receiver', request.modelRef);
     const binding = this.options.models.getAgentBinding(request.agent.slice('copilot_group:'.length));
     if (!binding?.enabled || !binding.toolsAuthorized || binding.source !== snapshot.source || binding.baseUrl !== snapshot.baseUrl)
       throw new Error('The Group Agent source or endpoint changed; explicitly retarget this task to rebind it.');

@@ -76,6 +76,14 @@ const CONTROL_TOOLS = new Set([
   'record_merge_request',
 ]);
 
+const groupModelRefSchema = {
+  type: 'object',
+  oneOf: [
+    { properties: { source: { const: 'vscode-lm' }, vendor: { type: 'string', minLength: 1, maxLength: 128 }, id: { type: 'string', minLength: 1, maxLength: 256 } }, required: ['source', 'vendor', 'id'], additionalProperties: false },
+    { properties: { source: { const: 'openai-compatible' }, id: { type: 'string', minLength: 1, maxLength: 256 }, origin: { type: 'string', minLength: 1, maxLength: 512 }, bindingRevision: { type: 'integer', minimum: 0 } }, required: ['source', 'id', 'origin', 'bindingRevision'], additionalProperties: false },
+  ],
+};
+
 export class MCPServer {
   private dispatcher: AsyncDispatcher;
   private reworkController: ReworkController;
@@ -407,6 +415,7 @@ export class MCPServer {
               description:
                 'Set true only when the user themselves named the model in `model` (e.g. "use deepseek flash"). Defaults to false, in which case a non-default `model` is ignored and the configured default is used. With true, the bridge shows the user a confirmation dialog; approval switches the task, "keep default" falls back, and no answer within 3 minutes aborts the dispatch.',
             },
+            modelRef: { ...groupModelRefSchema, description: 'Exact Group Agent model reference. Non-default references require modelRequestedByUser: true and the standard user approval.' },
             initiatorModel: {
               type: 'string',
               description:
@@ -478,6 +487,7 @@ export class MCPServer {
               description:
                 'Set true only when the user named this model; the bridge then asks them to confirm the switch.',
             },
+            modelRef: groupModelRefSchema,
           },
           required: ['threadId', 'feedback'],
         },
@@ -546,6 +556,7 @@ export class MCPServer {
               description:
                 'Set true only when the user named this model; the bridge then asks them to confirm the switch.',
             },
+            modelRef: groupModelRefSchema,
           },
           required: ['threadId'],
         },
@@ -576,6 +587,7 @@ export class MCPServer {
               description:
                 'Set true only when the user named this model; the bridge then asks them to confirm the switch.',
             },
+            modelRef: groupModelRefSchema,
           },
           required: ['threadId'],
         },
@@ -1179,6 +1191,7 @@ export class MCPServer {
           callerSessionId: args.callerSessionId,
           workspacePath: args.workspacePath,
           model: args.model,
+          modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
           initiatorModel: args.initiatorModel,
         });
@@ -1217,6 +1230,7 @@ export class MCPServer {
           callerSessionId: args.callerSessionId,
           targetAgent: args.targetAgent,
           model: args.model,
+          modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
         });
         // Reviewer decision submitted: hand the task role over to the
@@ -1245,6 +1259,7 @@ export class MCPServer {
         return this.reworkController.resumePausedTask(args.threadId, {
           targetAgent: args.targetAgent,
           model: args.model,
+          modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
         });
       }
@@ -1254,6 +1269,7 @@ export class MCPServer {
           threadId: args.threadId,
           targetAgent: args.targetAgent,
           model: args.model,
+          modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
           reason: args.reason,
           by: (process.env.MESH_CALLER_AGENT as string) || 'caller',
@@ -1582,7 +1598,9 @@ export class MCPServer {
               configuredModelRef: receiver || null,
               initiatorModel: initiator?.id || null,
               initiatorModelRef: initiator || null,
-              models: receiver ? [{ id: receiver.id, hint: 'configured default', modelRef: receiver }] : [],
+              models: (entry.models || [])
+                .map((modelRef: any) => ({ id: modelRef.id, modelRef, ...(modelRef.source === 'vscode-lm' ? { vendor: modelRef.vendor } : { origin: modelRef.origin }), ...(JSON.stringify(modelRef) === JSON.stringify(receiver) ? { hint: 'configured default' } : { capability: 'unknown until explicitly probed for this role' }) }))
+                .sort((left: any, right: any) => Number(right.hint === 'configured default') - Number(left.hint === 'configured default')),
               source: entry.source,
               capability: {
                 receiver: entry.receiverReady && !!host ? 'ready' : 'unknown',

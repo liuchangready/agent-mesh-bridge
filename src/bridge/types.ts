@@ -838,6 +838,7 @@ export interface ModelApprovalRecord {
 export interface ExecutorOverride {
   targetAgent?: AgentId;
   model?: string;
+  modelRef?: GroupModelRef;
   /** The user named this model (see the model-approval rule). */
   modelRequestedByUser?: boolean;
 }
@@ -851,6 +852,8 @@ export interface TaskRetargetRecord {
   toAgent: AgentId;
   fromModel?: string;
   toModel?: string;
+  fromModelRef?: GroupModelRef;
+  toModelRef?: GroupModelRef;
   /** Native session dropped because a different agent cannot resume it. */
   previousReceiverSessionId?: string;
   sessionReset: boolean;
