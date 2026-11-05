@@ -4,6 +4,7 @@ import * as os from 'os';
 import { AgentId } from './types';
 import { AgentDetector } from './agent-detector';
 import { getDshSessionsDir } from './deepseek-harness';
+import { assertCanExecute } from './agent-capabilities';
 
 export class ActiveAgentResolver {
   private manualOverride: AgentId | null = null;
@@ -14,6 +15,7 @@ export class ActiveAgentResolver {
   }
 
   public setManualOverride(agent: AgentId | null): void {
+    if (agent) assertCanExecute(agent, 'be selected as the default receiver');
     this.manualOverride = agent;
   }
 

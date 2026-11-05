@@ -38,6 +38,7 @@ import {
   resolveDispatchModel,
 } from './model-approval';
 import { normalizeModelId, resolveConfiguredModel } from './model-catalog';
+import { assertCanExecute } from './agent-capabilities';
 
 export interface RetargetTaskParams extends ExecutorOverride {
   threadId: string;
@@ -101,6 +102,7 @@ export class TaskRetargetService {
       .slice(-1)[0];
 
     const nextAgent: AgentId = params.targetAgent || initialTargetAgent;
+    assertCanExecute(nextAgent, 'be selected as a task receiver');
 
     const agentChanged = nextAgent !== initialTargetAgent;
     const requested = normalizeModelId(params.model);

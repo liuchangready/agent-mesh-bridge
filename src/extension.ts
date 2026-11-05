@@ -25,6 +25,9 @@ import { TaskControlService } from './bridge/task-control';
 import { TaskArchiveService } from './bridge/task-archive';
 import { ReviewerBootstrapService } from './bridge/reviewer-bootstrap';
 import { TaskExecutionRegistry } from './bridge/task-execution-registry';
+import { registerCopilotMcpProvider } from './copilot/copilot-mcp-provider';
+import { isCopilotRequester } from './copilot/copilot-projection';
+import { claimCopilotTerminalNotification } from './copilot/copilot-notifications';
 import { saveBridgePolicy, AgentLogDirectories } from './bridge/bridge-policy';
 import { probeCodexResumeSupport } from './bridge/codex-session';
 import {
@@ -128,6 +131,7 @@ const AGENT_LABELS: Record<AgentId, string> = {
 
 export function activate(context: vscode.ExtensionContext) {
   console.log('[Agent Mesh Bridge] Activating extension...');
+  const copilotHostInstanceId = registerCopilotMcpProvider(context);
 
   // Which build is actually rendering the UI?
   //
@@ -554,9 +558,14 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Track completed tasks to announce when a task transitions to completed
   const knownCompletedThreadIds = new Set<string>();
+  const knownCopilotTerminalStates = new Set<string>();
   for (const t of taskStore.getAllTasks()) {
     if (t.status === 'completed') {
       knownCompletedThreadIds.add(t.threadId);
+    }
+    if (t.requesterBinding?.hostInstanceId === copilotHostInstanceId &&
+        ['completed', 'failed', 'review_failed'].includes(t.status)) {
+      knownCopilotTerminalStates.add(`${t.threadId}:${t.status}`);
     }
   }
 
@@ -573,6 +582,17 @@ export function activate(context: vscode.ExtensionContext) {
 
     const taskList = Array.isArray(allTasks) ? allTasks : taskStore.getAllTasks();
     for (const t of taskList) {
+      if (isCopilotRequester(t)) {
+        if (claimCopilotTerminalNotification(t, copilotHostInstanceId, knownCopilotTerminalStates)) {
+          void vscode.window.showInformationMessage(
+            `[Agent Mesh Bridge] Copilot request “${t.title}” ${t.status}. Open the Bridge task details for the summary.`,
+            'View Details',
+          ).then((choice) => {
+            if (choice === 'View Details') TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, t.threadId);
+          }, (error: unknown) => console.warn('[Agent Mesh Bridge] Copilot task notification failed:', error));
+        }
+        continue;
+      }
       if (t.status === 'completed' && !knownCompletedThreadIds.has(t.threadId)) {
         knownCompletedThreadIds.add(t.threadId);
         const lastRound = t.rounds && t.rounds[t.rounds.length - 1];
