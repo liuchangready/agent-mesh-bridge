@@ -29,6 +29,7 @@ export type ThreadStatus =
   | 'queued'
   | 'running'
   | 'waiting_review'
+  | 'waiting_merge'
   | 'reworking'
   | 'paused'
   | 'review_failed'
@@ -325,8 +326,7 @@ export interface DelegationRound {
   assessment?: ResponseAssessment;
   /**
    * Files this round actually changed (workspace-relative), measured with a git
-   * status probe bracketing the run. Complements the caller's declared
-   * `expectedFiles`, which may be missing or incomplete.
+   * status probe bracketing the run. This is observation data only.
    */
   touchedFiles?: string[];
   /**
@@ -405,7 +405,7 @@ export type ReviewBootstrapPhase =
  * its first turn only calls `dispatch_task` with a one-time bootstrap token. The
  * developer round starts only after the token confirms, the reviewer process
  * has exited, and its native session id has been durably captured. Other tasks
- * may run concurrently when scope and configured limits permit.
+ * may run concurrently when configured task limits permit.
  */
 export interface ReviewerBootstrapState {
   phase: ReviewBootstrapPhase;
@@ -448,15 +448,30 @@ export interface TaskFinalSummary {
 /**
  * Metadata for a task that ran in a temporary git worktree.
  *
- * `mergePending` means "this task produced work that is not on the main line
- * yet": it is set once the task completes without a merge request and cleared
- * when the caller records one. Nothing is auto-merged in this phase.
+ * `integration` records bridge-managed local integration into the shared batch
+ * ref. An MR is separate remote-delivery metadata and never changes this state.
  */
 export interface WorktreeInfo {
   /** Absolute path of the temporary worktree the agent edited. */
   path: string;
   /** Absolute path of the main checkout the worktree belongs to. */
   mainPath: string;
+  commonDir?: string;
+  repositoryPath?: string;
+  targetRef?: string;
+  taskBranch?: string;
+  headCommit?: string;
+  approvedCommit?: string;
+  integration?: {
+    phase: 'ready' | 'no_changes' | 'waiting' | 'merging' | 'conflict' | 'validation_failed' | 'merged';
+    sourceCommit?: string;
+    targetOldCommit?: string;
+    candidateCommit?: string;
+    mergedCommit?: string;
+    error?: string;
+    conflictFiles?: string[];
+    updatedAt: string;
+  };
   /** Branch the worktree was based on / will be merged from. */
   branch?: string;
   /** Commit the worktree was created from. */
@@ -465,19 +480,9 @@ export interface WorktreeInfo {
   mergePending?: boolean;
 }
 
-/**
- * Caller-supplied worktree declaration on `dispatch_task`.
- *
- * `path` is not repeated here: it is exactly the task's `workspacePath`, so the
- * two can never disagree.
- */
-export interface DispatchWorktreeSpec {
-  /** Main checkout the temporary worktree must eventually merge back into. */
-  mainPath: string;
-  /** Branch the worktree was created from (recorded for the merge audit). */
-  branch?: string;
-  /** Commit the worktree was created from (recorded for the merge audit). */
-  baseCommit?: string;
+/** Metadata written by the isolated-worktree lifecycle introduced by the bridge. */
+export function isIsolatedTaskWorktree(worktree?: WorktreeInfo): worktree is WorktreeInfo & { targetRef: string; taskBranch: string; baseCommit: string; repositoryPath: string; commonDir: string } {
+  return !!worktree?.targetRef && !!worktree.taskBranch && !!worktree.baseCommit && !!worktree.repositoryPath && !!worktree.commonDir;
 }
 
 /**
@@ -542,7 +547,7 @@ export interface ReviewBlockInfo {
  * reviewer is working and nothing will ever move it without human action.
  *
  * Terminal semantics (identical to `failed` for scheduling): the task releases
- * the global queue slot and no longer blocks the file-scope gate; re-review /
+ * the global queue slot; re-review /
  * request_rework / retry / approve all re-open it.
  */
 export interface ReviewFailure {
@@ -566,7 +571,7 @@ export interface DelegationThread {
   title: string; // Brief title, e.g. "Fix TCP cursor drift"
   initiatorAgent: AgentId; // Initiator (Caller A)
   targetAgent: AgentId; // Receiver (Target B)
-  status: ThreadStatus; // Lifecycle status ('queued' while waiting for the one global execution slot or an exact same-file conflict)
+  status: ThreadStatus; // Lifecycle status; each task has its own isolated Git worktree.
   currentRound: number; // Current round (1: initial, 2+: rework)
   createdAt: string; // ISO8601 creation timestamp
   updatedAt: string; // ISO8601 update timestamp
@@ -708,27 +713,10 @@ export interface DelegationThread {
   mergeRequest?: MergeRequestInfo;
 
   /**
-   * Temporary git worktree the task was executed in, when it was not run
-   * directly in `workspacePath`.
-   *
-   * The bridge never creates or removes a worktree in this phase: it only keeps
-   * the metadata and refuses to let the成果 die with the temporary directory.
-   * A completed task whose worktree has no recorded merge request stays
-   * `mergePending`, and `delete_task` refuses it until the caller records the MR
-   * (or explicitly forces the deletion).
+   * Isolated task worktree and local integration transaction. The target ref is
+   * a bridge-managed batch branch; MR metadata records remote delivery only.
    */
   worktree?: WorktreeInfo;
-
-  // File scope for conflict detection and queueing
-  expectedFiles?: string[]; // Concrete code files (directories/globs are rejected at dispatch)
-
-  /**
-   * Caller explicitly allowed this task to touch files another open task already
-   * changed. Without it, a scope overlap keeps the task queued.
-   */
-  scopeOverride?: boolean;
-  /** Why this task is parked by the scope gate (cleared once it can start). */
-  scopeBlockedBy?: { threadId: string; title?: string; files: string[] };
 
   // Summary for fast sidebar rendering
   summary: ThreadSummary;
@@ -766,37 +754,11 @@ export interface DispatchTaskParams {
    */
   initiatorModel?: string;
   /**
-   * Concrete code file paths expected to be modified. Directories and glob
-   * patterns are rejected so the lock scope stays per-file.
-   *
-   * Required by `dispatch_task` unless the caller passes `allowNoScope`: the
-   * scope is what lets the bridge refuse to start a task on a file another open
-   * task already changed.
-   */
-  expectedFiles?: string[];
-  /** Caller confirms this task touches no workspace file (or refuses to declare). */
-  allowNoScope?: boolean;
-  /**
    * Override the review topology for this task (tests/internal callers only).
    * Omitted = mirrored policy (`bridge-policy.json`), falling back to legacy
    * when no extension host/supervisor is alive to run the reviewer bootstrap.
    */
   reviewFlow?: ReviewFlow;
-  /** Caller accepts running on top of files another open task already changed. */
-  allowScopeOverlap?: boolean;
-  /**
-   * Declare that `workspacePath` points at a TEMPORARY git worktree rather than
-   * the main checkout. The bridge then records the merge-back obligation: the
-   * task cannot be deleted until a merge request is recorded (unless forced),
-   * so work that only exists in the throwaway checkout cannot be lost.
-   */
-  worktree?: DispatchWorktreeSpec;
-  /**
-   * Reject the dispatch when `expectedFiles` is empty and `allowNoScope` is not
-   * set. Enabled by the MCP layer (agent callers must declare a scope); internal
-   * callers and tests keep the lenient behaviour.
-   */
-  requireScope?: boolean;
 }
 
 /**
@@ -910,7 +872,7 @@ export interface ApproveTaskParams {
 
 export interface ApproveResult {
   threadId: string;
-  status: 'COMPLETED';
+  status: 'WAITING_MERGE' | 'COMPLETED';
   message: string;
 }
 
@@ -1131,7 +1093,7 @@ export function isReviewerBootstrapPending(thread: DelegationThread): boolean {
 
 /**
  * Legacy compatibility helper. Runtime scheduling must not use a global FIFO
- * queue head: candidates are admitted independently subject to scope, role,
+ * queue head: candidates are admitted independently subject to role,
  * per-thread round, bootstrap handoff, and optional concurrency limits.
  */
 export function findQueueHead(tasks: DelegationThread[]): DelegationThread | undefined {
@@ -1147,7 +1109,12 @@ export function findQueueHead(tasks: DelegationThread[]): DelegationThread | und
  * in a throwaway directory, so the task must not be deleted as if it were noise.
  */
 export function isMergePending(thread: DelegationThread): boolean {
-  return !!thread?.worktree && thread.status === 'completed' && !thread.mergeRequest;
+  const state = thread?.worktree?.integration?.phase;
+  if (!thread?.worktree || state === 'merged' || state === 'no_changes') return false;
+  return thread.status === 'waiting_merge' || thread.worktree.approvedCommit !== undefined ||
+    (!!thread.worktree.baseCommit && !!thread.worktree.path && !['completed', 'review_failed', 'archived'].includes(thread.status)) ||
+    state === 'ready' || state === 'waiting' || state === 'merging' || state === 'conflict' || state === 'validation_failed' ||
+    thread.status === 'completed';
 }
 
 /**

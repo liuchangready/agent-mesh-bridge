@@ -14,9 +14,9 @@
   3. **接收方原生留痕**：执行必须携带原生会话参数（`--session-id` / `--conversation` / `--session-id <dsh>`），确保在接收方原生历史可查。
   4. **异步非阻塞回调**：发起方下发任务后立即结束当前 Turn（不长轮询等待），任务完成后插件主动唤醒发起方原会话继续。
   5. **同会话多轮返修**：A 对 B 结果不满意时，调用 `request_rework` 在 B 的**同一个原生会话中继续修改**，多轮迭代直至 A 认可。
-  6. **1000 条任务账本**：持久化保留最新 1,000 条任务，展示 `A -> B 标题 摘要`，支持查看完整多轮时间轴与代码 Diff。
+  6. **1000 条任务账本**：容量上限 1,000 条；仅安全终态可淘汰，未合入成果保留，容量无安全淘汰对象时拒绝新任务。
   7. **全自动无人值守 (`skip-danger`)**：严格配置免交互与权限旁路参数，关闭标准输入，杜绝后台卡死。
-  8. **并发执行与 scope 隔离（当前策略，替代旧全局串行铁律）**：网格不存在全局执行锁或按 workspace 串行锁。同一 workspace 的不同任务可并发；仅 scope 冲突、同一任务单轮不变量、任务角色锁和可选并发限额会阻止启动。`TaskExecutionRegistry` 只登记线程、轮次、workspace、agent 与 PID，不互斥；旧 `execution.lock` / `leases` 只能用于同一 thread 的历史恢复或定向停止，不得阻挡其他 thread 启动。并发限额跨进程是 best-effort 观测，不是原子预留。
+  8. **并发与 Git 隔离**：每个新代码任务在唯一 `mesh/task/<threadId>` 分支和独立 worktree 中执行；同一仓库任务可以并发修改同一文件。共享批次集成 ref 基于来源仓库身份固定，任务从其最新已提交 SHA 起步；用户 checkout 与未提交改动不参与任务输入。`touchedFiles` 仅作观测审计，不用于调度。
   9. **接收方禁止转发（当前策略）**：被派发的 Agent（receiver）只执行当前任务并回传结果，**不得**调用 `dispatch_task` / `invoke_agent` 把工作再转给其他 Agent，也不得驱动自己任务的 review 闭环。接收方进程由 `MESH_TASK_RECEIVER=1` 标记，MCP server 会隐藏并拒绝转发类工具。
   10. **权限旁路不可失效**：拆分/派发出去的任务必须真正无人值守。Codex 的 `--ask-for-approval` 是**全局参数，必须放在 `exec` 之前**；DSH 必须注入 `DSH_PERMISSION_MODE=danger-full-access`（否则 headless 默认 `workspace-write` + `approval: ask`，任务会卡在无人应答的权限询问上）。
   11. **可暂停、可删除、可追溯**：运行中的任务必须可以暂停（终止 Agent 进程并保留当前轮次以便恢复）、可以删除（先终止进程，再移除账本条目）；暂停、停止、看门狗、超时等非正常结束必须在 `thread.interruption` / `round.interruption` 中记录 `{ kind, reason, at, by }`，且保留 `interruptions[]` 历史。
@@ -24,15 +24,7 @@
       - 角色锁存于 `~/.agent-mesh-bridge/roles/<threadId>.json`，带心跳与僵尸回收。
       - reviewer 在 `request_rework` / `approve_task` 成功时视为完成交接并释放角色；developer 轮次结束后、唤醒 reviewer 前释放 developer 角色。
       - 中断后**不得新建任务或另起会话**：必须沿用同一 `threadId`、同一 `receiverSessionId` / `callerSessionId`，并基于账本中的历轮指令、开发报告、返修意见（中间文档链）继续。
-  13. **候选独立调度（替代旧任务级 FIFO 铁律）**：每个可执行轮次独立参与调度，不存在单一队头或全局任务槽；`paused`、`waiting_review`、blocked review、bootstrap pending 任务不得阻挡 scope 无关的候选。
-      - 当候选遇到 scope 冲突、同 thread 角色占用或启用的并发限额时，标记为等待并继续检查后续候选，不得因较早任务停滞而停止整个扫描。
-      - `completed`、`failed`、`review_failed` 视为终止态；`failed` / `review_failed` 不长期阻塞历史任务，重试或重新检视后会重新占用队列。
-      - **`review_failed`（检视失败）是独立终态**：receiver 已交付但没有任何检视方给出结论，且桥接不会再自动唤醒。触发条件只有 `reviewWake.gaveUp === true` 的两类：自动重试预算耗尽（`retries_exhausted`），以及看门狗判定「挂起在不可观测依赖上」（`unresolvable_park`）。写入时必须同时记录 `thread.reviewFailure = { kind, reason, at, round, by, agent?, wake? }`，原因不得为空、不得只写「失败」；任务树/详情面板显示原因。该状态与 `failed` 一样**释放队列槽与 scope 闸门**；恢复只能显式进行——「重新检视（`wakeUpCaller`，会先 `reopenFailedReview()` 回到 `waiting_review` 再唤醒原会话）」「`request_rework` / `retry_task`」「`approve_task`」，`reviewFailure` 保留为审计历史。`completed` 永远不会被迟到的失败报告降级。
-      - queued 候选的顺序只用于稳定、单向仲裁 scope 相同的尚未启动任务（按 `createdAt`、再按 `threadId`）；已运行/有 touchedFiles 的任务不论新旧都作为 scope owner。`findQueueHead()` 只保留兼容用途，不得用于运行时启动闸门。
-      - 新任务派发时，只有实际 scope 冲突或启用限额达到上限时才返回 `QUEUED`，并说明具体阻塞任务或限额。
-      - 任务被 approve / delete 后，队列自动推进到下一个任务；无需手动唤醒。
-      - **检视挂起（blocked）不是新状态**：检视方用 `request_rework(..., blocked=true)` 主动挂起时，任务**保持 `waiting_review`**（不新增轮次）；它不占全局/ workspace 槽，不阻挡 scope 无关任务，只继续保护自己声明/触及的 scope。只把依赖与理由写进 `thread.reviewBlocked`；任务树显示 `Parked Review · 已挂起` 与等待的依赖，详情面板给出依赖、理由和「重新检视（解除挂起）」入口（`wakeUpCaller` 会先清掉 `reviewBlocked` 再唤醒）。`reviewBlocked` **无 `waitingForThreadId`**、或依赖线程**已从账本删除**属于不可恢复挂起：看门狗必须把它转成可见的终态停滞（`reviewWake.kind='timeout'` + `gaveUp`，不自动重试）并清掉死挂起，绝不静默跳过。
-
+  13. **候选独立调度**：每个可执行轮次独立参与调度；只有同任务角色、bootstrap、明确启用的并发限额会阻止启动。暂停、待检视、返修和 bootstrap pending 不阻挡其他任务。并发工作目录隔离由 Git worktree 保证，不按文件范围排队。`review_failed` 仅在重试预算耗尽或不可恢复挂起时进入，释放调度资源；只有本地集成成功或 no_changes 的任务可归档/淘汰。
   14. **MR 收口由调用者完成**：任务（或同一批任务）验收通过后，由**调用者/检视方**统一合成一个 MR 并同步远端；开发者(receiver)不负责提交/推送。
       - 调用者汇总该任务及同批尚未推送的改动，只创建一个 MR，使用仓库既有远端与 `gh` / `glab` / 等价 CLI 推送。
       - 推送后必须调用 `record_merge_request(threadId, url, branch, commit, remote, status, summary)` 把 MR 信息写回账本。
@@ -48,13 +40,7 @@
       - `RunResult.assessment` 必须持久化到 `round.assessment`，字段包括 `success`、`errorCode`、`exitCode`、`warnings[]`、`stream.{chunkCount, stdoutBytes, stderrBytes, firstOutputAtMs, lastOutputAtMs, maxGapMs, rawMaxGapMs, excludedSuspensionMs, suspensionCount, gapThresholdMs, hasActualOutput, continuous, gapExceeded}`。
       - 任何 `exitCode === 0` 但不能提取实际输出（例如只有 JSON status/metadata）的轮次必须判定为 `failed`，不得进入 `waiting_review`，更不得唤醒 reviewer。
 
-  17. **文件归属互斥（scope gate，硬不变量）**：并发运行时同一 git workspace 的快照会看到其他任务写入，单轮 `touchedFiles` 不能可靠归因给单个 Agent。因此：
-      - `dispatch_task` 必须声明 `expectedFiles`（具体代码文件）；确实不触碰工作区文件的，显式传 `allowNoScope: true`。
-      - 每个轮次用 git probe 测量观察到的工作区变化（`git status --porcelain -z` 前后快照 + HEAD 变化），写入 `round.touchedFiles`。并发任务的变更可能同时出现在快照中；该数据是观测记录，不保证精确归因，申报范围外变更也不能作为可靠的单任务归属证明。
-      - 任何轮次启动前必须执行 `findScopeConflicts()`：候选任务的 `expectedFiles` 与其他**未收口任务**的 `expectedFiles ∪ touchedFiles` 有交集时**不得启动**，置 `queued` 并把冲突方与文件写入 `thread.scopeBlockedBy`。
-      - 「未收口」= 未完成（`queued`/`running`/`reworking`/`waiting_review`/`paused`），或已完成但**没有** `mergeRequest` 且在 `SCOPE_BLOCK_WINDOW_MS`（24h）内；`failed` / `review_failed` 不再阻塞。
-      - 放行只能通过 `allow_scope_overlap(threadId)`（或派发时 `allowScopeOverlap: true`），任务树显示 `⛔scope`、详情面板显示冲突文件。
-
+  17. **每任务独立 Git worktree**：新代码任务记录仓库身份、来源目录、固定集成 ref、base/head/approved SHA、任务分支和 worktree；bootstrap、执行、检视、返修、重试与恢复始终使用同一 worktree。旧任务无隔离元数据时维持旧语义，不猜归属、不自动迁移；非 Git 或无有效 HEAD 时拒绝派发。开发退出后桥接创建本地交付提交，审核绑定固定提交；批准进入 `waiting_merge`，无改动任务用 `no_changes` 完成。全 mesh 文件锁在读取目标 SHA 前获取，覆盖三方合并、真实 compile/test、old-SHA ref 更新和账本持久化。冲突、验证失败或批准提交变化时回到原 reviewer 会话返修；MR 只代表远端交付。暂停/删除取消锁等待和验证；失败/暂停保留 worktree，丢弃未合入成果需 force，未合入任务不得归档或容量淘汰。
   18. **模型默认优先、非默认必须用户点击同意（硬不变量）**：接收方模型的选择权属于用户，不属于 caller。
       - **接收者默认与下发者默认分开配置（硬不变量）**：`agentMeshBridge.models.*` 是**接收者默认**（该 Agent 执行被派发任务时用的模型），`agentMeshBridge.initiatorModels.*` 是**下发者默认**（该 Agent 作为下发者/检视者被唤醒时用的模型）。两者分别写入 `~/.agent-mesh-bridge/model-config.json` 的 `models` / `initiatorModels`，互不覆盖：`saveModelDefaults()` 在未显式传 `initiatorModels` 时**不得**抹掉已存的下发者配置，清空某一侧设置必须真的清空该侧。下发者与接收者的模型互不影响。**允许同一个 Agent 自派发**，但仅限专用 Reviewer 流程（第 22 条），且必须满足 reviewer 模型 ≠ 执行模型（同模型不得审阅自己的输出）。
       - 不传 `model` 一律使用该 Agent 的**接收者配置默认模型**（`agentMeshBridge.models.*`），这是唯一无需确认的路径。
@@ -101,11 +87,11 @@
   22. **新任务默认专用 Reviewer 会话（方案 B，硬不变量）**：新任务不再让请求方会话兼任审阅者，而是由桥接为每个任务创建**独立的 reviewer 会话**；旧任务（账本中没有 `reviewFlow`）继续走原来的 caller-resume 审阅，不得迁移。
       - **拓扑**：`dispatch_task` 解析 `reviewFlow`（镜像在 `bridge-policy.json` 的 `reviewFlow`，默认 `dedicated`；设置项 `agentMeshBridge.reviewFlow` 可回滚到 `legacy`）并固定到 `thread.reviewFlow`。`dedicated` 任务创建后状态为 `queued`、`reviewBootstrap.phase='pending'`，**开发者轮次不得启动**；`executeBackgroundRound` / `TaskSupervisor.executeThreadRound` / 队列泵都必须以 `isReviewerBootstrapPending()` 拦住。
       - **bootstrap 由谁下发**：扩展宿主的 `ReviewerBootstrapService` 可独立启动多个待处理任务的**全新** reviewer 会话；每个 bootstrap 以 `TaskExecutionRegistry` 登记 PID，并在各自 `threadId` 角色锁保护下运行，不使用全局单飞或 FIFO。env 注入 `MESH_REVIEW_BOOTSTRAP=1` / `MESH_REVIEW_BOOTSTRAP_TOKEN` / `MESH_REVIEW_THREAD_ID` / `MESH_CALLER_AGENT`，**并把一次性 token 同时写进 bootstrap prompt**；该轮只允许调用一次 `dispatch_task`（业务参数忽略，brief 从账本读取，防止提示词漂移）。token 文件位于 `~/.agent-mesh-bridge/bootstrap/<threadId>.json`，一次性、确认后删除。
-      - **识别必须多通道（硬不变量，已实测两次事故）**：宿主可能把 MCP server 的环境**换成闭集**（Codex 0.164 只把 `~/.codex/config.toml` 里的 `env` 表传给子 MCP server，**不继承** CLI 进程环境；DeepSeek Harness 也会清洗继承变量），**也可能让桥接 server 看不到真实父进程**（MCP server 由中间 broker 拉起时 `process.ppid` 不是 bridge 启动的 reviewer CLI）。任一单一通道失效，reviewer 的 `dispatch_task` 都会落进**普通派发**分支、因缺 `expectedFiles` 被拒，任务最终以 `the reviewer turn ended without calling dispatch_task` 失败（该轮其实调用过工具，只是没被识别为 bootstrap）。因此 `dispatch_task` 必须按序尝试**四条通道**：
+      - **识别必须多通道（硬不变量，已实测两次事故）**：宿主可能把 MCP server 的环境**换成闭集**（Codex 0.164 只把 `~/.codex/config.toml` 里的 `env` 表传给子 MCP server，**不继承** CLI 进程环境；DeepSeek Harness 也会清洗继承变量），**也可能让桥接 server 看不到真实父进程**（MCP server 由中间 broker 拉起时 `process.ppid` 不是 bridge 启动的 reviewer CLI）。任一单一通道失效，reviewer 的 `dispatch_task` 都会落进**普通派发**分支、因缺少普通派发 brief 被拒，任务最终以 `the reviewer turn ended without calling dispatch_task` 失败（该轮其实调用过工具，只是没被识别为 bootstrap）。因此 `dispatch_task` 必须按序尝试**四条通道**：
         1. **prompt 凭证**（主通道，最确定）：prompt 里写明 `dispatch_task({"reviewBootstrap":{"threadId":…,"token":…}})`，MCP 侧认 `args.reviewBootstrap`；
         2. **env 三元组**：`MESH_REVIEW_BOOTSTRAP=1` + `MESH_REVIEW_THREAD_ID` + `MESH_REVIEW_BOOTSTRAP_TOKEN`；
         3. **pid 通道**：「启动记录里的 reviewer CLI pid（`ReviewerBootstrapToken.hostPid`，由 `onChildPid` 写入）== 本 MCP server 的 `process.ppid`」调用 `findReviewerBootstrapByHostPid()` 识别；hostPid 记录带 30 分钟 TTL，防止 pid 复用认领陈旧记录；
-        4. **唯一待确认兜底**：当次调用**没有任何任务 brief**（无 title/prompt/expectedFiles/allowNoScope）且该调用者 Agent 只有**唯一**一个待 bootstrap 任务（优先匹配工作目录）时，用 `findSolePendingBootstrap()` 认领；否则仍按普通派发报错，绝不猜。
+        4. **唯一待确认兜底**：当次调用**没有任何任务 brief**（无任务 brief）且该调用者 Agent 只有**唯一**一个待 bootstrap 任务（优先匹配工作目录）时，用 `findSolePendingBootstrap()` 认领；否则仍按普通派发报错，绝不猜。
 
         `confirmReviewerBootstrap()` 接受 token 或 hostPid 凭证；只认 env 视为 bug。2026-11-02 的真实事故（`thread_20261102_224144_b057`）正是 env 与 pid 同时失效：reviewer 发了 `arguments:{}`，被当成普通派发而失败——第 1 与第 4 通道即为此而设。
       - **确认与交接**：MCP 的 `dispatch_task` 检测到 bootstrap（env 或 hostPid）时走 `confirmReviewerBootstrap()`，只把 `reviewBootstrap.phase` 置为 `confirmed`、状态保持 `queued`，**不创建第二个任务**；bootstrap 进程退出并将原生会话 id 写入 `reviewerSessionId` / `callerSessionId`、标记 `reviewerSessionCaptured=true` 后，developer 才可启动。PID 在 `TaskExecutionRegistry` 中登记；可选限额只影响启动 admission，不互斥其他任务。
@@ -168,7 +154,6 @@ src/
 ├── bridge/
 │   ├── types.ts               # 核心类型: DelegationThread, DelegationRound, AgentId, Status
 │   ├── active-agent-resolver.ts# 默认 Agent 探测与选路算法 (宿主 -> 扩展 -> LRU -> 状态栏)
-│   ├── file-scope.ts          # 具体代码文件范围校验与精确同文件冲突检测 (拒绝目录/通配符)
 │   ├── task-execution-registry.ts # 非互斥执行/PID登记与特定 thread 孤儿取消
 │   ├── cancellation-registry.ts# 跨进程暂停/删除信号 (cancellations/<threadId>.json)
 │   ├── task-role-lock.ts      # 单任务 reviewer/developer 角色锁 (roles/<threadId>.json)
@@ -178,7 +163,7 @@ src/
 │   ├── async-dispatcher.ts    # 异步非阻塞任务派发器 (生成 threadId, 全局排队, 立即返回)
 │   ├── rework-controller.ts   # 同会话多轮返修控制器 (绑定 receiverSessionId)
 │   ├── autonomous-runner.ts   # 跨平台 skip-danger 进程执行器 (关闭 stdin, 注入安全绕过参数)
-│   ├── task-supervisor.ts     # 宿主常驻守护进程 (30s 实时流式同步, scope/role/limit 候选调度)
+│   ├── task-supervisor.ts     # 宿主常驻守护进程与并发候选调度
 │   ├── callback-manager.ts    # 回调唤醒引擎 (Codex queue / Claude resume / Anti wake / DSH headless)
 │   ├── task-store.ts          # 1000 条任务持久化、原子写入与 LRU 淘汰
 │   ├── platform.ts            # 平台差异唯一出口（PATH 探测/可执行位/扩展目录/进程树终止）
@@ -213,14 +198,13 @@ src/
 
 | 工具名                    | 关键入参                                                           | 语义与行为                                                                                    |
 | :------------------------ | :----------------------------------------------------------------- | :-------------------------------------------------------------------------------------------- |
-| `dispatch_task`           | `targetAgent`, `title`, `prompt`, `expectedFiles`（必填）, `allowNoScope?`, `allowScopeOverlap?`, `callerSessionId?`, `model?`, `modelRequestedByUser?`, `initiatorModel?` | 异步发起新任务，`expectedFiles` 必须是**具体代码文件**（禁止目录、结尾斜杠、`*`/`?` 通配符），派发前校验失败即拒绝；**缺省即拒绝**（确实不改任何工作区文件时显式传 `allowNoScope: true`）。`model?` 固定**接收方模型**：**缺省即用该 Agent 配置的默认模型**；非默认型号必须同时传 `modelRequestedByUser: true`（仅在用户点名时）并由用户在 VS Code 点击确认才生效，否则忽略该型号回落默认（见第 18 条）。`initiatorModel?` 声明**发送方模型**（缺省按 环境提示 → **下发者配置默认** → 接收者配置默认 推断）；两端模型都随任务落账本，任务树/详情/MCP 响应统一展示 `发送 A(x) ➔ 接收 B(y)`，返修/重试沿用同一接收方模型。**新任务默认走专用 reviewer 流程**：返回 `REVIEWER_STARTING`，由扩展宿主启动全新 reviewer 会话，并由该会话用一次性 token 调 `dispatch_task` 确认后才启动 developer；同一 Agent 自派发允许，但 reviewer 模型必须不同于执行模型（见第 22 条）。存量任务按原 caller-resume 逻辑。只有 scope 冲突或启用的并发限额会使任务返回 `QUEUED`；paused / waiting_review / blocked / bootstrap pending 候选不会阻挡无关任务。**返回后发起方必须立即结束 Turn**（回包含 `nextAction=END_TURN_AND_WAIT_FOR_CALLBACK` 与 `stopInstruction`，见第 19 条） |
+| `dispatch_task` | `targetAgent`, `title`, `prompt`, `workspacePath?`, `callerSessionId?`, `model?`, `modelRequestedByUser?`, `initiatorModel?` | 自动创建隔离 task worktree 并异步派发；无有效 Git 仓库/HEAD 时拒绝。返回后立即结束 Turn，等待回调。
 | `request_rework`          | `threadId`, `feedback`, `targetAgent?`, `model?`, `modelRequestedByUser?` | **在同一个原生会话中唤醒接收方返修**，进入第 N+1 轮；传 `targetAgent`/`model` 时先改派执行者再开新轮（换 Agent 会重置原生会话，见第 18 条） |
 | `approve_task`            | `threadId`, `remarks?`                                             | 验收通过，标记为 `COMPLETED`，归档任务                                                        |
 | `pause_task`              | `threadId`, `reason`                                               | 暂停运行中/排队中的任务：终止 Agent 进程、轮次标记 `paused`、记录中断原因，可随后恢复          |
 | `resume_task`             | `threadId`, `targetAgent?`, `model?`, `modelRequestedByUser?`      | 恢复暂停轮次：保留原 prompt 与原生会话；未捕获原生会话时以初始轮重新执行；带 `targetAgent`/`model` 时在恢复前改派执行者 |
 | `retry_task`              | `threadId`, `targetAgent?`, `model?`, `modelRequestedByUser?`      | **原地重跑失败轮**：复用同一轮号、同一 prompt、同一原生会话；不追加新轮次，因此不会在账本里出现"看起来重复的第二轮"。调用者想"把原任务再做一遍"时必须用它，**不要**把原始 prompt 原样传给 `request_rework`；带 `targetAgent`/`model` 时换执行者重跑 |
 | `retarget_task`           | `threadId`, `targetAgent?`, `model?`, `modelRequestedByUser?`, `reason?` | **执行者改派**：把已有任务切到另一个 Agent 和/或该 Agent 的另一个模型，保留 threadId、轮次历史与文件范围；`queued`/`paused`/`waiting_review`/`failed` 可改派且状态不变，有在飞轮次（先 pause）或已 `completed` 则拒绝。换 Agent 必重置原生会话，旧 id 记入 `retargets[].previousReceiverSessionId`；非默认模型仍需 `modelRequestedByUser: true` + 用户点击确认。receiver 不可用 |
-| `allow_scope_overlap`     | `threadId`, `reason?`                                              | **放行文件归属互斥**：让被 scope 闸门挡住的任务继续执行（仅当重叠确实安全，例如前一个任务已提交）。调用者控制面工具，receiver 不可用 |
 | `delete_task`             | `threadId`, `reason`, `force?`                                     | 永久删除任务：先终止进程，再移除账本条目，原因写入 `deleted_tasks.log` 墓碑；同时**尽力清理接收方原生对话**（Claude `~/.claude/projects`、Codex `~/.codex/sessions` + `session_index.jsonl`、Antigravity `conversations/*.db` + `brain/annotations/implicit` + cache 元数据、DSH `sessions/<slug>/<sessionId>/` + projcache + `workspace.json` 引用）。找不到对话不是错误，单个文件失败只记录在墓碑 `nativeSessions[].error`，绝不回滚删除；调用方（initiator）会话永不清理。**唯一硬拒绝是 merge gate**（worktree 未记录 `merge_request`），`force: true` 才放行，且墓碑追加 `"forced": true` 留痕；VS Code 任务右键新增「强制删除任务」命令（`agent-mesh-bridge.deleteTaskForce`），普通删除遇到未合并 worktree 时也会直接给出「强制删除 / 取消」选择，不会死路 |
 | `record_merge_request`    | `threadId`, `url?`, `branch?`, `commit?`, `remote?`, `baseBranch?`, `status?`, `summary?` | **调用者/检视方专用**：任务或批次验收通过后，记录 MR URL/分支/提交/远端与状态；MR 由调用者创建并推送，receiver 不可调用 |
 | `list_recent_tasks`       | `limit` (最大1000), `statusFilter?`                                | 查询任务列表（包含 `A -> B 标题 摘要` 与 `queued/running` 状态），每条附**读时派生**的 `tokenUsage` 汇总 |
@@ -264,7 +248,7 @@ code --install-extension agent-mesh-bridge-1.0.0.vsix
 
 1. **会话连续性不可破坏**：在处理返修（`rework`）时，绝对禁止为接收方生成全新的 Session ID，必须严格复用 `receiverSessionId` 进行 `--resume`。
 2. **免交互防御必须完整**：任何子进程拉起逻辑必须包含 `stdin.end()` 以及各自平台的 `skip-danger` 命令行开关，严禁无参数裸跑子进程。
-3. **1000 条硬上限控制**：`TaskStore` 每次保存必须执行容量截断校验，禁止无限制无限追加导致内存和磁盘暴涨。
+3. **1000 条容量控制**：超出容量时仅淘汰可安全丢弃的已收口记录；若无安全候选（包括未合入成果），拒绝新任务并说明原因。
 4. **日志与错误捕获**：所有进程退出码非 0、超时以及解析异常必须记录在对应 `DelegationRound.error` 中并向上冒泡，不得静默吞并。
 5. **DSH 会话语义不可臆造**：DSH 的 `--session-id` 只用于**接管已存在**的 Session。新任务严禁传该参数，必须在首轮结束后由事件流回填 `receiverSessionId`，之后返修轮次才复用该 id。
 6. **DSH patch 必须可反复同步**：写入 `~/.dsh/profiles/*/cordis.patch.yml` 的内容必须包裹在托管标记内，覆盖式更新而非追加，严禁重复插入或破坏用户自有 patch 条目。
@@ -274,8 +258,7 @@ code --install-extension agent-mesh-bridge-1.0.0.vsix
    - `TaskStore.updateRound()` 命中重复轮号时更新**最后一条**（最新）记录；且在已有在飞轮次时**拒绝追加**新的 `running` 轮次。
    - `TaskSupervisor.executeThreadRound()` 必须拒绝在**另一轮在飞**时启动本轮；`normalizeRoundIntegrity()` 负责自愈历史脏数据（保留最高轮号的在飞轮，其余标记失败），避免新约束把老账本永久卡死。
 8. **执行登记与候选并发**：执行器在 spawn 前通过 `TaskExecutionRegistry.begin()` 登记 thread / round / workspace / agent，spawn 后登记 child PID，finally 中 `end()`。登记不是互斥锁；旧 `execution.lock` / `leases/` 只可用于同一 thread 的历史恢复或定向停止，不得阻挡其他 thread 启动或进入并发限额统计。
-   - 以同 thread 的在飞轮次、规范 thread role lock、scope conflict 和可选并发限额判断候选是否可启动；scope 无冲突时允许同 workspace 并发。
-   - `expectedFiles` 的锁范围必须收窄到**具体代码文件**：`validateExpectedFiles()` 拒绝目录、结尾斜杠、`*`/`?` 通配符；`doPathsConflict()` 只做精确同文件匹配，不再做目录前缀/glob 展开。
+   - 以同 thread 在飞轮次、规范 role lock、bootstrap 与可选并发限额判断候选是否可启动；每个任务的独立 Git worktree 隔离文件变更。
    - 非 supervisor 路径在轮次结束后调用 `QueueDrainer.schedule()` 扫描所有 ready 候选，不得以一个候选的阻塞状态终止扫描。
    - 并发限额仅在 `concurrency.enabled === true` 时生效；跨进程通过 registry 观察后做 best-effort admission，不提供原子预留或严格上限保证。
    - `pause_task` / `delete_task` 必须写 cancellation 并通过 `TaskExecutionRegistry.killOrphanChild(threadId, true)` 定向终止该任务遗留进程；不得影响其它 thread。
@@ -302,10 +285,8 @@ code --install-extension agent-mesh-bridge-1.0.0.vsix
    - 中断恢复只能沿用原 `threadId`、原 `receiverSessionId` / `callerSessionId`，并以账本中历轮 prompt/output/feedback 作为中间文档继续；严禁新建任务、另起会话或把同一任务拆成新的 reviewer/developer 任务。
 
 14. **候选扫描不可退化为队头 FIFO**：
-   - `TaskSupervisor` / `QueueDrainer` 必须扫描所有 ready 候选；某个候选因 scope、角色、bootstrap handoff 或可选限额受阻时，继续检查后续候选。
-   - `paused` / `waiting_review` / blocked / bootstrap pending 只阻挡相应 thread 自身，不得挡住 scope 无关任务。
-   - 已运行或已有 `touchedFiles` 的 scope owner 不论创建时间都参与冲突判断；只有尚未启动且 scope 相交的 queued peers 才按 `createdAt`、再按 `threadId` 单向定向，避免相互阻塞。
-   - `findQueueHead()` / `isTaskUnfinished()` 可为兼容保留，但不得作为运行时是否启动其它任务的条件。
+   - `TaskSupervisor` / `QueueDrainer` 扫描所有 ready 候选；某个候选因角色、bootstrap handoff 或可选限额受阻时，继续检查后续候选。
+   - `paused` / `waiting_review` / blocked / bootstrap pending 只阻挡相应 thread 自身，不得挡住其他任务。   - `findQueueHead()` / `isTaskUnfinished()` 可为兼容保留，但不得作为运行时是否启动其它任务的条件。
    - `failed` / `review_failed` 仍是终态；重试 / 重新检视后仅该 thread 重新进入候选扫描。
 
 15. **MR 收口不可绕过调用者**：
@@ -322,7 +303,4 @@ code --install-extension agent-mesh-bridge-1.0.0.vsix
    - 模型参数注入必须按各 CLI 语法落位：Codex 用全局 `-c model="..."`（在 `exec` 之前），Claude / Antigravity 用 `--model`，DSH 用一次性 `--patch` overlay（不得改写用户 profile patch）。
 
 17. **文件归属互斥不可绕过**：
-   - `AsyncDispatcher` / `TaskSupervisor` / `ReworkController` 在 spawn 前都必须调用 `findScopeConflicts()`，命中即 `markQueued(..., scopeConflict)`；**不得**只在 dispatch 时检查一次就放行。
    - 每个轮次必须用 `captureWorkspaceSnapshot()` / `diffWorkspaceSnapshots()` 记录 `round.touchedFiles`；非 git 工作区允许为空（`available: false`，不得因此把整棵树当成"全被改动"）。
-   - `expectedFiles` 必填由 MCP 层 `requireScope: true` 触发（内部调用与测试保持宽松），**不得**删除 MCP 侧校验。
-   - `scopeBlockedBy` 必须写在实际被 `upsertTask` 的对象上（`markQueued` 内部处理），否则 UI 与账本会丢失阻塞原因。

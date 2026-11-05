@@ -395,6 +395,7 @@ export class TaskDetailPanel {
       running: '#f59e0b',
       reworking: '#f59e0b',
       waiting_review: '#3b82f6',
+      waiting_merge: '#8b5cf6',
       paused: '#f97316',
       completed: '#10b981',
       failed: '#ef4444',
@@ -906,31 +907,17 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
         <div class="meta-label">Workspace</div>
         <div class="meta-val">${escapeHtml(thread.workspacePath)}</div>
       </div>
+      ${thread.worktree ? `
+      <div class="meta-item" style="grid-column: 1 / -1;">
+        <div class="meta-label">Local integration</div>
+        <div class="meta-val">${escapeHtml(thread.worktree.integration?.phase || 'ready')} · target ${escapeHtml(thread.worktree.targetRef || '')} · approved ${escapeHtml(thread.worktree.approvedCommit || 'none')} · head ${escapeHtml(thread.worktree.headCommit || 'unknown')}</div>
+        ${thread.worktree.integration?.error ? `<div class="meta-val" style="white-space:pre-wrap;color:#fca5a5;">${escapeHtml(thread.worktree.integration.error)}</div>` : ''}
+        ${thread.worktree.integration?.conflictFiles?.length ? `<div class="meta-val">Conflicts: ${escapeHtml(thread.worktree.integration.conflictFiles.join(', '))}</div>` : ''}
+      </div>` : ''}
       <div class="meta-item">
         <div class="meta-label">Created At</div>
         <div class="meta-val">${new Date(thread.createdAt).toLocaleString()}</div>
       </div>
-      ${
-        thread.scopeBlockedBy
-          ? `
-      <div class="meta-item" style="grid-column: 1 / -1;">
-        <div class="meta-label" style="color: #fbbf24;">Scope Block（文件归属互斥）</div>
-        <div class="meta-val" style="color: #fde68a;">
-          以下文件已被任务 <strong>${escapeHtml(thread.scopeBlockedBy.threadId)}</strong>${
-            thread.scopeBlockedBy.title ? `「${escapeHtml(thread.scopeBlockedBy.title)}」` : ''
-          } 声明或实际修改，本任务不会启动，直到该任务收口（approve + record_merge_request）或调用 allow_scope_overlap 放行：
-          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px;">
-            ${thread.scopeBlockedBy.files
-              .map(
-                (f) =>
-                  `<span style="background: rgba(251, 191, 36, 0.18); border: 1px solid rgba(251, 191, 36, 0.45); padding: 2px 8px; border-radius: 4px; font-size: 12px; color: #fde68a;">${escapeHtml(f)}</span>`,
-              )
-              .join('')}
-          </div>
-        </div>
-      </div>`
-          : ''
-      }
       ${
         thread.status === 'waiting_review' && thread.reviewBlocked
           ? `
@@ -951,28 +938,6 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
         </div>
       </div>`
           : ''
-      }
-      ${
-        thread.expectedFiles && thread.expectedFiles.length > 0
-          ? `
-      <div class="meta-item" style="grid-column: 1 / -1;">
-        <div class="meta-label">Expected File Scope (文件归属互斥)</div>
-        <div class="meta-val" style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px;">
-          ${thread.expectedFiles
-            .map(
-              (f) =>
-                `<span style="background: rgba(168, 85, 247, 0.2); border: 1px solid rgba(168, 85, 247, 0.4); padding: 2px 8px; border-radius: 4px; font-size: 12px; color: #e9d5ff;">${escapeHtml(f)}</span>`,
-            )
-            .join('')}
-        </div>
-      </div>`
-          : `
-      <div class="meta-item" style="grid-column: 1 / -1;">
-        <div class="meta-label">Expected File Scope (文件归属互斥)</div>
-        <div class="meta-val" style="color: #94a3b8;">
-          未声明（早期派发或 allowNoScope）。文件归属互斥对它不生效；但本轮实际改动的文件仍会由 git probe 记录，用于保护后续任务。
-        </div>
-      </div>`
       }
       ${
         thread.mergeRequest
@@ -1014,6 +979,12 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
       <div style="font-size: 12px; opacity: 0.75; margin-top: 2px;">当前任务正在等待冲突任务释放文件锁定，释放后网格将自动唤醒开始执行，无需人工干预。</div>
     </div>
   </div>`
+      : thread.status === 'waiting_merge'
+      ? `
+  <div style="background: rgba(139, 92, 246, 0.15); border: 1px solid #8b5cf6; border-radius: 8px; padding: 16px; margin-bottom: 20px;">
+    <strong>Review approved; waiting for serialized local merge and combined validation.</strong>
+    <div style="margin-top:6px">This task remains open until its approved commit is merged into the batch target and validation passes.</div>
+  </div>`
       : thread.status === 'waiting_review'
       ? thread.reviewWake && thread.reviewWake.round === (thread.currentRound || 1)
         ? `
@@ -1038,7 +1009,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
             ? `桥接将在 ${new Date(thread.reviewWake.autoRetryAt).toLocaleString()} 自动重新唤醒（第 ${(thread.reviewWake.autoRetryAttempts || 0) + 1} 次自动尝试）。`
             : ''
       }</div>
-      <div style="font-size: 12px; opacity: 0.75; margin-top: 4px;">该任务仍在等待检视；它只会阻挡 scope 冲突或受显式并发限额约束的任务。</div>
+      <div style="font-size: 12px; opacity: 0.75; margin-top: 4px;">该任务仍在等待检视；它只会阻挡同任务后续轮次；其他任务可在独立 worktree 并发执行。</div>
     </div>
   </div>`
         : `
@@ -1100,10 +1071,10 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
     ${(thread.status === 'failed' || thread.rounds.some((r) => r.status === 'failed')) ? `<button class="retry-btn" style="background: #dc2626; color: white;" onclick="retryFailedRound()">🔄 重试失败轮次 (Retry Failed)</button>` : ''}
     ${thread.status === 'waiting_review' && thread.reviewWake && thread.reviewWake.round === (thread.currentRound || 1) ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（唤醒失败）</button>` : ''}
     ${thread.status === 'review_failed' ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（检视失败）</button>` : ''}
-    ${(thread.status === 'running' || thread.status === 'reworking' || thread.status === 'queued') ? `<button style="background:#ea580c;color:white;" onclick="pauseTask()">⏸ 暂停任务 (Pause)</button>` : ''}
+    ${(thread.status === 'running' || thread.status === 'reworking' || thread.status === 'queued' || thread.status === 'waiting_merge') ? `<button style="background:#ea580c;color:white;" onclick="pauseTask()">⏸ 暂停任务 (Pause)</button>` : ''}
     ${thread.status === 'paused' ? `<button class="resume-btn" onclick="resumeTask()">▶ 恢复执行 (Resume)</button>` : ''}
     ${(thread.status === 'failed' || thread.status === 'waiting_review' || thread.status === 'review_failed') ? `<button class="resume-btn" onclick="resumeTask()">▶ 下发返修要求 / 重新执行</button>` : ''}
-    ${thread.status !== 'completed' ? `<button onclick="approveTask()">✓ 手动验收通过 (Approve Task)</button>` : ''}
+    ${(thread.status === 'waiting_review' || thread.status === 'failed' || thread.status === 'review_failed') ? `<button onclick="approveTask()">✓ 手动验收通过 (Approve Task)</button>` : ''}
     <button style="background:#7f1d1d;color:white;" onclick="deleteTask()">🗑 删除任务 (Delete)</button>
     <button class="secondary" onclick="printRecentLogs()">📄 打印最近1000行日志 (Print 1,000 Lines)</button>
     <button class="secondary" onclick="refresh()">⟳ Refresh</button>

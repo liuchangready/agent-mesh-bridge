@@ -10,7 +10,7 @@ export interface QueuedExecution {
 
 /**
  * Fallback scheduler used when no persistent `TaskSupervisor` is running.
- * It scans every runnable round; a review/paused/scope-blocked task never hides
+ * It scans every runnable round; a review/paused/bootstrap-blocked task never hides
  * a later disjoint task. TaskRoleLock is the only per-thread admission gate.
  */
 export class QueueDrainer {

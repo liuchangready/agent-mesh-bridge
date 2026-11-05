@@ -1,12 +1,26 @@
-﻿import { test, describe, beforeEach, afterEach } from 'node:test';
+import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { spawnSync } from 'child_process';
 
 const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-concurrency-home-'));
 process.env.USERPROFILE = isolatedHome;
 process.env.HOME = isolatedHome;
+const gitExe = process.env.MESH_GIT_PATH || (process.platform === 'win32' ? 'D:\\Git\\cmd\\git.exe' : 'git');
+process.env.MESH_GIT_PATH = gitExe;
+
+function initGitRepo(root: string): void {
+  const run = (...args: string[]) => {
+    const result = spawnSync(gitExe, args, { cwd: root, encoding: 'utf8', windowsHide: true });
+    if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(' ')} failed`);
+  };
+  run('init', '-b', 'test/source');
+  run('config', 'user.name', 'Mesh Test');
+  run('config', 'user.email', 'mesh-test@example.test');
+  run('commit', '--allow-empty', '-m', 'base');
+}
 
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import {
@@ -95,7 +109,7 @@ describe('bridge policy - optional best-effort concurrency limits', () => {
   });
 });
 
-describe('AsyncDispatcher - independent scope admission', () => {
+describe('AsyncDispatcher - independent task admission', () => {
   let tempDir: string;
   let taskStore: TaskStore;
   let runner: AutonomousRunner;
@@ -112,6 +126,7 @@ describe('AsyncDispatcher - independent scope admission', () => {
     tempDir = trackedTempDir('agent-bridge-dispatch-concurrency-');
     workspace = path.join(tempDir, 'workspace');
     fs.mkdirSync(workspace, { recursive: true });
+    initGitRepo(workspace);
     taskStore = new TaskStore(tempDir);
     const detector = new AgentDetector();
     registry = new TaskExecutionRegistry(tempDir);
@@ -143,28 +158,89 @@ describe('AsyncDispatcher - independent scope admission', () => {
     taskStore.dispose();
   });
 
-  test('two disjoint tasks in one workspace overlap; a conflicting candidate queues without stopping later work', async () => {
+  test('same-file tasks in one repository run concurrently in isolated worktrees', async () => {
     saveBridgePolicy({ concurrency: { enabled: false } });
-    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'A', prompt: 'edit a', workspacePath: workspace, expectedFiles: ['src/a.ts'] });
+    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'A', prompt: 'edit a', workspacePath: workspace });
     assert.strictEqual(first.status, 'DISPATCHED');
     await waitFor(() => started.length === 1);
 
-    const conflict = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'B conflict', prompt: 'edit a too', workspacePath: workspace, expectedFiles: ['src/a.ts'] });
-    assert.strictEqual(conflict.status, 'QUEUED');
-
-    const disjoint = await dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'C disjoint', prompt: 'edit c', workspacePath: workspace, expectedFiles: ['src/c.ts'] });
-    assert.strictEqual(disjoint.status, 'DISPATCHED', disjoint.message);
+    const conflict = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'B same file', prompt: 'edit a too', workspacePath: workspace });
+    assert.strictEqual(conflict.status, 'DISPATCHED');
     await waitFor(() => started.length === 2);
-    assert.strictEqual(maxActive, 2, 'the runner promises overlap in wall time, not merely in dispatcher return statuses');
-    assert.deepStrictEqual(started.slice().sort(), ['A', 'C disjoint']);
-    assert.strictEqual(taskStore.getTask(conflict.threadId)?.status, 'queued');
+
+    const disjoint = await dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'C disjoint', prompt: 'edit c', workspacePath: workspace });
+    assert.strictEqual(disjoint.status, 'DISPATCHED', disjoint.message);
+    await waitFor(() => started.length === 3);
+    assert.strictEqual(maxActive, 3, 'the runner promises overlap in wall time, not merely in dispatcher return statuses');
+    assert.deepStrictEqual(started.slice().sort(), ['A', 'B same file', 'C disjoint']);
+    assert.notStrictEqual(taskStore.getTask(first.threadId)?.worktree?.path, taskStore.getTask(conflict.threadId)?.worktree?.path);
+  });
+
+  test('live stdout chunks are persisted while a round is still running', async () => {
+    dispatcher.setStreamSyncIntervalMs(30);
+    let releaseTask: () => void = () => {};
+    const held = new Promise<void>((resolve) => { releaseTask = resolve; });
+    let chunkSeen = false;
+    runner.execute = async (options: RunOptions): Promise<RunResult> => {
+      options.onStdoutChunk?.('Streaming chunk 1: editing files...\n');
+      chunkSeen = true;
+      await held;
+      return { exitCode: 0, stdout: 'Streaming chunk 1\nStreaming chunk 2\nTask completed', stderr: '', extractedOutput: 'Task completed successfully', durationMs: 150 };
+    };
+    const task = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Streaming', prompt: 'stream output', workspacePath: workspace });
+    try {
+      await waitFor(() => chunkSeen);
+      await waitFor(() => !!taskStore.getTask(task.threadId)?.rounds[0].output?.includes('Streaming chunk'));
+      assert.strictEqual(taskStore.getTask(task.threadId)?.status, 'running');
+    } finally {
+      releaseTask();
+      await waitFor(() => taskStore.getTask(task.threadId)?.status === 'waiting_review').catch(() => {});
+    }
+    assert.strictEqual(taskStore.getTask(task.threadId)?.rounds[0].status, 'completed');
+  });
+
+  test('recent execution logs return the requested tail while running and after completion', async () => {
+    const detector = new AgentDetector();
+    const supervisor = new TaskSupervisor(taskStore, runner, callbackManager, detector, registry);
+    supervisor.setStreamSyncIntervalMs(30);
+    let releaseTask: () => void = () => {};
+    const held = new Promise<void>((resolve) => { releaseTask = resolve; });
+    let logChunkSeen = false;
+    const totalLineCount = 1_500;
+    const rawLogText = Array.from({ length: totalLineCount }, (_, index) => `[LOG LINE ${index + 1}] processing data chunk ${index + 1}`).join('\n');
+    runner.execute = async (options: RunOptions): Promise<RunResult> => {
+      options.onStdoutChunk?.(`${rawLogText}\n`);
+      logChunkSeen = true;
+      await held;
+      return { exitCode: 0, stdout: rawLogText, stderr: '', extractedOutput: rawLogText, durationMs: 50 };
+    };
+    const task = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'High volume log', prompt: 'emit 1500 lines', workspacePath: workspace });
+    supervisor.checkPendingTasks();
+    try {
+      await waitFor(() => logChunkSeen);
+      const running = supervisor.getRecentLogs(task.threadId, 1_000);
+      assert.strictEqual(running.isRunning, true);
+      assert.ok(running.totalLines >= totalLineCount);
+      assert.strictEqual(running.returnedLines, 1_000);
+      assert.ok(running.logs.includes('[LOG LINE 1500]'));
+      assert.ok(!running.logs.includes('[LOG LINE 1] processing data chunk 1'));
+    } finally {
+      releaseTask();
+      await waitFor(() => taskStore.getTask(task.threadId)?.status === 'waiting_review');
+      supervisor.dispose();
+    }
+    const completed = TaskSupervisor.getRecentLogs(task.threadId, 500, taskStore);
+    assert.strictEqual(completed.isRunning, false);
+    assert.strictEqual(completed.returnedLines, 500);
+    assert.ok(completed.logs.includes('[LOG LINE 1500]'));
+    assert.ok(!completed.logs.includes('[LOG LINE 900]'));
   });
 
   test('an old execution.lock record does not block a new independent task', async () => {
     const legacy = { token: 'legacy', pid: process.pid, threadId: 'old-thread', round: 1, acquiredAt: Date.now(), updatedAt: Date.now() };
     fs.writeFileSync(path.join(tempDir, 'execution.lock'), JSON.stringify(legacy));
     saveBridgePolicy({ concurrency: { enabled: false } });
-    const task = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Independent', prompt: 'edit', workspacePath: workspace, expectedFiles: ['src/independent.ts'] });
+    const task = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Independent', prompt: 'edit', workspacePath: workspace });
     assert.strictEqual(task.status, 'DISPATCHED');
     await waitFor(() => started.length === 1);
     assert.strictEqual(taskStore.getTask(task.threadId)?.status, 'running');
@@ -173,25 +249,25 @@ describe('AsyncDispatcher - independent scope admission', () => {
 
   test('enabled limits queue only after observed registrations reach the cap', async () => {
     saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 1, maxConcurrentPerAgent: 2 } });
-    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Limited A', prompt: 'a', workspacePath: workspace, expectedFiles: ['src/a.ts'] });
+    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Limited A', prompt: 'a', workspacePath: workspace });
     assert.strictEqual(first.status, 'DISPATCHED');
     await waitFor(() => started.length === 1);
-    const second = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Limited B', prompt: 'b', workspacePath: workspace, expectedFiles: ['src/b.ts'] });
+    const second = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Limited B', prompt: 'b', workspacePath: workspace });
     assert.strictEqual(second.status, 'QUEUED');
     assert.match(second.message, /limit reached/i);
   });
 
   test('a per-agent cap skips only that agent and still starts a different agent candidate', async () => {
     saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 3, maxConcurrentPerAgent: 1 } });
-    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Codex active', prompt: 'a', workspacePath: workspace, expectedFiles: ['src/a.ts'] });
+    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Codex active', prompt: 'a', workspacePath: workspace });
     assert.strictEqual(first.status, 'DISPATCHED');
     await waitFor(() => started.length === 1);
 
-    const sameAgent = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Codex queued', prompt: 'b', workspacePath: workspace, expectedFiles: ['src/b.ts'] });
+    const sameAgent = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Codex queued', prompt: 'b', workspacePath: workspace });
     assert.strictEqual(sameAgent.status, 'QUEUED');
     assert.match(sameAgent.message, /agent codex/i);
 
-    const otherAgent = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Other agent', prompt: 'c', workspacePath: workspace, expectedFiles: ['src/c.ts'] });
+    const otherAgent = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Other agent', prompt: 'c', workspacePath: workspace });
     assert.strictEqual(otherAgent.status, 'DISPATCHED', otherAgent.message);
     await waitFor(() => started.length === 2);
     assert.deepStrictEqual(started.slice().sort(), ['Codex active', 'Other agent']);
@@ -204,15 +280,15 @@ describe('AsyncDispatcher - independent scope admission', () => {
     const rework = new ReworkController(taskStore, runner, callbackManager, undefined, registry);
     const markers: Array<(stale: DelegationThread) => void> = [
       (stale) => (dispatcher as any).markThreadQueued(stale, undefined, 'stale cap result'),
-      (stale) => (supervisor as any).markQueued(stale, undefined, 'stale scope result'),
-      (stale) => (rework as any).markQueued(stale, undefined, 'stale scope result'),
+      (stale) => (supervisor as any).markQueued(stale, undefined, 'stale scheduler result'),
+      (stale) => (rework as any).markQueued(stale, undefined, 'stale scheduler result'),
     ];
 
     try {
       for (const [markerIndex, markQueued] of markers.entries()) {
         for (const terminalState of ['paused', 'completed', 'deleted'] as const) {
           const threadId = `thread_delayed_queue_${markerIndex}_${terminalState}`;
-          const stale = makePendingThread(threadId, workspace, new Date().toISOString(), `src/${threadId}.ts`);
+          const stale = makePendingThread(threadId, workspace, new Date().toISOString());
           taskStore.upsertTask(stale);
           if (terminalState === 'deleted') taskStore.deleteTask(threadId);
           else {
@@ -234,10 +310,10 @@ describe('AsyncDispatcher - independent scope admission', () => {
   });
 });
 
-function makePendingThread(threadId: string, workspacePath: string, createdAt: string, scope: string): DelegationThread {
+function makePendingThread(threadId: string, workspacePath: string, createdAt: string): DelegationThread {
   return makeThread({
     threadId, title: threadId, status: 'running', workspacePath, createdAt, updatedAt: createdAt,
-    expectedFiles: [scope], currentRound: 1,
+    currentRound: 1,
     rounds: [{ round: 1, type: 'initial', prompt: 'work ' + threadId, status: 'running', durationMs: 0, timestamp: createdAt }],
   });
 }
@@ -249,11 +325,11 @@ describe('QueueDrainer - scan every runnable candidate', () => {
     const registry = new TaskExecutionRegistry(dir);
     const workspace = path.join(dir, 'ws');
     const old = '2026-11-01T00:00:00.000Z';
-    store.upsertTask(makePendingThread('paused', workspace, old, 'src/paused.ts') as any);
-    store.upsertTask(makePendingThread('review', workspace, old, 'src/review.ts') as any);
-    store.upsertTask(makePendingThread('blocked', workspace, old, 'src/blocked.ts') as any);
-    store.upsertTask(makePendingThread('bootstrap', workspace, old, 'src/bootstrap.ts') as any);
-    store.upsertTask(makePendingThread('ready', workspace, old, 'src/ready.ts') as any);
+    store.upsertTask(makePendingThread('paused', workspace, old) as any);
+    store.upsertTask(makePendingThread('review', workspace, old) as any);
+    store.upsertTask(makePendingThread('blocked', workspace, old) as any);
+    store.upsertTask(makePendingThread('bootstrap', workspace, old) as any);
+    store.upsertTask(makePendingThread('ready', workspace, old) as any);
     const paused = store.getTask('paused')!; paused.status = 'paused'; store.upsertTask(paused);
     const review = store.getTask('review')!; review.status = 'waiting_review'; store.upsertTask(review);
     const blocked = store.getTask('blocked')!; blocked.status = 'waiting_review'; blocked.reviewBlocked = { reason: 'dependency', at: old } as any; store.upsertTask(blocked);
@@ -275,8 +351,8 @@ describe('QueueDrainer - scan every runnable candidate', () => {
     const registry = new TaskExecutionRegistry(dir);
     const ws = path.join(dir, 'ws');
     const when = '2026-11-01T00:00:00.000Z';
-    store.upsertTask(makePendingThread('a', ws, when, 'src/a.ts'));
-    store.upsertTask(makePendingThread('b', ws, when, 'src/b.ts'));
+    store.upsertTask(makePendingThread('a', ws, when));
+    store.upsertTask(makePendingThread('b', ws, when));
     saveBridgePolicy({ concurrency: { enabled: false } });
     const started: string[] = [];
     const drainer = new QueueDrainer(store, registry, () => false, async (target) => {
@@ -307,15 +383,15 @@ describe('TaskSupervisor - same-workspace overlap and same-thread exclusion', ()
     const supervisor = new TaskSupervisor(store, runner, callback, detector, registry);
     const ws = path.join(dir, 'ws');
     const when = new Date().toISOString();
-    const a = makePendingThread('thread_a', ws, when, 'src/a.ts');
-    const b = makePendingThread('thread_b', ws, when, 'src/b.ts');
+    const a = makePendingThread('thread_a', ws, when);
+    const b = makePendingThread('thread_b', ws, when);
     store.upsertTask(a); store.upsertTask(b);
     supervisor.checkPendingTasks();
     await waitFor(() => starts.length === 2);
     assert.deepStrictEqual(starts.slice().sort(), ['thread_a', 'thread_b']);
     assert.strictEqual(registry.listOwners().length, 2);
 
-    const same = makePendingThread('thread_same', ws, when, 'src/same.ts');
+    const same = makePendingThread('thread_same', ws, when);
     store.upsertTask(same);
     const sameRound = same.rounds[0];
     const sameRuns = [
@@ -334,10 +410,10 @@ describe('TaskSupervisor - same-workspace overlap and same-thread exclusion', ()
 });
 
 describe('merge gate - pendingMerges', () => {
-  test('only completed worktree tasks without a merge request, oldest first', () => {
-    const older = makeThread({ threadId: 'thread_old', createdAt: '2026-10-01T00:00:00.000Z', worktree: { path: 'D:/wt/old', mainPath: 'D:/repo' } });
-    const newer = makeThread({ threadId: 'thread_new', createdAt: '2026-10-02T00:00:00.000Z', worktree: { path: 'D:/wt/new', mainPath: 'D:/repo' } });
-    const merged = makeThread({ threadId: 'thread_merged', createdAt: '2026-10-03T00:00:00.000Z', worktree: { path: 'D:/wt/merged', mainPath: 'D:/repo', mergePending: true }, mergeRequest: { url: 'https://example.com/mr/1', status: 'synced', updatedAt: '2026-10-03T00:00:00.000Z' } });
+  test('local integration state controls pending results, regardless of MR metadata', () => {
+    const older = makeThread({ threadId: 'thread_old', createdAt: '2026-10-01T00:00:00.000Z', worktree: { path: 'D:/wt/old', mainPath: 'D:/repo', integration: { phase: 'ready', updatedAt: '2026-10-01T00:00:00.000Z' } } });
+    const newer = makeThread({ threadId: 'thread_new', createdAt: '2026-10-02T00:00:00.000Z', worktree: { path: 'D:/wt/new', mainPath: 'D:/repo', integration: { phase: 'ready', updatedAt: '2026-10-02T00:00:00.000Z' } }, mergeRequest: { url: 'https://example.com/mr/1', status: 'synced', updatedAt: '2026-10-02T00:00:00.000Z' } });
+    const merged = makeThread({ threadId: 'thread_merged', createdAt: '2026-10-03T00:00:00.000Z', worktree: { path: 'D:/wt/merged', mainPath: 'D:/repo', mergePending: true, integration: { phase: 'merged', updatedAt: '2026-10-03T00:00:00.000Z' } } });
     const noWorktree = makeThread({ threadId: 'thread_plain', createdAt: '2026-10-04T00:00:00.000Z' });
     const stillRunning = makeThread({ threadId: 'thread_running', createdAt: '2026-10-05T00:00:00.000Z', status: 'running', worktree: { path: 'D:/wt/running', mainPath: 'D:/repo' } });
     assert.deepStrictEqual(pendingMerges([newer, noWorktree, merged, older, stillRunning]).map((task) => task.threadId), ['thread_old', 'thread_new']);

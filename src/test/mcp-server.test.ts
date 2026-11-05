@@ -3,10 +3,25 @@ import * as assert from 'node:assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { spawnSync } from 'child_process';
 
 const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-mcp-home-'));
 process.env.USERPROFILE = isolatedHome;
 process.env.HOME = isolatedHome;
+const gitExe = process.env.MESH_GIT_PATH || (process.platform === 'win32' ? 'D:\\Git\\cmd\\git.exe' : 'git');
+process.env.MESH_GIT_PATH = gitExe;
+let originalCwd = process.cwd();
+
+function initGitRepo(root: string): void {
+  const run = (...args: string[]) => {
+    const result = spawnSync(gitExe, args, { cwd: root, encoding: 'utf8', windowsHide: true });
+    if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(' ')} failed`);
+  };
+  run('init', '-b', 'test/source');
+  run('config', 'user.name', 'Mesh Test');
+  run('config', 'user.email', 'mesh-test@example.test');
+  run('commit', '--allow-empty', '-m', 'base');
+}
 
 import { TaskStore } from '../bridge/task-store';
 import { AgentDetector } from '../bridge/agent-detector';
@@ -44,6 +59,11 @@ describe('MCPServer Protocol Tests', () => {
 
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-mcp-test-'));
+    const workspace = path.join(tempDir, 'repo');
+    fs.mkdirSync(workspace, { recursive: true });
+    initGitRepo(workspace);
+    originalCwd = process.cwd();
+    process.chdir(workspace);
     taskStore = new TaskStore(tempDir);
     detector = new AgentDetector();
     resolver = new ActiveAgentResolver(detector);
@@ -80,6 +100,7 @@ describe('MCPServer Protocol Tests', () => {
   };
 
   afterEach(() => {
+    process.chdir(originalCwd);
     taskStore.dispose();
     try {
       fs.rmSync(tempDir, { recursive: true, force: true });
@@ -122,7 +143,6 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(toolNames.includes('resume_task'));
     assert.ok(toolNames.includes('retry_task'));
     assert.ok(toolNames.includes('retarget_task'));
-    assert.ok(toolNames.includes('allow_scope_overlap'));
     assert.ok(toolNames.includes('delete_task'));
     assert.ok(toolNames.includes('record_merge_request'));
     assert.ok(toolNames.includes('list_recent_tasks'));
@@ -135,7 +155,10 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(toolNames.includes('get_reviewer_log'));
     assert.ok(toolNames.includes('list_agent_models'));
     assert.ok(toolNames.includes('get_task_summary'));
-    assert.strictEqual(toolNames.length, 20);
+    const dispatch = tools.find((t: any) => t.name === 'dispatch_task');
+    assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'expectedFiles'));
+    assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'allowNoScope'));
+    assert.strictEqual(toolNames.length, 19);
   });
 
   test('list_agent_models reports the receiver and sender defaults separately', async () => {
@@ -200,7 +223,6 @@ describe('MCPServer Protocol Tests', () => {
         targetAgent: 'claude_code',
         title: 'Summarise me',
         prompt: 'do the work',
-        allowNoScope: true,
       }),
     );
     await waitForStatus(dispatched.threadId, 'waiting_review');
@@ -241,7 +263,6 @@ describe('MCPServer Protocol Tests', () => {
         targetAgent: 'claude_code',
         title: 'Reviewer output',
         prompt: 'do the work',
-        allowNoScope: true,
       }),
     );
     await waitForStatus(dispatched.threadId, 'waiting_review');
@@ -296,7 +317,6 @@ describe('MCPServer Protocol Tests', () => {
         targetAgent: 'codex',
         title: 'Stop polling',
         prompt: 'do the work',
-        allowNoScope: true,
       }),
     );
     // The dispatch reply itself must carry the directive, before anything else.
@@ -529,7 +549,6 @@ describe('MCPServer Protocol Tests', () => {
           targetAgent: 'codex',
           title: 'Refactor Cache Layer',
           prompt: 'Use LRU cache with 500 items max',
-          expectedFiles: ['src/cache/lru.ts'],
           callerSessionId: 'caller_mcp_1',
         },
       },
@@ -828,7 +847,6 @@ describe('MCPServer Protocol Tests', () => {
           targetAgent: 'codex',
           title: 'Retry in place',
           prompt: 'Implement the extension exactly as designed',
-          expectedFiles: ['src/extension/sleeve.ts'],
           callerSessionId: 'caller_mcp_retry',
         },
       },
@@ -869,7 +887,6 @@ describe('MCPServer Protocol Tests', () => {
           targetAgent: 'codex',
           title: 'Repeat instruction',
           prompt,
-          expectedFiles: ['src/extension/repeat.ts'],
           callerSessionId: 'caller_mcp_repeat',
         },
       },
@@ -896,106 +913,6 @@ describe('MCPServer Protocol Tests', () => {
     );
   });
 
-  test('requires a declared scope unless the caller explicitly opts out', async () => {
-    const noScope = await mcpServer.handleRpcMessage({
-      jsonrpc: '2.0',
-      id: 60,
-      method: 'tools/call',
-      params: {
-        name: 'dispatch_task',
-        arguments: { targetAgent: 'codex', title: 'No scope', prompt: 'do work' },
-      },
-    });
-    assert.ok(noScope.error, 'a dispatch without expectedFiles must be rejected');
-    assert.match(noScope.error.message, /expectedFiles/);
-
-    const optedOut = await mcpServer.handleRpcMessage({
-      jsonrpc: '2.0',
-      id: 61,
-      method: 'tools/call',
-      params: {
-        name: 'dispatch_task',
-        arguments: {
-          targetAgent: 'codex',
-          title: 'Docs only',
-          prompt: 'answer a question',
-          allowNoScope: true,
-        },
-      },
-    });
-    assert.ok(optedOut.result, 'allowNoScope must be accepted');
-    assert.strictEqual(JSON.parse(optedOut.result.content[0].text).status, 'DISPATCHED');
-  });
-
-  test('blocks a task whose declared files another open task already owns', async () => {
-    // A task that was accepted but never收口 (no merge request) still owns its
-    // files: the next task would overwrite the uncommitted work.
-    const now = new Date().toISOString();
-    // The gate only lets an EARLIER task hold files, and equal timestamps are
-    // broken by threadId, which would make this assertion depend on the id the
-    // dispatcher happens to mint. Seed the owner in the past so ordering is
-    // deterministic.
-    const earlier = new Date(Date.now() - 60_000).toISOString();
-    taskStore.upsertTask({
-      threadId: 'thread_seeded_owner',
-      title: 'Earlier overlapping task',
-      initiatorAgent: 'codex',
-      targetAgent: 'deepseek_harness',
-      status: 'completed',
-      currentRound: 1,
-      createdAt: earlier,
-      updatedAt: now,
-      receiverSessionId: 'session-seeded-owner',
-      callerSessionId: 'caller-seeded',
-      workspacePath: process.cwd(),
-      expectedFiles: ['engine/src/shared/TableAuthority.kt'],
-      summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
-      rounds: [
-        {
-          round: 1,
-          type: 'initial',
-          prompt: 'touch TableAuthority',
-          status: 'completed',
-          durationMs: 1,
-          timestamp: now,
-        },
-      ],
-    });
-
-    const blocked = await mcpServer.handleRpcMessage({
-      jsonrpc: '2.0',
-      id: 70,
-      method: 'tools/call',
-      params: {
-        name: 'dispatch_task',
-        arguments: {
-          targetAgent: 'codex',
-          title: 'Overlapping follow-up',
-          prompt: 'also touch TableAuthority',
-          expectedFiles: ['engine/src/shared/TableAuthority.kt'],
-        },
-      },
-    });
-    const data = JSON.parse(blocked.result.content[0].text);
-    assert.strictEqual(data.status, 'QUEUED');
-    assert.match(data.message, /scope/i);
-    assert.match(data.message, /thread_seeded_owner/);
-
-    const thread = taskStore.getTask(data.threadId)!;
-    assert.deepStrictEqual(thread.scopeBlockedBy?.files, ['engine/src/shared/TableAuthority.kt']);
-
-    const override = await mcpServer.handleRpcMessage({
-      jsonrpc: '2.0',
-      id: 71,
-      method: 'tools/call',
-      params: { name: 'allow_scope_overlap', arguments: { threadId: data.threadId, reason: 'reviewed' } },
-    });
-    assert.strictEqual(JSON.parse(override.result.content[0].text).status, 'SCOPE_OVERRIDE');
-    const after = taskStore.getTask(data.threadId)!;
-    assert.strictEqual(after.scopeOverride, true);
-    assert.strictEqual(after.scopeBlockedBy, undefined);
-  });
-
   test('rejects self-dispatch instead of parking a task that can never be reviewed', async () => {
     const call = async (name: string, args: any) =>
       mcpServer.handleRpcMessage({
@@ -1013,7 +930,6 @@ describe('MCPServer Protocol Tests', () => {
       initiatorAgent: 'codex',
       title: 'Self dispatch',
       prompt: 'do the work',
-      allowNoScope: true,
     });
     assert.ok(rejected.error, 'a self-dispatch must be an error, not a queued task');
     assert.match(
@@ -1055,7 +971,6 @@ describe('MCPServer Protocol Tests', () => {
       reviewerModel: 'gpt-6-pro',
       targetModel: 'sonnet',
       reviewBootstrap: { phase: 'pending', attempts: 0 },
-      expectedFiles: [],
       summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
       rounds: [
         {
@@ -1136,7 +1051,6 @@ describe('MCPServer Protocol Tests', () => {
       reviewerModel: 'gpt-6-pro',
       targetModel: 'sonnet',
       reviewBootstrap: { phase: 'pending', attempts: 0 },
-      expectedFiles: [],
       summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
       rounds: [
         {
