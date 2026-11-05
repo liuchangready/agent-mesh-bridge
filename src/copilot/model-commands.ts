@@ -8,6 +8,7 @@ import {
   validateGroup,
 } from './model-groups';
 import { CopilotModelService } from './model-service';
+import { GroupModelRef } from '../bridge/types';
 
 class ResultDocuments implements vscode.TextDocumentContentProvider {
   private values = new Map<string, string>();
@@ -280,6 +281,35 @@ export function registerCopilotModelCommands(
     await service.refresh();
     return true;
   };
+  const configureGroupAgent = async (group: CopilotModelGroup, side: 'receiver' | 'initiator') => {
+    const binding = service.getAgentBinding(group.id);
+    if (side === 'receiver' && !binding?.enabled) {
+      const answer = await vscode.window.showWarningMessage(
+        `Authorize ${group.name} to read and modify files and run commands in each explicitly assigned task worktree? Commands execute with your user permissions.`,
+        { modal: true }, 'Authorize and enable',
+      );
+      if (answer !== 'Authorize and enable') return;
+    }
+    const previous = side === 'receiver' ? binding?.receiverModel : binding?.initiatorModel;
+    const preselect: HostModelRef | string | undefined = previous
+      ? previous.source === 'vscode-lm' ? { id: previous.id, vendor: previous.vendor } : previous.id
+      : undefined;
+    const selected = await chooseModel(group, preselect);
+    if (!selected) return;
+    await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Checking structured tools for ${group.name}` },
+      async (_progress, token) => service.probeToolCalling(group!.id, selected, token));
+    await service.configureGroupAgent(group.id, {
+      enabled: side === 'receiver' ? true : binding?.enabled === true,
+      toolsAuthorized: side === 'receiver' ? true : binding?.toolsAuthorized === true,
+      ...(side === 'receiver' ? { receiverModel: selected } : { initiatorModel: selected }),
+    });
+    if (side === 'receiver') await service.markGroupAgentRoleReady(group.id, side);
+    if (side === 'receiver') {
+      await vscode.window.showInformationMessage(`Bridge Agent ${group.name} is enabled for developer tasks. Its configured model and authorization are pinned for each new task.`);
+    } else {
+      await vscode.window.showWarningMessage(`The sender model is saved for ${group.name}, but Group reviewer sessions are not available yet. This group cannot be selected as a default sender.`);
+    }
+  };
   const manageGroup = async (group?: CopilotModelGroup) => {
     if (!canConfigure()) return;
     group = await chooseGroup(group);
@@ -290,6 +320,13 @@ export function registerCopilotModelCommands(
         { label: 'Manage model members', id: 'members' },
         { label: 'Call model', id: 'call' },
         { label: 'Test connection', id: 'test' },
+        { label: 'Enable / configure as Bridge Agent receiver', id: 'agent-receiver' },
+        ...(service.getAgentBinding(group.id)?.enabled ? [
+          { label: 'Configure Bridge Agent sender model', id: 'agent-sender' },
+          { label: 'Disable Bridge Agent', id: 'agent-disable' },
+        ] : []),
+        { label: 'Set as default receiver', id: 'default-receiver' },
+        { label: 'Set as default sender / reviewer', id: 'default-sender' },
         ...(group.source === 'openai-compatible'
           ? [
               { label: 'Configure / replace API key', id: 'key' },
@@ -348,6 +385,21 @@ export function registerCopilotModelCommands(
       }
     } else if (action.id === 'call') await runCall(group, false);
     else if (action.id === 'test') await runCall(group, true);
+    else if (action.id === 'agent-receiver') await configureGroupAgent(group, 'receiver');
+    else if (action.id === 'agent-sender') await configureGroupAgent(group, 'initiator');
+    else if (action.id === 'agent-disable') {
+      const binding = service.getAgentBinding(group.id);
+      await service.configureGroupAgent(group.id, { enabled: false, toolsAuthorized: binding?.toolsAuthorized === true });
+    } else if (action.id === 'default-receiver') {
+      if (!service.getAgentBinding(group.id)?.enabled) throw new Error('Enable and authorize this group as an Agent first.');
+      await vscode.workspace.getConfiguration('agentMeshBridge').update('defaultAgent', service.getGroupAgentId(group.id), vscode.ConfigurationTarget.Global);
+      await service.refresh();
+    } else if (action.id === 'default-sender') {
+      const binding = service.getAgentBinding(group.id);
+      if (!binding?.enabled || !binding.initiatorModel || !binding.initiatorReady) throw new Error('Group reviewer sessions are not available yet; this group cannot be selected as the default sender.');
+      await vscode.workspace.getConfiguration('agentMeshBridge').update('defaultReviewer', service.getGroupAgentId(group.id), vscode.ConfigurationTarget.Global);
+      await service.refresh();
+    }
     else if (action.id === 'key' && group.source === 'openai-compatible') await configureKey(group);
     else if (action.id === 'delete-key' && group.source === 'openai-compatible') {
       service.cancelGroup(group.id);

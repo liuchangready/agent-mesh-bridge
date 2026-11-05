@@ -51,6 +51,7 @@ import {
 } from './reviewer-log';
 import { aggregateThreadTokenUsage } from './token-usage-collector';
 import { assertCanExecute } from './agent-capabilities';
+import { isGroupAgentId, loadGroupAgentConfig, loadGroupAgentHost } from './group-agent-registry';
 import { COPILOT_MAX_ROUNDS, projectCopilotRoundTokenUsage, projectCopilotTaskDetails, projectCopilotTaskSummary, projectCopilotTokenUsage } from '../copilot/copilot-projection';
 
 /** Older non-compacted rounds are excerpted to this many characters. */
@@ -375,13 +376,11 @@ export class MCPServer {
           properties: {
             targetAgent: {
               type: 'string',
-              enum: ['default', 'codex', 'claude_code', 'antigravity', 'deepseek_harness'],
               description:
                 'Target agent to execute the task. Defaults to "default" (auto-detected). May be your own agent identity: same-agent dispatch runs under the dedicated reviewer flow and requires a reviewer model that differs from the executor model.',
             },
             initiatorAgent: {
               type: 'string',
-              enum: ['default', 'codex', 'claude_code', 'antigravity', 'deepseek_harness'],
               description:
                 'Your agent identity (codex, claude_code, antigravity, deepseek_harness). Defaults to auto-detected caller.',
             },
@@ -599,7 +598,6 @@ export class MCPServer {
             },
             targetAgent: {
               type: 'string',
-              enum: ['antigravity', 'codex', 'claude_code', 'deepseek_harness'],
               description:
                 'New receiver agent. Omit to keep the current agent and change only the model. May be the task\'s initiator for a dedicated-review task, where a separate reviewer conversation inspects the result; the reviewer model must differ from this receiver model.',
             },
@@ -867,7 +865,6 @@ export class MCPServer {
           properties: {
             targetAgent: {
               type: 'string',
-              enum: ['default', 'codex', 'claude_code', 'antigravity', 'deepseek_harness'],
               description: 'Target agent to query.',
             },
             prompt: {
@@ -1654,6 +1651,29 @@ export class MCPServer {
 
         const agents: Record<string, any> = {};
         for (const agent of requested) {
+          if (isGroupAgentId(agent)) {
+            const entry = loadGroupAgentConfig()?.agents.find((item) => item.id === agent && item.enabled);
+            const host = loadGroupAgentHost();
+            if (!entry) continue;
+            const receiver = entry.receiverModel;
+            const initiator = entry.initiatorModel;
+            agents[agent] = {
+              configuredModel: receiver?.id || null,
+              configuredModelRef: receiver || null,
+              initiatorModel: initiator?.id || null,
+              initiatorModelRef: initiator || null,
+              models: receiver ? [{ id: receiver.id, hint: 'configured default', modelRef: receiver }] : [],
+              source: entry.source,
+              capability: {
+                receiver: entry.receiverReady && !!host ? 'ready' : 'unknown',
+                initiator: entry.initiatorReady && !!host ? 'ready' : 'unknown',
+                host: host ? 'online' : 'offline',
+                toolsAuthorized: entry.toolsAuthorized,
+              },
+              updatedAt: new Date(loadGroupAgentConfig()?.updatedAt || Date.now()).toISOString(),
+            };
+            continue;
+          }
           const catalog = all[agent];
           if (!catalog) continue;
           const configuredModel = defaults[agent] || null;

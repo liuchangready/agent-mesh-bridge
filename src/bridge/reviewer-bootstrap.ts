@@ -456,6 +456,8 @@ export class ReviewerBootstrapService {
         taskThreadId: thread.threadId,
         taskRound: 0,
         model: thread.reviewerModel,
+        modelRef: thread.reviewerModelRef,
+        role: 'bootstrap',
         markAsReceiver: false,
         timeoutMs: this.deps.timeoutMs ?? 3 * 60 * 1000,
         silenceTimeoutMs: 2 * 60 * 1000,

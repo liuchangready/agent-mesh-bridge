@@ -527,3 +527,12 @@ D:\agent_bridge\
 └── resources\
     └── bridge-icon.svg            # 插件品牌图标
 ```
+# Copilot Group Agent transport extension
+
+`copilot_group:<groupUuid>` is a registry-validated, Bridge-owned runtime. It consumes an exact user-bound host `{vendor,id}` model or compatible endpoint `{origin,id,revision}` model. `vscode_chat` remains the native Copilot requester and is not an execution adapter.
+
+The existing four CLI transports retain their native sessions, process flags, and `exitCode + stdout` assessment unchanged. Group Agent sessions are stored as append-only Bridge-owned history and shown with their owner and transport. They never impersonate, copy, resume, or delete the user’s native Copilot conversation. CLI executable detection still enumerates only the four installed CLIs; dynamic group admission requires a published binding, a fresh trusted local desktop host/workspace, role-specific model binding, explicit tool permission, and a successful user-initiated structured-tool capability probe.
+
+The shared dispatcher, task ledger, supervisor, worktree, role locks, reviewer flow, callbacks, rework/retry, and merge gate remain the task state machine. Group model requests run in the extension host; the current `GroupAgentRuntime` persists tool intents/results in its Bridge session store and exposes only worktree file tools and a fixed-cwd command tool. Unknown results for a persisted side effect are not replayed automatically. Tool paths are realpath-checked, command output is bounded/redacted, child processes are receiver-marked and cancellation-tracked, and API keys remain in SecretStorage.
+
+Assessment is transport-specific: CLI `exitCode + stdout` remains authoritative; Group runs require a real non-empty final event and carry a `bridge-agent` discriminator without synthesizing successful CLI output. Missing native model usage is unavailable/partial. Group transport obeys the same role separation, no-forwarding, model approval, pinned worktree/SHA, cancellation, token, archival, and tombstone rules. Reviewer decisions must call the existing task services under a validated reviewer session lease; model text never grants control authority.

@@ -9,6 +9,8 @@ import {
   MESH_TASK_ROUND_ENV,
   MESH_TASK_THREAD_ENV,
   ResponseAssessment,
+  BridgeAgentAssessment,
+  GroupModelRef,
   StreamAssessment,
   StreamGapPolicy,
   TaskInterruption,
@@ -27,6 +29,7 @@ import {
 } from './cancellation-registry';
 import type { TaskStore } from './task-store';
 import { assertCanExecute } from './agent-capabilities';
+import { isGroupAgentId, loadGroupAgentConfig } from './group-agent-registry';
 
 /** Default silence watchdog: 10 minutes (long model reasoning is not a hang). */
 export const DEFAULT_SILENCE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -281,6 +284,9 @@ export interface RunOptions {
    * then to whatever default the CLI itself ships with.
    */
   model?: string;
+  modelRef?: GroupModelRef;
+  role?: 'developer' | 'reviewer' | 'bootstrap';
+  signal?: AbortSignal;
   /**
    * Token usage already recorded for this round.
    *
@@ -332,6 +338,8 @@ export interface RunResult {
   tokenUsage?: TokenUsageMetrics;
   /** The model this attempt actually ran with. */
   model?: string;
+  /** CLI results keep exitCode/stdout; Bridge Agent results carry a final-event assessment. */
+  transport?: 'cli' | 'bridge-agent';
 }
 
 export class AutonomousRunner {
@@ -342,6 +350,8 @@ export class AutonomousRunner {
   private activeChildren: Map<string, child_process.ChildProcess> = new Map();
   private localCancellations: Map<string, CancellationRequest> = new Map();
   private executingThreads: Set<string> = new Set();
+  private groupAgentExecutor?: (options: RunOptions, signal: AbortSignal) => Promise<{ text: string; toolCallsCompleted: number }>;
+  private activeGroupCancels = new Map<string, () => void>();
   /** Where an unspecified model comes from; replaceable for tests. */
   private modelResolver: (agent: AgentId) => string | undefined = (agent) =>
     resolveConfiguredModel(agent);
@@ -379,6 +389,7 @@ export class AutonomousRunner {
       at: new Date().toISOString(),
       by,
     });
+    this.activeGroupCancels.get(threadId)?.();
     const child = this.activeChildren.get(threadId);
     if (child) {
       try {
@@ -727,6 +738,95 @@ export class AutonomousRunner {
    */
   public async execute(options: RunOptions): Promise<RunResult> {
     assertCanExecute(options.agent, 'run as an executor or reviewer');
+    if (isGroupAgentId(options.agent)) {
+      if (!this.groupAgentExecutor) throw new Error('The trusted VS Code Group Agent host is not attached.');
+      const binding = loadGroupAgentConfig()?.agents.find((entry) => entry.id === options.agent);
+      const reviewer = options.role === 'reviewer' || options.role === 'bootstrap';
+      const modelRef = options.modelRef || (reviewer ? binding?.initiatorModel : binding?.receiverModel);
+      if (!binding?.enabled || !binding.toolsAuthorized || !modelRef)
+        throw new Error('The Group Agent is disabled, unauthorized, or has no model for this role.');
+      if (reviewer)
+        throw new Error('Group Agent reviewer/bootstrap control tools are not available yet; this role is deliberately not admitted.');
+      const runId = require('crypto').randomUUID() as string;
+      const startedAt = new Date().toISOString();
+      const start = monotonicNowMs();
+      const suspension = new HostSuspensionGuard();
+      suspension.start();
+      const aborter = new AbortController();
+      const externalAbort = () => aborter.abort(options.signal?.reason);
+      options.signal?.addEventListener('abort', externalAbort, { once: true });
+      if (options.signal?.aborted) externalAbort();
+      if (options.taskThreadId) this.activeGroupCancels.set(options.taskThreadId, () => aborter.abort());
+      let timeout: NodeJS.Timeout | undefined;
+      let timedOut = false;
+      const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
+      const timeoutPromise = new Promise<never>((_resolve, reject) => {
+        const check = () => {
+          suspension.sync();
+          const now = monotonicNowMs();
+          const activeMs = now - start - suspension.suspendedWithin(start, now);
+          if (activeMs >= timeoutMs) {
+            timedOut = true;
+            aborter.abort(new Error('Group Agent task timed out.'));
+            reject(new Error(`Group Agent task timed out after ${timeoutMs} ms of active host time.`));
+          } else {
+            timeout = setTimeout(check, Math.min(1000, Math.max(50, timeoutMs - activeMs)));
+            timeout.unref?.();
+          }
+        };
+        timeout = setTimeout(check, Math.min(1000, timeoutMs));
+        timeout.unref?.();
+      });
+      try {
+        const output = await Promise.race([
+          this.groupAgentExecutor({ ...options, modelRef, extraEnv: { ...options.extraEnv, MESH_GROUP_RUN_ID: runId } }, aborter.signal),
+          timeoutPromise,
+        ]);
+        const text = output.text;
+        const ended = new Date().toISOString();
+        const assessment: BridgeAgentAssessment = {
+          transport: 'bridge-agent', success: Boolean(text.trim()),
+          errorCode: text.trim() ? 'OK' : 'EMPTY_OUTPUT', runId,
+          stream: { chunkCount: 0, stdoutBytes: 0, stderrBytes: 0, maxGapMs: 0, gapThresholdMs: DEFAULT_SILENCE_TIMEOUT_MS, hasActualOutput: false, continuous: false },
+          exitCode: -1,
+          sessionId: options.receiverSessionId, finalEvent: Boolean(text.trim()),
+          toolCallsCompleted: output.toolCallsCompleted, startedAt, completedAt: ended,
+        };
+        return {
+          exitCode: -1, stdout: '', stderr: '', extractedOutput: text,
+          durationMs: Math.max(0, monotonicNowMs() - start), model: options.model,
+          transport: 'bridge-agent', assessment,
+          tokenUsage: {
+            uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+            promptTokens: 0, outputTokens: 0, totalTokens: 0, agent: options.agent,
+            model: options.model, source: 'unavailable', available: false, partial: true,
+            attempts: 1, notes: 'The host model did not provide usage metadata.',
+            collectedAt: ended,
+          },
+        };
+      } catch (error) {
+        const ended = new Date().toISOString();
+        return {
+          exitCode: -1, stdout: '', stderr: '', extractedOutput: '',
+          durationMs: Math.max(0, monotonicNowMs() - start),
+          error: error instanceof Error ? error.message : String(error),
+          transport: 'bridge-agent',
+          assessment: {
+            transport: 'bridge-agent', success: false, errorCode: timedOut ? 'TIMEOUT' : aborter.signal.aborted ? 'CANCELLED' : 'BRIDGE_AGENT_ERROR',
+            stream: { chunkCount: 0, stdoutBytes: 0, stderrBytes: 0, maxGapMs: 0, gapThresholdMs: DEFAULT_SILENCE_TIMEOUT_MS, hasActualOutput: false, continuous: false },
+            exitCode: -1,
+            runId, sessionId: options.receiverSessionId, finalEvent: false,
+            toolCallsCompleted: 0, startedAt, completedAt: ended,
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        };
+      } finally {
+        options.signal?.removeEventListener('abort', externalAbort);
+        if (timeout) clearTimeout(timeout);
+        suspension.stop();
+        if (options.taskThreadId) this.activeGroupCancels.delete(options.taskThreadId);
+      }
+    }
     const maxRetries = options.maxRetries ?? 3;
     const baseBackoffMs = options.retryBackoffMs ?? 2000;
     const taskThreadId = options.taskThreadId;
@@ -894,6 +994,10 @@ export class AutonomousRunner {
         this.executingThreads.delete(taskThreadId);
       }
     }
+  }
+
+  public setGroupAgentExecutor(executor: ((options: RunOptions, signal: AbortSignal) => Promise<{ text: string; toolCallsCompleted: number }>) | undefined): void {
+    this.groupAgentExecutor = executor;
   }
 
   /**

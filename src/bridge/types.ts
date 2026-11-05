@@ -2,12 +2,16 @@
  * Data contracts and core types for Agent Mesh Bridge.
  */
 
-export type AgentId =
+export type CliAgentId =
   | 'antigravity'
   | 'claude_code'
   | 'codex'
   | 'deepseek_harness'
   | 'vscode_chat';
+
+/** A configured Copilot model group is executable only through the host registry. */
+export type GroupAgentId = `copilot_group:${string}`;
+export type AgentId = CliAgentId | GroupAgentId;
 
 export type TargetAgentSelection = 'default' | AgentId;
 
@@ -119,7 +123,8 @@ export type StreamGapPolicy = 'warn' | 'fail';
  */
 export const DEFAULT_STREAM_GAP_POLICY: StreamGapPolicy = 'warn';
 
-export interface ResponseAssessment {
+export interface CliResponseAssessment {
+  transport?: 'cli';
   /** exitCode === 0 AND actual output existed AND no unattributable stall. */
   success: boolean;
   /** Stable response status code, e.g. OK / NONZERO_EXIT / EMPTY_OUTPUT / STREAM_STALLED. */
@@ -130,6 +135,26 @@ export interface ResponseAssessment {
   /** Non-fatal findings (e.g. a long gap that was downgraded to a warning). */
   warnings?: AssessmentWarning[];
 }
+
+export interface BridgeAgentAssessment {
+  transport: 'bridge-agent';
+  success: boolean;
+  errorCode: string;
+  /** CLI stream metrics do not apply; zero chunks and no stdout are intentional. */
+  stream: StreamAssessment;
+  /** -1 means this transport has no operating-system CLI exit code. */
+  exitCode: -1;
+  runId: string;
+  sessionId: string;
+  finalEvent: boolean;
+  toolCallsCompleted: number;
+  startedAt: string;
+  completedAt: string;
+  warnings?: AssessmentWarning[];
+  reason?: string;
+}
+
+export type ResponseAssessment = CliResponseAssessment | BridgeAgentAssessment;
 
 /**
  * Merge-request handoff recorded by the caller/reviewer after a task (or a
@@ -572,6 +597,10 @@ export interface DelegationThread {
   title: string; // Brief title, e.g. "Fix TCP cursor drift"
   initiatorAgent: AgentId; // Initiator (Caller A)
   targetAgent: AgentId; // Receiver (Target B)
+  /** Exact host/API model identity pinned for Bridge Group Agent tasks. */
+  targetModelRef?: GroupModelRef;
+  initiatorModelRef?: GroupModelRef;
+  reviewerModelRef?: GroupModelRef;
   status: ThreadStatus; // Lifecycle status; each task has its own isolated Git worktree.
   currentRound: number; // Current round (1: initial, 2+: rework)
   createdAt: string; // ISO8601 creation timestamp
@@ -752,6 +781,7 @@ export interface DispatchTaskParams {
    * in VS Code. Otherwise the configured default is used.
    */
   model?: string;
+  modelRef?: GroupModelRef;
   /**
    * Caller declares the user themselves specified `model`. Defaults to false, so
    * a caller guessing a "better" model cannot silently switch away from the
@@ -921,9 +951,13 @@ export interface AgentInfo {
 export interface AgentMeshStatus {
   activeAgent: AgentId;
   resolvedMode: 'auto' | 'manual';
-  agents: Record<AgentId, AgentInfo>;
+  agents: Partial<Record<AgentId, AgentInfo>> & Record<CliAgentId, AgentInfo>;
   totalLedgerTasks: number;
 }
+
+export type GroupModelRef =
+  | { source: 'vscode-lm'; vendor: string; id: string }
+  | { source: 'openai-compatible'; id: string; origin: string; bindingRevision: number };
 
 /**
  * Validates whether a given string is a genuine session ID/UUID rather than an agent identifier or dummy value.

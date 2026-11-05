@@ -273,15 +273,13 @@
       "properties": {
         "agentMeshBridge.defaultAgent": {
           "type": "string",
-          "enum": [
-            "auto",
-            "codex",
-            "claude_code",
-            "antigravity",
-            "deepseek_harness"
-          ],
           "default": "auto",
-          "description": "Default target agent for task delegation when not explicitly specified."
+          "markdownDescription": "Default receiver Agent for new tasks. Built-in CLI Agent IDs and explicitly enabled Copilot Group IDs are supported. A disabled, unavailable, or unauthorized explicit default fails admission instead of silently selecting another Agent."
+        },
+        "agentMeshBridge.defaultReviewer": {
+          "type": "string",
+          "default": "caller",
+          "markdownDescription": "Default sender/reviewer for new dedicated tasks. `caller` preserves the requesting Agent; an explicitly enabled Copilot Group ID can be selected from that group's menu. Legacy review remains caller-owned."
         },
         "agentMeshBridge.models.antigravity": {
           "type": "string",

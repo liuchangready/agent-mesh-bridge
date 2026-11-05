@@ -1,6 +1,10 @@
 import * as vscode from 'vscode';
-import { completeCompatibleChat, fetchCompatibleModels } from './compatible-model-client';
+import { completeCompatibleChat, completeCompatibleTools, fetchCompatibleModels } from './compatible-model-client';
 import { CopilotModelGroup, CopilotModelGroups, HostModelRef, validateGroup } from './model-groups';
+import { GroupAgentRuntime, GroupAgentRunResult, GroupMessage } from './group-agent-runtime';
+import { GroupModelRef } from '../bridge/types';
+import { getBridgeHome } from '../bridge/model-catalog';
+import { saveGroupAgentConfig, loadGroupAgentConfig, loadGroupAgentHost, GroupAgentBinding } from '../bridge/group-agent-registry';
 
 export class CopilotModelService implements vscode.Disposable {
   readonly groups: CopilotModelGroups;
@@ -12,8 +16,13 @@ export class CopilotModelService implements vscode.Disposable {
   private readonly changed = new vscode.EventEmitter<void>();
   readonly onDidChange = this.changed.event;
   private readonly modelChange: vscode.Disposable;
+  private groupRuntime?: GroupAgentRuntime;
+  private readonly modelAccess: vscode.LanguageModelAccessInformation;
+  private readonly globalState: vscode.Memento;
 
   constructor(context: vscode.ExtensionContext) {
+    this.modelAccess = context.languageModelAccessInformation;
+    this.globalState = context.globalState;
     this.groups = new CopilotModelGroups(context.globalState, context.secrets);
     this.modelChange = vscode.lm.onDidChangeChatModels(() => {
       this.hostModels = [];
@@ -22,6 +31,7 @@ export class CopilotModelService implements vscode.Disposable {
     });
     context.subscriptions.push(this);
     context.subscriptions.push(context.secrets.onDidChange(() => this.changed.fire()));
+    this.publishAgentConfig();
   }
 
   async refreshHostModels(): Promise<void> {
@@ -64,7 +74,150 @@ export class CopilotModelService implements vscode.Disposable {
   }
 
   async refresh(): Promise<void> {
+    this.publishAgentConfig();
     this.changed.fire();
+  }
+
+  getGroupAgentId(groupId: string): `copilot_group:${string}` {
+    return `copilot_group:${groupId}`;
+  }
+
+  getAgentBinding(groupId: string): GroupAgentBinding | undefined {
+    return loadGroupAgentConfig()?.agents.find((entry) => entry.groupId === groupId);
+  }
+
+  async configureGroupAgent(groupId: string, settings: {
+    enabled: boolean;
+    toolsAuthorized: boolean;
+    receiverModel?: HostModelRef | string | null;
+    initiatorModel?: HostModelRef | string | null;
+  }): Promise<void> {
+    const group = this.groups.getAll().find((entry) => entry.id === groupId);
+    if (!group) throw new Error('The model group no longer exists.');
+    const previous = this.globalState.get<Record<string, any>>('copilot.groupAgentSettings.v1', {})[groupId] || {};
+    const revision = (previous.revision || 0) + 1;
+    const modelRef = (selection: HostModelRef | string | null | undefined): GroupModelRef | undefined => {
+      if (selection === undefined || selection === null) return undefined;
+      if (group.source === 'vscode-lm') {
+        if (typeof selection === 'string' || !group.models.some((model) => model.id === selection.id && model.vendor === selection.vendor))
+          throw new Error('The selected host model is not a member of this group.');
+        const model = this.hostModels.find((candidate) => candidate.id === selection.id && candidate.vendor === selection.vendor);
+        if (!model || this.modelAccess.canSendRequest(model) !== true)
+          throw new Error('The host model is unavailable or its background request permission is not already granted.');
+        return { source: 'vscode-lm', vendor: selection.vendor, id: selection.id };
+      }
+      if (typeof selection !== 'string' || !group.models.some((model) => model.id === selection))
+        throw new Error('The selected endpoint model is not a member of this group.');
+      if (!previous.toolsAuthorized && settings.toolsAuthorized !== true)
+        throw new Error('Enable the group only after explicitly authorizing task tools.');
+      return { source: 'openai-compatible', id: selection, origin: new URL(group.baseUrl).origin, bindingRevision: revision };
+    };
+    const updated = {
+      ...previous,
+      enabled: settings.enabled,
+      toolsAuthorized: settings.toolsAuthorized,
+      revision,
+    };
+    const receiverSelection = settings.receiverModel !== undefined
+      ? settings.receiverModel
+      : previous.receiverModel;
+    const initiatorSelection = settings.initiatorModel !== undefined
+      ? settings.initiatorModel
+      : previous.initiatorModel;
+    const receiverRef = modelRef(receiverSelection);
+    const initiatorRef = modelRef(initiatorSelection);
+    if (receiverRef) updated.receiverModel = receiverRef;
+    else delete updated.receiverModel;
+    if (initiatorRef) updated.initiatorModel = initiatorRef;
+    else delete updated.initiatorModel;
+    const all = this.globalState.get<Record<string, any>>('copilot.groupAgentSettings.v1', {});
+    await this.globalState.update('copilot.groupAgentSettings.v1', { ...all, [groupId]: updated });
+    this.publishAgentConfig();
+    this.changed.fire();
+  }
+
+  async probeToolCalling(groupId: string, selection: HostModelRef | string, token: vscode.CancellationToken): Promise<void> {
+    const group = this.groups.getAll().find((entry) => entry.id === groupId);
+    if (!group) throw new Error('The model group was deleted.');
+    const nonce = require('crypto').randomUUID() as string;
+    const tool = { name: 'bridge_capability_probe', description: 'Return the supplied nonce unchanged. Do not request any other tool.', inputSchema: { type: 'object', properties: { nonce: { type: 'string' } }, required: ['nonce'], additionalProperties: false } };
+    if (group.source === 'vscode-lm') {
+      if (typeof selection === 'string' || !group.models.some((ref) => ref.id === selection.id && ref.vendor === selection.vendor))
+        throw new Error('Select an exact host model that belongs to this group.');
+      const model = this.hostModels.find((candidate) => candidate.id === selection.id && candidate.vendor === selection.vendor);
+      if (!model) throw new Error('The selected host model is not currently visible. Refresh the catalog and grant host model access first.');
+      const source = new vscode.CancellationTokenSource();
+      const cancel = token.onCancellationRequested(() => source.cancel());
+      try {
+        const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(`Call bridge_capability_probe with nonce ${nonce}.`)], { tools: [tool] }, source.token);
+        const calls: vscode.LanguageModelToolCallPart[] = [];
+        for await (const part of response.stream) if (part instanceof vscode.LanguageModelToolCallPart) calls.push(part);
+        if (calls.length !== 1 || calls[0].name !== tool.name || (calls[0].input as Record<string, unknown>)?.nonce !== nonce)
+          throw new Error('The selected host model did not return the exact structured capability probe.');
+      } finally { cancel.dispose(); source.dispose(); }
+    } else {
+      if (typeof selection !== 'string' || !group.models.some((model) => model.id === selection)) throw new Error('Select an exact endpoint model that belongs to this group.');
+      const apiKey = await this.groups.getApiKey(group);
+      if (!apiKey) throw new Error('Configure the endpoint API key before probing.');
+      const aborter = new AbortController();
+      const cancel = token.onCancellationRequested(() => aborter.abort());
+      try {
+        const result = await completeCompatibleTools({
+          baseUrl: group.baseUrl, model: selection,
+          messages: [{ role: 'user', content: `Call bridge_capability_probe with nonce ${nonce}.` }],
+          tools: [tool], apiKey, signal: aborter.signal,
+        });
+        if (result.finishReason !== 'tool_calls' || result.toolCalls.length !== 1 || result.toolCalls[0].name !== tool.name || result.toolCalls[0].arguments.nonce !== nonce)
+          throw new Error('The selected endpoint model did not return the exact structured capability probe.');
+      } finally { cancel.dispose(); }
+    }
+  }
+
+  async markGroupAgentRoleReady(groupId: string, role: 'receiver' | 'initiator'): Promise<void> {
+    const group = this.groups.getAll().find((entry) => entry.id === groupId);
+    const settings = this.globalState.get<Record<string, any>>('copilot.groupAgentSettings.v1', {});
+    const saved = settings[groupId];
+    const selection = role === 'receiver' ? saved?.receiverModel : saved?.initiatorModel;
+    if (!group || !saved?.enabled || !saved.toolsAuthorized || !selection) throw new Error('Configure and authorize this Group Agent role before marking it ready.');
+    const host = loadGroupAgentHost();
+    if (!host) throw new Error('The trusted local VS Code host/workspace is offline.');
+    const probeKey = JSON.stringify(selection);
+    const next = { ...saved, [`${role}Probe`]: { model: probeKey, revision: saved.revision, hostGeneration: host.generation } };
+    await this.globalState.update('copilot.groupAgentSettings.v1', { ...settings, [groupId]: next });
+    this.publishAgentConfig();
+    this.changed.fire();
+  }
+
+  private publishAgentConfig(): void {
+    const settings = this.globalState.get<Record<string, any>>('copilot.groupAgentSettings.v1', {});
+    const agents: GroupAgentBinding[] = this.groups.getAll().map((group) => {
+      const saved = settings[group.id] || {};
+      const receiverModel = saved.receiverModel;
+      const initiatorModel = saved.initiatorModel;
+      const host = loadGroupAgentHost();
+      const ready = (role: 'receiver' | 'initiator', ref: unknown) => {
+        // Reviewer control calls must be bound to the real reviewer session; until
+        // that transport exists a probed model alone is not reviewer readiness.
+        if (role === 'initiator') return false;
+        const probe = saved[`${role}Probe`];
+        return Boolean(ref && host && probe && probe.model === JSON.stringify(ref) && probe.revision === saved.revision && probe.hostGeneration === host.generation);
+      };
+      return {
+        id: this.getGroupAgentId(group.id), groupId: group.id, name: group.name,
+        source: group.source, ...(group.source === 'openai-compatible' ? { baseUrl: group.baseUrl } : {}),
+        enabled: saved.enabled === true, toolsAuthorized: saved.toolsAuthorized === true,
+        receiverReady: ready('receiver', receiverModel), initiatorReady: ready('initiator', initiatorModel),
+        revision: Number.isInteger(saved.revision) ? saved.revision : 0,
+        ...(receiverModel ? { receiverModel } : {}),
+        ...(initiatorModel ? { initiatorModel } : {}),
+      };
+    });
+    const config = vscode.workspace.getConfiguration('agentMeshBridge');
+    saveGroupAgentConfig({
+      version: 1, updatedAt: Date.now(), agents,
+      defaultAgent: config.get<string>('defaultAgent', 'auto'),
+      defaultReviewer: config.get<string>('defaultReviewer', 'caller'),
+    });
   }
 
   async invoke(
@@ -177,6 +330,109 @@ export class CopilotModelService implements vscode.Disposable {
       this.active.delete(aborter);
       this.changed.fire();
     }
+  }
+
+  async runGroupAgent(
+    groupId: string,
+    modelRef: GroupModelRef,
+    sessionId: string,
+    cwd: string,
+    prompt: string,
+    token: vscode.CancellationToken,
+    onChildPid?: (pid: number | undefined) => void,
+    role: 'developer' | 'reviewer' | 'bootstrap' = 'developer',
+  ): Promise<GroupAgentRunResult> {
+    if (!vscode.workspace.isTrusted || vscode.env.uiKind === vscode.UIKind.Web || vscode.env.remoteName)
+      throw new Error('Group Agent execution requires a trusted local desktop workspace.');
+    if (!prompt.trim() || Buffer.byteLength(prompt) > 32_000) throw new Error('Task prompt is empty or exceeds 32 KB.');
+    const group = this.groups.getAll().find((entry) => entry.id === groupId);
+    if (!group) throw new Error('The Group Agent binding was removed.');
+    const binding = loadGroupAgentConfig()?.agents.find((entry) => entry.groupId === groupId);
+    const configuredModel = role === 'developer' ? binding?.receiverModel : binding?.initiatorModel;
+    if (!binding?.enabled || !binding.toolsAuthorized || !configuredModel || JSON.stringify(configuredModel) !== JSON.stringify(modelRef))
+      throw new Error('The Group Agent role binding changed or is not authorized.');
+    if (modelRef.source === 'openai-compatible' && (group.source !== 'openai-compatible' || modelRef.origin !== new URL(group.baseUrl).origin || modelRef.bindingRevision !== binding.revision))
+      throw new Error('The pinned Group Agent endpoint origin or binding revision changed.');
+    const runtime = new GroupAgentRuntime({
+      bridgeHome: getBridgeHome(),
+      onChildPid,
+      request: async (messages, tools, signal) => {
+        const selected = group.source === 'vscode-lm'
+          ? modelRef.source === 'vscode-lm' && group.models.some((ref) => ref.id === modelRef.id && ref.vendor === modelRef.vendor)
+          : modelRef.source === 'openai-compatible' && modelRef.origin === new URL(group.baseUrl).origin && group.models.some((model) => model.id === modelRef.id);
+        if (!selected) throw new Error('The pinned Group Agent model no longer matches this group binding.');
+        const current = this.groups.getAll().find((entry) => entry.id === groupId);
+        if (!current || JSON.stringify(validateGroup(current)) !== JSON.stringify(validateGroup(group)))
+          throw new Error('The Group Agent binding changed during execution.');
+        if (group.source === 'openai-compatible') {
+          if (modelRef.source !== 'openai-compatible') throw new Error('Endpoint group requires an endpoint model reference.');
+          const apiKey = await this.groups.getApiKey(group);
+          if (!apiKey) throw new Error('Group Agent API key is missing.');
+          const apiMessages = messages.map((message) => ({
+            role: message.role,
+            content: message.content,
+            ...(message.toolCallId ? { tool_call_id: message.toolCallId, name: message.toolName } : {}),
+            ...(message.toolCalls ? { tool_calls: message.toolCalls.map((call) => ({ id: call.id, type: 'function' as const, function: { name: call.name, arguments: JSON.stringify(call.arguments) } })) } : {}),
+          }));
+          return completeCompatibleTools({
+            baseUrl: group.baseUrl,
+            model: modelRef.id,
+            messages: apiMessages,
+            tools,
+            apiKey,
+            signal,
+          });
+        }
+        if (modelRef.source !== 'vscode-lm') throw new Error('Host model group requires a vendor/id reference.');
+        const model = this.hostModels.find((candidate) => candidate.id === modelRef.id && candidate.vendor === modelRef.vendor);
+        if (!model || this.modelAccess.canSendRequest(model) !== true)
+          throw new Error('The exact VS Code host model is unavailable or has not been authorized for background requests.');
+        const requestToken = new vscode.CancellationTokenSource();
+        const abortRequest = () => requestToken.cancel();
+        signal.addEventListener('abort', abortRequest, { once: true });
+        const schemaTools: vscode.LanguageModelChatTool[] = tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema }));
+        try {
+          const input = messages.map((message) => {
+            if (message.role === 'tool') return vscode.LanguageModelChatMessage.User([
+              new vscode.LanguageModelToolResultPart(message.toolCallId!, [new vscode.LanguageModelTextPart(message.content)]),
+            ]);
+            if (message.role === 'assistant') return vscode.LanguageModelChatMessage.Assistant([
+              ...(message.content ? [new vscode.LanguageModelTextPart(message.content)] : []),
+              ...(message.toolCalls || []).map((call) => new vscode.LanguageModelToolCallPart(call.id, call.name, call.arguments)),
+            ]);
+            return vscode.LanguageModelChatMessage.User(message.content);
+          });
+          const response = await model.sendRequest(input, { tools: schemaTools }, requestToken.token);
+          let text = '';
+          const toolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown> }> = [];
+          for await (const part of response.stream) {
+            if (signal.aborted) throw new Error('Request cancelled.');
+            if (part instanceof vscode.LanguageModelTextPart) text += part.value;
+            else if (part instanceof vscode.LanguageModelToolCallPart) {
+              if (!part.input || typeof part.input !== 'object' || Array.isArray(part.input)) throw new Error('Host model returned invalid tool arguments.');
+              toolCalls.push({ id: part.callId, name: part.name, arguments: part.input as Record<string, unknown> });
+            } else if (part !== undefined && part !== null) throw new Error('Host model returned an unsupported response part.');
+          }
+          return { text, toolCalls, finishReason: toolCalls.length ? 'tool_calls' as const : 'stop' as const };
+        } finally {
+          requestToken.dispose();
+          signal.removeEventListener('abort', abortRequest);
+        }
+      },
+    });
+    this.groupRuntime = runtime;
+    const aborter = new AbortController();
+    const subscription = token.onCancellationRequested(() => aborter.abort());
+    try {
+      return await runtime.run(sessionId, cwd, prompt, aborter.signal);
+    } finally {
+      subscription.dispose();
+    }
+  }
+
+  readGroupAgentSession(sessionId: string, offset = 0, limit = 100): GroupMessage[] {
+    if (!this.groupRuntime) this.groupRuntime = new GroupAgentRuntime({ bridgeHome: getBridgeHome(), request: async () => { throw new Error('Session history is read-only.'); } });
+    return this.groupRuntime.sessions.read(sessionId, offset, limit);
   }
 
   async listCompatibleModels(

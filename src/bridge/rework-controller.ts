@@ -937,6 +937,8 @@ export class ReworkController {
           taskThreadId: thread.threadId,
           taskRound: roundNumber,
           model: thread.targetModel,
+          modelRef: thread.targetModelRef,
+          role: 'developer',
           previousTokenUsage: readStoredRoundUsage(this.taskStore, thread.threadId, roundNumber),
           onChildPid: (pid) => {
             if (registration) this.executionRegistry.attachChildPid(pid, registration);

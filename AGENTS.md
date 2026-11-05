@@ -114,6 +114,15 @@
 
 ---
 
+### 23. Group Agent transport compatibility
+
+Copilot model groups are a separate Bridge-owned transport, registered only by stable `copilot_group:<groupUuid>` entries published from the trusted local extension host. `vscode_chat` remains requester-only. CLI executable discovery and the four CLI static IDs are unchanged; task admission resolves registered transport and role capability instead of treating every Agent as a CLI binary.
+
+- CLI native sessions, invocation flags, unattended permissions, and `exitCode + stdout` assessment keep their existing behavior. Bridge Group Agent sessions are append-only Bridge-owned native history; the UI must identify their owner and transport. The user’s native Copilot chat is never copied, resumed, or deleted.
+- A Group Agent must have a current host/workspace binding, explicit tool authorization, an exact role model binding, and a successful user-triggered structured-tool probe. Unknown capability is unavailable. A `bridge-agent` result uses final-event assessment and never fabricates CLI stdout or exit code zero; missing native usage remains unavailable/partial.
+- The extension host owns model access and SecretStorage. Model/tool execution stays in the registered task worktree; tool paths must be contained after realpath resolution, command output is bounded and redacted, and command children are cancellable and receiver-marked. An unresolved persisted side-effect intent is not replayed automatically.
+- Existing one-task/one-role, receiver no-forwarding, dedicated reviewer, model approval, pinned worktree/base SHA, merge gate, token, pause/resume/delete, archive and tombstone requirements apply to this transport. Reviewer control actions must reuse the existing business services and validate the actual reviewer session/role lease; a prompt or model output is never a credential.
+
 ## 2. 技术栈与运行环境
 
 - **运行宿主**：Visual Studio Code (`^1.90.0`)

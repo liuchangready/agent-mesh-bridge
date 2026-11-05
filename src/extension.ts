@@ -412,7 +412,26 @@ export function activate(context: vscode.ExtensionContext) {
   modelApprovalService.start();
   context.subscriptions.push(modelApprovalService);
   const timeoutMinutes = config.get<number>('taskTimeoutMinutes', 120);
+  const copilotModelService = new CopilotModelService(context);
   const runner = new AutonomousRunner(detector, timeoutMinutes * 60 * 1000, undefined, taskStore);
+  runner.setGroupAgentExecutor(async (options, signal) => {
+    if (!options.agent.startsWith('copilot_group:') || !options.cwd || !options.modelRef)
+      throw new Error('Group Agent run is missing its registered identity, model reference, or task worktree.');
+    const source = new vscode.CancellationTokenSource();
+    const abort = () => source.cancel();
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    try {
+      return await copilotModelService.runGroupAgent(
+        options.agent.slice('copilot_group:'.length), options.modelRef,
+        options.receiverSessionId, options.cwd, options.prompt, source.token, options.onChildPid,
+        options.role || 'developer',
+      );
+    } finally {
+      signal.removeEventListener('abort', abort);
+      source.dispose();
+    }
+  });
   const callbackManager = new CallbackManager(detector);
   // A deferred wake must re-read the thread when it is replayed.
   callbackManager.setTaskStore(taskStore);
@@ -531,18 +550,20 @@ export function activate(context: vscode.ExtensionContext) {
     recentTreeProvider.refresh();
   });
 
-  // Apply defaultAgent config if manual
-  const defaultAgentCfg = config.get<string>('defaultAgent', 'auto');
-  if (defaultAgentCfg && defaultAgentCfg !== 'auto') {
-    resolver.setManualOverride(defaultAgentCfg as AgentId);
-  }
+  // Explicit dynamic defaults are revalidated at selection time; an unavailable
+  // Group Agent produces an admission error instead of silently choosing a CLI.
+  const applyAgentDefaults = () => {
+    const selected = vscode.workspace.getConfiguration('agentMeshBridge').get<string>('defaultAgent', 'auto');
+    resolver.setManualOverride(selected && selected !== 'auto' ? selected as AgentId : null);
+    void copilotModelService.refresh();
+  };
+  applyAgentDefaults();
 
   // 3. Status Bar Controller
   const statusBar = new StatusBarController(resolver, detector);
   context.subscriptions.push(statusBar.getStatusBarItem());
 
   // 4. Tree Views
-  const copilotModelService = new CopilotModelService(context);
   const agentNodesProvider = new AgentNodesProvider(detector, resolver, copilotModelService);
   const activeTreeProvider = new TaskTreeProvider(taskStore, 'active');
   const recentTreeProvider = new TaskTreeProvider(taskStore, 'all');
@@ -1709,6 +1730,8 @@ export function activate(context: vscode.ExtensionContext) {
       if (
         !e.affectsConfiguration('agentMeshBridge.models') &&
         !e.affectsConfiguration('agentMeshBridge.initiatorModels') &&
+        !e.affectsConfiguration('agentMeshBridge.defaultAgent') &&
+        !e.affectsConfiguration('agentMeshBridge.defaultReviewer') &&
         !e.affectsConfiguration('agentMeshBridge.logDirectories') &&
         !e.affectsConfiguration('agentMeshBridge.requireModelApproval') &&
         !e.affectsConfiguration('agentMeshBridge.contextCompaction') &&
@@ -1717,6 +1740,7 @@ export function activate(context: vscode.ExtensionContext) {
       ) {
         return;
       }
+      applyAgentDefaults();
       applyModelSettings();
       applyBridgePolicy();
       reviewWakeScheduler.setStallTimeoutMs(
