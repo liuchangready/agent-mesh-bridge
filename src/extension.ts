@@ -29,6 +29,7 @@ import { registerCopilotMcpProvider } from './copilot/copilot-mcp-provider';
 import { isCopilotRequester } from './copilot/copilot-projection';
 import { claimCopilotTerminalNotification } from './copilot/copilot-notifications';
 import { CopilotModelService } from './copilot/model-service';
+import { GroupAgentHostBroker } from './copilot/group-agent-host-broker';
 import { registerCopilotModelCommands } from './copilot/model-commands';
 import { saveBridgePolicy, AgentLogDirectories } from './bridge/bridge-policy';
 import { probeCodexResumeSupport } from './bridge/codex-session';
@@ -541,6 +542,14 @@ export function activate(context: vscode.ExtensionContext) {
     }
     throw new Error(`Unsupported Group reviewer control: ${name}`);
   });
+  const groupAgentHostBroker = new GroupAgentHostBroker({
+    hostInstanceId: copilotHostInstanceId,
+    taskStore,
+    models: copilotModelService,
+    storageDir: path.dirname(taskStore.getStoragePath()),
+  });
+  groupAgentHostBroker.start();
+  context.subscriptions.push(groupAgentHostBroker);
   const taskControl = new TaskControlService(taskStore, runner);
   const configSync = new ConfigSyncService(undefined, dshProvider);
   configSync.setAgentMcpEnv(agentMcpEnvFor(dshProvider));

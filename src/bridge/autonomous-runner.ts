@@ -29,7 +29,8 @@ import {
 } from './cancellation-registry';
 import type { TaskStore } from './task-store';
 import { assertCanExecute } from './agent-capabilities';
-import { isGroupAgentId, loadGroupAgentConfig } from './group-agent-registry';
+import { isGroupAgentId, loadGroupAgentConfig, loadGroupAgentHost } from './group-agent-registry';
+import { GroupAgentMailboxClient } from './group-agent-mailbox';
 
 /** Default silence watchdog: 10 minutes (long model reasoning is not a hang). */
 export const DEFAULT_SILENCE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -740,11 +741,23 @@ export class AutonomousRunner {
     const reviewer = options.role === 'reviewer' || options.role === 'bootstrap';
     assertCanExecute(options.agent, reviewer ? 'run as a reviewer' : 'run as an executor', reviewer ? 'initiator' : 'receiver');
     if (isGroupAgentId(options.agent)) {
-      if (!this.groupAgentExecutor) throw new Error('The trusted VS Code Group Agent host is not attached.');
+      const groupAgentId = options.agent as `copilot_group:${string}`;
       const binding = loadGroupAgentConfig()?.agents.find((entry) => entry.id === options.agent);
       const modelRef = options.modelRef || (reviewer ? binding?.initiatorModel : binding?.receiverModel);
       if (!binding?.enabled || !binding.toolsAuthorized || !modelRef)
         throw new Error('The Group Agent is disabled, unauthorized, or has no model for this role.');
+      const host = loadGroupAgentHost();
+      const thread = options.taskThreadId ? this.taskStore?.getTask(options.taskThreadId) : undefined;
+      const snapshot = thread
+        ? (reviewer ? thread.initiatorGroupBindingSnapshot : thread.targetGroupBindingSnapshot)
+        : {
+            agentId: groupAgentId, revision: binding.revision, source: binding.source,
+            ...(binding.baseUrl ? { baseUrl: binding.baseUrl } : {}), modelRef,
+          };
+      if (!snapshot || snapshot.agentId !== options.agent || JSON.stringify(snapshot.modelRef) !== JSON.stringify(modelRef))
+        throw new Error('This task has no matching pinned Group Agent binding snapshot; explicitly retarget it to bind the current group.');
+      if (snapshot.source !== binding.source || snapshot.baseUrl !== binding.baseUrl)
+        throw new Error('The Group Agent source or endpoint changed; explicitly retarget this task to rebind it.');
       const runId = require('crypto').randomUUID() as string;
       const startedAt = new Date().toISOString();
       const start = monotonicNowMs();
@@ -781,21 +794,34 @@ export class AutonomousRunner {
       timeout = setTimeout(checkTimeout, Math.min(1000, timeoutMs));
       timeout.unref?.();
       try {
+        if (!host) throw new Error('The trusted local VS Code Group Agent host is offline; resume this task in its original session when the host returns.');
         if (options.taskThreadId && this.taskStore) {
           const task = this.taskStore.getTask(options.taskThreadId);
           if (!task) cancellation ||= { action: 'delete', reason: 'Task was deleted before Group Agent execution started', at: new Date().toISOString(), by: 'task_store' };
-          else if (options.taskRound !== undefined && task.currentRound !== options.taskRound)
+          else if (options.role !== 'bootstrap' && options.taskRound !== undefined && task.currentRound !== options.taskRound)
             throw new Error('The Group Agent round is no longer current.');
         }
         cancellation ||= options.taskThreadId ? this.checkPendingCancellation(options.taskThreadId, initialTaskExisted) : undefined;
         if (cancellation) throw new Error(cancellation.reason);
         if (aborter.signal.aborted) throw new Error('Group Agent execution was cancelled before it started.');
-        const output = await this.groupAgentExecutor({ ...options, modelRef, extraEnv: { ...options.extraEnv, MESH_GROUP_RUN_ID: runId } }, aborter.signal);
+        const runOptions = { ...options, modelRef, extraEnv: { ...options.extraEnv, MESH_GROUP_RUN_ID: runId } };
+        const output = this.groupAgentExecutor
+          ? await this.groupAgentExecutor(runOptions, aborter.signal)
+          : await (async () => {
+              if (!options.taskThreadId || !options.cwd) throw new Error('Group Agent mailbox requests require a task id and task worktree.');
+              return new GroupAgentMailboxClient().execute({
+              threadId: options.taskThreadId || '', round: options.taskRound ?? thread?.currentRound ?? 1,
+              role: options.role || 'developer', agent: groupAgentId, sessionId: options.receiverSessionId,
+              worktree: options.cwd || '', prompt: options.prompt, modelRef, bindingSnapshot: snapshot,
+              isRework: options.isRework, timeoutMs, previousTokenUsage: options.previousTokenUsage,
+              extraEnv: Object.fromEntries(Object.entries(options.extraEnv || {}).filter(([key, value]) => key.startsWith('MESH_REVIEW_') && typeof value === 'string')) as Record<string, string>,
+            }, host, aborter.signal, options.onChildPid);
+            })();
         cancellation ||= options.taskThreadId ? this.checkPendingCancellation(options.taskThreadId, initialTaskExisted) : undefined;
         if (options.taskThreadId && this.taskStore) {
           const task = this.taskStore.getTask(options.taskThreadId);
           if (!task) cancellation ||= { action: 'delete', reason: 'Task was deleted before the Group Agent result was accepted', at: new Date().toISOString(), by: 'task_store' };
-          else if (options.taskRound !== undefined && task.currentRound !== options.taskRound)
+          else if (options.role !== 'bootstrap' && options.taskRound !== undefined && task.currentRound !== options.taskRound)
             throw new Error('The Group Agent round changed before its result was accepted.');
         }
         if (cancellation) aborter.abort(new Error(cancellation.reason));
@@ -821,7 +847,7 @@ export class AutonomousRunner {
                 attempts: output.modelRequests ?? 1, notes: 'The model did not provide native usage metadata.', collectedAt: ended,
               };
         return {
-          exitCode: -1, stdout: '', stderr: '', extractedOutput: text,
+          exitCode: -1, stdout: '', stderr: '', extractedOutput: text, actualSessionId: options.receiverSessionId,
           durationMs: Math.max(0, monotonicNowMs() - start), model: options.model,
           transport: 'bridge-agent', assessment, tokenUsage,
         };
@@ -830,6 +856,8 @@ export class AutonomousRunner {
         const ended = new Date().toISOString();
         const interrupted: TaskInterruption | undefined = timedOut
           ? { kind: 'timeout', reason: 'Group Agent task timed out.', at: ended, by: 'runner' }
+          : /Group Agent host (?:is offline|generation changed)/i.test(error instanceof Error ? error.message : String(error))
+            ? { kind: 'paused', reason: error instanceof Error ? error.message : String(error), at: ended, by: 'group-agent-host' }
           : cancellation
             ? { kind: cancellation.action === 'pause' ? 'paused' : cancellation.action === 'delete' ? 'deleted' : 'stopped', reason: cancellation.reason, at: cancellation.at, by: cancellation.by }
             : aborter.signal.aborted
@@ -842,7 +870,7 @@ export class AutonomousRunner {
             ? { ...options.previousTokenUsage, partial: true, attempts: (options.previousTokenUsage.attempts ?? 1) + ((error as { modelRequests?: number } | null)?.modelRequests ?? 1), notes: [options.previousTokenUsage.notes, 'The interrupted execution returned no complete usage summary.'].filter(Boolean).join(' ') }
             : undefined;
         return {
-          exitCode: -1, stdout: '', stderr: '', extractedOutput: '',
+          exitCode: -1, stdout: '', stderr: '', extractedOutput: '', actualSessionId: options.receiverSessionId,
           durationMs: Math.max(0, monotonicNowMs() - start),
           error: error instanceof Error ? error.message : String(error),
           transport: 'bridge-agent',

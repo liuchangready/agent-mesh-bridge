@@ -601,6 +601,9 @@ export interface DelegationThread {
   targetModelRef?: GroupModelRef;
   initiatorModelRef?: GroupModelRef;
   reviewerModelRef?: GroupModelRef;
+  /** Non-secret Group endpoint/identity snapshot used by the host broker. */
+  targetGroupBindingSnapshot?: GroupAgentBindingSnapshot;
+  initiatorGroupBindingSnapshot?: GroupAgentBindingSnapshot;
   status: ThreadStatus; // Lifecycle status; each task has its own isolated Git worktree.
   currentRound: number; // Current round (1: initial, 2+: rework)
   createdAt: string; // ISO8601 creation timestamp
@@ -958,6 +961,14 @@ export interface AgentMeshStatus {
 export type GroupModelRef =
   | { source: 'vscode-lm'; vendor: string; id: string }
   | { source: 'openai-compatible'; id: string; origin: string; bindingRevision: number };
+
+export interface GroupAgentBindingSnapshot {
+  agentId: `copilot_group:${string}`;
+  revision: number;
+  source: 'vscode-lm' | 'openai-compatible';
+  baseUrl?: string;
+  modelRef: GroupModelRef;
+}
 
 /**
  * Validates whether a given string is a genuine session ID/UUID rather than an agent identifier or dummy value.

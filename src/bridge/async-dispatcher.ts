@@ -10,6 +10,7 @@ import {
   DispatchStatus,
   WorktreeInfo,
   GroupModelRef,
+  GroupAgentBindingSnapshot,
   isIsolatedTaskWorktree,
   getModelRouting,
   findInFlightRound,
@@ -256,6 +257,14 @@ export class AsyncDispatcher {
     }
     const worktree: WorktreeInfo = createTaskWorktree(resolveGitRepository(repositoryPath, this.storageDir), threadId, this.storageDir);
     const workspacePath = worktree.path;
+    const groupBindingSnapshot = (agent: AgentId, modelRef: GroupModelRef | undefined): GroupAgentBindingSnapshot | undefined => {
+      if (!isGroupAgentId(agent) || !modelRef) return undefined;
+      const binding = loadGroupAgentConfig()?.agents.find((entry) => entry.id === agent);
+      if (!binding || !binding.enabled || !binding.toolsAuthorized) throw new Error(`Group Agent ${agent} changed before task snapshot creation.`);
+      return { agentId: agent, revision: binding.revision, source: binding.source, ...(binding.baseUrl ? { baseUrl: binding.baseUrl } : {}), modelRef };
+    };
+    const targetGroupBindingSnapshot = groupBindingSnapshot(targetAgent, targetModelRef);
+    const initiatorGroupBindingSnapshot = groupBindingSnapshot(initiatorAgent, initiatorModelRef);
     const tempCandidate: DelegationThread = {
       threadId,
       title: params.title || 'Untitled Delegation Task',
@@ -293,6 +302,8 @@ export class AsyncDispatcher {
       targetModel,
       targetModelRef,
       reviewerModelRef,
+      ...(targetGroupBindingSnapshot ? { targetGroupBindingSnapshot } : {}),
+      ...(initiatorGroupBindingSnapshot ? { initiatorGroupBindingSnapshot } : {}),
       modelNotice,
       modelApproval: modelResolution.approval,
       summary: {
