@@ -158,6 +158,12 @@ export function noteAutoRetryLaunched(
   nowMs: number = Date.now(),
 ): ReviewWakeState {
   const used = (state.autoRetryAttempts || 0) + 1;
+  // The fifth launch is still in flight, so do not mark the task terminal yet.
+  // Its callback (or the watchdog if it disappears) decides whether it reached
+  // a verdict; no sixth automatic launch is scheduled.
+  if (used >= REVIEW_WAKE_MAX_AUTO_RETRIES) {
+    return { ...state, autoRetryAt: undefined, autoRetryAttempts: used, gaveUp: false };
+  }
   const next = planAutoRetry({ ...state, autoRetryAttempts: used }, nowMs);
   return { ...next, autoRetryAttempts: used };
 }

@@ -316,14 +316,15 @@ describe('File Scope and Conflict Queueing Tests', () => {
       assert.deepStrictEqual(startOrder.length, 2, 'the waiting-review owner keeps only the overlapping candidate queued');
     });
     test('should sync live output stream periodically (30s stream sync)', async () => {
+      let releaseExecution: () => void = () => {};
+      let chunkSeen = false;
+      const executionHeld = new Promise<void>((resolve) => {
+        releaseExecution = resolve;
+      });
       runner.execute = async (options: RunOptions): Promise<RunResult> => {
-        // Emit chunks over time
-        for (let i = 1; i <= 3; i++) {
-          await new Promise((r) => setTimeout(r, 40));
-          if (options.onStdoutChunk) {
-            options.onStdoutChunk(`Streaming chunk ${i}: modifying files...\n`);
-          }
-        }
+        options.onStdoutChunk?.('Streaming chunk 1: modifying files...\n');
+        chunkSeen = true;
+        await executionHeld;
         return {
           exitCode: 0,
           stdout: 'Streaming chunk 1\nStreaming chunk 2\nStreaming chunk 3\nTask completed',
@@ -340,17 +341,34 @@ describe('File Scope and Conflict Queueing Tests', () => {
         expectedFiles: ['service/Worker.kt'],
       });
 
-      // Wait enough for the 30ms stream sync to trigger at least once while executing
-      await new Promise((r) => setTimeout(r, 90));
+      const waitUntil = async (predicate: () => boolean, description: string, timeoutMs = 2_000) => {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          if (predicate()) return;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        assert.ok(predicate(), `timed out waiting for ${description}`);
+      };
 
-      const midTask = taskStore.getTask(res.threadId);
-      assert.ok(midTask);
-      const midRound = midTask.rounds[0];
-      // Live output should have synced partial streamed text before final completion
-      assert.ok(midRound.output && midRound.output.includes('Streaming chunk'));
+      try {
+        await waitUntil(() => chunkSeen, 'the runner to emit a streaming chunk');
+        await waitUntil(() => {
+          const round = taskStore.getTask(res.threadId)?.rounds[0];
+          return round?.status === 'running' && !!round.output?.includes('Streaming chunk');
+        }, 'the live chunk to be synchronized while the round is running');
 
-      // Wait for complete
-      await new Promise((r) => setTimeout(r, 120));
+        const midTask = taskStore.getTask(res.threadId);
+        assert.ok(midTask);
+        assert.strictEqual(midTask.status, 'running');
+        assert.strictEqual(midTask.rounds[0].status, 'running');
+        assert.ok(midTask.rounds[0].output?.includes('Streaming chunk'));
+      } finally {
+        releaseExecution();
+        await waitUntil(() => taskStore.getTask(res.threadId)?.status === 'waiting_review', 'round completion').catch(
+          () => {},
+        );
+      }
+
       const finalTask = taskStore.getTask(res.threadId);
       assert.strictEqual(finalTask?.status, 'waiting_review');
       assert.strictEqual(finalTask?.rounds[0].status, 'completed');

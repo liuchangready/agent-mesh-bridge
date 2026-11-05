@@ -520,7 +520,7 @@ export class CallbackManager extends EventEmitter {
           const state = this.finalizeWake(thread, round, callerSessionId, {
             ...outcome,
             output: capture.text(),
-          });
+          }, wakeKind);
           if (state) {
             console.warn(
               `[CallbackManager] Wake for ${thread.threadId} failed: ${state.lastError}` +
@@ -736,30 +736,68 @@ export class CallbackManager extends EventEmitter {
     round: DelegationRound,
     callerSessionId: string,
     outcome: { exitCode?: number; output?: string; error?: string },
+    wakeKind: 'review' | 'failure' = 'review',
   ): ReviewWakeState | undefined {
     const output = outcome.output || '';
     const signal = detectRateLimitSignal(output);
     const clean = !outcome.error && outcome.exitCode === 0 && !signal;
 
-    // Re-read the ledger: the review may have been decided by another reviewer
-    // process while this one was dying, and a stale copy would resurrect it.
+    // Failure notifications are informational; their exit status is not a
+    // review verdict and must not create or clear the review retry plan.
+    if (wakeKind === 'failure') return undefined;
+
+    // Re-read the authoritative ledger: a tool call may have handed off to a
+    // rework, parked the review, or approved the task while this process exits.
     let target = thread;
     if (this.taskStore) {
       try {
         this.taskStore.loadFromDisk();
-        target = this.taskStore.getTask(thread.threadId) || thread;
-      } catch {}
+        const current = this.taskStore.getTask(thread.threadId);
+        // Deleted and archived tasks must never be resurrected from this
+        // callback's stale in-memory copy.
+        if (!current || current.archivedAt) return undefined;
+        target = current;
+      } catch {
+        return undefined;
+      }
     }
 
-    if (clean) {
-      if (!target.reviewWake) return undefined;
-      target.reviewWake = undefined;
-      target.updatedAt = new Date().toISOString();
-      try {
-        this.taskStore?.upsertTask(target);
-      } catch {}
+    if (target.status === 'completed') {
+      if (target.reviewWake?.round === round.round) {
+        target.reviewWake = undefined;
+        target.updatedAt = new Date().toISOString();
+        try {
+          this.taskStore?.upsertTask(target);
+        } catch {}
+      }
       return undefined;
     }
+
+    // Paused/failed/deleted/review_failed tasks no longer own a review slot.
+    if (target.status !== 'waiting_review') return undefined;
+
+    const handedOff =
+      (target.rounds || []).some((candidate) => candidate.round > round.round && candidate.type !== 'approval') ||
+      !!target.reviewBlocked;
+    if (handedOff) {
+      // Clear only this round's plan. A late callback must not erase a newer
+      // round's retry state.
+      if (target.reviewWake?.round === round.round) {
+        target.reviewWake = undefined;
+        target.updatedAt = new Date().toISOString();
+        try {
+          this.taskStore?.upsertTask(target);
+        } catch {}
+      }
+      return undefined;
+    }
+
+    // A callback for a prior round cannot write a retry plan for the new one.
+    if (target.currentRound !== round.round) return undefined;
+
+    const failure = clean
+      ? 'REVIEW_NO_DECISION: reviewer exited successfully without a recorded approve_task, request_rework, or review block'
+      : outcome.error;
 
     const tracker = this.detector.getRateLimitTracker();
     let quota = signal ? tracker.recordExhaustion(thread.initiatorAgent, output) : undefined;
@@ -775,7 +813,7 @@ export class CallbackManager extends EventEmitter {
       round: round.round,
       agent: thread.initiatorAgent,
       output,
-      error: outcome.error,
+      error: failure,
       exitCode: outcome.exitCode,
       // Attempts accumulate only within the same round: a rework starts a fresh
       // review and must get its own budget.
