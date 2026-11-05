@@ -13,6 +13,7 @@ import {
   StreamGapPolicy,
   TaskInterruption,
   TokenUsageMetrics,
+  isValidSessionId,
 } from './types';
 import { AgentDetector } from './agent-detector';
 import { buildDshHeadlessCommand } from './deepseek-harness';
@@ -27,6 +28,9 @@ import {
 } from './cancellation-registry';
 import type { TaskStore } from './task-store';
 import { assertCanExecute } from './agent-capabilities';
+import { NativeSessionCompactor } from './native-session-compactor';
+import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
+import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 
 /** Default silence watchdog: 10 minutes (long model reasoning is not a hang). */
 export const DEFAULT_SILENCE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -275,6 +279,8 @@ export interface RunOptions {
   taskThreadId?: string;
   /** Round being executed (used for diagnostics and receiver guard). */
   taskRound?: number;
+  /** Role for native-session ownership; reviewer bootstrap is round zero. */
+  nativeSessionRole?: 'developer' | 'reviewer';
   /**
    * Model to run this round with. When omitted the bridge falls back to the
    * model configured for the agent (settings -> `model-config.json`), and only
@@ -314,6 +320,8 @@ export interface RunOptions {
    * agent still running) can be detected and killed before another round starts.
    */
   onChildPid?: (pid: number | undefined) => void;
+  /** Called as soon as a first native session id appears while its process is alive. */
+  onNativeSessionId?: (sessionId: string, childPid?: number) => void;
 }
 
 export interface RunResult {
@@ -730,22 +738,116 @@ export class AutonomousRunner {
     const maxRetries = options.maxRetries ?? 3;
     const baseBackoffMs = options.retryBackoffMs ?? 2000;
     const taskThreadId = options.taskThreadId;
+    const nativeRole = options.nativeSessionRole || 'developer';
     const initialTaskExisted =
       taskThreadId && this.taskStore ? Boolean(this.taskStore.getTask(taskThreadId)) : false;
+    const compactor = this.taskStore ? new NativeSessionCompactor(this.taskStore, this.detector) : undefined;
+    let nativeSessionId: string | undefined;
+    let nativeLease: NativeSessionLease | undefined;
+    let recoveryVersion: string | undefined;
+    let preparationExecution: { registry: TaskExecutionRegistry; registration: TaskExecutionRegistration; owned: boolean } | undefined;
+    let runId = `${taskThreadId || 'run'}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
     if (taskThreadId) {
       this.executingThreads.add(taskThreadId);
     }
 
     try {
-      let attemptOptions = options;
+      let runOptions = options;
+      if (taskThreadId && compactor && this.taskStore) {
+        let prepared;
+        for (;;) {
+          const pending = this.checkPendingCancellation(taskThreadId, initialTaskExisted);
+          if (pending) {
+            this.consumeCancellation(taskThreadId);
+            return this.buildInterruptedResult(pending);
+          }
+          try {
+            prepared = await compactor.prepareBeforeResume(taskThreadId, nativeRole, options.model, nativeRole === 'reviewer' && options.taskRound === 0);
+            break;
+          } catch (error: any) {
+            if (!String(error?.message || error).includes('already owned by another Bridge process')) throw error;
+            const cancelled = await this.cancellableSleep(250, taskThreadId, initialTaskExisted);
+            if (cancelled) {
+              this.consumeCancellation(taskThreadId);
+              return this.buildInterruptedResult(cancelled);
+            }
+          }
+        }
+        if (prepared.pauseReason) {
+          return this.buildInterruptedResult({
+            action: 'pause', reason: prepared.pauseReason, at: new Date().toISOString(), by: 'native_session_compaction',
+          });
+        }
+        nativeSessionId = prepared.sessionId;
+        nativeLease = prepared.lease;
+        preparationExecution = prepared.executionLease;
+        recoveryVersion = prepared.recoveryVersion;
+        if (prepared.warning) console.warn(`[AutonomousRunner] ${prepared.warning}`);
+        const sessionLock = new NativeSessionLock(path.dirname(this.taskStore.getStoragePath()));
+        const originalOnChildPid = options.onChildPid;
+        const originalOnNativeSessionId = options.onNativeSessionId;
+        const captureSession = (sessionId: string, childPid?: number) => {
+          if (!isValidSessionId(sessionId)) throw new Error('Agent emitted an invalid native session id.');
+          if (nativeSessionId && nativeSessionId !== sessionId) throw new Error('Native session id changed during one task execution.');
+          this.taskStore!.loadFromDisk();
+          const boundAgent = nativeRole === 'developer' ? options.agent : this.taskStore!.getTask(taskThreadId)?.initiatorAgent;
+          if (!boundAgent) throw new Error('Task disappeared before the first native session id could be bound.');
+          if (!nativeLease) {
+            nativeLease = sessionLock.acquire(boundAgent, sessionId, childPid);
+            if (!nativeLease) throw new Error(`Native session ${sessionId} is already owned by another Bridge process.`);
+            nativeSessionId = sessionId;
+            this.taskStore!.loadFromDisk();
+            const current = this.taskStore!.getTask(taskThreadId);
+            const cancel = this.checkPendingCancellation(taskThreadId, initialTaskExisted);
+            const currentAgent = current && (nativeRole === 'developer' ? current.targetAgent : current.initiatorAgent);
+            const currentModel = current && (nativeRole === 'developer' ? current.targetModel : current.reviewerModel);
+            const currentSession = current && (nativeRole === 'developer' ? current.receiverSessionId : current.reviewerSessionId);
+            const currentCaptured = current && (nativeRole === 'developer' ? current.receiverSessionCaptured : current.reviewerSessionCaptured);
+            const allowedStatus = current && (nativeRole === 'developer'
+              ? !['paused', 'completed', 'failed', 'archived'].includes(current.status)
+              : current.status === 'queued' || current.status === 'waiting_review' || current.status === 'reworking');
+            if (cancel || !current || current.archivedAt || currentAgent !== boundAgent ||
+                currentModel !== options.model || !allowedStatus || (currentCaptured && currentSession !== sessionId)) {
+              sessionLock.release(nativeLease);
+              nativeLease = undefined;
+              throw new Error('Task binding or state changed before the first native session id could be published.');
+            }
+            if (nativeRole === 'developer') {
+              current.receiverSessionId = sessionId;
+              current.receiverSessionCaptured = true;
+            } else {
+              current.reviewerSessionId = sessionId;
+              current.reviewerSessionCaptured = true;
+              current.callerSessionId = sessionId;
+            }
+            this.taskStore!.upsertTask(current);
+          } else if (nativeLease) {
+            sessionLock.attachChild(nativeLease, childPid);
+          }
+          originalOnNativeSessionId?.(sessionId, childPid);
+        };
+        runOptions = {
+          ...options,
+          prompt: prepared.recoveryPrefix
+            ? `<bridge_recovery_document version="${prepared.recoveryVersion}">\n${prepared.recoveryPrefix}\n</bridge_recovery_document>\n\n<CURRENT_INSTRUCTION>\n${options.prompt}\n</CURRENT_INSTRUCTION>`
+            : options.prompt,
+          onChildPid: (pid) => {
+            if (nativeLease) sessionLock.attachChild(nativeLease, pid);
+            if (preparationExecution) preparationExecution.registry.attachChildPid(pid, preparationExecution.registration);
+            originalOnChildPid?.(pid);
+          },
+          onNativeSessionId: captureSession,
+        };
+      }
+      let attemptOptions = runOptions;
       let attempt = 0;
       // Every attempt is billed, so the round's token usage is the SUM of all
       // attempts, not just the last one (transient-error replays cost real
       // money even when they fail). A retried or resumed round also carries
       // the spend of its previous execution, which the executor seeds here.
-      let accumulatedUsage: TokenUsageMetrics | undefined = options.previousTokenUsage
-        ? { ...options.previousTokenUsage }
+      let accumulatedUsage: TokenUsageMetrics | undefined = runOptions.previousTokenUsage
+        ? { ...runOptions.previousTokenUsage }
         : undefined;
       while (true) {
         attempt++;
@@ -760,11 +862,31 @@ export class AutonomousRunner {
         }
 
         const result = await this.executeOnce(attemptOptions);
-        accumulatedUsage = accumulateTokenUsage(accumulatedUsage, result.tokenUsage);
+        const eventSessionId = result.actualSessionId || nativeSessionId;
+        if (taskThreadId && compactor && eventSessionId && !(nativeRole === 'reviewer' && options.taskRound === 0)) {
+          compactor.recordNativeAutoCompactionEvents(taskThreadId, nativeRole, eventSessionId, result.stdout || '');
+        }
+        accumulatedUsage = accumulateTokenUsage(
+          accumulatedUsage,
+          result.tokenUsage,
+          `${runId}:${attempt}`,
+          `legacy-business-round-${options.taskRound || 1}`,
+          nativeRole,
+        );
         const succeeded =
           result.exitCode === 0 && (!result.assessment || result.assessment.success);
         if (succeeded) {
           result.tokenUsage = accumulatedUsage;
+          const sessionId = result.actualSessionId || nativeSessionId;
+          if (taskThreadId && compactor && sessionId) {
+            if (!nativeLease && !nativeSessionId) {
+              // Some CLIs emit the session id only in their final chunk; bind it after process exit before publishing.
+              nativeLease = new NativeSessionLock(path.dirname(this.taskStore!.getStoragePath())).acquire(options.agent, sessionId);
+            }
+            if (!(nativeRole === 'reviewer' && options.taskRound === 0)) {
+              compactor.recordBusinessSuccess(taskThreadId, nativeRole, sessionId, `${runId}:${attempt}`, recoveryVersion);
+            }
+          }
           return result;
         }
 
@@ -890,6 +1012,21 @@ export class AutonomousRunner {
         return result;
       }
     } finally {
+      if (nativeLease && this.taskStore) {
+        const lock = new NativeSessionLock(path.dirname(this.taskStore.getStoragePath()));
+        let released = false;
+        for (let attempt = 0; attempt < 2 && !released; attempt++) {
+          try { released = lock.release(nativeLease); }
+          catch (error: any) {
+            console.error(`[AutonomousRunner] Native session lease release is pending for ${taskThreadId}: ${error?.message || error}`);
+          }
+        }
+        if (!released) console.error(`[AutonomousRunner] Native session lease remains safely held for ${taskThreadId}; retry after owner-gate contention clears.`);
+      }
+      if (preparationExecution) {
+        if (preparationExecution.owned) preparationExecution.registry.end(preparationExecution.registration);
+        preparationExecution.registry.dispose();
+      }
       if (taskThreadId) {
         this.executingThreads.delete(taskThreadId);
       }
@@ -1235,6 +1372,8 @@ export class AutonomousRunner {
       let stdoutData = '';
       let stderrData = '';
       let isSettled = false;
+      let childBindingError: string | undefined;
+      let childCleanupError: string | undefined;
       let lastActivityMono = startMono;
       let watchdogTriggered = false;
       let maxTimerTriggered = false;
@@ -1315,19 +1454,6 @@ export class AutonomousRunner {
         try {
           child.stdin.end();
         } catch {}
-      }
-
-      // Publish the real agent PID to the execution lease: it outlives a crashed
-      // host on Windows, and the next round must not start on top of it.
-      if (child.pid) {
-        try {
-          options.onChildPid?.(child.pid);
-        } catch {}
-        child.once('exit', () => {
-          try {
-            options.onChildPid?.(undefined);
-          } catch {}
-        });
       }
 
       // Cross-process pause/delete: a control plane running elsewhere writes a
@@ -1444,6 +1570,9 @@ export class AutonomousRunner {
       // stderr stays free-text: that is where the CLI reports its own failures.
       let rateLimitSignal: string | undefined;
       let stdoutPartialLine = '';
+      let sessionPartialLine = '';
+      let observedSessionId: string | undefined;
+      let sessionCaptureError: string | undefined;
       let stderrPartialLine = '';
       const MAX_PARTIAL_LINE = 1 << 20; // 1 MiB guard against a newline-less stream
       const abortOnRateLimit = (hit: string) => {
@@ -1484,6 +1613,20 @@ export class AutonomousRunner {
         const str = data.toString();
         stdoutData += str;
         stdoutPartialLine = scanLines(str, stdoutPartialLine, detectStructuredRateLimitSignal);
+        const sessionLines = (sessionPartialLine + str).split(/\r?\n/);
+        sessionPartialLine = sessionLines.pop() || '';
+        for (const line of sessionLines) {
+          if (childBindingError) break;
+          const sessionId = this.extractSessionId(line);
+          if (!sessionId || sessionId === observedSessionId) continue;
+          observedSessionId = sessionId;
+          try { options.onNativeSessionId?.(sessionId, child.pid); }
+          catch (error: any) {
+            sessionCaptureError = String(error?.message || error);
+            try { this.killProcess(child); } catch {}
+            break;
+          }
+        }
         if (options.onStdoutChunk) {
           options.onStdoutChunk(str);
         }
@@ -1503,6 +1646,11 @@ export class AutonomousRunner {
 
       child.on('error', (err) => {
         if (isSettled) return;
+        if (child.pid && child.exitCode === null) {
+          childBindingError ||= `Native child lifecycle failed: ${err.message}`;
+          try { this.killProcess(child); } catch {}
+          return;
+        }
         isSettled = true;
         clearInterval(silenceInterval);
         clearInterval(maxTimer);
@@ -1537,6 +1685,10 @@ export class AutonomousRunner {
       child.on('close', (code) => {
         if (isSettled) return;
         isSettled = true;
+        if (child.pid) {
+          try { options.onChildPid?.(undefined); }
+          catch (error: any) { childCleanupError = String(error?.message || error); }
+        }
         // Pick up a suspension window that ended right at exit time (e.g. the
         // machine was asleep when the child's last output arrived).
         suspension.sync();
@@ -1551,6 +1703,10 @@ export class AutonomousRunner {
         const durationMs = Date.now() - startTime;
         const extracted = this.extractCleanOutput(stdoutData);
         const actualSessionId = this.extractSessionId(stdoutData);
+        if (!childBindingError && actualSessionId && actualSessionId !== observedSessionId) {
+          try { options.onNativeSessionId?.(actualSessionId); }
+          catch (captureError: any) { sessionCaptureError = String(captureError?.message || captureError); }
+        }
         // A killed CLI never unregisters itself: clean its ownership record so
         // the next resume is not rejected as "already in use". Live processes
         // are never touched by the helper.
@@ -1598,8 +1754,16 @@ export class AutonomousRunner {
         } else if (code !== 0) {
           error = stderrData.trim() || `Process exited with non-zero code ${code ?? -1}`;
         }
+        if (sessionCaptureError) {
+          error = `Could not safely bind native session: ${sessionCaptureError}`;
+          interruption = { kind: 'stopped', reason: error, at: new Date().toISOString(), by: 'bridge' };
+        }
+        if (childBindingError || childCleanupError) {
+          error = `Could not safely maintain native child ownership: ${childBindingError || childCleanupError}`;
+          interruption = { kind: 'stopped', reason: error, at: new Date().toISOString(), by: 'bridge' };
+        }
 
-        const exitCode = cancellation ? -1 : (code ?? 0);
+        const exitCode = cancellation || childBindingError || childCleanupError ? -1 : (code ?? 0);
 
         let assessment = this.evaluateResponse({
           exitCode,
@@ -1682,6 +1846,16 @@ export class AutonomousRunner {
           model: effectiveModel,
         });
       });
+
+      // Install close/error handlers first. If durable PID binding fails, kill
+      // this child and let close record a failed round only after it has exited.
+      if (child.pid) {
+        try { options.onChildPid?.(child.pid); }
+        catch (error: any) {
+          childBindingError = String(error?.message || error);
+          try { this.killProcess(child); } catch {}
+        }
+      }
     });
   }
 

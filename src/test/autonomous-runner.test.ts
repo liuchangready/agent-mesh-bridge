@@ -187,6 +187,31 @@ describe('AutonomousRunner Tests', () => {
     );
   });
 
+  test('fails the real child when native PID binding fails and waits for close', async () => {
+    const local = new AutonomousRunner(detector);
+    local.buildCommand = () => ({
+      command: process.execPath,
+      args: ['-e', `process.stdout.write(${JSON.stringify('{"type":"result","subtype":"success","result":"business completed"}\\n')});setInterval(()=>{},1000)`],
+      useShell: false,
+    });
+    let pid: number | undefined;
+    let cleared = false;
+    const result = await local.executeOnce({
+      agent: 'claude_code', prompt: 'temporary child only', isRework: false,
+      receiverSessionId: 'temp-native-pid-binding', timeoutMs: 10_000, silenceTimeoutMs: 10_000,
+      onChildPid: (value) => {
+        if (value) { pid = value; throw new Error('Could not acquire the native-session owner gate to persist the child PID.'); }
+        cleared = true;
+      },
+    });
+    assert.ok(pid, 'the test child was started');
+    assert.equal(cleared, true, 'PID cleanup runs after the actual close event');
+    assert.equal(result.exitCode, -1);
+    assert.equal(result.assessment?.success, false);
+    assert.match(result.error || '', /native child ownership/i);
+    assert.match(result.extractedOutput, /business completed/);
+  });
+
   test('clears only dead-owner Claude session records', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-claude-reg-'));
     const dir = path.join(home, '.claude', 'sessions');

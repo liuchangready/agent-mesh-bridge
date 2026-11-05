@@ -9,6 +9,7 @@ import {
   TaskInterruption,
   MergeRequestInfo,
   TokenUsageMetrics,
+  TokenUsageComponent,
   appendInterruption,
   isMergePending,
 } from './types';
@@ -21,6 +22,7 @@ import {
   removeTaskArtifacts,
 } from './task-summary';
 import { cleanupThreadNativeSessions } from './native-session-cleanup';
+import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
 
 export const MAX_STORED_TASKS = 1000;
 
@@ -51,13 +53,72 @@ function canEvictForCapacity(task: DelegationThread): boolean {
 function preferTokenUsage(
   existing: TokenUsageMetrics | undefined,
   incoming: TokenUsageMetrics | undefined,
+  legacyId: string,
 ): TokenUsageMetrics | undefined {
   if (!existing) return incoming;
   if (!incoming) return existing;
+  if (existing.components?.length || incoming.components?.length) {
+    const components = new Map<string, TokenUsageComponent>();
+    for (const item of existing.components || [legacyUsageComponent(existing, legacyId)]) components.set(item.id, item);
+    for (const item of incoming.components || [legacyUsageComponent(incoming, legacyId)]) {
+      const current = components.get(item.id);
+      components.set(item.id, current ? preferUsageComponent(current, item) : item);
+    }
+    const values = [...components.values()];
+    const measured = values.filter((item) => item.available);
+    const uncachedInputTokens = measured.reduce((sum, item) => sum + item.uncachedInputTokens, 0);
+    const cacheReadTokens = measured.reduce((sum, item) => sum + item.cacheReadTokens, 0);
+    const cacheWriteTokens = measured.reduce((sum, item) => sum + item.cacheWriteTokens, 0);
+    const outputTokens = measured.reduce((sum, item) => sum + item.outputTokens, 0);
+    const costs = measured.filter((item) => item.costUsd !== undefined);
+    const reasoningTokens = measured.some((item) => item.reasoningTokens !== undefined)
+      ? measured.reduce((sum, item) => sum + (item.reasoningTokens || 0), 0) : undefined;
+    const nativeTotalTokens = measured.some((item) => item.nativeTotalTokens !== undefined)
+      ? measured.reduce((sum, item) => sum + (item.nativeTotalTokens || 0), 0) : undefined;
+    return {
+      ...existing,
+      uncachedInputTokens, cacheReadTokens, cacheWriteTokens,
+      promptTokens: uncachedInputTokens + cacheReadTokens + cacheWriteTokens,
+      outputTokens, totalTokens: uncachedInputTokens + cacheReadTokens + cacheWriteTokens + outputTokens,
+      reasoningTokens, nativeTotalTokens,
+      source: measured.length && measured.every((item) => item.source === 'native_reported') ? 'native_reported' : measured.length ? 'estimated' : 'unavailable',
+      agent: existing.agent, model: existing.model,
+      costUsd: costs.length ? costs.reduce((sum, item) => sum + (item.costUsd || 0), 0) : undefined,
+      costSource: costs.length ? 'native' : undefined,
+      available: measured.length > 0,
+      partial: values.some((item) => item.partial) || measured.length !== values.length || undefined,
+      attempts: values.length,
+      components: values,
+    };
+  }
   const existingIsNative = existing.source === 'native_reported';
   const incomingIsNative = incoming.source === 'native_reported';
   if (existingIsNative !== incomingIsNative) return existingIsNative ? existing : incoming;
   return (incoming.totalTokens ?? 0) >= (existing.totalTokens ?? 0) ? incoming : existing;
+}
+
+function legacyUsageComponent(usage: TokenUsageMetrics, id: string): TokenUsageComponent {
+  return {
+    id, kind: 'business', role: 'developer', agent: usage.agent,
+    model: usage.model, uncachedInputTokens: usage.uncachedInputTokens,
+    cacheReadTokens: usage.cacheReadTokens, cacheWriteTokens: usage.cacheWriteTokens,
+    outputTokens: usage.outputTokens, reasoningTokens: usage.reasoningTokens,
+    nativeTotalTokens: usage.nativeTotalTokens, costUsd: usage.costUsd,
+    costSource: usage.costSource, source: usage.source, available: usage.available, partial: usage.partial,
+  };
+}
+
+function preferUsageComponent(existing: TokenUsageComponent, incoming: TokenUsageComponent): TokenUsageComponent {
+  if (!existing.available) return incoming.available ? incoming : existing;
+  if (!incoming.available) return existing;
+  const total = (value: TokenUsageComponent) => value.uncachedInputTokens + value.cacheReadTokens + value.cacheWriteTokens + value.outputTokens;
+  if (total(incoming) < total(existing)) return existing;
+  return {
+    ...incoming,
+    nativeTotalTokens: Math.max(existing.nativeTotalTokens || 0, incoming.nativeTotalTokens || 0) || undefined,
+    costUsd: Math.max(existing.costUsd || 0, incoming.costUsd || 0) || undefined,
+    costSource: incoming.costUsd !== undefined || existing.costUsd !== undefined ? 'native' : undefined,
+  };
 }
 
 /**
@@ -78,7 +139,11 @@ function mergeRoundPreferringCompaction(
   const merged: DelegationRound = { ...incoming };
 
   // Durable execution metadata: never lose it to an older copy.
-  merged.tokenUsage = preferTokenUsage(incomingExisting?.tokenUsage, incoming.tokenUsage);
+  merged.tokenUsage = preferTokenUsage(
+    incomingExisting?.tokenUsage,
+    incoming.tokenUsage,
+    `legacy-business-round-${incoming.round}`,
+  );
   if (merged.executorAgent === undefined && incomingExisting?.executorAgent !== undefined) {
     merged.executorAgent = incomingExisting.executorAgent;
   }
@@ -91,6 +156,10 @@ function mergeRoundPreferringCompaction(
   if (merged.touchedFiles === undefined && incomingExisting?.touchedFiles !== undefined) {
     merged.touchedFiles = incomingExisting.touchedFiles;
   }
+  merged.nativeSessionCompactions = mergeNativeCompactions(
+    incomingExisting?.nativeSessionCompactions,
+    incoming.nativeSessionCompactions,
+  );
 
   if (!incomingExisting?.isCompacted || incoming.isCompacted) return merged;
   return {
@@ -103,6 +172,93 @@ function mergeRoundPreferringCompaction(
     rawOutputFilePath: incomingExisting.rawOutputFilePath,
     outputBytes: incomingExisting.outputBytes,
   };
+}
+
+function mergeNativeCompactions(
+  prior: DelegationRound['nativeSessionCompactions'],
+  incoming: DelegationRound['nativeSessionCompactions'],
+): DelegationRound['nativeSessionCompactions'] {
+  const byId = new Map((prior || []).map((operation) => [operation.id, operation]));
+  for (const operation of incoming || []) {
+    const current = byId.get(operation.id);
+    if (!current || operation.revision > current.revision || operation.revision === current.revision && current.phase === 'running' && operation.phase !== 'running') {
+      byId.set(operation.id, operation);
+    }
+  }
+  return byId.size ? [...byId.values()] : undefined;
+}
+
+function mergeNativeCursors(
+  prior: DelegationThread['nativeSessionCompaction'],
+  incoming: DelegationThread['nativeSessionCompaction'],
+  boundSessions: { developer?: string; reviewer?: string },
+): DelegationThread['nativeSessionCompaction'] {
+  const merged: NonNullable<DelegationThread['nativeSessionCompaction']> = {};
+  for (const role of ['developer', 'reviewer'] as const) {
+    const oldCursor = prior?.[role];
+    const nextCursor = incoming?.[role];
+    const bound = boundSessions[role];
+    const oldValid = oldCursor && bound && oldCursor.sessionId === bound ? oldCursor : undefined;
+    const nextValid = nextCursor && bound && nextCursor.sessionId === bound ? nextCursor : undefined;
+    if (!oldValid) { if (nextValid) merged[role] = nextValid; continue; }
+    if (!nextValid) { merged[role] = oldValid; continue; }
+    if (oldValid.sessionId !== nextValid.sessionId) {
+      merged[role] = nextValid.revision && nextValid.revision > (oldValid.revision || 0) ? nextValid : oldValid;
+      continue;
+    }
+    const chosen = (nextValid.revision || 0) >= (oldValid.revision || 0) ? nextValid : oldValid;
+    const other = chosen === nextValid ? oldValid : nextValid;
+    const sameRecovery = chosen.recoveryVersion === other.recoveryVersion;
+    const sameOperation = chosen.lastOperationId === other.lastOperationId;
+    const recoveryDelivered = sameRecovery &&
+      (oldValid.recoveryDeliveredVersion === chosen.recoveryVersion || nextValid.recoveryDeliveredVersion === chosen.recoveryVersion);
+    merged[role] = {
+        ...chosen,
+        recentBusinessTurnIds: Array.from(new Set([...(oldValid.recentBusinessTurnIds || []), ...(nextValid.recentBusinessTurnIds || [])])).slice(-64),
+        recentNativeAutoCompactionEventIds: Array.from(new Set([...(oldValid.recentNativeAutoCompactionEventIds || []), ...(nextValid.recentNativeAutoCompactionEventIds || [])])).slice(-64),
+        turnsSinceCompaction: chosen.turnCounterResetId !== other.turnCounterResetId
+          ? chosen.turnsSinceCompaction
+          : Math.max(oldValid.turnsSinceCompaction, nextValid.turnsSinceCompaction),
+        turnCounterResetId: chosen.turnCounterResetId,
+        recoveryVersion: chosen.recoveryVersion || other.recoveryVersion,
+        recoveryDeliveredVersion: sameRecovery
+          ? (recoveryDelivered ? chosen.recoveryVersion : undefined)
+          : chosen.recoveryDeliveredVersion,
+        recoveryVerifiedOperationId: sameOperation
+          ? chosen.recoveryVerifiedOperationId || other.recoveryVerifiedOperationId
+          : chosen.recoveryVerifiedOperationId,
+        autoSuppressedOperationId: recoveryDelivered
+          ? undefined
+          : chosen.autoSuppressedOperationId || other.autoSuppressedOperationId,
+        autoDisabledReason: chosen.autoDisabledReason || other.autoDisabledReason,
+      };
+  }
+  return Object.keys(merged).length ? merged : undefined;
+}
+
+function bindingRank(thread: DelegationThread, role: 'developer' | 'reviewer'): [number, number, number] {
+  const retargets = role === 'developer' ? (thread.retargets || []).length : 0;
+  const captured = role === 'developer' ? thread.receiverSessionCaptured : thread.reviewerSessionCaptured;
+  return [retargets, captured ? 1 : 0, Date.parse(thread.updatedAt) || 0];
+}
+
+function preferBinding(current: DelegationThread, prior: DelegationThread): void {
+  for (const role of ['developer', 'reviewer'] as const) {
+    const a = bindingRank(current, role);
+    const b = bindingRank(prior, role);
+    const priorWins = b.some((value, index) => value !== a[index] && value > a[index] && b.slice(0, index).every((x, i) => x === a[i]));
+    if (!priorWins) continue;
+    if (role === 'developer') {
+      current.targetAgent = prior.targetAgent;
+      current.targetModel = prior.targetModel;
+      current.receiverSessionId = prior.receiverSessionId;
+      current.receiverSessionCaptured = prior.receiverSessionCaptured;
+      current.retargets = prior.retargets;
+    } else {
+      current.reviewerSessionId = prior.reviewerSessionId;
+      current.reviewerSessionCaptured = prior.reviewerSessionCaptured;
+    }
+  }
 }
 
 /** Directory holding one JSON file per thread (the authoritative ledger). */
@@ -456,6 +612,16 @@ export class TaskStore extends EventEmitter {
     } catch {}
     const inMemory = this.tasks.get(thread.threadId);
     if ((onDisk || inMemory) && onDisk !== thread) {
+      const authority = [inMemory, onDisk].filter(Boolean) as DelegationThread[];
+      for (const prior of authority) preferBinding(thread, prior);
+      thread.nativeSessionCompaction = mergeNativeCursors(
+        mergeNativeCursors(inMemory?.nativeSessionCompaction, onDisk?.nativeSessionCompaction, {
+          developer: thread.receiverSessionId,
+          reviewer: thread.reviewerSessionId,
+        }),
+        thread.nativeSessionCompaction,
+        { developer: thread.receiverSessionId, reviewer: thread.reviewerSessionId },
+      );
       // Merge rounds from every known copy to prevent losing rounds added by
       // another process or by an earlier in-memory state. Duplicate round
       // numbers are preserved inside one copy (legacy ledgers may hold them and
@@ -619,6 +785,7 @@ export class TaskStore extends EventEmitter {
         ...(roundUpdate.tokenUsage ? { tokenUsage: roundUpdate.tokenUsage } : {}),
         ...(roundUpdate.executorAgent ? { executorAgent: roundUpdate.executorAgent } : {}),
         ...(roundUpdate.executorModel ? { executorModel: roundUpdate.executorModel } : {}),
+        ...(roundUpdate.nativeSessionCompactions ? { nativeSessionCompactions: roundUpdate.nativeSessionCompactions } : {}),
       });
     }
 
@@ -741,6 +908,21 @@ export class TaskStore extends EventEmitter {
     this.ensureUpToDate();
     const thread = this.tasks.get(threadId);
     if (!thread || thread.archivedAt || !isTerminalThreadStatus(thread.status)) return undefined;
+    const nativeLock = new NativeSessionLock(this.storageDir);
+    const leases: NativeSessionLease[] = [];
+    const sessions = [
+      thread.receiverSessionCaptured ? [thread.targetAgent, thread.receiverSessionId] as const : undefined,
+      thread.reviewFlow === 'dedicated' && thread.reviewerSessionCaptured ? [thread.initiatorAgent, thread.reviewerSessionId] as const : undefined,
+    ].filter((entry): entry is readonly [DelegationThread['targetAgent'], string | undefined] => !!entry && !!entry[1]);
+    for (const [agent, sessionId] of sessions) {
+      const lease = nativeLock.acquire(agent, sessionId!);
+      if (!lease) {
+        for (const held of leases) nativeLock.release(held);
+        return undefined;
+      }
+      leases.push(lease);
+    }
+    try {
     // Read the session ids BEFORE they are stripped: archival is the "keep only
     // the summary" boundary, so the native conversations and bridge logs are
     // removed now. Best-effort: a missing conversation is not an error.
@@ -761,6 +943,9 @@ export class TaskStore extends EventEmitter {
     this.writeAggregate();
     this.emit('changed', Array.from(this.tasks.values()));
     return thread;
+    } finally {
+      for (const lease of leases) nativeLock.release(lease);
+    }
   }
 
   /**

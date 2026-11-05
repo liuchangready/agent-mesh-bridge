@@ -90,6 +90,7 @@ describe('Reviewer stream capture', () => {
       child.stdout.emit('data', Buffer.from('REVIEWER-STDOUT line\n'));
       child.stderr.emit('data', Buffer.from('REVIEWER-STDERR line\n'));
       child.emit('exit', 0);
+      child.emit('close', 0);
 
       const file = reviewerLogPath(thread.threadId, 1);
       assert.strictEqual(fs.existsSync(file), true, `expected reviewer log at ${file}`);

@@ -177,12 +177,12 @@ export class TaskRoleLock {
    * a bridge restart cannot invalidate a review that is still in progress.
    */
   public attachChild(lease: TaskRoleLease | null, childPid: number | undefined): boolean {
-    if (!lease || !childPid) return false;
+    if (!lease) return false;
     const file = this.filePath(lease.threadId);
     const owner = this.readOwnerFile(file);
     if (!owner || owner.token !== lease.token) return false;
     try {
-      owner.childPid = childPid;
+      owner.childPid = childPid && childPid > 0 ? childPid : undefined;
       owner.updatedAt = Date.now();
       fs.writeFileSync(file, JSON.stringify(owner), 'utf8');
       return true;
