@@ -213,7 +213,10 @@ function mergeNativeCursors(
         ...chosen,
         recentBusinessTurnIds: Array.from(new Set([...(oldValid.recentBusinessTurnIds || []), ...(nextValid.recentBusinessTurnIds || [])])).slice(-64),
         recentNativeAutoCompactionEventIds: Array.from(new Set([...(oldValid.recentNativeAutoCompactionEventIds || []), ...(nextValid.recentNativeAutoCompactionEventIds || [])])).slice(-64),
-        turnsSinceCompaction: Math.max(oldValid.turnsSinceCompaction, nextValid.turnsSinceCompaction),
+        turnsSinceCompaction: chosen.turnCounterResetId !== other.turnCounterResetId
+          ? chosen.turnsSinceCompaction
+          : Math.max(oldValid.turnsSinceCompaction, nextValid.turnsSinceCompaction),
+        turnCounterResetId: chosen.turnCounterResetId,
         recoveryVersion: chosen.recoveryVersion || other.recoveryVersion,
         recoveryDeliveredVersion: sameRecovery
           ? (oldValid.recoveryDeliveredVersion === chosen.recoveryVersion || nextValid.recoveryDeliveredVersion === chosen.recoveryVersion

@@ -1,6 +1,7 @@
 import * as crypto from 'crypto';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { AgentDetector } from './agent-detector';
 import { CancellationRegistry } from './cancellation-registry';
@@ -32,7 +33,36 @@ export interface NativeCompactionCapabilityIdentity {
   executablePath: string;
   executableVersion: string;
   providerRoute: string;
+  providerId: string;
   model: string;
+}
+
+export function resolveCodexProviderIdentity(
+  config: string | undefined,
+  env: Record<string, string | undefined>,
+): Pick<NativeCompactionCapabilityIdentity, 'providerRoute' | 'providerId'> | undefined {
+  const baseUrl = env.OPENAI_BASE_URL || env.CODEX_BASE_URL;
+  if (baseUrl) return undefined;
+  if (config === undefined) return undefined;
+  const lines = config.split(/\r?\n/).map((line) => line.replace(/\s+#.*$/, '').trim());
+  let section = '';
+  let providerId: string | undefined;
+  let providerBaseUrl: string | undefined;
+  let hasCustomProviders = false;
+  for (const line of lines) {
+    const table = line.match(/^\[model_providers\.([A-Za-z0-9_-]+)\]$/);
+    if (table) { section = table[1]; hasCustomProviders = true; continue; }
+    if (line.startsWith('[')) { section = '!other'; continue; }
+    const assignment = line.match(/^([A-Za-z0-9_-]+)\s*=\s*"([^"]*)"\s*$/);
+    if (!assignment) continue;
+    if (section === '' && assignment[1] === 'model_provider') providerId = assignment[2];
+    if (providerId && section === providerId && assignment[1] === 'base_url') providerBaseUrl = assignment[2];
+  }
+  if (!providerId) {
+    return hasCustomProviders ? undefined : { providerId: 'openai', providerRoute: 'subscription-default' };
+  }
+  if (providerId !== 'openai' && !providerBaseUrl) return undefined;
+  return { providerId, providerRoute: providerBaseUrl ? `${providerId}|${providerBaseUrl}` : providerId };
 }
 
 export type NativeCompactionCapabilityResolver = (
@@ -119,7 +149,8 @@ export class NativeSessionCompactor {
     try {
       const entries = JSON.parse(fs.readFileSync(path.join(root, 'native-session-capabilities.json'), 'utf8')) as Array<NativeCompactionCapabilityIdentity & { status?: NativeCompactionCapability }>;
       status = entries.find((entry) => entry.agent === identity.agent && entry.executablePath === identity.executablePath &&
-        entry.executableVersion === identity.executableVersion && entry.providerRoute === identity.providerRoute && entry.model === identity.model)?.status || 'needs_validation';
+        entry.executableVersion === identity.executableVersion && entry.providerRoute === identity.providerRoute &&
+        entry.providerId === identity.providerId && entry.model === identity.model)?.status || 'needs_validation';
     } catch {}
     this.capabilityCache.set(key, status);
     return status;
@@ -146,10 +177,15 @@ export class NativeSessionCompactor {
     const versionResult = spawnSync(executablePath, ['--version'], { encoding: 'utf8', timeout: 3_000, windowsHide: true });
     const executableVersion = `${versionResult.stdout || ''}${versionResult.stderr || ''}`.trim().split(/\r?\n/, 1)[0];
     if (versionResult.status !== 0 || !executableVersion) return undefined;
-    const providerRoute = process.env.OPENAI_BASE_URL || process.env.CODEX_BASE_URL || 'subscription-default';
+    let codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+    if (!path.isAbsolute(codexHome)) return undefined;
+    let config: string | undefined;
+    try { config = fs.readFileSync(path.join(codexHome, 'config.toml'), 'utf8'); } catch {}
+    const provider = resolveCodexProviderIdentity(config, process.env);
+    if (!provider) return undefined;
     let actualPath = path.resolve(executablePath);
     try { actualPath = fs.realpathSync.native(executablePath); } catch {}
-    return { agent, executablePath: actualPath, executableVersion, providerRoute, model };
+    return { agent, executablePath: actualPath, executableVersion, ...provider, model };
   }
 
   /** Acquire the session write lease and supply any still-undelivered recovery document. */
@@ -250,6 +286,7 @@ export class NativeSessionCompactor {
       ? (thread.rounds || []).flatMap((round) => round.nativeSessionCompactions || []).find((entry) => entry.id === latestCursor.lastOperationId)
       : undefined;
     let warning: string | undefined;
+    let recoveredUnknownOperation = false;
     if (latestOperation && ['unknown', 'interrupted'].includes(latestOperation.phase)) {
       const activeExecution = ensureExecutionLease();
       let recovered = false;
@@ -260,7 +297,7 @@ export class NativeSessionCompactor {
           model: latestOperation.model || model || '', operationId: latestOperation.id,
           role, cancelled: () => !!new CancellationRegistry(root).peek(threadId),
           onChildPid: (pid) => {
-            new NativeSessionLock(root).attachChild(lease, pid);
+            new NativeSessionLock(root).attachChild(lease, pid, pid ? () => !!new CancellationRegistry(root).peek(threadId) : undefined);
             activeExecution.registry.attachChildPid(pid, activeExecution.registration);
             roleLock.attachChild(roleLease, pid);
           },
@@ -278,14 +315,27 @@ export class NativeSessionCompactor {
         return { sessionId, pauseReason: reason };
       }
       if (cursor) {
-        cursor = { ...cursor, recoveryVersion: cursor.recoveryVersion || latestOperation.id, revision: (cursor.revision || 0) + 1 };
+        recoveredUnknownOperation = true;
+        cursor = {
+          ...cursor, recoveryVersion: cursor.recoveryVersion || latestOperation.id,
+          turnsSinceCompaction: 0, autoSuppressedOperationId: latestOperation.id,
+          turnCounterResetId: latestOperation.id,
+          revision: (cursor.revision || 0) + 1,
+        };
+        if (latestOperation.errorCode !== 'UNKNOWN_OPERATION_RECOVERED_READONLY') {
+          latestOperation.errorCode = 'UNKNOWN_OPERATION_RECOVERED_READONLY';
+          latestOperation.error = 'Same-ID read-only recovery succeeded. Automatic compaction is suppressed until the carried recovery document is delivered by a successful business turn.';
+          latestOperation.revision++;
+        }
         thread.nativeSessionCompaction = { ...thread.nativeSessionCompaction, [role]: cursor };
         this.store.upsertTask(thread);
       }
+      warning = 'Unknown native operation was recovered read-only; the pending recovery document will be carried and compaction is suppressed.';
     }
     const mode = readBridgePolicy(root).nativeSessionCompaction?.mode || 'off';
     const turns = cursor && cursor.sessionId === sessionId ? cursor.turnsSinceCompaction : 0;
-    if (mode === 'auto' && turns >= 4 && !warning) {
+    if (mode === 'auto' && turns >= 4 && !warning && !recoveredUnknownOperation &&
+        (!cursor?.autoSuppressedOperationId || cursor.autoSuppressedOperationId !== cursor.lastOperationId)) {
       if (cursor?.autoDisabledReason) {
         warning = `Automatic compaction is disabled for this session: ${cursor.autoDisabledReason}.`;
       } else {
@@ -293,7 +343,7 @@ export class NativeSessionCompactor {
         const capability = identity ? this.capabilityResolver(identity) : 'needs_validation';
         if (capability === 'certified' && identity) {
           ensureExecutionLease();
-          const result = await this.compactAutomatically(thread, role, agent, model!, sessionId!, lease, cursor || { sessionId: sessionId!, turnsSinceCompaction: 0 });
+          const result = await this.compactAutomatically(thread, role, agent, model!, sessionId!, lease, cursor || { sessionId: sessionId!, turnsSinceCompaction: 0 }, identity);
           if (result.pauseReason) {
             releaseExecutionLease();
             new NativeSessionLock(root).release(lease);
@@ -377,6 +427,7 @@ export class NativeSessionCompactor {
     sessionId: string,
     lease: ReturnType<NativeSessionLock['acquire']> & {},
     cursor: NonNullable<DelegationThread['nativeSessionCompaction']>[TaskRole],
+    identity: NativeCompactionCapabilityIdentity,
   ): Promise<{ warning?: string; pauseReason?: string }> {
     const root = path.dirname(this.store.getStoragePath());
     const roleLock = new TaskRoleLock(root);
@@ -410,19 +461,22 @@ export class NativeSessionCompactor {
     const registry = new TaskExecutionRegistry(root);
     const executionOwner = registry.getOwner(thread.threadId);
     const registration = executionOwner ? { token: executionOwner.token, threadId: executionOwner.threadId, round: executionOwner.round, recordPath: executionOwner.recordPath } : undefined;
+    const roleLease = { token: roleOwner.token, threadId: thread.threadId, role: role as 'developer' | 'reviewer', ...(roleOwner.conversationId ? { conversationId: roleOwner.conversationId } : {}) };
+    const bindChild = (pid: number | undefined) => {
+      new NativeSessionLock(root).attachChild(lease, pid, pid ? () => !!cancellation.peek(thread.threadId) : undefined);
+      if (registration) registry.attachChildPid(pid, registration);
+      roleLock.attachChild(roleLease, pid);
+    };
     const originalStatus = thread.status;
     operation.phase = 'running'; operation.revision++;
     this.store.upsertTask(thread);
     try {
       const result = await this.codex.compact({
         executable, sessionId, cwd: thread.worktree?.path || thread.workspacePath, model, operationId: id, role: role as 'developer' | 'reviewer',
+        expectedProviderId: identity.providerId,
         cancelled: () => !!cancellation.peek(thread.threadId),
         onUsage: (usage) => this.recordMaintenanceUsage(thread.threadId, latest.round, id, role, agent, model, usage),
-        onChildPid: (pid) => {
-          new NativeSessionLock(root).attachChild(lease, pid);
-          if (registration) registry.attachChildPid(pid, registration);
-          roleLock.attachChild({ token: roleOwner.token, threadId: thread.threadId, role: role as 'developer' | 'reviewer', ...(roleOwner.conversationId ? { conversationId: roleOwner.conversationId } : {}) }, pid);
-        },
+        onChildPid: bindChild,
       });
       this.store.loadFromDisk();
       const current = this.store.getTask(thread.threadId);
@@ -449,7 +503,7 @@ export class NativeSessionCompactor {
       }
       current.nativeSessionCompaction = {
         ...current.nativeSessionCompaction,
-        [role]: { ...freshCursor, turnsSinceCompaction: 0, revision: freshCursor.revision + 1 },
+        [role]: { ...freshCursor, turnsSinceCompaction: 0, turnCounterResetId: id, revision: freshCursor.revision + 1 },
       };
       this.store.upsertTask(current);
       fs.appendFileSync(operation.logPath, `${JSON.stringify({ at: operation.finishedAt, operationId: id, phase: operation.phase, nativeTurnId: operation.nativeTurnId, usage: result.usage || { available: false, partial: true } })}\n`);
@@ -470,7 +524,7 @@ export class NativeSessionCompactor {
       try { fs.appendFileSync(operation.logPath, `${JSON.stringify({ at: operation.finishedAt, operationId: id, phase: operation.phase, errorCode: operation.errorCode, error: operation.error })}\n`); } catch {}
       if (operation.phase === 'interrupted') return { pauseReason: 'Automatic compaction was cancelled; the task must remain paused.' };
       try {
-        const healthy = await this.codex.probeResume({ executable, sessionId, cwd: thread.worktree?.path || thread.workspacePath, model, operationId: id, role: role as 'developer' | 'reviewer', cancelled: () => !!cancellation.peek(thread.threadId) });
+        const healthy = await this.codex.probeResume({ executable, sessionId, cwd: thread.worktree?.path || thread.workspacePath, model, operationId: id, role: role as 'developer' | 'reviewer', cancelled: () => !!cancellation.peek(thread.threadId), onChildPid: bindChild });
         if (healthy) return { warning: 'Automatic compaction outcome is unknown; same-ID read-only recovery succeeded and the recovery document remains pending.' };
       } catch {}
       const reason = `Native session ${sessionId} could not be proven healthy after automatic operation ${id}; compression was not replayed.`;
@@ -518,6 +572,7 @@ export class NativeSessionCompactor {
         revision: (cursor.revision || 0) + 1,
         recentNativeAutoCompactionEventIds: [...seen].slice(-64),
         turnsSinceCompaction: 0,
+        turnCounterResetId: fresh[fresh.length - 1],
         ...(ineffective ? { autoDisabledReason: 'ineffective: native compaction recurred within two business turns' } : {}),
       },
     };
@@ -548,6 +603,9 @@ export class NativeSessionCompactor {
         recentBusinessTurnIds: next,
         turnsSinceCompaction: cursor.turnsSinceCompaction + 1,
         ...(recoveryVersion && cursor.recoveryVersion === recoveryVersion ? { recoveryDeliveredVersion: recoveryVersion } : {}),
+        ...(recoveryVersion && cursor.recoveryVersion === recoveryVersion && cursor.autoSuppressedOperationId === recoveryVersion
+          ? { autoSuppressedOperationId: undefined }
+          : {}),
       },
     };
     this.store.upsertTask(thread);
@@ -576,6 +634,8 @@ export class NativeSessionCompactor {
       ? thread.targetModel || resolveConfiguredModel(agent)
       : thread.reviewerModel || thread.initiatorModel || resolveConfiguredModel(agent, undefined, 'initiator');
     if (!model) throw new Error(`No resolved ${role} model is available; refusing to guess.`);
+    const identity = this.capabilityIdentity(agent, model);
+    if (!identity) throw new Error('Codex provider route could not be safely resolved; refusing native compaction.');
     let round = [...(thread.rounds || [])].reverse().find((entry) => entry.type !== 'approval');
     if (!round) throw new Error('The task has no business round to attach the maintenance record to.');
 
@@ -643,7 +703,7 @@ export class NativeSessionCompactor {
       const oldCursor = thread.nativeSessionCompaction?.[role];
       thread.nativeSessionCompaction = {
         ...thread.nativeSessionCompaction,
-        [role]: { revision: (oldCursor?.revision || 0) + 1, sessionId: nativeSessionId, lastOperationId: id, turnsSinceCompaction: 0, recoveryVersion: id },
+      [role]: { revision: (oldCursor?.revision || 0) + 1, sessionId: nativeSessionId, lastOperationId: id, turnsSinceCompaction: 0, recoveryVersion: id, turnCounterResetId: id },
       };
       this.store.upsertTask(thread);
 
@@ -654,6 +714,7 @@ export class NativeSessionCompactor {
       this.store.upsertTask(thread);
       const result = await this.codex.compact({
         executable, sessionId: nativeSessionId, cwd: thread.worktree?.path || thread.workspacePath, model, operationId: id, role: role as 'developer' | 'reviewer',
+        expectedProviderId: identity.providerId,
         cancelled: isNewCancellation,
         onUsage: (usage) => this.recordMaintenanceUsage(threadId, round!.round, id, role, agent, model!, usage),
         onChildPid: (pid) => {

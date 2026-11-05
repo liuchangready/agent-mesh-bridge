@@ -146,3 +146,72 @@ test('attachChild replaces the complete owner record atomically while another pr
   assert.notEqual(child.exitCode, null, 'the child should exit naturally after the atomic updates');
   lock.release(lease);
 });
+
+test('attachChild waits for a live reaper gate and never reports an unpersisted PID as attached', async () => {
+  const root = tempRoot();
+  const lock = new NativeSessionLock(root);
+  const lease = lock.acquire('codex', 'attach-gate-contention')!;
+  const script = `const fs=require('fs'); const p=${JSON.stringify(`${lease.path}.reaper`)}; fs.writeFileSync(p,JSON.stringify({token:'held-gate',pid:process.pid}),{flag:'wx'}); process.stdout.write('ready'); setTimeout(()=>fs.unlinkSync(p),250); setTimeout(()=>{},500);`;
+  const holder = spawn(process.execPath, ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  let output = ''; holder.stdout.on('data', (chunk) => { output += chunk.toString(); });
+  const deadline = Date.now() + 2_000;
+  while (!output.includes('ready') && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(output.includes('ready'));
+  assert.equal(lock.attachChild(lease, process.pid), true);
+  assert.equal(JSON.parse(fs.readFileSync(lease.path, 'utf8')).childPid, process.pid);
+  assert.equal(await new Promise<number | null>((resolve) => holder.once('close', (code) => resolve(code))), 0);
+  lock.attachChild(lease, undefined);
+  lock.release(lease);
+});
+
+test('release waits for transient reaper ownership and removes the lease before returning', async () => {
+  const root = tempRoot();
+  const lock = new NativeSessionLock(root);
+  const lease = lock.acquire('codex', 'release-gate-contention')!;
+  const script = `const fs=require('fs'); const p=${JSON.stringify(`${lease.path}.reaper`)}; fs.writeFileSync(p,JSON.stringify({token:'held-gate',pid:process.pid}),{flag:'wx'}); process.stdout.write('ready'); setTimeout(()=>fs.unlinkSync(p),250); setTimeout(()=>{},500);`;
+  const holder = spawn(process.execPath, ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  let output = ''; holder.stdout.on('data', (chunk) => { output += chunk.toString(); });
+  const deadline = Date.now() + 2_000;
+  while (!output.includes('ready') && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(output.includes('ready'));
+  assert.equal(lock.release(lease), true);
+  assert.equal(fs.existsSync(lease.path), false);
+  assert.equal(await new Promise<number | null>((resolve) => holder.once('close', (code) => resolve(code))), 0);
+});
+
+test('child binding can abandon a contended gate on cancellation without claiming success', async () => {
+  const root = tempRoot();
+  const lock = new NativeSessionLock(root);
+  const lease = lock.acquire('codex', 'attach-gate-cancel')!;
+  const script = `const fs=require('fs'); const p=${JSON.stringify(`${lease.path}.reaper`)}; fs.writeFileSync(p,JSON.stringify({token:'held-gate',pid:process.pid}),{flag:'wx'}); process.stdout.write('ready'); setTimeout(()=>fs.unlinkSync(p),500); setTimeout(()=>{},700);`;
+  const holder = spawn(process.execPath, ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  let output = ''; holder.stdout.on('data', (chunk) => { output += chunk.toString(); });
+  const deadline = Date.now() + 2_000;
+  while (!output.includes('ready') && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(output.includes('ready'));
+  assert.throws(() => lock.attachChild(lease, process.pid, () => true), /Could not acquire/);
+  assert.equal(JSON.parse(fs.readFileSync(lease.path, 'utf8')).childPid, undefined);
+  const closed = new Promise<number | null>((resolve) => holder.once('close', (code) => resolve(code)));
+  assert.equal(await closed, 0);
+  lock.release(lease);
+});
+
+test('a live child keeps the session locked after its bridge parent exits', async () => {
+  const root = tempRoot();
+  const modulePath = path.resolve(__dirname, '../bridge/native-session-lock.js');
+  const script = `const {spawn}=require('child_process'); const {NativeSessionLock}=require(${JSON.stringify(modulePath)}); const child=spawn(process.execPath,['-e','setTimeout(()=>{},10000)'],{stdio:'ignore',windowsHide:true,detached:true}); child.unref(); const lease=new NativeSessionLock(${JSON.stringify(root)}).acquire('codex','parent-exit-child-live',child.pid); process.stdout.write(JSON.stringify({path:lease.path,pid:child.pid})); process.exit(0);`;
+  const owner = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', windowsHide: true });
+  assert.equal(owner.status, 0, owner.stderr);
+  const binding = JSON.parse(owner.stdout);
+  const lock = new NativeSessionLock(root);
+  assert.equal(lock.acquire('codex', 'parent-exit-child-live'), undefined, 'a live native child prevents stale parent lease recovery');
+  try { process.kill(binding.pid, 'SIGTERM'); } catch {}
+  const until = Date.now() + 3_000;
+  let lease;
+  while (!lease && Date.now() < until) {
+    lease = lock.acquire('codex', 'parent-exit-child-live');
+    if (!lease) await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.ok(lease, 'after confirmed child death another bridge may recover the owner');
+  lock.release(lease!);
+});

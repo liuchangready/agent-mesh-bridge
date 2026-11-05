@@ -111,24 +111,30 @@ export class NativeSessionLock {
     return undefined;
   }
 
-  private acquireGate(gatePath: string): { token: string; pid: number } | undefined {
+  private acquireGate(gatePath: string, waitMs = 0, cancelled?: () => boolean): { token: string; pid: number } | undefined {
+    const deadline = Date.now() + waitMs;
     const gate = { token: crypto.randomUUID(), pid: process.pid };
-    try { if (publish(gatePath, gate, true)) return gate; }
-    catch (error: any) { if (error?.code !== 'EEXIST') throw error; }
-    let observed: { token?: string; pid?: number };
-    try { observed = JSON.parse(fs.readFileSync(gatePath, 'utf8')); } catch { return undefined; }
-    if (!observed.token || pidAlive(observed.pid)) return undefined;
-    const quarantine = `${gatePath}.${crypto.randomUUID()}.stale`;
-    try { fs.renameSync(gatePath, quarantine); } catch { return undefined; }
-    let moved: { token?: string; pid?: number };
-    try { moved = JSON.parse(fs.readFileSync(quarantine, 'utf8')); } catch { return undefined; }
-    if (moved.token !== observed.token || pidAlive(moved.pid)) {
-      try { fs.linkSync(quarantine, gatePath); } catch {}
-      try { fs.unlinkSync(quarantine); } catch {}
-      return undefined;
+    while (true) {
+      try { if (publish(gatePath, gate, true)) return gate; }
+      catch (error: any) { if (error?.code !== 'EEXIST') throw error; }
+      let observed: { token?: string; pid?: number };
+      try { observed = JSON.parse(fs.readFileSync(gatePath, 'utf8')); } catch { observed = {}; }
+      if (observed.token && !pidAlive(observed.pid)) {
+        const quarantine = `${gatePath}.${crypto.randomUUID()}.stale`;
+        try { fs.renameSync(gatePath, quarantine); } catch {}
+        let moved: { token?: string; pid?: number } = {};
+        try { moved = JSON.parse(fs.readFileSync(quarantine, 'utf8')); } catch {}
+        if (moved.token === observed.token && !pidAlive(moved.pid)) {
+          try { fs.unlinkSync(quarantine); } catch { return undefined; }
+          try { if (publish(gatePath, gate, true)) return gate; } catch {}
+        } else {
+          try { fs.linkSync(quarantine, gatePath); } catch {}
+          try { fs.unlinkSync(quarantine); } catch {}
+        }
+      }
+      if (Date.now() >= deadline || cancelled?.()) return undefined;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(25, deadline - Date.now()));
     }
-    try { fs.unlinkSync(quarantine); } catch { return undefined; }
-    try { return publish(gatePath, gate, true) ? gate : undefined; } catch { return undefined; }
   }
 
   private ownsGate(gatePath: string, token: string): boolean {
@@ -139,15 +145,16 @@ export class NativeSessionLock {
     if (this.ownsGate(gatePath, token)) try { fs.unlinkSync(gatePath); } catch {}
   }
 
-  attachChild(lease: NativeSessionLease, childPid?: number): void {
+  attachChild(lease: NativeSessionLease, childPid?: number, cancelled?: () => boolean): boolean {
     const gatePath = `${lease.path}.reaper`;
-    const gate = this.acquireGate(gatePath);
-    if (!gate) return;
+    const gate = this.acquireGate(gatePath, 5_000, cancelled);
+    if (!gate) throw new Error('Could not acquire the native-session owner gate to persist the child PID.');
     try {
-      if (!this.ownsGate(gatePath, gate.token)) return;
+      if (!this.ownsGate(gatePath, gate.token)) throw new Error('Native-session owner gate changed before child PID persistence.');
       let current: NativeSessionOwner;
-      try { current = JSON.parse(fs.readFileSync(lease.path, 'utf8')) as NativeSessionOwner; } catch { return; }
-      if (current.token !== lease.token) return;
+      try { current = JSON.parse(fs.readFileSync(lease.path, 'utf8')) as NativeSessionOwner; }
+      catch { throw new Error('Native-session owner record is unavailable while binding its child PID.'); }
+      if (current.token !== lease.token) throw new Error('Native-session lease changed before child PID persistence.');
       current.childPid = childPid;
       current.updatedAt = Date.now();
       const pendingPath = `${lease.path}.pending.${lease.token}`;
@@ -157,7 +164,7 @@ export class NativeSessionLock {
         fs.writeFileSync(fd, JSON.stringify(current));
         fs.fsyncSync(fd);
         fs.closeSync(fd); fd = undefined;
-        if (!this.ownsGate(gatePath, gate.token)) return;
+        if (!this.ownsGate(gatePath, gate.token)) throw new Error('Native-session owner gate changed before child PID publication.');
         try { fs.renameSync(pendingPath, lease.path); }
         catch (error: any) {
           if (error?.code !== 'EPERM' && error?.code !== 'EEXIST') throw error;
@@ -169,19 +176,23 @@ export class NativeSessionLock {
         if (fd !== undefined) try { fs.closeSync(fd); } catch {}
         try { fs.unlinkSync(pendingPath); } catch {}
       }
+      return true;
     } finally { this.releaseGate(gatePath, gate.token); }
   }
 
-  release(lease: NativeSessionLease): void {
+  release(lease: NativeSessionLease, cancelled?: () => boolean): boolean {
     const gatePath = `${lease.path}.reaper`;
-    const gate = this.acquireGate(gatePath);
-    if (!gate) return;
+    const gate = this.acquireGate(gatePath, 5_000, cancelled);
+    if (!gate) throw new Error('Could not acquire the native-session owner gate to release the lease.');
     try {
-      if (!this.ownsGate(gatePath, gate.token)) return;
-    try {
-      const current = JSON.parse(fs.readFileSync(lease.path, 'utf8')) as NativeSessionOwner;
-      if (current.token === lease.token && !pidAlive(current.childPid)) fs.unlinkSync(lease.path);
-    } catch {}
+      if (!this.ownsGate(gatePath, gate.token)) throw new Error('Native-session owner gate changed before lease release.');
+      let current: NativeSessionOwner;
+      try { current = JSON.parse(fs.readFileSync(lease.path, 'utf8')) as NativeSessionOwner; }
+      catch (error: any) { if (error?.code === 'ENOENT') return true; throw new Error('Native-session owner record is unreadable during release.'); }
+      if (current.token !== lease.token) return true;
+      if (pidAlive(current.childPid)) return false;
+      fs.unlinkSync(lease.path);
+      return true;
     } finally { this.releaseGate(gatePath, gate.token); }
   }
 }

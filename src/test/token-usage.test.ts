@@ -3,6 +3,7 @@ import * as assert from 'node:assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { spawn } from 'child_process';
 
 import {
   accumulateTokenUsage,
@@ -18,8 +19,9 @@ import { ContextCompactor } from '../bridge/context-compactor';
 import { getWorkerLogDir } from '../bridge/round-log';
 import { CancellationRegistry } from '../bridge/cancellation-registry';
 import { NativeSessionLock } from '../bridge/native-session-lock';
-import { NativeSessionCompactor } from '../bridge/native-session-compactor';
+import { NativeSessionCompactor, resolveCodexProviderIdentity } from '../bridge/native-session-compactor';
 import { TaskRoleLock } from '../bridge/task-role-lock';
+import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { saveBridgePolicy } from '../bridge/bridge-policy';
 import { DelegationRound, DelegationThread, TokenUsageMetrics } from '../bridge/types';
 
@@ -380,6 +382,21 @@ describe('token usage - accumulation and rollup', () => {
 });
 
 describe('token usage - durability', () => {
+  test('changing the Codex configured provider invalidates a certified capability identity', () => {
+    const { store, dir } = makeStore();
+    const first = resolveCodexProviderIdentity('model_provider = "gateway_a"\n[model_providers.gateway_a]\nname = "Gateway A"\nbase_url = "https://gateway-a.invalid/v1"', {});
+    const second = resolveCodexProviderIdentity('model_provider = "gateway_b"\n[model_providers.gateway_b]\nname = "Gateway B"\nbase_url = "https://gateway-b.invalid/v1"', {});
+    assert.ok(first && second);
+    const common = { agent: 'codex' as const, executablePath: 'C:/codex.exe', executableVersion: 'codex-cli 1.0', model: 'gpt-6-luna' };
+    const certifiedIdentity = { ...common, ...first };
+    const changedIdentity = { ...common, ...second };
+    fs.writeFileSync(path.join(dir, 'native-session-capabilities.json'), JSON.stringify([{ ...certifiedIdentity, status: 'certified' }]));
+    const compactor = new NativeSessionCompactor(store, {} as any);
+    assert.equal((compactor as any).readCapabilityRecord(certifiedIdentity), 'certified');
+    assert.equal((compactor as any).readCapabilityRecord(changedIdentity), 'needs_validation');
+    assert.equal(resolveCodexProviderIdentity(undefined, {}), undefined, 'unreadable configuration is not treated as subscription default');
+  });
+
   const usage = (total: number): TokenUsageMetrics => ({
     uncachedInputTokens: total,
     cacheReadTokens: 0,
@@ -666,7 +683,9 @@ describe('token usage - durability', () => {
     store.upsertTask(thread);
     const roleLock = new TaskRoleLock(dir);
     const roleLease = roleLock.tryAcquire(thread.threadId, 'developer')!;
-    const compactor = new NativeSessionCompactor(store, { resolveExecutable: () => 'fake-codex' } as any);
+    const compactor = new NativeSessionCompactor(store, { resolveExecutable: () => process.execPath } as any, () => 'certified');
+    (compactor as any).capabilityIdentity = () => ({ agent: 'codex', executablePath: process.execPath, executableVersion: 'test', providerRoute: 'subscription-default', providerId: 'openai', model: 'gpt-6-luna' });
+    saveBridgePolicy({ nativeSessionCompaction: { mode: 'auto' } }, dir);
     let probes = 0; let compactions = 0;
     (compactor as any).codex = {
       probeResume: async (request: any) => { probes++; assert.equal(request.sessionId, sessionId); return true; },
@@ -679,9 +698,107 @@ describe('token usage - durability', () => {
     assert.equal(prepared.recoveryVersion, 'unknown-recovery-op');
     assert.match(prepared.recoveryPrefix || '', /complete task brief/);
     assert.equal(store.getTask(thread.threadId)!.status, 'running');
+    assert.equal(store.getTask(thread.threadId)!.nativeSessionCompaction!.developer!.lastOperationId, 'unknown-recovery-op');
+    assert.equal(store.getTask(thread.threadId)!.nativeSessionCompaction!.developer!.autoSuppressedOperationId, 'unknown-recovery-op');
+    assert.equal(store.getTask(thread.threadId)!.nativeSessionCompaction!.developer!.turnsSinceCompaction, 0);
+    assert.equal(compactions, 0);
     new NativeSessionLock(dir).release(prepared.lease!);
     if (prepared.executionLease?.owned) prepared.executionLease.registry.end(prepared.executionLease.registration);
     prepared.executionLease?.registry.dispose();
+    roleLock.release(roleLease);
+    const secondRoleLease = roleLock.tryAcquire(thread.threadId, 'developer')!;
+    const second = await compactor.prepareBeforeResume(thread.threadId, 'developer', 'gpt-6-luna');
+    assert.equal(second.recoveryVersion, 'unknown-recovery-op', 'retries keep carrying the original pending version');
+    assert.equal(store.getTask(thread.threadId)!.nativeSessionCompaction!.developer!.lastOperationId, 'unknown-recovery-op');
+    assert.equal(store.getTask(thread.threadId)!.nativeSessionCompaction!.developer!.turnsSinceCompaction, 0);
+    assert.equal(probes, 2);
+    assert.equal(compactions, 0, 'unknown recovery never reissues compact before a successful business turn');
+    new NativeSessionLock(dir).release(second.lease!);
+    if (second.executionLease?.owned) second.executionLease.registry.end(second.executionLease.registration);
+    second.executionLease?.registry.dispose();
+    roleLock.release(secondRoleLease);
+  });
+
+  test('auto mode also suppresses compaction after a healthy interrupted-operation probe', async () => {
+    const { store, dir } = makeStore();
+    const sessionId = 'c0fd2b1f-65bb-4f44-8f02-bff3c9a79fd0';
+    const thread = makeThread([{ round: 1, type: 'initial', prompt: 'brief', durationMs: 1, status: 'running', timestamp: new Date().toISOString() }]);
+    thread.status = 'running'; thread.targetAgent = 'codex'; thread.targetModel = 'gpt-6-luna';
+    thread.receiverSessionId = sessionId; thread.receiverSessionCaptured = true;
+    const logDir = getWorkerLogDir('codex', dir); fs.mkdirSync(logDir, { recursive: true });
+    const recoveryPath = path.join(logDir, 'interrupted.recovery.json'); fs.writeFileSync(recoveryPath, '{"brief":"brief"}');
+    thread.rounds[0].nativeSessionCompactions = [{ id: 'interrupted-op', role: 'developer', agent: 'codex', sessionId, model: 'gpt-6-luna', reason: 'turn_budget', phase: 'interrupted', revision: 2, startedAt: new Date().toISOString(), recoveryPath, logPath: path.join(logDir, 'interrupted.log') } as any];
+    thread.nativeSessionCompaction = { developer: { sessionId, lastOperationId: 'interrupted-op', recoveryVersion: 'interrupted-op', turnsSinceCompaction: 4, revision: 2 } };
+    store.upsertTask(thread); saveBridgePolicy({ nativeSessionCompaction: { mode: 'auto' } }, dir);
+    const roleLock = new TaskRoleLock(dir); const roleLease = roleLock.tryAcquire(thread.threadId, 'developer')!;
+    const compactor = new NativeSessionCompactor(store, { resolveExecutable: () => process.execPath } as any, () => 'certified');
+    (compactor as any).capabilityIdentity = () => ({ agent: 'codex', executablePath: process.execPath, executableVersion: 'test', providerRoute: 'subscription-default', providerId: 'openai', model: 'gpt-6-luna' });
+    let compactCalls = 0;
+    (compactor as any).codex = { probeResume: async () => true, compact: async () => { compactCalls++; throw Error('must not compact'); } };
+    const prepared = await compactor.prepareBeforeResume(thread.threadId, 'developer', 'gpt-6-luna');
+    assert.equal(compactCalls, 0);
+    assert.equal(prepared.recoveryVersion, 'interrupted-op');
+    assert.equal(store.getTask(thread.threadId)!.nativeSessionCompaction!.developer!.autoSuppressedOperationId, 'interrupted-op');
+    new NativeSessionLock(dir).release(prepared.lease!);
+    if (prepared.executionLease?.owned) prepared.executionLease.registry.end(prepared.executionLease.registration);
+    prepared.executionLease?.registry.dispose(); roleLock.release(roleLease);
+  });
+
+  test('automatic failure probe binds its live PID and cancellation waits for probe exit', async () => {
+    const { store, dir } = makeStore();
+    const sessionId = '601d6973-203e-4f2a-bac6-747bd2dd4e9e';
+    const thread = makeThread([{ round: 1, type: 'initial', prompt: 'brief', durationMs: 1, status: 'running', timestamp: new Date().toISOString() }]);
+    thread.status = 'running'; thread.targetAgent = 'codex'; thread.targetModel = 'gpt-6-luna';
+    thread.receiverSessionId = sessionId; thread.receiverSessionCaptured = true;
+    thread.nativeSessionCompaction = { developer: { sessionId, turnsSinceCompaction: 4, revision: 4 } };
+    store.upsertTask(thread); saveBridgePolicy({ nativeSessionCompaction: { mode: 'auto' } }, dir);
+    const roleLock = new TaskRoleLock(dir); const roleLease = roleLock.tryAcquire(thread.threadId, 'developer')!;
+    const detector = { resolveExecutable: () => process.execPath } as any;
+    const compactor = new NativeSessionCompactor(store, detector, () => 'certified');
+    (compactor as any).capabilityIdentity = () => ({ agent: 'codex', executablePath: process.execPath, executableVersion: 'test', providerRoute: 'subscription-default', providerId: 'openai', model: 'gpt-6-luna' });
+    let compactChild: ReturnType<typeof spawn> | undefined;
+    let probeChild: ReturnType<typeof spawn> | undefined;
+    let probeWasTracked = false;
+    let probeWasCleared = false;
+    (compactor as any).codex = {
+      compact: async (request: any) => {
+        compactChild = spawn(process.execPath, ['-e', 'setTimeout(()=>{},10000)'], { stdio: 'ignore', windowsHide: true });
+        request.onChildPid(compactChild.pid);
+        const nativeOwnerPath = fs.readdirSync(path.join(dir, 'native-sessions')).map((name) => path.join(dir, 'native-sessions', name))
+          .find((file) => file.endsWith('.json') && !file.endsWith('.reaper') && JSON.parse(fs.readFileSync(file, 'utf8')).sessionId === sessionId)!;
+        assert.equal(JSON.parse(fs.readFileSync(nativeOwnerPath, 'utf8')).childPid, compactChild.pid);
+        const compactExited = new Promise<void>((resolve) => compactChild!.once('close', () => resolve()));
+        try { compactChild.kill(); } catch {}
+        await compactExited;
+        request.onChildPid(undefined);
+        throw new Error('ACK received, then the compact connection disconnected');
+      },
+      probeResume: async (request: any) => {
+        probeChild = spawn(process.execPath, ['-e', 'setTimeout(()=>{},10000)'], { stdio: 'ignore', windowsHide: true });
+        request.onChildPid(probeChild.pid);
+        const native = new NativeSessionLock(dir).acquire('codex', sessionId);
+        assert.equal(native, undefined, 'the active probe PID is persisted before another writer checks the session');
+        const execution = new TaskExecutionRegistry(dir);
+        assert.equal(execution.getOwner(thread.threadId)?.childPid, probeChild.pid);
+        assert.equal(roleLock.getOwner(thread.threadId)?.childPid, probeChild.pid);
+        probeWasTracked = true;
+        new CancellationRegistry(dir).request(thread.threadId, 'pause', 'pause during recovery probe', 'test');
+        const probeExited = new Promise<void>((resolve) => probeChild!.once('close', () => resolve()));
+        try { probeChild.kill(); } catch {}
+        await probeExited;
+        request.onChildPid(undefined);
+        assert.equal(execution.getOwner(thread.threadId)?.childPid, undefined);
+        assert.equal(roleLock.getOwner(thread.threadId)?.childPid, undefined);
+        probeWasCleared = true;
+        execution.dispose();
+        return false;
+      },
+    };
+    const prepared = await compactor.prepareBeforeResume(thread.threadId, 'developer', 'gpt-6-luna');
+    assert.match(prepared.pauseReason || '', /could not be proven healthy/);
+    assert.equal(store.getTask(thread.threadId)?.status, 'paused');
+    assert.equal(probeWasTracked, true);
+    assert.equal(probeWasCleared, true);
     roleLock.release(roleLease);
   });
 

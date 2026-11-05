@@ -8,6 +8,7 @@ export interface CodexCompactionRequest {
   sessionId: string;
   cwd: string;
   model: string;
+  expectedProviderId?: string;
   operationId: string;
   role: 'developer' | 'reviewer';
   timeoutMs?: number;
@@ -42,7 +43,6 @@ export class CodexNativeCompaction {
       cwd: request.cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env },
     });
     if (!child.stdin || !child.stdout) throw new Error('Codex recovery probe stdio is unavailable.');
-    request.onChildPid?.(child.pid);
     const reader = readline.createInterface({ input: child.stdout });
     const waiters = new Map<string, { resolve: (value: RpcMessage) => void; reject: (error: Error) => void }>();
     let id = 0; let processError: Error | undefined; let exited = false;
@@ -80,6 +80,7 @@ export class CodexNativeCompaction {
       request.onChildPid?.(undefined);
     };
     try {
+      request.onChildPid?.(child.pid);
       await rpc('initialize', { clientInfo: { name: 'agent-mesh-bridge', title: 'Agent Mesh Bridge', version: '1.0.0' }, capabilities: null });
       child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} })}\n`);
       const response = await rpc('thread/resume', { threadId: request.sessionId, cwd: request.cwd, model: request.model, approvalPolicy: 'never', sandbox: 'read-only', excludeTurns: true, config: { mcp_servers: {}, hooks: {} } });
@@ -122,7 +123,6 @@ export class CodexNativeCompaction {
     const reportPid = (pid: number | undefined) => { activeChildPid = pid; request.onChildPid?.(pid); };
     const reportMainExit = () => { if (compactSettled && activeChildPid === child.pid) reportPid(undefined); };
     child.once('exit', reportMainExit);
-    reportPid(child.pid);
     let nextId = 0;
     const notifications: RpcMessage[] = [];
     let protocolError: Error | undefined;
@@ -207,6 +207,7 @@ export class CodexNativeCompaction {
     };
 
     try {
+      reportPid(child.pid);
       await rpc('initialize', { clientInfo: { name: 'agent-mesh-bridge', title: 'Agent Mesh Bridge', version: '1.0.0' }, capabilities: null });
       child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} })}\n`);
       const resumed = await rpc('thread/resume', {
@@ -216,6 +217,9 @@ export class CodexNativeCompaction {
       const thread = resumed.result?.thread;
       if (!thread || thread.id !== threadId || thread.cwd !== request.cwd || thread.model !== request.model) {
         throw new Error('Codex did not resume the same thread, worktree, and requested model.');
+      }
+      if (request.expectedProviderId && thread.modelProvider !== request.expectedProviderId) {
+        throw new Error(`Codex resumed provider ${thread.modelProvider || 'unknown'}, which does not match certified provider ${request.expectedProviderId}.`);
       }
       if (thread.status?.type !== 'idle') {
         throw new Error(`Codex thread is not confirmed idle (${thread.status?.type || 'unknown'}).`);

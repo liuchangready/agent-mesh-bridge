@@ -333,6 +333,8 @@ export interface NativeSessionCompactionCursor {
   recoveryVersion?: string;
   recoveryDeliveredVersion?: string;
   autoDisabledReason?: string;
+  autoSuppressedOperationId?: string;
+  turnCounterResetId?: string;
   recentBusinessTurnIds?: string[];
   recentNativeAutoCompactionEventIds?: string[];
 }

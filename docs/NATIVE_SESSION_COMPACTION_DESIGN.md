@@ -121,3 +121,13 @@ reviewer bootstrap 也显式标记为 `nativeSessionRole: reviewer` 并共用 ru
 针对性命令：`node node_modules/typescript/bin/tsc -p ./`；`node --test out/test/token-usage.test.js out/test/review-wake.test.js out/test/callback-failure.test.js out/test/caller-wake-queue.test.js out/test/native-session-lock.test.js`。
 
 本轮最终验证结果：`node node_modules/typescript/bin/tsc -p ./` 成功；针对性回归 74/74；全量 `node --test out/test/**/*.test.js` 在清除 receiver 测试环境标记后 463/463。临时真实 E2E 的维护 usage 被正确保存为 `available=false, partial=true, source=unavailable`，未把未采集量显示为零费用。
+
+## 第 4 轮定点返修
+
+unknown/interrupted 操作经同 ID 只读探针确认健康后，保留原 `recoveryVersion` 与 operation ID，持久化 `autoSuppressedOperationId` 和 `turnCounterResetId`；在恢复资料随成功业务 turn 交付前不允许自动压缩再次发送。TaskStore 按 reset ID 合并轮数，避免 stale snapshot 把压缩前计数恢复。ACK 后断连与 interrupted 的 auto 回归均验证不会产生第二个 compact operation。
+
+session owner PID 更新与释放在 gate 竞争时最多等待 5 秒并支持取消；失败会显式抛错，不再静默报告成功。TaskRoleLock 支持在子进程退出后清除 child PID。自动维护失败后的只读 probe 复用同一 PID 回调绑定 native session、执行登记与 role owner，确认退出后才清理登记；临时子进程测试覆盖 gate 等待/取消、parent 退出但 child 存活及 pause 中 probe 的绑定与清理。
+
+Codex 能力身份从 `CODEX_HOME/config.toml` 解析 `model_provider` 及对应 provider 的 `base_url`，不读取/记录密钥；配置不可解析时不形成可认证身份。压缩 app-server resume 返回的 `thread.modelProvider` 必须与能力记录的 provider ID 一致。更换 provider 配置会使旧 certified 记录失配。生产仍保持 `needs_validation/off`。
+
+第 4 轮验证：`node node_modules/typescript/bin/tsc -p ./` 成功；native-session-lock、token-usage 与 task-role-lock 定向回归 48/48。最终两次并行全量复跑均在未修改的 `git-worktree-merge.test.js` 临时目录清理处出现 `ENOTEMPTY`（469/470）；该失败用例单独重跑通过。最后一行安全性调整之前，同代码全量复跑为 470/470。日志：`%TEMP%/agent-mesh-bridge-full-r4-final-71d38307a844422293130d1fd4a8c5d1.log`、`%TEMP%/agent-mesh-bridge-full-r4-final2-94866aa2b5e74619941cdd2b2483cfe4.log`。
