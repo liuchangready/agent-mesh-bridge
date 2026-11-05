@@ -432,7 +432,13 @@ export function collectTokenUsage(ctx: TokenCollectionContext): TokenUsageMetric
 export function accumulateTokenUsage(
   existing: TokenUsageMetrics | undefined,
   incoming: TokenUsageMetrics | undefined,
+  componentId?: string,
+  legacyId = 'legacy-business',
+  role: 'developer' | 'reviewer' = 'developer',
 ): TokenUsageMetrics | undefined {
+  if (!existing && incoming && componentId) {
+    return appendTokenUsageComponent(undefined, usageComponent(incoming, componentId, role), legacyId);
+  }
   if (!existing) {
     return incoming ? { ...incoming, attempts: incoming.attempts ?? 1 } : undefined;
   }
@@ -476,7 +482,33 @@ export function accumulateTokenUsage(
   const notes = [existing.notes, incoming.notes].filter(Boolean) as string[];
   merged.notes = notes.length > 0 ? Array.from(new Set(notes)).join('; ') : undefined;
 
-  return merged;
+  if (!componentId) return merged;
+  return appendTokenUsageComponent(existing, usageComponent(incoming, componentId, role), legacyId);
+}
+
+function usageComponent(
+  incoming: TokenUsageMetrics,
+  componentId: string,
+  role: 'developer' | 'reviewer',
+): TokenUsageComponent {
+  return {
+    id: componentId,
+    kind: 'business',
+    role,
+    agent: incoming.agent,
+    model: incoming.model,
+    uncachedInputTokens: incoming.uncachedInputTokens,
+    cacheReadTokens: incoming.cacheReadTokens,
+    cacheWriteTokens: incoming.cacheWriteTokens,
+    outputTokens: incoming.outputTokens,
+    reasoningTokens: incoming.reasoningTokens,
+    nativeTotalTokens: incoming.nativeTotalTokens,
+    costUsd: incoming.costUsd,
+    costSource: incoming.costSource,
+    source: incoming.source,
+    available: incoming.available,
+    partial: incoming.partial,
+  };
 }
 
 /** Add one independently billed operation without re-billing an existing round snapshot. */
@@ -501,7 +533,11 @@ export function appendTokenUsageComponent(
     partial: existing.partial,
   }] : [];
   const index = components.findIndex((value) => value.id === component.id);
-  if (index >= 0) components[index] = component;
+  if (index >= 0) {
+    const prior = components[index];
+    const total = (value: TokenUsageComponent) => value.uncachedInputTokens + value.cacheReadTokens + value.cacheWriteTokens + value.outputTokens;
+    components[index] = prior.available && (!component.available || total(prior) > total(component)) ? prior : component;
+  }
   else components.push(component);
   const available = components.filter((value) => value.available);
   const uncachedInputTokens = available.reduce((sum, value) => sum + value.uncachedInputTokens, 0);

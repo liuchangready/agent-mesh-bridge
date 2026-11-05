@@ -188,7 +188,8 @@ export class CallbackManager extends EventEmitter {
       return this.deferWake(callerSessionId, wakeRequest);
     }
 
-    const roleLock = new TaskRoleLock();
+    const storageRoot = this.taskStore ? path.dirname(this.taskStore.getStoragePath()) : undefined;
+    const roleLock = new TaskRoleLock(storageRoot);
     const reviewerConversationId =
       thread.reviewFlow === 'dedicated' ? thread.callerSessionId : undefined;
     const roleLease: TaskRoleLease | null = roleLock.tryAcquire(
@@ -215,17 +216,39 @@ export class CallbackManager extends EventEmitter {
           .prepareBeforeResume(thread.threadId, 'reviewer', reviewerModel);
       } catch (error: any) {
         roleLock.release(roleLease);
-        this.wakeQueue.release(callerSessionId);
+        if (String(error?.message || error).includes('already owned by another Bridge process')) {
+          return this.deferWake(callerSessionId, wakeRequest);
+        }
         console.warn(`[CallbackManager] Reviewer prepare skipped launch for ${thread.threadId}: ${error?.message || error}`);
         return false;
       }
     }
-    const executionRegistry = new TaskExecutionRegistry(this.taskStore ? path.dirname(this.taskStore.getStoragePath()) : undefined);
-    let executionRegistration: TaskExecutionRegistration | undefined;
+    if (reviewerPreparation?.pauseReason) {
+      roleLock.release(roleLease);
+      this.wakeQueue.release(callerSessionId);
+      this.drainNextWake(callerSessionId);
+      console.warn(`[CallbackManager] Reviewer prepare paused ${thread.threadId}: ${reviewerPreparation.pauseReason}`);
+      return false;
+    }
+    let reviewerSessionLease = reviewerPreparation?.lease;
+    if (thread.reviewFlow !== 'dedicated' || !this.taskStore) {
+      reviewerSessionLease = nativeLock.acquire(thread.initiatorAgent, callerSessionId);
+      if (!reviewerSessionLease) {
+        roleLock.release(roleLease);
+        this.wakeQueue.release(callerSessionId);
+        return this.deferWake(callerSessionId, wakeRequest);
+      }
+    }
+    const executionRegistry = reviewerPreparation?.executionLease?.registry || new TaskExecutionRegistry(this.taskStore ? path.dirname(this.taskStore.getStoragePath()) : undefined);
+    let executionRegistration: TaskExecutionRegistration | undefined = reviewerPreparation?.executionLease?.registration;
+    let ownsExecutionRegistration = reviewerPreparation?.executionLease?.owned ?? false;
     try {
-      executionRegistration = executionRegistry.begin(thread.threadId, reviewRound.round, thread.initiatorAgent, thread.workspacePath);
+      if (!executionRegistration) {
+        executionRegistration = executionRegistry.begin(thread.threadId, reviewRound.round, thread.initiatorAgent, thread.workspacePath);
+        ownsExecutionRegistration = true;
+      }
     } catch (error: any) {
-      if (reviewerPreparation?.lease) nativeLock.release(reviewerPreparation.lease);
+      if (reviewerSessionLease) nativeLock.release(reviewerSessionLease);
       roleLock.release(roleLease);
       this.wakeQueue.release(callerSessionId);
       executionRegistry.dispose();
@@ -233,19 +256,20 @@ export class CallbackManager extends EventEmitter {
       return false;
     }
 
-    if (reviewerPreparation?.lease && this.taskStore) {
+    if (thread.reviewFlow === 'dedicated' && this.taskStore) {
       this.taskStore.loadFromDisk();
       const fresh = this.taskStore.getTask(thread.threadId);
       const owner = roleLock.getOwner(thread.threadId);
-      const bindingMatches = fresh?.reviewerSessionId === callerSessionId && fresh.reviewerSessionCaptured &&
+      const bindingMatches = !!reviewerSessionLease && fresh?.reviewerSessionId === callerSessionId && fresh.reviewerSessionCaptured &&
         fresh.initiatorAgent === thread.initiatorAgent && fresh.reviewerModel === thread.reviewerModel &&
         JSON.stringify(fresh.worktree) === JSON.stringify(thread.worktree);
       if (!fresh || fresh.archivedAt || fresh.status !== 'waiting_review' || !bindingMatches ||
+          (reviewerPreparation?.pauseReason !== undefined) ||
           owner?.token !== roleLease.token || new CancellationRegistry(path.dirname(this.taskStore.getStoragePath())).peek(thread.threadId)) {
-        nativeLock.release(reviewerPreparation.lease);
+        if (reviewerSessionLease) nativeLock.release(reviewerSessionLease);
         roleLock.release(roleLease);
         this.wakeQueue.release(callerSessionId);
-        if (executionRegistration) executionRegistry.end(executionRegistration);
+        if (executionRegistration && ownsExecutionRegistration) executionRegistry.end(executionRegistration);
         executionRegistry.dispose();
         console.warn(`[CallbackManager] Reviewer state changed during prepare for ${thread.threadId}; launch was cancelled.`);
         return false;
@@ -282,6 +306,7 @@ export class CallbackManager extends EventEmitter {
     const release = () => {
       if (released) return;
       released = true;
+      if (reviewerSessionLease) nativeLock.release(reviewerSessionLease);
       roleLock.release(roleLease);
       this.wakeQueue.release(callerSessionId);
       this.drainNextWake(callerSessionId);
@@ -298,12 +323,12 @@ export class CallbackManager extends EventEmitter {
       (childPid) => {
         if (executionRegistration) executionRegistry.attachChildPid(childPid, executionRegistration);
         roleLock.attachChild(roleLease, childPid);
-        if (reviewerPreparation?.lease) {
-          if (childPid) nativeLock.attachChild(reviewerPreparation.lease, childPid);
-          else nativeLock.release(reviewerPreparation.lease);
+        if (reviewerSessionLease) {
+          if (childPid) nativeLock.attachChild(reviewerSessionLease, childPid);
+          else { nativeLock.attachChild(reviewerSessionLease, undefined); nativeLock.release(reviewerSessionLease); }
         }
         if (!childPid && executionRegistration) {
-          executionRegistry.end(executionRegistration);
+          if (ownsExecutionRegistration) executionRegistry.end(executionRegistration);
           executionRegistration = undefined;
           executionRegistry.dispose();
         }
@@ -312,8 +337,8 @@ export class CallbackManager extends EventEmitter {
     );
     if (!launched) {
       release();
-      if (reviewerPreparation?.lease) nativeLock.release(reviewerPreparation.lease);
-      if (executionRegistration) executionRegistry.end(executionRegistration);
+      if (reviewerSessionLease) nativeLock.release(reviewerSessionLease);
+      if (executionRegistration && ownsExecutionRegistration) executionRegistry.end(executionRegistration);
       executionRegistry.dispose();
     }
     return launched;
@@ -411,6 +436,39 @@ export class CallbackManager extends EventEmitter {
       });
     }
 
+    const storageRoot = this.taskStore ? path.dirname(this.taskStore.getStoragePath()) : undefined;
+    const roleLock = new TaskRoleLock(storageRoot);
+    const roleLease = roleLock.tryAcquire(thread.threadId, 'reviewer', thread.reviewFlow === 'dedicated' ? callerSessionId : undefined);
+    const nativeLock = new NativeSessionLock(storageRoot);
+    const sessionLease = roleLease && nativeLock.acquire(thread.initiatorAgent, callerSessionId);
+    if (!roleLease || !sessionLease) {
+      if (roleLease) roleLock.release(roleLease);
+      this.wakeQueue.release(callerSessionId);
+      return this.deferWake(callerSessionId, { threadId: thread.threadId, round: roundNumber, kind: 'failure', enqueuedAt: Date.now() });
+    }
+    const executionRegistry = new TaskExecutionRegistry(storageRoot);
+    let executionRegistration: TaskExecutionRegistration;
+    try {
+      executionRegistration = executionRegistry.begin(thread.threadId, roundNumber, thread.initiatorAgent, thread.workspacePath);
+    } catch (error: any) {
+      nativeLock.release(sessionLease); roleLock.release(roleLease); this.wakeQueue.release(callerSessionId); executionRegistry.dispose();
+      console.warn(`[CallbackManager] Failure wake registration failed for ${thread.threadId}: ${error?.message || error}`);
+      return false;
+    }
+    if (this.taskStore) {
+      this.taskStore.loadFromDisk();
+      const fresh = this.taskStore.getTask(thread.threadId);
+      const freshSession = fresh?.reviewFlow === 'dedicated' ? fresh.reviewerSessionId : fresh?.callerSessionId;
+      if (!fresh || fresh.archivedAt || fresh.status !== 'failed' || freshSession !== callerSessionId ||
+          roleLock.getOwner(thread.threadId)?.token !== roleLease.token ||
+          new CancellationRegistry(storageRoot).peek(thread.threadId)) {
+        nativeLock.release(sessionLease); roleLock.release(roleLease);
+        executionRegistry.end(executionRegistration); executionRegistry.dispose();
+        return false;
+      }
+      thread = fresh;
+    }
+
     console.log(
       `[CallbackManager] Waking caller ${thread.initiatorAgent} about failed round ${roundNumber} of ${thread.threadId}...`,
     );
@@ -419,10 +477,18 @@ export class CallbackManager extends EventEmitter {
     const release = () => {
       if (released) return;
       released = true;
+      nativeLock.release(sessionLease);
+      roleLock.release(roleLease);
+      executionRegistry.end(executionRegistration);
+      executionRegistry.dispose();
       this.wakeQueue.release(callerSessionId);
       this.drainNextWake(callerSessionId);
     };
-    const launched = this.launchCaller(thread, callerSessionId, promptMessage, round, 'failure', release);
+    const launched = this.launchCaller(thread, callerSessionId, promptMessage, round, 'failure', release, (childPid) => {
+      executionRegistry.attachChildPid(childPid, executionRegistration);
+      if (childPid) { nativeLock.attachChild(sessionLease, childPid); roleLock.attachChild(roleLease, childPid); }
+      else { nativeLock.attachChild(sessionLease, undefined); nativeLock.release(sessionLease); executionRegistry.end(executionRegistration); executionRegistry.dispose(); }
+    });
     if (launched) {
       thread.failureNotifications = [...alreadyNotified, roundNumber];
       this.emit('taskFailed', { thread, round, error: reason });

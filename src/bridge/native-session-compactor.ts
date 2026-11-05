@@ -1,4 +1,5 @@
 import * as crypto from 'crypto';
+import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { AgentDetector } from './agent-detector';
@@ -10,13 +11,14 @@ import { getReviewerLogDir, getWorkerLogDir, safeThreadIdPart } from './round-lo
 import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 import { TaskRoleLock, TaskRole } from './task-role-lock';
 import { TaskStore } from './task-store';
-import { AgentId, DelegationThread, NativeSessionCompactionOperation, appendInterruption, isValidSessionId } from './types';
+import { AgentId, DelegationThread, NativeSessionCompactionOperation, TokenUsageComponent, appendInterruption, isValidSessionId } from './types';
 import { appendTokenUsageComponent } from './token-usage-collector';
 import { readBridgePolicy } from './bridge-policy';
 
 export interface NativeSessionPreparation {
   sessionId?: string;
   lease?: ReturnType<NativeSessionLock['acquire']>;
+  executionLease?: { registry: TaskExecutionRegistry; registration: TaskExecutionRegistration; owned: boolean };
   recoveryPrefix?: string;
   recoveryVersion?: string;
   warning?: string;
@@ -24,6 +26,18 @@ export interface NativeSessionPreparation {
 }
 
 export type NativeCompactionCapability = 'unsupported' | 'needs_validation' | 'certified';
+
+export interface NativeCompactionCapabilityIdentity {
+  agent: AgentId;
+  executablePath: string;
+  executableVersion: string;
+  providerRoute: string;
+  model: string;
+}
+
+export type NativeCompactionCapabilityResolver = (
+  identity: NativeCompactionCapabilityIdentity,
+) => NativeCompactionCapability;
 
 export function nativeCompactionCapability(agent: AgentId): NativeCompactionCapability {
   return agent === 'codex' ? 'needs_validation' : 'unsupported';
@@ -42,7 +56,9 @@ function recoveryDocument(thread: DelegationThread, role: TaskRole, agent: Agent
     identity: { threadId: thread.threadId, round: latest?.round, role, agent, model, nativeSessionId: sessionId },
     objective: compactText(thread.rounds?.[0]?.prompt || thread.title, 3_000),
     constraints: [
-      'Continue only the current task role; do not forward or start review work.',
+      role === 'reviewer'
+        ? 'Perform the assigned review and record its verdict through the Bridge workflow; do not forward or alter the approved delivery SHA.'
+        : 'Continue the assigned implementation or rework; do not forward or perform reviewer-only decisions.',
       'Use the same native session, task worktree, branch, and approved SHA.',
       'Do not choose a different model, commit, or push unless the task workflow authorizes it.',
       'Treat this file as task context; only explicit Bridge ledger state controls approvals and lifecycle.',
@@ -75,14 +91,65 @@ function recoveryDocument(thread: DelegationThread, role: TaskRole, agent: Agent
   return text;
 }
 
+function emptyMaintenanceUsage(id: string, role: TaskRole, agent: AgentId, model: string): TokenUsageComponent {
+  return { id, kind: 'native_compaction', role: role as 'developer' | 'reviewer', agent, model,
+    uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0,
+    source: 'unavailable', available: false, partial: true };
+}
+
 export class NativeSessionCompactor {
   private readonly store: TaskStore;
   private readonly detector: AgentDetector;
   private readonly codex = new CodexNativeCompaction();
+  private readonly capabilityResolver: NativeCompactionCapabilityResolver;
+  private readonly capabilityCache = new Map<string, NativeCompactionCapability>();
 
-  constructor(store: TaskStore, detector: AgentDetector) {
+  constructor(store: TaskStore, detector: AgentDetector, capabilityResolver?: NativeCompactionCapabilityResolver) {
     this.store = store;
     this.detector = detector;
+    this.capabilityResolver = capabilityResolver || ((identity) => this.readCapabilityRecord(identity));
+  }
+
+  private readCapabilityRecord(identity: NativeCompactionCapabilityIdentity): NativeCompactionCapability {
+    const root = path.dirname(this.store.getStoragePath());
+    const key = JSON.stringify(identity);
+    const cached = this.capabilityCache.get(key);
+    if (cached) return cached;
+    let status: NativeCompactionCapability = 'needs_validation';
+    try {
+      const entries = JSON.parse(fs.readFileSync(path.join(root, 'native-session-capabilities.json'), 'utf8')) as Array<NativeCompactionCapabilityIdentity & { status?: NativeCompactionCapability }>;
+      status = entries.find((entry) => entry.agent === identity.agent && entry.executablePath === identity.executablePath &&
+        entry.executableVersion === identity.executableVersion && entry.providerRoute === identity.providerRoute && entry.model === identity.model)?.status || 'needs_validation';
+    } catch {}
+    this.capabilityCache.set(key, status);
+    return status;
+  }
+
+  private recordMaintenanceUsage(
+    threadId: string, roundNumber: number, operationId: string, role: TaskRole, agent: AgentId, model: string,
+    measured?: TokenUsageComponent,
+  ): void {
+    this.store.loadFromDisk();
+    const thread = this.store.getTask(threadId);
+    const round = thread && !thread.archivedAt && thread.rounds.find((entry) => entry.round === roundNumber);
+    if (!round) return;
+    const usage = measured || emptyMaintenanceUsage(operationId, role, agent, model);
+    usage.id = operationId;
+    round.tokenUsage = appendTokenUsageComponent(round.tokenUsage, usage, `legacy-business-round-${roundNumber}`);
+    this.store.upsertTask(thread);
+  }
+
+  private capabilityIdentity(agent: AgentId, model: string): NativeCompactionCapabilityIdentity | undefined {
+    if (agent !== 'codex') return undefined;
+    const executablePath = this.detector.resolveExecutable('codex');
+    if (!executablePath) return undefined;
+    const versionResult = spawnSync(executablePath, ['--version'], { encoding: 'utf8', timeout: 3_000, windowsHide: true });
+    const executableVersion = `${versionResult.stdout || ''}${versionResult.stderr || ''}`.trim().split(/\r?\n/, 1)[0];
+    if (versionResult.status !== 0 || !executableVersion) return undefined;
+    const providerRoute = process.env.OPENAI_BASE_URL || process.env.CODEX_BASE_URL || 'subscription-default';
+    let actualPath = path.resolve(executablePath);
+    try { actualPath = fs.realpathSync.native(executablePath); } catch {}
+    return { agent, executablePath: actualPath, executableVersion, providerRoute, model };
   }
 
   /** Acquire the session write lease and supply any still-undelivered recovery document. */
@@ -98,6 +165,14 @@ export class NativeSessionCompactor {
     if (!captured || !isValidSessionId(sessionId || '')) return {};
     const lease = new NativeSessionLock(root).acquire(agent, sessionId!);
     if (!lease) throw new Error(`Native session ${sessionId} is already owned by another Bridge process.`);
+    let executionLease: NativeSessionPreparation['executionLease'];
+    let keepLease = false;
+    try {
+    const roleOwnerAtStart = new TaskRoleLock(root).getOwner(threadId);
+    if (!roleOwnerAtStart || roleOwnerAtStart.role !== role) {
+      new NativeSessionLock(root).release(lease);
+      throw new Error('The task role lease is not held during native-session preparation.');
+    }
     const cancellation = new CancellationRegistry(root).peek(threadId);
     this.store.loadFromDisk();
     const fresh = this.store.getTask(threadId);
@@ -119,6 +194,35 @@ export class NativeSessionCompactor {
       throw new Error('Task state, cancellation, model, worktree, or native session changed before resume preparation.');
     }
     thread = fresh;
+    const ensureExecutionLease = () => {
+      if (executionLease) return executionLease;
+      const registry = new TaskExecutionRegistry(root);
+      const owner = registry.getOwner(threadId);
+      if (owner) {
+        executionLease = { registry, registration: { token: owner.token, threadId, round: owner.round, recordPath: owner.recordPath }, owned: false };
+      } else {
+        const currentRound = [...(thread!.rounds || [])].reverse().find((entry) => entry.type !== 'approval');
+        executionLease = {
+          registry,
+          registration: registry.begin(threadId, currentRound?.round || thread!.currentRound || 1, agent, thread!.worktree?.path || thread!.workspacePath),
+          owned: true,
+        };
+      }
+      return executionLease;
+    };
+    const roleLock = new TaskRoleLock(root);
+    const roleLease = {
+      token: roleOwnerAtStart.token,
+      threadId,
+      role,
+      ...(roleOwnerAtStart.conversationId ? { conversationId: roleOwnerAtStart.conversationId } : {}),
+    };
+    const releaseExecutionLease = () => {
+      if (!executionLease) return;
+      if (executionLease.owned) executionLease.registry.end(executionLease.registration);
+      executionLease.registry.dispose();
+      executionLease = undefined;
+    };
     let cursor = thread.nativeSessionCompaction?.[role];
     const currentCursor = cursor;
     if (currentCursor && currentCursor.sessionId === sessionId && currentCursor.lastOperationId) {
@@ -145,30 +249,279 @@ export class NativeSessionCompactor {
     const latestOperation = latestCursor && latestCursor.sessionId === sessionId && latestCursor.lastOperationId
       ? (thread.rounds || []).flatMap((round) => round.nativeSessionCompactions || []).find((entry) => entry.id === latestCursor.lastOperationId)
       : undefined;
+    let warning: string | undefined;
     if (latestOperation && ['unknown', 'interrupted'].includes(latestOperation.phase)) {
-      const reason = `Native session ${sessionId} cannot be resumed safely: operation ${latestOperation.id} has unconfirmed state and no validated read-only recovery probe is available.`;
-      appendInterruption(thread, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' });
-      thread.status = 'paused';
-      this.store.upsertTask(thread);
-      new NativeSessionLock(root).release(lease);
-      return { sessionId, pauseReason: reason };
+      const activeExecution = ensureExecutionLease();
+      let recovered = false;
+      try {
+        const executable = agent === 'codex' ? this.detector.resolveExecutable('codex') : undefined;
+        recovered = !!executable && !!latestOperation.model && await this.codex.probeResume({
+          executable, sessionId: sessionId!, cwd: thread.worktree?.path || thread.workspacePath,
+          model: latestOperation.model || model || '', operationId: latestOperation.id,
+          role, cancelled: () => !!new CancellationRegistry(root).peek(threadId),
+          onChildPid: (pid) => {
+            new NativeSessionLock(root).attachChild(lease, pid);
+            activeExecution.registry.attachChildPid(pid, activeExecution.registration);
+            roleLock.attachChild(roleLease, pid);
+          },
+        });
+      } catch (error: any) {
+        warning = `Same-ID read-only recovery probe failed: ${String(error?.message || error).slice(0, 300)}`;
+      }
+      if (!recovered) {
+        releaseExecutionLease();
+        const reason = `Native session ${sessionId} could not be proven healthy after operation ${latestOperation.id}; compression was not replayed.`;
+        appendInterruption(thread, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' });
+        thread.status = 'paused';
+        this.store.upsertTask(thread);
+        new NativeSessionLock(root).release(lease);
+        return { sessionId, pauseReason: reason };
+      }
+      if (cursor) {
+        cursor = { ...cursor, recoveryVersion: cursor.recoveryVersion || latestOperation.id, revision: (cursor.revision || 0) + 1 };
+        thread.nativeSessionCompaction = { ...thread.nativeSessionCompaction, [role]: cursor };
+        this.store.upsertTask(thread);
+      }
+    }
+    const mode = readBridgePolicy(root).nativeSessionCompaction?.mode || 'off';
+    const turns = cursor && cursor.sessionId === sessionId ? cursor.turnsSinceCompaction : 0;
+    if (mode === 'auto' && turns >= 4 && !warning) {
+      if (cursor?.autoDisabledReason) {
+        warning = `Automatic compaction is disabled for this session: ${cursor.autoDisabledReason}.`;
+      } else {
+        const identity = model ? this.capabilityIdentity(agent, model) : undefined;
+        const capability = identity ? this.capabilityResolver(identity) : 'needs_validation';
+        if (capability === 'certified' && identity) {
+          ensureExecutionLease();
+          const result = await this.compactAutomatically(thread, role, agent, model!, sessionId!, lease, cursor || { sessionId: sessionId!, turnsSinceCompaction: 0 });
+          if (result.pauseReason) {
+            releaseExecutionLease();
+            new NativeSessionLock(root).release(lease);
+            return { sessionId, pauseReason: result.pauseReason };
+          }
+          warning = result.warning;
+          this.store.loadFromDisk();
+          thread = this.store.getTask(threadId) || thread;
+          cursor = thread.nativeSessionCompaction?.[role];
+        } else {
+          warning = `${agent} native compaction is ${capability}; automatic compaction was skipped (executable/model/provider identity is not certified).`;
+        }
+      }
     }
     if (cursor && cursor.sessionId === sessionId && cursor.recoveryVersion && cursor.recoveryVersion !== cursor.recoveryDeliveredVersion) {
       const operation = (thread.rounds || []).flatMap((round) => round.nativeSessionCompactions || [])
         .find((entry) => entry.id === cursor.recoveryVersion && entry.sessionId === sessionId);
-      if (!operation) { new NativeSessionLock(root).release(lease); throw new Error('Pending native-session recovery record is missing.'); }
+      if (!operation) {
+        releaseExecutionLease();
+        const reason = 'Pending native-session recovery record is missing; refusing to resume without task context.';
+        appendInterruption(thread, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' });
+        thread.status = 'paused'; this.store.upsertTask(thread); new NativeSessionLock(root).release(lease);
+        return { sessionId, pauseReason: reason };
+      }
       const logDir = role === 'reviewer' ? getReviewerLogDir(agent, root) : getWorkerLogDir(agent, root);
       const recoveryPath = path.resolve(operation.recoveryPath);
-      if (path.dirname(recoveryPath) !== path.resolve(logDir)) { new NativeSessionLock(root).release(lease); throw new Error('Recovery document path is outside its agent log directory.'); }
+      if (path.dirname(recoveryPath) !== path.resolve(logDir)) {
+        releaseExecutionLease();
+        const reason = 'Pending native-session recovery path is outside the task agent log directory.';
+        appendInterruption(thread, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' });
+        thread.status = 'paused'; this.store.upsertTask(thread); new NativeSessionLock(root).release(lease);
+        return { sessionId, pauseReason: reason };
+      }
       try { recoveryPrefix = fs.readFileSync(recoveryPath, 'utf8'); }
-      catch (error) { new NativeSessionLock(root).release(lease); throw error; }
+      catch (error: any) {
+        releaseExecutionLease();
+        const reason = `Pending native-session recovery document is unavailable: ${String(error?.message || error).slice(0, 300)}`;
+        appendInterruption(thread, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' });
+        thread.status = 'paused'; this.store.upsertTask(thread); new NativeSessionLock(root).release(lease);
+        return { sessionId, pauseReason: reason };
+      }
     }
-    const mode = readBridgePolicy(root).nativeSessionCompaction?.mode || 'off';
-    const turns = cursor && cursor.sessionId === sessionId ? cursor.turnsSinceCompaction : 0;
-    const warning = mode === 'auto' && turns >= 4
-      ? `${agent} native compaction is ${nativeCompactionCapability(agent)}; automatic compaction was skipped.`
+    this.store.loadFromDisk();
+    const latestThread = this.store.getTask(threadId);
+    const latestAgent = latestThread && (role === 'developer' ? latestThread.targetAgent : latestThread.initiatorAgent);
+    const latestSession = latestThread && (role === 'developer' ? latestThread.receiverSessionId : latestThread.reviewerSessionId);
+    const latestModel = latestThread && (role === 'developer' ? latestThread.targetModel : latestThread.reviewerModel);
+    const latestWorktree = JSON.stringify(latestThread?.worktree && {
+      path: latestThread.worktree.path, branch: latestThread.worktree.taskBranch, base: latestThread.worktree.baseCommit,
+      head: latestThread.worktree.headCommit, approved: latestThread.worktree.approvedCommit,
+    });
+    const originalWorktree = JSON.stringify(thread.worktree && {
+      path: thread.worktree.path, branch: thread.worktree.taskBranch, base: thread.worktree.baseCommit,
+      head: thread.worktree.headCommit, approved: thread.worktree.approvedCommit,
+    });
+    const statusAllowed = latestThread && (role === 'developer'
+      ? ['running', 'reworking', 'queued'].includes(latestThread.status)
+      : latestThread.status === 'waiting_review' || reviewerBootstrap && latestThread.status === 'queued' && latestThread.reviewBootstrap?.phase === 'launching');
+    if (!latestThread || latestThread.archivedAt || !statusAllowed || latestAgent !== agent || latestSession !== sessionId ||
+        latestModel !== model || latestWorktree !== originalWorktree || new CancellationRegistry(root).peek(threadId) ||
+        new TaskRoleLock(root).getOwner(threadId)?.token !== roleOwnerAtStart.token) {
+      new NativeSessionLock(root).release(lease);
+      releaseExecutionLease();
+      return { sessionId, pauseReason: 'Task, role, model, session, worktree, or cancellation state changed during preparation.' };
+    }
+    keepLease = true;
+    return { sessionId, lease, executionLease, recoveryPrefix, recoveryVersion: recoveryPrefix ? cursor?.recoveryVersion : undefined, warning };
+    } catch (error) {
+      if (executionLease?.owned) executionLease.registry.end(executionLease.registration);
+      executionLease?.registry.dispose();
+      if (!keepLease) new NativeSessionLock(root).release(lease);
+      throw error;
+    }
+  }
+
+  private async compactAutomatically(
+    thread: DelegationThread,
+    role: TaskRole,
+    agent: AgentId,
+    model: string,
+    sessionId: string,
+    lease: ReturnType<NativeSessionLock['acquire']> & {},
+    cursor: NonNullable<DelegationThread['nativeSessionCompaction']>[TaskRole],
+  ): Promise<{ warning?: string; pauseReason?: string }> {
+    const root = path.dirname(this.store.getStoragePath());
+    const roleLock = new TaskRoleLock(root);
+    const roleOwner = roleLock.getOwner(thread.threadId);
+    if (!roleOwner || roleOwner.role !== role) return { warning: 'Automatic compaction skipped because the task role lease is not held.' };
+    const cancellation = new CancellationRegistry(root);
+    if (cancellation.peek(thread.threadId)) return { warning: 'Automatic compaction skipped because cancellation is pending.' };
+    const latest = [...(thread.rounds || [])].reverse().find((round) => round.type !== 'approval');
+    if (!latest) return { warning: 'Automatic compaction skipped because no business round is available.' };
+    const id = crypto.randomUUID();
+    const logDir = role === 'reviewer' ? getReviewerLogDir(agent, root) : getWorkerLogDir(agent, root);
+    const base = `${safeThreadIdPart(thread.threadId)}_round_${latest.round}.native_${id}`;
+    const operation: NativeSessionCompactionOperation = {
+      id, role: role as 'developer' | 'reviewer', agent, sessionId, model, reason: 'turn_budget',
+      phase: 'prepared', revision: 1, startedAt: new Date().toISOString(),
+      logPath: path.join(logDir, role === 'reviewer' ? `${base}.reviewer.log` : `${base}.log`),
+      recoveryPath: path.join(logDir, `${base}.recovery.json`),
+    };
+    const freshCursor = { ...cursor, sessionId, revision: (cursor?.revision || 0) + 1, lastOperationId: id, recoveryVersion: id };
+    try {
+      fs.writeFileSync(operation.recoveryPath, recoveryDocument(thread, role, agent, model, sessionId), { flag: 'wx', mode: 0o600 });
+      fs.writeFileSync(operation.logPath, `${JSON.stringify({ at: operation.startedAt, operationId: id, phase: 'prepared', reason: operation.reason })}\n`, { flag: 'wx', mode: 0o600 });
+      latest.nativeSessionCompactions = [...(latest.nativeSessionCompactions || []), operation];
+      thread.nativeSessionCompaction = { ...thread.nativeSessionCompaction, [role]: freshCursor };
+      this.store.upsertTask(thread);
+    } catch (error: any) {
+      return { warning: `Automatic compaction could not persist its recovery record: ${String(error?.message || error)}` };
+    }
+    const executable = this.detector.resolveExecutable('codex');
+    if (!executable) return { warning: 'Automatic compaction skipped because Codex executable disappeared.' };
+    const registry = new TaskExecutionRegistry(root);
+    const executionOwner = registry.getOwner(thread.threadId);
+    const registration = executionOwner ? { token: executionOwner.token, threadId: executionOwner.threadId, round: executionOwner.round, recordPath: executionOwner.recordPath } : undefined;
+    const originalStatus = thread.status;
+    operation.phase = 'running'; operation.revision++;
+    this.store.upsertTask(thread);
+    try {
+      const result = await this.codex.compact({
+        executable, sessionId, cwd: thread.worktree?.path || thread.workspacePath, model, operationId: id, role: role as 'developer' | 'reviewer',
+        cancelled: () => !!cancellation.peek(thread.threadId),
+        onUsage: (usage) => this.recordMaintenanceUsage(thread.threadId, latest.round, id, role, agent, model, usage),
+        onChildPid: (pid) => {
+          new NativeSessionLock(root).attachChild(lease, pid);
+          if (registration) registry.attachChildPid(pid, registration);
+          roleLock.attachChild({ token: roleOwner.token, threadId: thread.threadId, role: role as 'developer' | 'reviewer', ...(roleOwner.conversationId ? { conversationId: roleOwner.conversationId } : {}) }, pid);
+        },
+      });
+      this.store.loadFromDisk();
+      const current = this.store.getTask(thread.threadId);
+      const currentOwner = roleLock.getOwner(thread.threadId);
+      const currentAgent = current && (role === 'developer' ? current.targetAgent : current.initiatorAgent);
+      const currentSession = current && (role === 'developer' ? current.receiverSessionId : current.reviewerSessionId);
+      const currentModel = current && (role === 'developer' ? current.targetModel : current.reviewerModel);
+      if (!current || current.archivedAt || current.status !== originalStatus || cancellation.peek(thread.threadId) ||
+          currentAgent !== agent || currentSession !== sessionId || currentModel !== model || currentOwner?.token !== roleOwner.token) {
+        throw new Error('Task state changed while automatic maintenance was active.');
+      }
+      operation.phase = 'succeeded'; operation.nativeTurnId = result.nativeTurnId; operation.finishedAt = new Date().toISOString(); operation.revision++;
+      const currentRound = current.rounds.find((round) => round.round === latest.round);
+      if (currentRound) {
+        currentRound.nativeSessionCompactions = [...(currentRound.nativeSessionCompactions || []).filter((item) => item.id !== id), operation];
+        const usage = result.usage || {
+          id, kind: 'native_compaction' as const, role: role as 'developer' | 'reviewer', agent: 'codex' as const, model,
+          uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0,
+          source: 'unavailable' as const, available: false, partial: true,
+        };
+        usage.id = id;
+        if (!result.usage) { usage.available = false; usage.partial = true; }
+        currentRound.tokenUsage = appendTokenUsageComponent(currentRound.tokenUsage, usage, `legacy-business-round-${latest.round}`);
+      }
+      current.nativeSessionCompaction = {
+        ...current.nativeSessionCompaction,
+        [role]: { ...freshCursor, turnsSinceCompaction: 0, revision: freshCursor.revision + 1 },
+      };
+      this.store.upsertTask(current);
+      fs.appendFileSync(operation.logPath, `${JSON.stringify({ at: operation.finishedAt, operationId: id, phase: operation.phase, nativeTurnId: operation.nativeTurnId, usage: result.usage || { available: false, partial: true } })}\n`);
+      return {};
+    } catch (error: any) {
+      this.recordMaintenanceUsage(thread.threadId, latest.round, id, role, agent, model);
+      operation.phase = cancellation.peek(thread.threadId) ? 'interrupted' : 'unknown';
+      operation.errorCode = operation.phase === 'interrupted' ? 'CANCELLED' : 'NATIVE_COMPACTION_UNCONFIRMED';
+      operation.error = String(error?.message || error).slice(0, 500); operation.finishedAt = new Date().toISOString(); operation.revision++;
+      this.store.loadFromDisk();
+      const current = this.store.getTask(thread.threadId);
+      const currentRound = current && !current.archivedAt && current.rounds.find((round) => round.round === latest.round);
+      if (currentRound) {
+        currentRound.nativeSessionCompactions = [...(currentRound.nativeSessionCompactions || []).filter((item) => item.id !== id), operation];
+        current.nativeSessionCompaction = { ...current.nativeSessionCompaction, [role]: { ...freshCursor, revision: freshCursor.revision + 1 } };
+        this.store.upsertTask(current);
+      }
+      try { fs.appendFileSync(operation.logPath, `${JSON.stringify({ at: operation.finishedAt, operationId: id, phase: operation.phase, errorCode: operation.errorCode, error: operation.error })}\n`); } catch {}
+      if (operation.phase === 'interrupted') return { pauseReason: 'Automatic compaction was cancelled; the task must remain paused.' };
+      try {
+        const healthy = await this.codex.probeResume({ executable, sessionId, cwd: thread.worktree?.path || thread.workspacePath, model, operationId: id, role: role as 'developer' | 'reviewer', cancelled: () => !!cancellation.peek(thread.threadId) });
+        if (healthy) return { warning: 'Automatic compaction outcome is unknown; same-ID read-only recovery succeeded and the recovery document remains pending.' };
+      } catch {}
+      const reason = `Native session ${sessionId} could not be proven healthy after automatic operation ${id}; compression was not replayed.`;
+      if (current) { appendInterruption(current, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' }); current.status = 'paused'; this.store.upsertTask(current); }
+      return { pauseReason: reason };
+    } finally { registry.dispose(); }
+  }
+
+  /** Count a completed business turn and acknowledge only the recovery version it actually carried. */
+  public recordNativeAutoCompactionEvents(threadId: string, role: TaskRole, sessionId: string, stdout: string): void {
+    const events: string[] = [];
+    for (const line of String(stdout || '').split(/\r?\n/)) {
+      try {
+        const event = JSON.parse(line);
+        const params = event.params || event;
+        const item = params.item;
+        const eventThread = params.threadId || params.thread_id;
+        const turnId = params.turnId || params.turn_id;
+        if ((event.method === 'item/completed' || event.type === 'item.completed') && item?.type === 'contextCompaction' &&
+            typeof item.id === 'string' && typeof turnId === 'string' && eventThread === sessionId) {
+          events.push(`${sessionId}:${turnId}:${item.id}`);
+        }
+      } catch {}
+    }
+    if (!events.length) return;
+    this.store.loadFromDisk();
+    const thread = this.store.getTask(threadId);
+    if (!thread || thread.archivedAt) return;
+    const boundSessionId = role === 'developer' ? thread.receiverSessionId : thread.reviewerSessionId;
+    if (boundSessionId !== sessionId) return;
+    const old = thread.nativeSessionCompaction?.[role];
+    const cursor = old?.sessionId === sessionId ? old : { sessionId, turnsSinceCompaction: 0 };
+    const seen = new Set(cursor.recentNativeAutoCompactionEventIds || []);
+    const fresh: string[] = [];
+    for (const id of events) if (!seen.has(id)) { seen.add(id); fresh.push(id); }
+    if (!fresh.length) return;
+    const precedingOperation = cursor.lastOperationId
+      ? (thread.rounds || []).flatMap((round) => round.nativeSessionCompactions || []).find((operation) => operation.id === cursor.lastOperationId)
       : undefined;
-    return { sessionId, lease, recoveryPrefix, recoveryVersion: recoveryPrefix ? cursor?.recoveryVersion : undefined, warning };
+    const ineffective = precedingOperation?.phase === 'succeeded' && cursor.turnsSinceCompaction < 2;
+    thread.nativeSessionCompaction = {
+      ...thread.nativeSessionCompaction,
+      [role]: {
+        ...cursor,
+        revision: (cursor.revision || 0) + 1,
+        recentNativeAutoCompactionEventIds: [...seen].slice(-64),
+        turnsSinceCompaction: 0,
+        ...(ineffective ? { autoDisabledReason: 'ineffective: native compaction recurred within two business turns' } : {}),
+      },
+    };
+    this.store.upsertTask(thread);
   }
 
   /** Count a completed business turn and acknowledge only the recovery version it actually carried. */
@@ -208,6 +561,12 @@ export class NativeSessionCompactor {
     if (!thread || thread.archivedAt || thread.status !== 'paused') throw new Error('Native compaction is available only for an unarchived paused task.');
     if (role === 'reviewer' && thread.reviewFlow !== 'dedicated') throw new Error('Legacy caller/requester sessions are not managed by Bridge compaction.');
     const agent = role === 'developer' ? thread.targetAgent : thread.initiatorAgent;
+    const boundAgent = agent;
+    const boundModel = role === 'developer' ? thread.targetModel : thread.reviewerModel;
+    const boundWorktree = JSON.stringify(thread.worktree && {
+      path: thread.worktree.path, branch: thread.worktree.taskBranch, base: thread.worktree.baseCommit,
+      head: thread.worktree.headCommit, approved: thread.worktree.approvedCommit,
+    });
     const sessionId = role === 'developer' ? thread.receiverSessionId : thread.reviewerSessionId;
     const captured = role === 'developer' ? thread.receiverSessionCaptured : thread.reviewerSessionCaptured;
     if (!captured || !isValidSessionId(sessionId || '')) throw new Error(`The ${role} native session is not captured.`);
@@ -251,7 +610,13 @@ export class NativeSessionCompactor {
       this.store.loadFromDisk();
       const fresh = this.store.getTask(threadId);
       if (!fresh || fresh.status !== 'paused' || fresh.archivedAt ||
-          (role === 'developer' ? fresh.receiverSessionId : fresh.reviewerSessionId) !== nativeSessionId) {
+          (role === 'developer' ? fresh.receiverSessionId : fresh.reviewerSessionId) !== nativeSessionId ||
+          (role === 'developer' ? fresh.targetAgent : fresh.initiatorAgent) !== boundAgent ||
+          (role === 'developer' ? fresh.targetModel : fresh.reviewerModel) !== boundModel ||
+          JSON.stringify(fresh.worktree && {
+            path: fresh.worktree.path, branch: fresh.worktree.taskBranch, base: fresh.worktree.baseCommit,
+            head: fresh.worktree.headCommit, approved: fresh.worktree.approvedCommit,
+          }) !== boundWorktree) {
         throw new Error('Task state or native session changed before maintenance acquired ownership.');
       }
       thread = fresh;
@@ -290,6 +655,7 @@ export class NativeSessionCompactor {
       const result = await this.codex.compact({
         executable, sessionId: nativeSessionId, cwd: thread.worktree?.path || thread.workspacePath, model, operationId: id, role: role as 'developer' | 'reviewer',
         cancelled: isNewCancellation,
+        onUsage: (usage) => this.recordMaintenanceUsage(threadId, round!.round, id, role, agent, model!, usage),
         onChildPid: (pid) => {
           nativeChildPid = pid;
           executions.attachChildPid(pid, registration);
@@ -301,6 +667,12 @@ export class NativeSessionCompactor {
       const fresh = this.store.getTask(threadId);
       if (!fresh || fresh.archivedAt || fresh.status !== 'paused' || isNewCancellation() ||
           (role === 'developer' ? fresh.receiverSessionId : fresh.reviewerSessionId) !== nativeSessionId ||
+          (role === 'developer' ? fresh.targetAgent : fresh.initiatorAgent) !== boundAgent ||
+          (role === 'developer' ? fresh.targetModel : fresh.reviewerModel) !== boundModel ||
+          JSON.stringify(fresh.worktree && {
+            path: fresh.worktree.path, branch: fresh.worktree.taskBranch, base: fresh.worktree.baseCommit,
+            head: fresh.worktree.headCommit, approved: fresh.worktree.approvedCommit,
+          }) !== boundWorktree ||
           roleLock.getOwner(threadId)?.token !== roleLease.token) {
         operation.phase = 'unknown';
         operation.errorCode = 'TASK_CHANGED_DURING_MAINTENANCE';
@@ -314,15 +686,15 @@ export class NativeSessionCompactor {
       const freshRound = [...fresh.rounds].reverse().find((entry) => entry.round === round.round);
       if (freshRound) {
         freshRound.nativeSessionCompactions = [...(freshRound.nativeSessionCompactions || []).filter((item) => item.id !== id), operation];
-        if (result.usage) {
-          result.usage.id = id;
-          freshRound.tokenUsage = appendTokenUsageComponent(freshRound.tokenUsage, result.usage, `legacy-business-round-${round.round}`);
-        }
+        const usage = result.usage || emptyMaintenanceUsage(id, role, agent, model);
+        usage.id = id;
+        freshRound.tokenUsage = appendTokenUsageComponent(freshRound.tokenUsage, usage, `legacy-business-round-${round.round}`);
       }
       this.store.upsertTask(fresh);
       fs.appendFileSync(logPath, `${JSON.stringify({ at: operation.finishedAt, operationId: id, phase: operation.phase, nativeTurnId: operation.nativeTurnId, usage: result.usage || { available: false } })}\n`, 'utf8');
       return operation;
     } catch (error: any) {
+      this.recordMaintenanceUsage(threadId, round!.round, id, role, agent, model!);
       operation.phase = isNewCancellation() ? 'interrupted' : 'unknown';
       operation.errorCode = operation.phase === 'interrupted' ? 'CANCELLED' : 'NATIVE_COMPACTION_UNCONFIRMED';
       operation.error = String(error?.message || error).slice(0, 500);

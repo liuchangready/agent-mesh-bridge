@@ -212,6 +212,7 @@ function mergeNativeCursors(
     merged[role] = {
         ...chosen,
         recentBusinessTurnIds: Array.from(new Set([...(oldValid.recentBusinessTurnIds || []), ...(nextValid.recentBusinessTurnIds || [])])).slice(-64),
+        recentNativeAutoCompactionEventIds: Array.from(new Set([...(oldValid.recentNativeAutoCompactionEventIds || []), ...(nextValid.recentNativeAutoCompactionEventIds || [])])).slice(-64),
         turnsSinceCompaction: Math.max(oldValid.turnsSinceCompaction, nextValid.turnsSinceCompaction),
         recoveryVersion: chosen.recoveryVersion || other.recoveryVersion,
         recoveryDeliveredVersion: sameRecovery

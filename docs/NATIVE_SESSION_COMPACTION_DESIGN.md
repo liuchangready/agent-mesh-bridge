@@ -105,3 +105,19 @@ Codex stdio 客户端共享总活跃时间预算、取消与 HostSuspensionGuard
 reviewer bootstrap 也显式标记为 `nativeSessionRole: reviewer` 并共用 runner session 租约；bootstrap 首次捕获时先租约绑定再发布 reviewer/caller session。`prepared/running` 崩溃恢复会记为 `unknown`，因为当前没有通过认证的只读 session 恢复探针，prepare 会保留恢复资料并将任务暂停，不重放压缩或继续业务。
 
 仍须后续补齐：原生自动压缩事件识别及去重；Codex 同 ID 只读可恢复性探针；dedicated reviewer wake 与开发者三入口的专用集成竞态测试；CallerWakeQueue 与 session 写入租约的单一准入整合；stale reaper gate 自身崩溃后的安全恢复。以上缺口不改变 `needs_validation` / 默认 `off` 发布状态。
+
+## 第 3 轮返修状态（2026-11-06）
+
+本节在不删减 0.1 批准快照硬约束的前提下记录本轮变更。`AutonomousRunner.execute()` 是 async dispatch、rework/resume 与 task supervisor 三条 developer 路径共同调用的准备入口；它取得一次角色内 session lease，注入 pending recovery 文档，并把租约保持到业务子进程退出。reviewer 唤醒先异步 prepare，再统一复查任务、角色、绑定、模型、worktree 与 cancellation；prepare 返回 pause 时不启动 CLI。`CallerWakeQueue` 只持久化待处理顺序，唯一写准入为规范化 `agent + session ID` 租约。failure wake、reviewer wake、bootstrap、普通 developer 和维护均使用该租约；角色交接本身不释放仍有活 child PID 的 session lease。
+
+使用组件 ID 记录每次 runner business attempt；累计根字段从 components 派生。旧无组件 usage 只迁移为 `legacy-business-round-N` 一次；同 ID 合并保留较大的已知计量，Claude cost 不重复聚合。锁 owner 通过临时完整文件发布；attachChild 在 reaper gate 下更新，缺失/不可解析 owner 不代表进程死亡，遗留 pending owner 会先恢复并核对 PID；reaper 使用 quarantine/token 复核避免 stale unlink 抢新 gate。自动模式达到 turn 阈值时会读取与真实 executable 路径、版本、provider route 和模型完全匹配的能力记录；只有 `certified` 才复用相同 Codex maintenance core。自动压缩事件按 session/turn/item 去重；短间隔再次发生会标记 ineffective 并关闭该 session 的自动维护。无原生 usage 会落 unavailable/partial 组件，不制造零成本。
+
+`prepared/running` 恢复为 unknown 后不会重放压缩；Codex 走有界、同 ID、只读 app-server resume 探针。只在 session/cwd/model 状态可证明健康时继续并重复注入仍 pending 的恢复资料，直到携带该版本的业务或 reviewer turn 成功；不能证明则暂停并保留操作与日志。任务指令与报告不写入 `round.prompt`，长历史通过现有 `get_round_raw_log(..., source, offsetBytes)` 分页读取。
+
+本轮新增的真实临时 Bridge 端到端证据位于 `%TEMP%/native-compaction-bridge-e2e-Pac8rt/bridge-e2e-evidence.json`，包含临时 Codex 原生 session ID、Bridge operation/native turn ID、持久日志与恢复资料路径及同 ID resume 结果；相邻 `initial.jsonl` 与 `resume.jsonl` 是临时会话事件记录。验证使用既有 `gpt-6-luna` 路由，没有读取或修改任何生产 session/auth/config。Codex app-server 实际完成了压缩 turn，Bridge 关服后持久化校验成功，随后 `codex exec resume` 返回完全相同 session ID 和退出码 0。
+
+**发布认证仍未通过。** Codex executable 版本/路径/provider/model 的能力记录没有因本次 E2E 自动变成 certified，生产 `nativeSessionCompaction.mode` 仍默认 `off`。当前环境尚不能独立证明 Codex 的全局/用户配置不会重新开启外部 MCP、动态工具或 hooks，也没有原生侧机制阻止用户手动 CLI 同时写同一个 session；Bridge 文件租约只约束 Bridge 自己的 writer。故本环境的 Codex 与其他 Agent 均不被宣称 certified，生产自动维护不启动。完成 certified 还需要可审计的工具/hooks 隔离证据及外部同 session writer 安全契约。
+
+针对性命令：`node node_modules/typescript/bin/tsc -p ./`；`node --test out/test/token-usage.test.js out/test/review-wake.test.js out/test/callback-failure.test.js out/test/caller-wake-queue.test.js out/test/native-session-lock.test.js`。
+
+本轮最终验证结果：`node node_modules/typescript/bin/tsc -p ./` 成功；针对性回归 74/74；全量 `node --test out/test/**/*.test.js` 在清除 receiver 测试环境标记后 463/463。临时真实 E2E 的维护 usage 被正确保存为 `available=false, partial=true, source=unavailable`，未把未采集量显示为零费用。

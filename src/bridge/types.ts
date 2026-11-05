@@ -334,6 +334,7 @@ export interface NativeSessionCompactionCursor {
   recoveryDeliveredVersion?: string;
   autoDisabledReason?: string;
   recentBusinessTurnIds?: string[];
+  recentNativeAutoCompactionEventIds?: string[];
 }
 
 /**

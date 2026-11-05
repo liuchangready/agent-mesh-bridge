@@ -13,6 +13,7 @@ export interface CodexCompactionRequest {
   timeoutMs?: number;
   cancelled?: () => boolean;
   onChildPid?: (pid: number | undefined) => void;
+  onUsage?: (usage: TokenUsageComponent | undefined) => void;
 }
 
 export interface CodexCompactionResult {
@@ -28,6 +29,72 @@ interface RpcMessage { id?: number | string; method?: string; result?: any; erro
 
 /** A private stdio app-server client. It never starts a model-authored turn. */
 export class CodexNativeCompaction {
+  /** Read-only same-ID recovery check; this never submits a turn or compaction request. */
+  public async probeResume(request: CodexCompactionRequest): Promise<boolean> {
+    const timeoutMs = Math.min(request.timeoutMs ?? 30_000, 30_000);
+    const startedAt = monotonicNowMs();
+    const guard = new HostSuspensionGuard(); guard.start();
+    const remaining = () => {
+      guard.sync(); const now = monotonicNowMs();
+      return timeoutMs - (now - startedAt - guard.suspendedWithin(startedAt, now));
+    };
+    const child = childProcess.spawn(request.executable, ['app-server', '--listen', 'stdio://', '-c', 'mcp_servers={}', '-c', 'hooks={}'], {
+      cwd: request.cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env },
+    });
+    if (!child.stdin || !child.stdout) throw new Error('Codex recovery probe stdio is unavailable.');
+    request.onChildPid?.(child.pid);
+    const reader = readline.createInterface({ input: child.stdout });
+    const waiters = new Map<string, { resolve: (value: RpcMessage) => void; reject: (error: Error) => void }>();
+    let id = 0; let processError: Error | undefined; let exited = false;
+    reader.on('line', (line) => {
+      if (Buffer.byteLength(line, 'utf8') > 1 << 20) { processError = new Error('Codex recovery probe line exceeded 1 MiB.'); try { child.kill(); } catch {} return; }
+      let message: RpcMessage; try { message = JSON.parse(line); } catch { return; }
+      if (message.id !== undefined) {
+        const waiter = waiters.get(String(message.id));
+        if (waiter) { waiters.delete(String(message.id)); waiter.resolve(message); }
+        else if (message.method) child.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', id: message.id, error: { code: -32000, message: 'Read-only recovery probe rejects server requests.' } })}\n`);
+      }
+    });
+    child.on('error', (error) => { processError = error; for (const waiter of waiters.values()) waiter.reject(error); waiters.clear(); });
+    child.on('exit', (code) => { exited = true; const error = processError || new Error(`Codex recovery probe exited (${code ?? -1}).`); for (const waiter of waiters.values()) waiter.reject(error); waiters.clear(); });
+    const rpc = async (method: string, params: unknown): Promise<RpcMessage> => {
+      const requestId = ++id; child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', id: requestId, method, params })}\n`);
+      while (remaining() > 0) {
+        if (request.cancelled?.()) throw new Error('Codex recovery probe cancelled.');
+        if (processError) throw processError;
+        const response = await new Promise<RpcMessage | undefined>((resolve, reject) => {
+          const timer = setTimeout(() => resolve(undefined), 75);
+          waiters.set(String(requestId), { resolve: (value) => { clearTimeout(timer); resolve(value); }, reject });
+        });
+        if (response) { if (response.error) throw new Error(response.error.message || `${method} failed.`); return response; }
+      }
+      throw new Error('Codex same-session recovery probe timed out.');
+    };
+    const close = async (): Promise<void> => {
+      reader.close(); child.stdin?.end();
+      const closeStartedAt = monotonicNowMs();
+      while (!exited && remaining() > timeoutMs - 2_000) await new Promise((resolve) => setTimeout(resolve, 25));
+      if (!exited) { try { child.kill(); } catch {} }
+      while (!exited && remaining() > timeoutMs - 7_000 && monotonicNowMs() - closeStartedAt < 7_000) await new Promise((resolve) => setTimeout(resolve, 25));
+      if (!exited) throw new Error('Codex recovery probe process exit could not be confirmed.');
+      request.onChildPid?.(undefined);
+    };
+    try {
+      await rpc('initialize', { clientInfo: { name: 'agent-mesh-bridge', title: 'Agent Mesh Bridge', version: '1.0.0' }, capabilities: null });
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} })}\n`);
+      const response = await rpc('thread/resume', { threadId: request.sessionId, cwd: request.cwd, model: request.model, approvalPolicy: 'never', sandbox: 'read-only', excludeTurns: true, config: { mcp_servers: {}, hooks: {} } });
+      const thread = response.result?.thread;
+      const healthy = thread?.id === request.sessionId && thread?.cwd === request.cwd && thread?.model === request.model && thread?.status?.type === 'idle';
+      await close();
+      if (child.exitCode !== 0) throw new Error(`Codex recovery probe exited ${child.exitCode ?? -1}.`);
+      return !!healthy;
+    } catch (error) {
+      try { child.kill(); } catch {}
+      try { await close(); } catch (closeError: any) { throw new Error(`${String((error as any)?.message || error)}; ${closeError?.message || closeError}`); }
+      throw error;
+    } finally { guard.stop(); }
+  }
+
   public async compact(request: CodexCompactionRequest): Promise<CodexCompactionResult> {
     const threadId = request.sessionId.trim();
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId)) {
@@ -165,6 +232,7 @@ export class CodexNativeCompaction {
         message.method === 'thread/tokenUsage/updated' && message.params?.threadId === threadId &&
         message.params?.turnId === turn.id && message.params?.tokenUsage?.last);
       const usage = usageEvent ? codexCompactionUsage(usageEvent.params.tokenUsage.last, request) : undefined;
+      request.onUsage?.(usage);
       const exitCode = await close();
       if (exitCode !== 0) throw new Error(`Codex app-server exited ${exitCode} after reporting compaction completion.`);
       await this.verifyPersisted({ ...request, onChildPid: reportPid }, turn.id, thread.modelProvider, remainingMs, guard);
@@ -292,7 +360,8 @@ function codexCompactionUsage(value: any, request: CodexCompactionRequest): Toke
   const cached = value?.cachedInputTokens;
   const cacheWrite = value?.cacheWriteInputTokens;
   const output = value?.outputTokens;
-  if (![input, cached, cacheWrite, output].every((counter) => Number.isFinite(counter) && counter >= 0) || cached + cacheWrite > input) return undefined;
+  if (![input, cached, cacheWrite, output].every((counter) => Number.isFinite(counter) && counter >= 0) ||
+      cached + cacheWrite > input || input + output === 0) return undefined;
   return {
     id: request.operationId, kind: 'native_compaction', role: request.role, agent: 'codex', model: request.model,
     uncachedInputTokens: input - cached - cacheWrite,

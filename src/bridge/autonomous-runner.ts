@@ -30,6 +30,7 @@ import type { TaskStore } from './task-store';
 import { assertCanExecute } from './agent-capabilities';
 import { NativeSessionCompactor } from './native-session-compactor';
 import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
+import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 
 /** Default silence watchdog: 10 minutes (long model reasoning is not a hang). */
 export const DEFAULT_SILENCE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -744,6 +745,7 @@ export class AutonomousRunner {
     let nativeSessionId: string | undefined;
     let nativeLease: NativeSessionLease | undefined;
     let recoveryVersion: string | undefined;
+    let preparationExecution: { registry: TaskExecutionRegistry; registration: TaskExecutionRegistration; owned: boolean } | undefined;
     let runId = `${taskThreadId || 'run'}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
     if (taskThreadId) {
@@ -779,6 +781,7 @@ export class AutonomousRunner {
         }
         nativeSessionId = prepared.sessionId;
         nativeLease = prepared.lease;
+        preparationExecution = prepared.executionLease;
         recoveryVersion = prepared.recoveryVersion;
         if (prepared.warning) console.warn(`[AutonomousRunner] ${prepared.warning}`);
         const sessionLock = new NativeSessionLock(path.dirname(this.taskStore.getStoragePath()));
@@ -831,6 +834,7 @@ export class AutonomousRunner {
             : options.prompt,
           onChildPid: (pid) => {
             if (nativeLease) sessionLock.attachChild(nativeLease, pid);
+            if (preparationExecution) preparationExecution.registry.attachChildPid(pid, preparationExecution.registration);
             originalOnChildPid?.(pid);
           },
           onNativeSessionId: captureSession,
@@ -858,7 +862,17 @@ export class AutonomousRunner {
         }
 
         const result = await this.executeOnce(attemptOptions);
-        accumulatedUsage = accumulateTokenUsage(accumulatedUsage, result.tokenUsage);
+        const eventSessionId = result.actualSessionId || nativeSessionId;
+        if (taskThreadId && compactor && eventSessionId && !(nativeRole === 'reviewer' && options.taskRound === 0)) {
+          compactor.recordNativeAutoCompactionEvents(taskThreadId, nativeRole, eventSessionId, result.stdout || '');
+        }
+        accumulatedUsage = accumulateTokenUsage(
+          accumulatedUsage,
+          result.tokenUsage,
+          `${runId}:${attempt}`,
+          `legacy-business-round-${options.taskRound || 1}`,
+          nativeRole,
+        );
         const succeeded =
           result.exitCode === 0 && (!result.assessment || result.assessment.success);
         if (succeeded) {
@@ -999,6 +1013,10 @@ export class AutonomousRunner {
       }
     } finally {
       if (nativeLease && this.taskStore) new NativeSessionLock(path.dirname(this.taskStore.getStoragePath())).release(nativeLease);
+      if (preparationExecution) {
+        if (preparationExecution.owned) preparationExecution.registry.end(preparationExecution.registration);
+        preparationExecution.registry.dispose();
+      }
       if (taskThreadId) {
         this.executingThreads.delete(taskThreadId);
       }
