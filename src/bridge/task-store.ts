@@ -24,6 +24,23 @@ import { cleanupThreadNativeSessions } from './native-session-cleanup';
 
 export const MAX_STORED_TASKS = 1000;
 
+function canEvictForCapacity(task: DelegationThread): boolean {
+  if (task.status === 'completed') {
+    return !task.worktree || task.worktree.integration?.phase === 'merged' || task.worktree.integration?.phase === 'no_changes';
+  }
+  if (task.status !== 'failed') return false;
+  const worktree = task.worktree;
+  return !worktree || (
+    !worktree.approvedCommit &&
+    worktree.integration?.phase !== 'ready' &&
+    worktree.integration?.phase !== 'waiting' &&
+    worktree.integration?.phase !== 'merging' &&
+    worktree.integration?.phase !== 'conflict' &&
+    worktree.integration?.phase !== 'validation_failed' &&
+    (!worktree.headCommit || worktree.headCommit === worktree.baseCommit)
+  );
+}
+
 /**
  * Pick the better of two measurements of the same round.
  *
@@ -273,14 +290,21 @@ export class TaskStore extends EventEmitter {
     const file = this.threadFilePath(thread.threadId);
     const temp = `${file}.tmp.${process.pid}.${Date.now()}`;
     try {
-      fs.writeFileSync(temp, JSON.stringify(thread, null, 2), 'utf8');
+      const fd = fs.openSync(temp, 'w');
+      try { fs.writeFileSync(fd, JSON.stringify(thread, null, 2), 'utf8'); fs.fsyncSync(fd); }
+      finally { fs.closeSync(fd); }
       fs.renameSync(temp, file);
+      if (process.platform !== 'win32') {
+        const dirFd = fs.openSync(path.dirname(file), 'r');
+        try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+      }
       this.knownMtimes.set(path.basename(file), this.fileMtimeMs(file));
     } catch (err) {
       try {
         if (fs.existsSync(temp)) fs.unlinkSync(temp);
       } catch {}
       console.error(`[TaskStore] Failed to persist thread ${thread.threadId}:`, err);
+      throw new Error(`Could not durably persist task ${thread.threadId}: ${(err as Error)?.message || err}`, { cause: err });
     }
   }
 
@@ -295,15 +319,25 @@ export class TaskStore extends EventEmitter {
     const sorted = Array.from(this.tasks.values()).sort((a, b) => {
       const timeA = new Date(a.updatedAt || a.createdAt).getTime();
       const timeB = new Date(b.updatedAt || b.createdAt).getTime();
-      return timeB - timeA;
+      return timeA - timeB;
     });
-    for (const evicted of sorted.slice(MAX_STORED_TASKS)) {
+    const evictable = sorted.filter(canEvictForCapacity);
+    for (const evicted of evictable.slice(0, this.tasks.size - MAX_STORED_TASKS)) {
       this.tasks.delete(evicted.threadId);
       try {
         fs.unlinkSync(this.threadFilePath(evicted.threadId));
       } catch {}
       this.knownMtimes.delete(path.basename(this.threadFilePath(evicted.threadId)));
     }
+    if (this.tasks.size > MAX_STORED_TASKS) {
+      console.error(`[TaskStore] Ledger capacity reached (${MAX_STORED_TASKS}); retained all non-evictable tasks.`);
+    }
+  }
+
+  public canAcceptTask(): boolean {
+    this.ensureUpToDate();
+    if (this.tasks.size < MAX_STORED_TASKS) return true;
+    return Array.from(this.tasks.values()).some(canEvictForCapacity);
   }
 
   /**
@@ -404,6 +438,14 @@ export class TaskStore extends EventEmitter {
    */
   public upsertTask(thread: DelegationThread): void {
     this.ensureUpToDate();
+    const priorMemory = this.tasks.get(thread.threadId);
+    const rollbackSnapshot = priorMemory ? structuredClone(priorMemory) : undefined;
+    try {
+      const tombstones = fs.readFileSync(path.join(this.storageDir, 'deleted_tasks.log'), 'utf8');
+      if (tombstones.split(/\r?\n/).some((line) => {
+        try { return JSON.parse(line).threadId === thread.threadId; } catch { return false; }
+      })) return;
+    } catch {}
     // Merge against the on-disk copy too: another process may have appended a
     // round between our last read and this write. Per-thread files make that
     // the only shared surface left, and it is one file per task.
@@ -440,6 +482,35 @@ export class TaskStore extends EventEmitter {
         }
       }
       thread.rounds = merged.sort((a, b) => a.round - b.round);
+      const authoritative = [inMemory, onDisk].filter(Boolean) as DelegationThread[];
+      for (const prior of authoritative) {
+        if (!prior.worktree || !thread.worktree) continue;
+        const priorPhase = prior.worktree.integration?.phase;
+        const incomingPhase = thread.worktree.integration?.phase;
+        if (incomingPhase === 'merged') {
+          // Local integration is monotonic even when a stale writer carries a
+          // later wall-clock timestamp (for example after clock skew).
+          thread.status = 'completed';
+          continue;
+        }
+        const priorAt = new Date(prior.worktree.integration?.updatedAt || 0).getTime();
+        const nextAt = new Date(thread.worktree.integration?.updatedAt || 0).getTime();
+        // A cleared approval is an explicit transition, not a missing field to
+        // fill from a stale snapshot. Only newer snapshots may replace it.
+        if (priorPhase === 'merged' || priorAt > nextAt) {
+          thread.worktree = {
+            ...thread.worktree,
+            ...prior.worktree,
+            integration: prior.worktree.integration || thread.worktree.integration,
+            headCommit: prior.worktree.headCommit || thread.worktree.headCommit,
+            approvedCommit: priorAt > nextAt
+              ? prior.worktree.approvedCommit
+              : thread.worktree.approvedCommit,
+          };
+        }
+        if (priorPhase === 'merged') thread.status = 'completed';
+        else if (priorAt > nextAt) thread.status = prior.status;
+      }
       const highestKnown = Math.max(
         onDisk?.currentRound || 0,
         inMemory?.currentRound || 0,
@@ -459,7 +530,12 @@ export class TaskStore extends EventEmitter {
     // archival and what `get_task_summary` answers long after rounds are gone.
     ensureFinalSummary(thread);
     this.tasks.set(thread.threadId, thread);
-    this.persistThread(thread);
+    try { this.persistThread(thread); }
+    catch (error) {
+      if (rollbackSnapshot) this.tasks.set(thread.threadId, rollbackSnapshot);
+      else this.tasks.delete(thread.threadId);
+      throw error;
+    }
     this.enforceCapacity();
     this.writeAggregate();
     // Same contract as the old single-file save: every mutation notifies the
@@ -628,11 +704,7 @@ export class TaskStore extends EventEmitter {
       ...mergeRequest,
       updatedAt: mergeRequest.updatedAt || new Date().toISOString(),
     };
-    // The worktree's output is now on the main line (or at least handed off):
-    // clear the merge gate so the task can be closed out normally.
-    if (thread.worktree) {
-      thread.worktree.mergePending = false;
-    }
+    // MR metadata is remote delivery only; local integration is tracked separately.
     thread.updatedAt = new Date().toISOString();
     thread.summary.lastOutputSnippet = mergeRequest.url
       ? `MR: ${mergeRequest.url}`

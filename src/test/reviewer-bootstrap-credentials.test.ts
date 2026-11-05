@@ -37,7 +37,7 @@ describe('dedicated reviewer bootstrap identity', () => {
   let taskStore: TaskStore;
   let mcpServer: MCPServer;
 
-  const saved = ['MESH_REVIEW_BOOTSTRAP', 'MESH_REVIEW_BOOTSTRAP_TOKEN', 'MESH_REVIEW_THREAD_ID'];
+  const saved = ['MESH_REVIEW_BOOTSTRAP', 'MESH_REVIEW_BOOTSTRAP_TOKEN', 'MESH_REVIEW_THREAD_ID', 'MESH_TASK_RECEIVER', 'MESH_TASK_THREAD_ID', 'MESH_TASK_ROUND'];
 
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-bootstrap-cred-'));
@@ -82,7 +82,6 @@ describe('dedicated reviewer bootstrap identity', () => {
       reviewerModel: 'gpt-6-pro',
       targetModel: 'flash',
       reviewBootstrap: { phase: 'pending', attempts: 0 },
-      expectedFiles: [],
       summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
       rounds: [],
     });
@@ -175,9 +174,12 @@ describe('dedicated reviewer bootstrap identity', () => {
 
   test('without a pending bootstrap a brief-less call is still an ordinary error', async () => {
     try {
-      const res = await callDispatch({ targetAgent: 'claude_code' });
+      const noGitWorkspace = path.join(isolatedHome, 'no-git-workspace');
+      fs.mkdirSync(noGitWorkspace, { recursive: true });
+      fs.writeFileSync(path.join(noGitWorkspace, '.git'), 'invalid git directory marker');
+      const res = await callDispatch({ targetAgent: 'claude_code', title: 'No Git repository', prompt: 'must fail', workspacePath: noGitWorkspace });
       assert.ok(res.error, JSON.stringify(res));
-      assert.match(String(res.error.message), /requires expectedFiles/i);
+      assert.match(String(res.error.message), /Git|repository|HEAD/i);
     } finally {
       taskStore.dispose();
     }

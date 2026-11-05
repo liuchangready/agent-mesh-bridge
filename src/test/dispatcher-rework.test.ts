@@ -3,6 +3,7 @@ import * as assert from 'node:assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { spawnSync } from 'child_process';
 
 // Isolate the supervisor heartbeat and execution lock from concurrently running
 // test files. `TaskSupervisor.isSupervisorActive()` and `ExecutionGate` both read
@@ -10,6 +11,20 @@ import * as os from 'os';
 const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-dispatch-home-'));
 process.env.USERPROFILE = isolatedHome;
 process.env.HOME = isolatedHome;
+const gitExe = process.env.MESH_GIT_PATH || (process.platform === 'win32' ? 'D:\\Git\\cmd\\git.exe' : 'git');
+process.env.MESH_GIT_PATH = gitExe;
+let originalCwd = process.cwd();
+
+function initGitRepo(root: string): void {
+  const run = (...args: string[]) => {
+    const result = spawnSync(gitExe, args, { cwd: root, encoding: 'utf8', windowsHide: true });
+    if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(' ')} failed`);
+  };
+  run('init', '-b', 'test/source');
+  run('config', 'user.name', 'Mesh Test');
+  run('config', 'user.email', 'mesh-test@example.test');
+  run('commit', '--allow-empty', '-m', 'base');
+}
 
 import { TaskStore } from '../bridge/task-store';
 import { AgentDetector } from '../bridge/agent-detector';
@@ -35,6 +50,11 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
 
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-dispatch-'));
+    const workspace = path.join(tempDir, 'repo');
+    fs.mkdirSync(workspace, { recursive: true });
+    initGitRepo(workspace);
+    originalCwd = process.cwd();
+    process.chdir(workspace);
     taskStore = new TaskStore(tempDir);
     detector = new AgentDetector();
     resolver = new ActiveAgentResolver(detector);
@@ -58,6 +78,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
   });
 
   afterEach(() => {
+    process.chdir(originalCwd);
     taskStore.dispose();
     try {
       fs.rmSync(tempDir, { recursive: true, force: true });
@@ -297,7 +318,6 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
         targetAgent: 'codex',
         title: 'One dispatch, two model defaults',
         prompt: 'Implement the parser',
-        allowNoScope: true,
         callerSessionId: 'caller-session-two-ends',
         initiatorAgent: 'antigravity',
       });

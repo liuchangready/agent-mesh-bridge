@@ -279,7 +279,7 @@ export function buildReviewerBootstrapPrompt(thread: DelegationThread, token?: s
     credential,
     '',
     'The bridge validates that token against the pending task and fills in the brief itself. Do NOT pass',
-    'title/prompt/expectedFiles, do NOT explore the repository, do NOT modify files, and do NOT start any',
+    'title or prompt, do NOT explore the repository, do NOT modify files, and do NOT start any',
     'other task.',
     '',
     'After the tool returns, end your turn immediately. Do not poll for progress; the bridge will',

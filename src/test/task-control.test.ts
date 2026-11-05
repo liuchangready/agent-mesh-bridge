@@ -3,6 +3,7 @@ import * as assert from 'node:assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { spawn } from 'child_process';
 
 const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-control-home-'));
 process.env.USERPROFILE = isolatedHome;
@@ -17,6 +18,7 @@ import { CancellationRegistry } from '../bridge/cancellation-registry';
 import { TaskControlService } from '../bridge/task-control';
 import { ReworkController } from '../bridge/rework-controller';
 import { DelegationThread } from '../bridge/types';
+import { TaskRoleLock } from '../bridge/task-role-lock';
 
 function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread {
   return {
@@ -102,7 +104,7 @@ describe('TaskControlService - pause/delete reasons', () => {
     assert.strictEqual(request?.reason, 'switch to a hotfix');
   });
 
-  test('deleting a task removes it, stops the child, and writes a tombstone reason', () => {
+  test('deleting a task removes it, stops the child, and writes a tombstone reason', async () => {
     taskStore.upsertTask(makeThread());
     const control = new TaskControlService(
       taskStore,
@@ -111,7 +113,7 @@ describe('TaskControlService - pause/delete reasons', () => {
       tempDir,
     );
 
-    const result = control.deleteTask('thread_control_1', 'duplicate request', 'user');
+    const result = await control.deleteTask('thread_control_1', 'duplicate request', 'user');
     assert.strictEqual(result.status, 'DELETED');
     assert.strictEqual(taskStore.getTask('thread_control_1'), undefined);
     assert.deepStrictEqual(canceled, [
@@ -126,7 +128,7 @@ describe('TaskControlService - pause/delete reasons', () => {
     assert.strictEqual(record.forced, undefined);
   });
 
-  test('deleting a task also records the receiver conversation cleanup', () => {
+  test('deleting a task also records the receiver conversation cleanup', async () => {
     taskStore.upsertTask(makeThread());
     const cleanedThreads: string[] = [];
     const control = new TaskControlService(
@@ -151,7 +153,7 @@ describe('TaskControlService - pause/delete reasons', () => {
       },
     );
 
-    const result = control.deleteTask('thread_control_1', 'duplicate request', 'user');
+    const result = await control.deleteTask('thread_control_1', 'duplicate request', 'user');
 
     assert.deepStrictEqual(cleanedThreads, ['thread_control_1']);
     assert.ok(result.nativeSessions, 'the cleanup outcome is returned to the caller');
@@ -167,7 +169,7 @@ describe('TaskControlService - pause/delete reasons', () => {
     assert.strictEqual(record.nativeSessions.sessions[0].found, true);
   });
 
-  test('a failing native conversation cleanup never blocks the deletion', () => {
+  test('a failing native conversation cleanup never blocks the deletion', async () => {
     taskStore.upsertTask(makeThread());
     const control = new TaskControlService(
       taskStore,
@@ -179,7 +181,7 @@ describe('TaskControlService - pause/delete reasons', () => {
       },
     );
 
-    const result = control.deleteTask('thread_control_1', 'cleanup failed on purpose', 'user');
+    const result = await control.deleteTask('thread_control_1', 'cleanup failed on purpose', 'user');
 
     assert.strictEqual(result.status, 'DELETED');
     assert.strictEqual(taskStore.getTask('thread_control_1'), undefined);
@@ -188,6 +190,36 @@ describe('TaskControlService - pause/delete reasons', () => {
       fs.readFileSync(path.join(tempDir, 'deleted_tasks.log'), 'utf8').trim(),
     );
     assert.strictEqual(record.reason, 'cleanup failed on purpose');
+  });
+
+  test('deleting a task stops and waits for its live reviewer child before removing it', async () => {
+    const thread = makeThread({ status: 'waiting_review', rounds: [{ round: 1, type: 'initial', prompt: 'p', output: 'o', durationMs: 1, status: 'completed', timestamp: new Date().toISOString() }] });
+    taskStore.upsertTask(thread);
+    const roles = new TaskRoleLock(tempDir); const lease = roles.tryAcquire(thread.threadId, 'reviewer'); assert.ok(lease);
+    const reviewer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+    roles.attachChild(lease, reviewer.pid);
+    const control = new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir);
+    const deleting = control.deleteTask(thread.threadId, 'remove reviewed task', 'user', true);
+    await new Promise<void>((resolve) => reviewer.once('exit', () => resolve()));
+    const result = await deleting;
+    assert.equal(result.status, 'DELETED');
+    assert.equal(taskStore.getTask(thread.threadId), undefined);
+  });
+
+  test('forced deletion retains the ledger until the registered developer process exits', async () => {
+    const thread = makeThread({ status: 'running' }); taskStore.upsertTask(thread);
+    const registry = new TaskExecutionRegistry(tempDir);
+    const registration = registry.begin(thread.threadId, 1, 'test', tempDir);
+    const developer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+    registry.attachChildPid(developer.pid, registration);
+    developer.once('exit', () => registry.end(registration));
+    const control = new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir);
+    const deleting = control.deleteTask(thread.threadId, 'discard active run', 'user', true);
+    assert.equal(taskStore.getTask(thread.threadId)?.status, 'paused', 'deletion intent is durable while stopping the child');
+    await new Promise<void>((resolve) => developer.once('exit', () => resolve()));
+    assert.equal((await deleting).status, 'DELETED');
+    assert.equal(taskStore.getTask(thread.threadId), undefined);
+    registry.dispose();
   });
 
   test('resuming a paused task keeps history and clears the current interruption', async () => {

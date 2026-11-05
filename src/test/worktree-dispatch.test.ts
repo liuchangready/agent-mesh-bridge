@@ -1,216 +1,138 @@
-import { test, describe, beforeEach, afterEach } from 'node:test';
-import * as assert from 'node:assert';
+import { test } from 'node:test';
+import * as assert from 'node:assert/strict';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-
-// Keep this file's wake queue / cancellation registry out of the real home.
-const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-wt-home-'));
-process.env.USERPROFILE = isolatedHome;
-process.env.HOME = isolatedHome;
-
+import { spawnSync } from 'child_process';
 import { TaskStore } from '../bridge/task-store';
+import { TaskControlService } from '../bridge/task-control';
 import { AgentDetector } from '../bridge/agent-detector';
 import { ActiveAgentResolver } from '../bridge/active-agent-resolver';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
 import { AsyncDispatcher } from '../bridge/async-dispatcher';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
-import { TaskControlService } from '../bridge/task-control';
+import { MeshFileLock } from '../bridge/merge-coordinator';
 import { DelegationThread, pendingMerges } from '../bridge/types';
 
-function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread {
-  const base: DelegationThread = {
-    threadId: 'thread_wt_1',
-    title: 'Worktree task',
-    initiatorAgent: 'codex',
-    targetAgent: 'claude_code',
-    status: 'completed',
-    currentRound: 1,
-    createdAt: '2026-10-23T06:00:00.000Z',
-    updatedAt: '2026-10-23T06:10:00.000Z',
-    receiverSessionId: 'sess-1',
-    workspacePath: path.join(os.tmpdir(), 'majiang-wt', 'p1'),
-    summary: { lastPromptSnippet: 'p', lastOutputSnippet: 'o', totalDurationMs: 0 },
-    rounds: [],
-    worktree: {
-      path: path.join(os.tmpdir(), 'majiang-wt', 'p1'),
-      mainPath: path.join(os.tmpdir(), 'majiang'),
-      branch: 'wt/p1',
-      baseCommit: 'abc1234',
-      mergePending: false,
-    },
-  };
-  return { ...base, ...overrides } as DelegationThread;
+const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-wt-home-'));
+process.env.USERPROFILE = isolatedHome;
+process.env.HOME = isolatedHome;
+const gitExe = process.env.MESH_GIT_PATH || (process.platform === 'win32' ? 'D:\\Git\\cmd\\git.exe' : 'git');
+process.env.MESH_GIT_PATH = gitExe;
+
+function git(cwd: string, ...args: string[]): string {
+  const result = spawnSync(gitExe, args, { cwd, encoding: 'utf8', windowsHide: true });
+  if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(' ')} failed`);
+  return result.stdout.trim();
 }
 
-const MERGE_REQUEST = {
-  url: 'https://example.com/pr/9',
-  branch: 'wt/p1',
-  commit: 'def5678',
-  remote: 'origin',
-  status: 'synced' as const,
-  summary: 'merged',
-  updatedAt: '2026-10-23T06:20:00.000Z',
-  by: 'codex',
-};
+function initRepo(root: string): void {
+  fs.mkdirSync(root, { recursive: true });
+  git(root, 'init', '-b', 'feature/caller');
+  git(root, 'config', 'user.name', 'Mesh Test');
+  git(root, 'config', 'user.email', 'mesh-test@example.test');
+  fs.writeFileSync(path.join(root, 'tracked.txt'), 'committed input\n');
+  git(root, 'add', '-A');
+  git(root, 'commit', '-m', 'base');
+}
 
-describe('Worktree dispatch declaration', () => {
-  let tempDir: string;
-  let store: TaskStore;
-  let dispatcher: AsyncDispatcher;
-  let runner: AutonomousRunner;
-  let wtDir: string;
-  let mainDir: string;
+function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread {
+  const now = new Date().toISOString();
+  return {
+    threadId: 'thread_merge_gate', title: 'Merge gate', initiatorAgent: 'codex', targetAgent: 'claude_code',
+    status: 'completed', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-1',
+    workspacePath: os.tmpdir(), summary: { lastPromptSnippet: 'p', lastOutputSnippet: 'o', totalDurationMs: 1 }, rounds: [],
+    ...overrides,
+  };
+}
 
-  beforeEach(() => {
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-wt-store-'));
-    mainDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-main-'));
-    wtDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-wt-'));
-    store = new TaskStore(tempDir);
-    const detector = new AgentDetector();
-    const resolver = new ActiveAgentResolver(detector);
-    runner = new AutonomousRunner(detector);
-    runner.execute = async () => ({
-      exitCode: 0,
-      stdout: 'ok',
-      stderr: '',
-      extractedOutput: 'done',
-      durationMs: 1,
-    });
-    const callbackManager = new CallbackManager(detector, tempDir);
-    callbackManager.notifyCaller = async () => true;
-    callbackManager.notifyCallerOfFailure = async () => false;
-    const gate = new TaskExecutionRegistry(tempDir);
-    dispatcher = new AsyncDispatcher(store, resolver, runner, callbackManager, detector, gate);
-  });
+test('dispatch creates a separate task branch from committed target state and ignores caller dirt', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-worktree-dispatch-'));
+  const repository = path.join(root, 'repo');
+  const storage = path.join(root, 'ledger');
+  initRepo(repository);
+  const base = git(repository, 'rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(repository, 'tracked.txt'), 'uncommitted caller edit\n');
+  const store = new TaskStore(storage);
+  const detector = new AgentDetector();
+  const runner = new AutonomousRunner(detector);
+  runner.execute = async () => ({ exitCode: 0, stdout: 'done', stderr: '', extractedOutput: 'done', durationMs: 1 });
+  const callback = new CallbackManager(detector, storage);
+  callback.notifyCaller = async () => true;
+  callback.notifyCallerOfFailure = async () => false;
+  const registry = new TaskExecutionRegistry(storage);
+  const dispatcher = new AsyncDispatcher(store, new ActiveAgentResolver(detector), runner, callback, detector, registry);
+  t.after(() => { (dispatcher as unknown as { queueDrainer?: { dispose(): void } }).queueDrainer?.dispose(); registry.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
 
-  afterEach(() => {
-    store.dispose();
-    for (const dir of [tempDir, mainDir, wtDir]) {
-      try {
-        fs.rmSync(dir, { recursive: true, force: true });
-      } catch {}
-    }
-  });
-
-  test('records the merge-back obligation when a worktree is declared', async () => {
-    const res = await dispatcher.dispatchTask({
-      targetAgent: 'antigravity',
-      title: 'Worktree work',
-      prompt: 'edit files in the temporary worktree',
-      workspacePath: wtDir,
-      worktree: { mainPath: mainDir, branch: 'wt/x', baseCommit: 'abc1234' },
-      expectedFiles: ['src/Feature.kt'],
-    });
-
-    const thread = store.getTask(res.threadId)!;
-    assert.ok(thread.worktree, 'worktree metadata must be persisted');
-    assert.strictEqual(path.resolve(thread.worktree!.path), path.resolve(wtDir));
-    assert.strictEqual(path.resolve(thread.worktree!.mainPath), path.resolve(mainDir));
-    assert.strictEqual(thread.worktree!.branch, 'wt/x');
-    assert.strictEqual(thread.worktree!.baseCommit, 'abc1234');
-    assert.strictEqual(thread.worktree!.mergePending, false, 'not merged yet, not pending yet');
-  });
-
-  test('rejects a worktree declaration whose main path is the workspace itself', async () => {
-    await assert.rejects(
-      () =>
-        dispatcher.dispatchTask({
-          targetAgent: 'antigravity',
-          title: 'Bad worktree',
-          prompt: 'p',
-          workspacePath: wtDir,
-          worktree: { mainPath: wtDir },
-          expectedFiles: ['src/Feature.kt'],
-        }),
-      /must differ from workspacePath/i,
-    );
-    assert.strictEqual(store.getAllTasks().length, 0, 'nothing may be persisted on a bad spec');
-  });
-
-  test('rejects a worktree declaration without mainPath', async () => {
-    await assert.rejects(
-      () =>
-        dispatcher.dispatchTask({
-          targetAgent: 'antigravity',
-          title: 'Bad worktree',
-          prompt: 'p',
-          workspacePath: wtDir,
-          worktree: { mainPath: '   ' },
-          expectedFiles: ['src/Feature.kt'],
-        }),
-      /mainPath is required/i,
-    );
-    assert.strictEqual(store.getAllTasks().length, 0);
-  });
+  const result = await dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'Isolated task', prompt: 'inspect the committed file', workspacePath: repository });
+  const task = store.getTask(result.threadId)!;
+  assert.notStrictEqual(path.resolve(task.workspacePath), path.resolve(repository));
+  assert.strictEqual(task.worktree?.baseCommit, base);
+  assert.strictEqual(task.worktree?.headCommit, base);
+  assert.match(task.worktree?.targetRef || '', /^refs\/heads\/mesh\/integration\/[a-f0-9]{12}$/);
+  assert.strictEqual(fs.readFileSync(path.join(task.workspacePath, 'tracked.txt'), 'utf8').replace(/\r\n/g, '\n'), 'committed input\n');
+  assert.strictEqual(git(repository, 'rev-parse', 'feature/caller'), base);
+  assert.strictEqual(fs.readFileSync(path.join(repository, 'tracked.txt'), 'utf8').replace(/\r\n/g, '\n'), 'uncommitted caller edit\n');
 });
 
-describe('Merge gate - temporary worktree output must not be lost', () => {
-  let tempDir: string;
-  let store: TaskStore;
-  let control: TaskControlService;
+test('new dispatch creates its worktree while final integration validation holds the mesh lock', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-dispatch-during-merge-'));
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const store = new TaskStore(storage); const detector = new AgentDetector(); const runner = new AutonomousRunner(detector);
+  runner.execute = async () => ({ exitCode: 0, stdout: 'done', stderr: '', extractedOutput: 'done', durationMs: 1 });
+  const callback = new CallbackManager(detector, storage); callback.notifyCaller = async () => true; callback.notifyCallerOfFailure = async () => false;
+  const registry = new TaskExecutionRegistry(storage); const dispatcher = new AsyncDispatcher(store, new ActiveAgentResolver(detector), runner, callback, detector, registry);
+  const lock = new MeshFileLock(); const release = await lock.acquire(); assert.ok(release);
+  t.after(() => { release(); (dispatcher as unknown as { queueDrainer?: { dispose(): void } }).queueDrainer?.dispose(); registry.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
+  const result = await Promise.race([
+    dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'parallel dispatch', prompt: 'start independent task', workspacePath: repository }),
+    new Promise<never>((_, reject) => { const timer = setTimeout(() => reject(new Error('dispatch blocked on integration lock')), 3_000); timer.unref(); }),
+  ]);
+  const created = store.getTask(result.threadId)!;
+  assert.ok(created.worktree?.path);
+  assert.notEqual(path.resolve(created.worktree!.path), path.resolve(repository));
+  assert.equal(fs.existsSync(created.worktree!.path), true);
+  release();
+});
 
-  beforeEach(() => {
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-merge-'));
-    store = new TaskStore(tempDir);
-    control = new TaskControlService(store);
-  });
+test('non-Git source paths fail instead of dispatching in a shared directory', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-no-git-'));
+  fs.writeFileSync(path.join(root, '.git'), 'invalid git directory marker');
+  const store = new TaskStore(path.join(root, 'ledger'));
+  const detector = new AgentDetector();
+  const runner = new AutonomousRunner(detector);
+  const callback = new CallbackManager(detector, path.join(root, 'ledger'));
+  const registry = new TaskExecutionRegistry(path.join(root, 'ledger'));
+  const dispatcher = new AsyncDispatcher(store, new ActiveAgentResolver(detector), runner, callback, detector, registry);
+  t.after(() => { (dispatcher as unknown as { queueDrainer?: { dispose(): void } }).queueDrainer?.dispose(); registry.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
+  await assert.rejects(dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'Must fail', prompt: 'do work', workspacePath: root }), /Git|repository|HEAD/i);
+  assert.strictEqual(store.getAllTasks().length, 0);
+});
 
-  afterEach(() => {
+test('local merge state, not MR metadata, controls preservation and deletion', async () => {
+  const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-merge-gate-'));
+  const store = new TaskStore(storage);
+  const control = new TaskControlService(store);
+  try {
+    const thread = makeThread({ worktree: {
+      path: path.join(storage, 'worktree'), mainPath: path.join(storage, 'repo'), repositoryPath: path.join(storage, 'repo'),
+      commonDir: path.join(storage, 'repo', '.git'), targetRef: 'refs/heads/mesh/integration/test', taskBranch: 'mesh/task/thread_merge_gate',
+      branch: 'mesh/task/thread_merge_gate', baseCommit: 'base', headCommit: 'approved', approvedCommit: 'approved',
+      integration: { phase: 'ready', updatedAt: new Date().toISOString() }, mergePending: true,
+    } });
+    store.upsertTask(thread);
+    assert.deepStrictEqual(pendingMerges(store.getAllTasks()).map((task) => task.threadId), ['thread_merge_gate']);
+    store.recordMergeRequest('thread_merge_gate', {
+      url: 'https://example.test/mr/1', branch: 'mesh/integration/test', commit: 'approved', remote: 'origin',
+      status: 'synced', summary: 'remote record only', updatedAt: new Date().toISOString(), by: 'codex',
+    });
+    assert.strictEqual(pendingMerges(store.getAllTasks()).length, 1, 'an MR URL cannot claim that local integration succeeded');
+  await assert.rejects(() => control.deleteTask('thread_merge_gate', 'cleanup', 'test', false), /not been integrated locally/i);
+  await control.deleteTask('thread_merge_gate', 'discard explicitly', 'test', true);
+    assert.strictEqual(store.getTask('thread_merge_gate'), undefined);
+  } finally {
     store.dispose();
-    try {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    } catch {}
-  });
-
-  test('a completed worktree task is marked mergePending and listed in merge order', () => {
-    store.upsertTask(makeThread({ threadId: 'thread_late', createdAt: '2026-10-23T08:00:00.000Z' }));
-    store.upsertTask(makeThread({ threadId: 'thread_early', createdAt: '2026-10-23T06:00:00.000Z' }));
-    store.upsertTask(makeThread({ threadId: 'thread_plain', createdAt: '2026-10-23T05:00:00.000Z', worktree: undefined }));
-
-    assert.strictEqual(store.getTask('thread_early')!.worktree?.mergePending, true);
-    assert.strictEqual(store.getTask('thread_late')!.worktree?.mergePending, true);
-
-    const pending = pendingMerges(store.getAllTasks());
-    assert.deepStrictEqual(
-      pending.map((t) => t.threadId),
-      ['thread_early', 'thread_late'],
-      'merge order follows createdAt, and non-worktree tasks never appear',
-    );
-  });
-
-  test('delete is refused until the merge request is recorded', () => {
-    store.upsertTask(makeThread());
-
-    assert.throws(
-      () => control.deleteTask('thread_wt_1', 'cleanup', 'test', false),
-      /has not been merged|merge back/i,
-      'unmerged worktree output must not be deletable',
-    );
-    assert.ok(store.getTask('thread_wt_1'), 'the task must still exist after a refused delete');
-
-    store.recordMergeRequest('thread_wt_1', MERGE_REQUEST);
-    assert.strictEqual(
-      store.getTask('thread_wt_1')!.worktree?.mergePending,
-      false,
-      'recording the MR clears the pending flag',
-    );
-    assert.deepStrictEqual(pendingMerges(store.getAllTasks()), []);
-
-    control.deleteTask('thread_wt_1', 'cleanup', 'test', false);
-    assert.strictEqual(store.getTask('thread_wt_1'), undefined);
-  });
-
-  test('force:true still allows an explicit discard', () => {
-    store.upsertTask(makeThread({ threadId: 'thread_force' }));
-    control.deleteTask('thread_force', 'discard on purpose', 'test', true);
-    assert.strictEqual(store.getTask('thread_force'), undefined);
-  });
-
-  test('a non-worktree task deletes without a merge request', () => {
-    store.upsertTask(makeThread({ threadId: 'thread_plain', worktree: undefined }));
-    control.deleteTask('thread_plain', 'cleanup', 'test', false);
-    assert.strictEqual(store.getTask('thread_plain'), undefined);
-  });
+    fs.rmSync(storage, { recursive: true, force: true });
+  }
 });

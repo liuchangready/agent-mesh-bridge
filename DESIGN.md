@@ -19,7 +19,7 @@
 5. **同会话多次返修直至认可 (Multi-Turn Rework)**：若 A 对 B 的产出不满意，可在**同一个原生会话中多次要求其返修**（保留上下文、修改历史与中间思考），直至 A 验收通过。
 6. **1000 条任务中心与对话看板**：VSCode 侧边栏提供实时任务列表，以 `A -> B 标题` 格式呈现，显示对话摘要与轮次进度，支持点开查看全量多轮对话与 Diff 详情，持久化保留最新 1,000 条。
 7. **全自动无人值守运行 (`skip-danger`)**：严格封装非交互与权限旁路参数，避免后台进程因权限询问、终端等待或 Git 安全检查而挂起卡死；Codex 的全局审批参数必须位于 `exec` 之前，DSH 必须注入 `DSH_PERMISSION_MODE=danger-full-access`。
-8. **按候选并发调度（替代旧全局串行铁律）**：没有全局执行锁或 workspace 队头。同一 workspace 不同 scope 的任务可并发；scope 冲突、thread 级单轮和角色锁仍是硬闸门。paused、waiting_review、blocked review 和 bootstrap pending 不会挡住 scope 无关的候选。`TaskExecutionRegistry` 只登记执行者/PID，不互斥；旧 `execution.lock` 与 `leases/` 不参与启动判定。启用数值限额时仅以跨进程 best-effort 观察做 admission，计数不原子，可能短暂超额。
+8. **按候选并发调度**：开发不存在全局执行锁或 workspace 队头。同一仓库任务在独立 worktree 并发执行；只受 thread 级单轮、角色锁、bootstrap 与可选并发限额约束。暂停、待检视及 bootstrap pending 不阻挡其他候选。
 
 ---
 
@@ -33,7 +33,7 @@ flowchart TD
         Dispatcher["AsyncTaskDispatcher<br/>(任务状态机 & 异步派发引擎)"]
         ReworkCtrl["MultiTurnReworkController<br/>(同会话连续返修控制器)"]
         CallbackMgr["CallbackManager<br/>(回调唤醒引擎: Codex queue / Claude resume / Anti wake / DSH headless)"]
-        TaskStore[("本地统一任务存储<br/>~/.agent-mesh-bridge/delegation_threads.json<br/>(上限 1000 条，LRU 滚动淘汰)")]
+        TaskStore[("本地统一任务存储<br/>~/.agent-mesh-bridge/delegation_threads.json<br/>(上限 1000 条，安全终态优先淘汰，未合入成果保留)")]
         Runner["AutonomousProcessRunner<br/>(skip-danger 进程执行器 & 看门狗)"]
         MCPServer["MCP JSON-RPC Stdio 服务<br/>(bin/agent-bridge-mcp.cjs)"]
         ConfigSync["ConfigSyncService<br/>(自动向四端写入 MCP 配置)"]
@@ -72,7 +72,7 @@ flowchart TD
 2. **`AsyncTaskDispatcher`（异步派发引擎）**：
    - 负责解析 A 的下发意向，生成全局唯一 `threadId` 与接收方原生 `receiverSessionId`；
    - 立即向发起方返回 `DISPATCHED` / `QUEUED` 确认报文，断开长连接等待，允许 A 结束当前 Turn；
-   - 只在 scope 冲突或显式启用的并发限额阻止启动时返回 `QUEUED`；调度器跳过该候选并继续扫描其他任务。paused / waiting_review / blocked / bootstrap pending 仅阻挡自身后续 developer 轮次。
+   - 只有显式启用的并发限额阻止启动时返回 `QUEUED`；调度器跳过该候选并继续扫描其他任务。paused / waiting_review / blocked / bootstrap pending 仅阻挡自身后续 developer 轮次。
 3. **`MultiTurnReworkController`（多轮返修控制器）**：
    - 维系 `threadId` ↔ `receiverSessionId` 强绑定；
    - 处理 A 的 `request_rework` 指令，递增轮次并在接收方原有原生会话中触发续聊命令；
@@ -87,28 +87,25 @@ flowchart TD
    - 根据发起方类型调用各 Agent 原生唤醒信道（`codex queue`、`claude --resume`、`agy --conversation`、`dsh headless --session-id`），触发 A 的下一轮推理。
 6. **`TaskStore`（1,000 条任务中心）**：
    - 单文件/轻量存储 `~/.agent-mesh-bridge/delegation_threads.json`；
-   - 保证最多 1,000 条任务历史，超出部分自动截断清理；
+   - 最多 1,000 条；只淘汰可安全丢弃的收口任务，没有安全候选时拒绝新任务；
    - 跨进程文件监听与原子写入。
 7. **`TaskExecutionRegistry`（跨进程执行登记，不互斥）**：
    - 以 `~/.agent-mesh-bridge/executions/` 登记活动 thread、round、agent、workspace 与 PID，供跨进程观察与定向取消；它不创建全局锁或 workspace 锁，旧 `execution.lock` / `leases/` 不参与启动判定；
    - 每条登记带 token 和更新时间，维护子进程 PID 以支持定向取消及过期登记回收；登记只供观察，不作为加锁/互斥证明。跨进程并发限额基于读取到的活跃登记，属于 best-effort，不能保证原子限额；
    - `pause_task` / `delete_task` 先发 cancellation，再按 thread 登记杀掉该任务的孤儿进程；不影响其他 thread。
 8. **`QueueDrainer`（回退候选扫描器）**：
-   - 无常驻 supervisor 时扫描所有 ready 候选；因 scope、角色或限额阻塞的候选不阻止扫描后续任务；
+   - 无常驻 supervisor 时扫描所有 ready 候选；因角色、bootstrap 或限额阻塞的候选不阻止扫描后续任务；
    - paused / waiting_review / blocked / bootstrap pending 只跳过自身，不形成全局或 workspace 队头。
-9. **`git-probe` + scope gate（文件归属互斥）**：
-   - 并发时，同一工作区内其他任务的改动也可能出现在本轮前后快照中；`touchedFiles` 是观测到的变化，不保证精确归因给单个 task。
-   - 每个轮次在 spawn 前 `captureWorkspaceSnapshot()`、结束后 `diffWorkspaceSnapshots()`，把观察到的文件变化写入 `round.touchedFiles`（`git status --porcelain=v1 -z` 签名对比 + HEAD 变化；非 git 工作区返回空）。
-   - 启动任何轮次前 `findScopeConflicts(candidate, others)`：候选 `expectedFiles` 与 scope owner 的 `expectedFiles ∪ touchedFiles` 有交集即拒绝启动，置 `queued` 并记录 `thread.scopeBlockedBy`。已运行 / 有实际变化的 owner 不论创建时间都保护；queued peers 依 `createdAt`、`threadId` 单向仲裁。
-   - 「未收口」= 未完成任务，或已完成但没有 `mergeRequest` 且在 24h 内；`failed` 不阻塞。
-   - 放行：`allow_scope_overlap(threadId)` 或派发时 `allowScopeOverlap: true`。`dispatch_task` 必须声明 `expectedFiles`，除非显式 `allowNoScope: true`。
-
+9. **Git worktree 与本地集成**：每个新任务使用独立分支和 worktree，记录 Git common dir、来源仓库目录、固定批次集成 ref、base/head/approved commit。任务目录中的新派发沿用记录的集成目标并基于最新目标 SHA 创建，不继承父任务未验收改动。`touchedFiles` 仅是工作区变化观察值。
+   - 审核批准绑定到干净的 `approvedCommit` 并转为 `waiting_merge`。reviewer 进程退出后，桥接取得 mesh 级跨进程文件锁，然后读取最新目标 SHA。
+   - 锁覆盖临时三方合并、真实 compile/test 验证、带旧 SHA 的 ref 更新与账本写入。该锁不覆盖开发、单任务测试、review 或远端推送。
+   - 事务持久化 source/target/candidate SHA 和阶段；目标已更新而账本未写完时按候选提交祖先关系恢复。冲突、验证失败或批准提交变化会返回原 reviewer 会话返修，不丢弃任一方改动。
+   - `mergeRequest` 仅表示远端交付。未集成的成果不能自动归档、容量淘汰或普通删除；force 才可明确丢弃。旧任务不自动迁移。
 ### 2.1 运行时三条硬准则
 
 1. **拆分任务不因权限停摆**：所有被派发的轮次必须携带各端 `skip-danger` 参数；Codex 的 `--ask-for-approval` 是全局参数，必须位于 `exec` 之前；DSH 注入 `DSH_PERMISSION_MODE=danger-full-access`，使其 `approval` 策略变为 `never`。
-2. **多任务并发、同任务单轮**：不同任务可并发启动，包括同 workspace 的不同 scope；同一 thread 任一时刻只允许一个活跃 round/role。scope owner 可阻挡交叠文件；queued peers 按创建时间再按 threadId 单向仲裁，防止互相循环阻挡。并发计数限额可选且跨进程 best-effort。
+2. **多任务并发、同任务单轮**：不同任务在各自独立 worktree 并发执行，可同时编辑相同文件；同一 thread 同时只允许一个 round/role。只有明确启用的并发限额、bootstrap 和角色锁会阻止启动。
 3. **接收方不转发**：`AutonomousRunner` 以 `MESH_TASK_RECEIVER=1`（及 `MESH_TASK_THREAD_ID` / `MESH_TASK_ROUND`）标记任务接收方进程；该进程继承给其 MCP server 后，`dispatch_task` / `invoke_agent` / 旧版 `invoke_*` 会被隐藏并拒绝，`request_rework` / `approve_task` 也不能作用于它自己正在执行的任务。`CallbackManager` 唤醒发起方时会显式清除这些标记。
-4. **锁范围只到具体文件**：`expectedFiles` 必须是具体代码文件路径，`validateExpectedFiles()` 在派发前拒绝目录、结尾斜杠、`*`/`?` 通配符；`doPathsConflict()` 只做精确同文件匹配，不再做目录前缀或 glob 展开。这样声明 `src/service/Foo.ts` 不会锁住 `src/service/` 下的其他文件。
 
 ### 2.2 单任务角色链（reviewer → developer → reviewer）
 
@@ -175,17 +172,13 @@ interface ResponseAssessment {
 - Claude Code: `result` 字符串；
 - 非 JSON 纯文本：原始文本本身。
 
-### 2.4 候选独立调度（替代旧任务级 FIFO）
+### 2.4 候选调度与隔离工作区
 
-没有全局任务槽或 workspace 队头。调度器逐个检查 ready round：
+调度器独立扫描 ready 轮次。暂停、待检视、bootstrap pending 与返修任务只影响自身；明确启用的并发限额、角色锁和 bootstrap 才会阻止启动。所有新任务有独立 Git worktree，因此相同文件也能并发编辑；文件变化记录不用于排队或归属判定。
 
-- 任一任务的 `paused` / `waiting_review` / blocked review / pending bootstrap 状态只阻挡该任务自身开发轮次，不阻挡 scope 无关任务；
-- scope 冲突、同 thread 正在运行的 round/role、以及启用的并发限额会将该候选置为 queued；调度器继续扫描其他候选；
-- 已运行任务及已记录 `touchedFiles` 的任务始终作为 scope owner，不受创建时间影响。尚未启动且 scope 重叠的 queued peers 按 `createdAt`、再按 `threadId` 单向仲裁，避免队列互相循环阻挡；
-- `failed` / `review_failed` 仍是终态；重试或重新检视按该任务自身的角色和 scope 规则重新参加候选扫描；
-- scope 冲突提示需指出冲突 thread 与文件。`allow_scope_overlap` 可显式放行；
-- `findQueueHead()` 仅为兼容保留，运行时不得用它过滤候选或判定是否可启动。
+同一来源仓库共享一个桥接管理的集成 ref。任务分支从该 ref 最新已提交 SHA 创建，未提交用户改动不复制。隔离元数据缺失的历史任务保持原行为，不自动迁移。
 
+`waiting_merge` 表示 reviewer 已批准固定提交、等待后台本地集成，不是终态。全局跨进程锁在读取目标 SHA 前获取，并一直持有到真实组合验证、ref old-SHA 更新和账本写入完成。冲突或验证失败会清理临时合并目录并回到原 reviewer 会话返修。
 ### 2.5 MR 收口（调用者）
 
 任务或同一批任务验收通过后，MR 由**调用者/检视方**统一收口，不由开发者负责：
@@ -361,7 +354,7 @@ export interface DelegationRound {
 ### 4.2 1000 条容量控制与磁盘持久化规则
 
 1. **物理路径**：`~/.agent-mesh-bridge/delegation_threads.json`。
-2. **截断策略**：每次更新或新增任务后，按 `updatedAt` 降序排序，超出 1,000 条的记录从尾部自动剔除，确保文件大小维持在可控范围内（通常约 10–20 MB）。
+2. **容量策略**：超过 1,000 条时仅淘汰已安全收口的任务；未合入成果不可淘汰。没有安全候选时拒绝新任务并给出明确错误。
 3. **原子写入**：使用 `fs.writeFileSync` 写入临时文件后执行原子重命名，防止多进程或多窗口写入竞争。
 4. **变动监听**：VSCode 扩展宿主采用 `fs.watchFile`（1秒防抖轮询），一旦磁盘数据变化即触发侧边栏 UI 响应刷新。
 
@@ -405,7 +398,6 @@ export interface DelegationRound {
   - `prompt` (string, 必填): 具体任务要求、目标与约束
   - `callerSessionId` (string, 可选): A 当前会话 ID（用于完成时唤醒）
   - `workspacePath` (string, 可选): 工作区路径
-  - `expectedFiles` (string[], 可选): **具体代码文件**列表（如 `src/service/Foo.ts`）。禁止目录、结尾斜杠、`*`/`?` 通配符；`validateExpectedFiles()` 会在创建线程前拒绝非法范围。
 - **返回值**：`{ threadId, status: "DISPATCHED", message: "Task started in background. Conclude your turn and await callback." }`
 
 ### 2. `request_rework`（要求在同一会话中返修）
@@ -522,7 +514,7 @@ D:\agent_bridge\
 │   │   ├── rework-controller.ts   # 同会话多轮返修控制器
 │   │   ├── autonomous-runner.ts   # 跨平台 skip-danger 进程执行器
 │   │   ├── callback-manager.ts    # 回调唤醒引擎 (Codex/Claude/Anti/DSH 适配)
-│   │   ├── task-store.ts          # 1000 条任务持久化与 LRU 管理
+│   │   ├── task-store.ts          # 1000 条账本与未合入成果保护
 │   │   ├── agent-detector.ts      # 本地可执行文件与环境探测
 │   │   ├── deepseek-harness.ts    # DSH 专属接入面 (安装探测/headless 契约/原生会话/MCP patch)
 │   │   └── mcp-server.ts          # MCP JSON-RPC 协议解析与工具分发

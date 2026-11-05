@@ -46,7 +46,6 @@ function makeDedicatedThread(threadId: string, overrides: Partial<DelegationThre
     reviewerModel: 'gpt-6-pro',
     targetModel: 'gpt-6-flash',
     reviewBootstrap: { phase: 'pending', attempts: 0 },
-    expectedFiles: [],
     summary: { lastPromptSnippet: 'p', lastOutputSnippet: 'o', totalDurationMs: 0 },
     rounds: [
       {
@@ -290,7 +289,6 @@ test('paused and waiting-review tasks do not serialize independent reviewer boot
   const parked = makeDedicatedThread('thread_waiting_review', {
     status: 'waiting_review',
     workspacePath: workspace,
-    expectedFiles: ['src/parked.ts'],
   });
   parked.reviewFlow = 'legacy';
   parked.reviewBootstrap = undefined;
@@ -299,7 +297,6 @@ test('paused and waiting-review tasks do not serialize independent reviewer boot
   const targets = ['thread_bootstrap_a', 'thread_bootstrap_b'].map((threadId, index) => {
     const target = makeDedicatedThread(threadId, {
       workspacePath: workspace,
-      expectedFiles: [`src/bootstrap-${index}.ts`],
       createdAt: `2026-11-01T00:00:0${index}.000Z`,
     });
     store.upsertTask(target);

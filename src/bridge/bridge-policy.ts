@@ -24,8 +24,9 @@ export const DEFAULT_COMPACTION_MIN_CHARS = 1500;
  * The enabled flag keeps its historical opt-in meaning for the numeric limits:
  * when false there is no concurrency limit; when true the configured mesh-wide
  * and per-agent limits are applied as best-effort admission checks. Neither
- * setting creates a global or per-workspace mutex. Scope conflicts and the
- * per-thread role lock remain the actual execution blockers.
+ * setting creates a global or per-workspace mutex. Per-thread roles and the
+ * explicit concurrency limits are the execution blockers; Git worktrees
+ * isolate task files from each other.
  */
 export type AgentLogDirectories = Partial<Record<AgentId | 'default', string>>;
 
