@@ -39,6 +39,8 @@ export interface ConcurrencyPolicy {
 }
 
 export interface BridgePolicy {
+  /** Bridge-controlled native session maintenance; shipped disabled until certification. */
+  nativeSessionCompaction?: { mode?: 'off' | 'auto' };
   /**
    * Condense the previous round's output once a later round has completed.
    * Defaults to true; only an explicit `false` disables it.
@@ -104,6 +106,9 @@ export function saveBridgePolicy(patch: BridgePolicy, root?: string): BridgePoli
   ) {
     next.contextCompactionMinChars = Math.floor(patch.contextCompactionMinChars);
   }
+  if (patch.nativeSessionCompaction?.mode === 'off' || patch.nativeSessionCompaction?.mode === 'auto') {
+    next.nativeSessionCompaction = { mode: patch.nativeSessionCompaction.mode };
+  }
   if (patch.concurrency !== undefined) {
     const currentConcurrency = next.concurrency || {};
     const merged: NonNullable<BridgePolicy['concurrency']> = { ...currentConcurrency };
@@ -151,6 +156,10 @@ export function saveBridgePolicy(patch: BridgePolicy, root?: string): BridgePoli
 /** Compaction is on unless the user explicitly turned it off. */
 export function isContextCompactionEnabled(root?: string): boolean {
   return readBridgePolicy(root).contextCompaction !== false;
+}
+
+export function nativeSessionCompactionMode(root?: string): 'off' | 'auto' {
+  return readBridgePolicy(root).nativeSessionCompaction?.mode === 'auto' ? 'auto' : 'off';
 }
 
 export function contextCompactionMinChars(root?: string): number {

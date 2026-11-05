@@ -39,6 +39,8 @@ import {
   MAX_RAW_LOG_BYTES,
   findExistingExecutionLog,
   findExistingOutputArchive,
+  getReviewerLogDir,
+  getWorkerLogDir,
   readTextFilePaged,
   resolveExistingArtifactPath,
   roundExecutionLogPath,
@@ -187,12 +189,27 @@ export class MCPServer {
       );
     }
 
-    const source = args?.source === 'execution' ? 'execution' : 'output';
+    const source = args?.source === 'execution' ? 'execution' : args?.source === 'native_compaction' ? 'native_compaction' : 'output';
     const maxBytes = Math.min(
       Math.max(1, Number(args?.maxBytes) || DEFAULT_RAW_LOG_BYTES),
       MAX_RAW_LOG_BYTES,
     );
     const offsetBytes = Math.max(0, Number(args?.offsetBytes) || 0);
+
+    if (source === 'native_compaction') {
+      const operation = round.nativeSessionCompactions?.find((entry) => entry.id === args?.operationId);
+      if (!operation) throw new Error(`Native compaction operation not found on round ${roundNumber}.`);
+      const root = path.dirname(this.taskStore.getStoragePath());
+      const allowedDir = operation.role === 'reviewer'
+        ? getReviewerLogDir(operation.agent, root)
+        : getWorkerLogDir(operation.agent, root);
+      const file = path.resolve(operation.logPath);
+      if (path.dirname(file) !== path.resolve(allowedDir)) throw new Error('Native compaction log path is outside its agent log directory.');
+      const page = readTextFilePaged(file, { offsetBytes, maxBytes });
+      return { threadId, round: roundNumber, operationId: operation.id, source, available: true,
+        unit: 'bytes', ...page, returnedBytes: Buffer.byteLength(page.content, 'utf8'),
+        hint: page.truncated ? `Paged: continue with offsetBytes=${page.nextOffset}.` : 'End of file.' };
+    }
 
     if (source === 'execution') {
       const logPath = this.resolveRoundExecutionLog(threadId, roundNumber);
@@ -757,10 +774,11 @@ export class MCPServer {
             round: { type: 'number', description: 'Round number to read (1-based).' },
             source: {
               type: 'string',
-              enum: ['output', 'execution'],
+              enum: ['output', 'execution', 'native_compaction'],
               description:
-                'output = archived agent answer, execution = raw stdio log (default: output).',
+                'output = archived answer, execution = raw stdio log, native_compaction = one maintenance operation log (requires operationId).',
             },
+            operationId: { type: 'string', description: 'Operation id required with source native_compaction.' },
             offsetBytes: {
               type: 'number',
               description: 'Byte offset to start from (default 0).',

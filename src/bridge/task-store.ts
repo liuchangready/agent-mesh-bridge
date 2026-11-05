@@ -9,6 +9,7 @@ import {
   TaskInterruption,
   MergeRequestInfo,
   TokenUsageMetrics,
+  TokenUsageComponent,
   appendInterruption,
   isMergePending,
 } from './types';
@@ -54,10 +55,54 @@ function preferTokenUsage(
 ): TokenUsageMetrics | undefined {
   if (!existing) return incoming;
   if (!incoming) return existing;
+  if (existing.components?.length || incoming.components?.length) {
+    const components = new Map<string, TokenUsageComponent>();
+    for (const item of existing.components || []) components.set(item.id, item);
+    for (const item of incoming.components || []) components.set(item.id, item);
+    if (!existing.components?.length) components.set('legacy-business', legacyUsageComponent(existing));
+    if (!incoming.components?.length && !existing.components?.length) components.set('legacy-business', legacyUsageComponent(incoming));
+    const values = [...components.values()];
+    const measured = values.filter((item) => item.available);
+    const uncachedInputTokens = measured.reduce((sum, item) => sum + item.uncachedInputTokens, 0);
+    const cacheReadTokens = measured.reduce((sum, item) => sum + item.cacheReadTokens, 0);
+    const cacheWriteTokens = measured.reduce((sum, item) => sum + item.cacheWriteTokens, 0);
+    const outputTokens = measured.reduce((sum, item) => sum + item.outputTokens, 0);
+    const costs = measured.filter((item) => item.costUsd !== undefined);
+    const reasoningTokens = measured.some((item) => item.reasoningTokens !== undefined)
+      ? measured.reduce((sum, item) => sum + (item.reasoningTokens || 0), 0) : undefined;
+    const nativeTotalTokens = measured.some((item) => item.nativeTotalTokens !== undefined)
+      ? measured.reduce((sum, item) => sum + (item.nativeTotalTokens || 0), 0) : undefined;
+    return {
+      ...existing,
+      uncachedInputTokens, cacheReadTokens, cacheWriteTokens,
+      promptTokens: uncachedInputTokens + cacheReadTokens + cacheWriteTokens,
+      outputTokens, totalTokens: uncachedInputTokens + cacheReadTokens + cacheWriteTokens + outputTokens,
+      reasoningTokens, nativeTotalTokens,
+      source: measured.length && measured.every((item) => item.source === 'native_reported') ? 'native_reported' : measured.length ? 'estimated' : 'unavailable',
+      agent: existing.agent, model: existing.model,
+      costUsd: costs.length ? costs.reduce((sum, item) => sum + (item.costUsd || 0), 0) : undefined,
+      costSource: costs.length ? 'native' : undefined,
+      available: measured.length > 0,
+      partial: values.some((item) => item.partial) || measured.length !== values.length || undefined,
+      attempts: values.length,
+      components: values,
+    };
+  }
   const existingIsNative = existing.source === 'native_reported';
   const incomingIsNative = incoming.source === 'native_reported';
   if (existingIsNative !== incomingIsNative) return existingIsNative ? existing : incoming;
   return (incoming.totalTokens ?? 0) >= (existing.totalTokens ?? 0) ? incoming : existing;
+}
+
+function legacyUsageComponent(usage: TokenUsageMetrics): TokenUsageComponent {
+  return {
+    id: 'legacy-business', kind: 'business', role: 'developer', agent: usage.agent,
+    model: usage.model, uncachedInputTokens: usage.uncachedInputTokens,
+    cacheReadTokens: usage.cacheReadTokens, cacheWriteTokens: usage.cacheWriteTokens,
+    outputTokens: usage.outputTokens, reasoningTokens: usage.reasoningTokens,
+    nativeTotalTokens: usage.nativeTotalTokens, costUsd: usage.costUsd,
+    costSource: usage.costSource, source: usage.source, available: usage.available, partial: usage.partial,
+  };
 }
 
 /**
@@ -91,6 +136,10 @@ function mergeRoundPreferringCompaction(
   if (merged.touchedFiles === undefined && incomingExisting?.touchedFiles !== undefined) {
     merged.touchedFiles = incomingExisting.touchedFiles;
   }
+  merged.nativeSessionCompactions = mergeNativeCompactions(
+    incomingExisting?.nativeSessionCompactions,
+    incoming.nativeSessionCompactions,
+  );
 
   if (!incomingExisting?.isCompacted || incoming.isCompacted) return merged;
   return {
@@ -103,6 +152,55 @@ function mergeRoundPreferringCompaction(
     rawOutputFilePath: incomingExisting.rawOutputFilePath,
     outputBytes: incomingExisting.outputBytes,
   };
+}
+
+function mergeNativeCompactions(
+  prior: DelegationRound['nativeSessionCompactions'],
+  incoming: DelegationRound['nativeSessionCompactions'],
+): DelegationRound['nativeSessionCompactions'] {
+  const byId = new Map((prior || []).map((operation) => [operation.id, operation]));
+  for (const operation of incoming || []) {
+    const current = byId.get(operation.id);
+    if (!current || operation.revision > current.revision || operation.revision === current.revision && current.phase === 'running' && operation.phase !== 'running') {
+      byId.set(operation.id, operation);
+    }
+  }
+  return byId.size ? [...byId.values()] : undefined;
+}
+
+function mergeNativeCursors(
+  prior: DelegationThread['nativeSessionCompaction'],
+  incoming: DelegationThread['nativeSessionCompaction'],
+): DelegationThread['nativeSessionCompaction'] {
+  if (!prior) return incoming;
+  if (!incoming) return prior;
+  const merged = { ...incoming };
+  for (const role of ['developer', 'reviewer'] as const) {
+    const oldCursor = prior[role];
+    const nextCursor = incoming[role];
+    if (!oldCursor) continue;
+    if (!nextCursor) {
+      merged[role] = oldCursor;
+    } else if (oldCursor.sessionId !== nextCursor.sessionId) {
+      // A changed session is an explicit retarget/rebind; stale snapshots must not restore the old session cursor.
+      merged[role] = nextCursor;
+    } else if (oldCursor.lastOperationId !== nextCursor.lastOperationId) {
+      // Only a cursor still pointing at the old operation can be considered stale.
+      if (!nextCursor.lastOperationId) merged[role] = oldCursor;
+    } else {
+      const sameRecovery = oldCursor.recoveryVersion === nextCursor.recoveryVersion;
+      merged[role] = {
+        ...nextCursor,
+        turnsSinceCompaction: Math.max(oldCursor.turnsSinceCompaction, nextCursor.turnsSinceCompaction),
+        recoveryVersion: nextCursor.recoveryVersion || oldCursor.recoveryVersion,
+        recoveryDeliveredVersion: sameRecovery
+          ? (nextCursor.recoveryDeliveredVersion || oldCursor.recoveryDeliveredVersion)
+          : nextCursor.recoveryDeliveredVersion,
+        autoDisabledReason: oldCursor.autoDisabledReason || nextCursor.autoDisabledReason,
+      };
+    }
+  }
+  return merged;
 }
 
 /** Directory holding one JSON file per thread (the authoritative ledger). */
@@ -456,6 +554,10 @@ export class TaskStore extends EventEmitter {
     } catch {}
     const inMemory = this.tasks.get(thread.threadId);
     if ((onDisk || inMemory) && onDisk !== thread) {
+      thread.nativeSessionCompaction = mergeNativeCursors(
+        mergeNativeCursors(inMemory?.nativeSessionCompaction, onDisk?.nativeSessionCompaction),
+        thread.nativeSessionCompaction,
+      );
       // Merge rounds from every known copy to prevent losing rounds added by
       // another process or by an earlier in-memory state. Duplicate round
       // numbers are preserved inside one copy (legacy ledgers may hold them and
@@ -619,6 +721,7 @@ export class TaskStore extends EventEmitter {
         ...(roundUpdate.tokenUsage ? { tokenUsage: roundUpdate.tokenUsage } : {}),
         ...(roundUpdate.executorAgent ? { executorAgent: roundUpdate.executorAgent } : {}),
         ...(roundUpdate.executorModel ? { executorModel: roundUpdate.executorModel } : {}),
+        ...(roundUpdate.nativeSessionCompactions ? { nativeSessionCompactions: roundUpdate.nativeSessionCompactions } : {}),
       });
     }
 

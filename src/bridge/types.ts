@@ -280,6 +280,58 @@ export interface TokenUsageMetrics {
   notes?: string;
   /** ISO8601 collection timestamp. */
   collectedAt: string;
+  /** Per operation/attempt accounting; absent on historical ledger entries. */
+  components?: TokenUsageComponent[];
+}
+
+export interface TokenUsageComponent {
+  id: string;
+  kind: 'business' | 'native_compaction';
+  role: 'developer' | 'reviewer';
+  agent: AgentId;
+  model?: string;
+  uncachedInputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  outputTokens: number;
+  reasoningTokens?: number;
+  nativeTotalTokens?: number;
+  costUsd?: number;
+  costSource?: TokenCostSource;
+  source: TokenMetricSource;
+  available: boolean;
+  partial?: boolean;
+}
+
+export type NativeCompactionPhase =
+  | 'prepared' | 'running' | 'succeeded' | 'skipped' | 'failed' | 'interrupted' | 'unknown';
+
+export interface NativeSessionCompactionOperation {
+  id: string;
+  role: 'developer' | 'reviewer';
+  agent: AgentId;
+  sessionId: string;
+  model?: string;
+  reason: 'context_pressure' | 'turn_budget' | 'manual';
+  phase: NativeCompactionPhase;
+  revision: number;
+  startedAt: string;
+  finishedAt?: string;
+  nativeTurnId?: string;
+  errorCode?: string;
+  error?: string;
+  interruption?: TaskInterruption;
+  recoveryPath: string;
+  logPath: string;
+}
+
+export interface NativeSessionCompactionCursor {
+  sessionId: string;
+  lastOperationId?: string;
+  turnsSinceCompaction: number;
+  recoveryVersion?: string;
+  recoveryDeliveredVersion?: string;
+  autoDisabledReason?: string;
 }
 
 /**
@@ -372,6 +424,7 @@ export interface DelegationRound {
    * `output`).
    */
   tokenUsage?: TokenUsageMetrics;
+  nativeSessionCompactions?: NativeSessionCompactionOperation[];
 }
 
 export interface ThreadSummary {
@@ -444,6 +497,9 @@ export interface TaskFinalSummary {
   totalTokens?: number;
   promptTokens?: number;
   outputTokens?: number;
+  tokenUsageByAgent?: Partial<Record<AgentId, number>>;
+  tokenUsageByModel?: Record<string, number>;
+  nativeCompactions?: { count: number; warnings: string[] };
 }
 
 /**
@@ -579,6 +635,7 @@ export interface DelegationThread {
 
   // Native session bindings for continuous rework resume
   receiverSessionId: string; // Native session ID for target agent
+  nativeSessionCompaction?: Partial<Record<'developer' | 'reviewer', NativeSessionCompactionCursor>>;
   /**
    * True once the receiver's real native session is known: either an agent
    * emitted its native id, or Claude's preassigned `--session-id` is the native

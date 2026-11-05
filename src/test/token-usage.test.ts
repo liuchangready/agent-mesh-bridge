@@ -6,6 +6,7 @@ import * as path from 'path';
 
 import {
   accumulateTokenUsage,
+  appendTokenUsageComponent,
   aggregateThreadTokenUsage,
   collectTokenUsage,
   estimateOutputTokens,
@@ -283,6 +284,30 @@ describe('token usage - accumulation and rollup', () => {
     assert.strictEqual(summary.measuredRounds, 2);
     assert.strictEqual(summary.totalRounds, 3);
     assert.strictEqual(summary.isPartialOrEstimated, true);
+  });
+
+  test('a reviewer compaction component is counted once and grouped by its own agent/model', () => {
+    const developer = usage(1_200, 1_000, 200);
+    developer.agent = 'codex';
+    developer.model = 'gpt-6-luna';
+    const combined = appendTokenUsageComponent(developer, {
+      id: 'compact-operation-1', kind: 'native_compaction', role: 'reviewer',
+      agent: 'claude_code', model: 'sonnet', uncachedInputTokens: 300,
+      cacheReadTokens: 200, cacheWriteTokens: 0, outputTokens: 50,
+      source: 'native_reported', available: true,
+    }, 'round-1-business');
+    const round: DelegationRound = {
+      round: 1, type: 'initial', prompt: 'p', durationMs: 1,
+      status: 'completed', timestamp: new Date().toISOString(),
+      executorAgent: 'codex', executorModel: 'gpt-6-luna', tokenUsage: combined,
+    };
+    const summary = aggregateThreadTokenUsage([round]);
+    assert.equal(summary.totalTokens, 1_750);
+    assert.equal(summary.byAgent.codex, 1_200);
+    assert.equal(summary.byAgent.claude_code, 550);
+    assert.equal(summary.byModel['gpt-6-luna'], 1_200);
+    assert.equal(summary.byModel.sonnet, 550);
+    assert.equal(summary.totalCostUsd, undefined);
   });
 
   test('a retried round seeds the runner with its previous spend (no overwrite)', async () => {

@@ -30,6 +30,7 @@ import {
   AgentId,
   DelegationRound,
   ThreadTokenUsageSummary,
+  TokenUsageComponent,
   TokenCostSource,
   TokenMetricSource,
   TokenUsageMetrics,
@@ -478,6 +479,56 @@ export function accumulateTokenUsage(
   return merged;
 }
 
+/** Add one independently billed operation without re-billing an existing round snapshot. */
+export function appendTokenUsageComponent(
+  existing: TokenUsageMetrics | undefined,
+  component: TokenUsageComponent,
+  legacyId: string,
+): TokenUsageMetrics {
+  const components = existing?.components ? [...existing.components] : existing ? [{
+    id: legacyId, kind: 'business' as const, role: 'developer' as const,
+    agent: existing.agent, model: existing.model,
+    uncachedInputTokens: existing.uncachedInputTokens,
+    cacheReadTokens: existing.cacheReadTokens,
+    cacheWriteTokens: existing.cacheWriteTokens,
+    outputTokens: existing.outputTokens,
+    reasoningTokens: existing.reasoningTokens,
+    nativeTotalTokens: existing.nativeTotalTokens,
+    costUsd: existing.costUsd,
+    costSource: existing.costSource,
+    source: existing.source,
+    available: existing.available,
+    partial: existing.partial,
+  }] : [];
+  const index = components.findIndex((value) => value.id === component.id);
+  if (index >= 0) components[index] = component;
+  else components.push(component);
+  const available = components.filter((value) => value.available);
+  const uncachedInputTokens = available.reduce((sum, value) => sum + value.uncachedInputTokens, 0);
+  const cacheReadTokens = available.reduce((sum, value) => sum + value.cacheReadTokens, 0);
+  const cacheWriteTokens = available.reduce((sum, value) => sum + value.cacheWriteTokens, 0);
+  const outputTokens = available.reduce((sum, value) => sum + value.outputTokens, 0);
+  const reasoningTokens = available.some((value) => value.reasoningTokens !== undefined)
+    ? available.reduce((sum, value) => sum + (value.reasoningTokens || 0), 0) : undefined;
+  const costs = available.filter((value) => value.costUsd !== undefined);
+  return {
+    uncachedInputTokens, cacheReadTokens, cacheWriteTokens,
+    promptTokens: uncachedInputTokens + cacheReadTokens + cacheWriteTokens,
+    outputTokens, totalTokens: uncachedInputTokens + cacheReadTokens + cacheWriteTokens + outputTokens,
+    reasoningTokens, nativeTotalTokens: available.some((value) => value.nativeTotalTokens !== undefined)
+      ? available.reduce((sum, value) => sum + (value.nativeTotalTokens || 0), 0) : undefined,
+    agent: existing?.agent || component.agent, model: existing?.model || component.model,
+    costUsd: costs.length ? costs.reduce((sum, value) => sum + (value.costUsd || 0), 0) : undefined,
+    costSource: costs.length ? 'native' : undefined,
+    source: available.every((value) => value.source === 'native_reported') ? 'native_reported' : available.length ? 'estimated' : 'unavailable',
+    available: available.length > 0,
+    partial: components.some((value) => value.partial) || available.length !== components.length || undefined,
+    attempts: components.length,
+    collectedAt: new Date().toISOString(),
+    components,
+  };
+}
+
 /**
  * Task-level rollup, derived from the rounds on every read.
  *
@@ -511,28 +562,34 @@ export function aggregateThreadTokenUsage(rounds: DelegationRound[]): ThreadToke
     }
 
     summary.measuredRounds += 1;
-    summary.totalUncachedInputTokens += usage.uncachedInputTokens;
-    summary.totalCacheReadTokens += usage.cacheReadTokens;
-    summary.totalCacheWriteTokens += usage.cacheWriteTokens;
-    summary.totalPromptTokens += usage.promptTokens;
-    summary.totalOutputTokens += usage.outputTokens;
-    summary.totalTokens += usage.totalTokens;
+    const items = usage.components?.length ? usage.components.filter((item) => item.available) : [{
+      ...usage,
+      agent: round.executorAgent || usage.agent,
+      model: round.executorModel || usage.model,
+    }];
+    const roundTotal = items.reduce((sum, item) => sum + item.uncachedInputTokens + item.cacheReadTokens + item.cacheWriteTokens + item.outputTokens, 0);
+    for (const item of items) {
+      summary.totalUncachedInputTokens += item.uncachedInputTokens;
+      summary.totalCacheReadTokens += item.cacheReadTokens;
+      summary.totalCacheWriteTokens += item.cacheWriteTokens;
+      summary.totalPromptTokens += item.uncachedInputTokens + item.cacheReadTokens + item.cacheWriteTokens;
+      summary.totalOutputTokens += item.outputTokens;
+      if (item.costUsd !== undefined) {
+        summary.totalCostUsd = (summary.totalCostUsd ?? 0) + item.costUsd;
+        summary.costSource = 'native';
+      }
+      if (item.source !== 'native_reported' || item.partial) summary.isPartialOrEstimated = true;
+      summary.byAgent[item.agent] = (summary.byAgent[item.agent] ?? 0) + item.uncachedInputTokens + item.cacheReadTokens + item.cacheWriteTokens + item.outputTokens;
+      if (item.model) summary.byModel[item.model] = (summary.byModel[item.model] ?? 0) + item.uncachedInputTokens + item.cacheReadTokens + item.cacheWriteTokens + item.outputTokens;
+    }
+    summary.totalTokens += roundTotal;
 
     if (usage.source !== 'native_reported' || usage.partial) {
       summary.isPartialOrEstimated = true;
     }
-    if (usage.costUsd !== undefined) {
+    if (!usage.components?.length && usage.costUsd !== undefined) {
       summary.totalCostUsd = (summary.totalCostUsd ?? 0) + usage.costUsd;
       summary.costSource = 'native';
-    }
-
-    const agent = round.executorAgent || usage.agent;
-    if (agent) {
-      summary.byAgent[agent] = (summary.byAgent[agent] ?? 0) + usage.totalTokens;
-    }
-    const model = round.executorModel || usage.model;
-    if (model) {
-      summary.byModel[model] = (summary.byModel[model] ?? 0) + usage.totalTokens;
     }
   }
 

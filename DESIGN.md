@@ -527,3 +527,7 @@ D:\agent_bridge\
 └── resources\
     └── bridge-icon.svg            # 插件品牌图标
 ```
+
+## 原生会话压缩 v2
+
+原生会话压缩是独立于账本 v1 的版本化能力，必须保持原 thread/session/worktree/model 路由并通过原生控制面完成；不能通过改写原生文件、摘要 prompt 或新会话实现。实现与认证要求见 [docs/NATIVE_SESSION_COMPACTION_DESIGN.md](docs/NATIVE_SESSION_COMPACTION_DESIGN.md)。适配未按 executable/version/provider 认证时保持 `needs_validation`，Bridge 自动维护默认关闭。
