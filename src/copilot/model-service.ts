@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { completeCompatibleChat, completeCompatibleTools, fetchCompatibleModels } from './compatible-model-client';
 import { CopilotModelGroup, CopilotModelGroups, HostModelRef, validateGroup } from './model-groups';
 import { GroupAgentRuntime, GroupAgentRunResult, GroupMessage } from './group-agent-runtime';
-import { GroupModelRef } from '../bridge/types';
+import { GroupModelRef, TokenUsageMetrics } from '../bridge/types';
 import { getBridgeHome } from '../bridge/model-catalog';
 import { saveGroupAgentConfig, loadGroupAgentConfig, loadGroupAgentHost, GroupAgentBinding } from '../bridge/group-agent-registry';
 
@@ -17,6 +17,7 @@ export class CopilotModelService implements vscode.Disposable {
   readonly onDidChange = this.changed.event;
   private readonly modelChange: vscode.Disposable;
   private groupRuntime?: GroupAgentRuntime;
+  private groupAgentControl?: (context: { groupId: string; sessionId: string; threadId?: string; role: 'developer' | 'reviewer' | 'bootstrap'; extraEnv?: NodeJS.ProcessEnv }, name: string, input: Record<string, unknown>) => Promise<string>;
   private readonly modelAccess: vscode.LanguageModelAccessInformation;
   private readonly globalState: vscode.Memento;
 
@@ -86,31 +87,46 @@ export class CopilotModelService implements vscode.Disposable {
     return loadGroupAgentConfig()?.agents.find((entry) => entry.groupId === groupId);
   }
 
+  setGroupAgentControlHandler(handler: typeof this.groupAgentControl): void {
+    this.groupAgentControl = handler;
+    this.publishAgentConfig();
+    this.changed.fire();
+  }
+
   async configureGroupAgent(groupId: string, settings: {
     enabled: boolean;
     toolsAuthorized: boolean;
-    receiverModel?: HostModelRef | string | null;
-    initiatorModel?: HostModelRef | string | null;
+    receiverModel?: HostModelRef | GroupModelRef | string | null;
+    initiatorModel?: HostModelRef | GroupModelRef | string | null;
   }): Promise<void> {
     const group = this.groups.getAll().find((entry) => entry.id === groupId);
     if (!group) throw new Error('The model group no longer exists.');
-    const previous = this.globalState.get<Record<string, any>>('copilot.groupAgentSettings.v1', {})[groupId] || {};
+    const previous = (this.globalState.get<Record<string, any>>('copilot.groupAgentSettings.v1', {}) || {})[groupId] || {};
     const revision = (previous.revision || 0) + 1;
-    const modelRef = (selection: HostModelRef | string | null | undefined): GroupModelRef | undefined => {
+    const modelRef = (selection: HostModelRef | GroupModelRef | string | null | undefined): GroupModelRef | undefined => {
       if (selection === undefined || selection === null) return undefined;
       if (group.source === 'vscode-lm') {
-        if (typeof selection === 'string' || !group.models.some((model) => model.id === selection.id && model.vendor === selection.vendor))
+        const hostSelection: HostModelRef | string = typeof selection === 'string'
+          ? selection
+          : 'source' in selection
+            ? selection.source === 'vscode-lm' ? { id: selection.id, vendor: selection.vendor } : { id: selection.id, vendor: '' }
+            : selection;
+        if (typeof hostSelection === 'string' || !group.models.some((model) => model.id === hostSelection.id && model.vendor === hostSelection.vendor))
           throw new Error('The selected host model is not a member of this group.');
-        const model = this.hostModels.find((candidate) => candidate.id === selection.id && candidate.vendor === selection.vendor);
+        const model = this.hostModels.find((candidate) => candidate.id === hostSelection.id && candidate.vendor === hostSelection.vendor);
         if (!model || this.modelAccess.canSendRequest(model) !== true)
           throw new Error('The host model is unavailable or its background request permission is not already granted.');
-        return { source: 'vscode-lm', vendor: selection.vendor, id: selection.id };
+        return { source: 'vscode-lm', vendor: hostSelection.vendor, id: hostSelection.id };
       }
-      if (typeof selection !== 'string' || !group.models.some((model) => model.id === selection))
+      const endpointId = typeof selection === 'string' ? selection : 'source' in selection && selection.source === 'openai-compatible' ? selection.id : undefined;
+      if (!endpointId || !group.models.some((model) => model.id === endpointId))
         throw new Error('The selected endpoint model is not a member of this group.');
       if (!previous.toolsAuthorized && settings.toolsAuthorized !== true)
         throw new Error('Enable the group only after explicitly authorizing task tools.');
-      return { source: 'openai-compatible', id: selection, origin: new URL(group.baseUrl).origin, bindingRevision: revision };
+      const origin = new URL(group.baseUrl).origin;
+      if (typeof selection === 'object' && (!('source' in selection) || selection.source !== 'openai-compatible' || selection.origin !== origin))
+        throw new Error('The saved endpoint model is bound to a different source or origin.');
+      return { source: 'openai-compatible', id: endpointId, origin, bindingRevision: revision };
     };
     const updated = {
       ...previous,
@@ -118,19 +134,17 @@ export class CopilotModelService implements vscode.Disposable {
       toolsAuthorized: settings.toolsAuthorized,
       revision,
     };
-    const receiverSelection = settings.receiverModel !== undefined
-      ? settings.receiverModel
-      : previous.receiverModel;
-    const initiatorSelection = settings.initiatorModel !== undefined
-      ? settings.initiatorModel
-      : previous.initiatorModel;
-    const receiverRef = modelRef(receiverSelection);
-    const initiatorRef = modelRef(initiatorSelection);
-    if (receiverRef) updated.receiverModel = receiverRef;
-    else delete updated.receiverModel;
-    if (initiatorRef) updated.initiatorModel = initiatorRef;
-    else delete updated.initiatorModel;
-    const all = this.globalState.get<Record<string, any>>('copilot.groupAgentSettings.v1', {});
+    if (settings.receiverModel !== undefined) {
+      const receiverRef = modelRef(settings.receiverModel);
+      if (receiverRef) updated.receiverModel = receiverRef;
+      else delete updated.receiverModel;
+    }
+    if (settings.initiatorModel !== undefined) {
+      const initiatorRef = modelRef(settings.initiatorModel);
+      if (initiatorRef) updated.initiatorModel = initiatorRef;
+      else delete updated.initiatorModel;
+    }
+    const all = this.globalState.get<Record<string, any>>('copilot.groupAgentSettings.v1', {}) || {};
     await this.globalState.update('copilot.groupAgentSettings.v1', { ...all, [groupId]: updated });
     this.publishAgentConfig();
     this.changed.fire();
@@ -175,10 +189,11 @@ export class CopilotModelService implements vscode.Disposable {
 
   async markGroupAgentRoleReady(groupId: string, role: 'receiver' | 'initiator'): Promise<void> {
     const group = this.groups.getAll().find((entry) => entry.id === groupId);
-    const settings = this.globalState.get<Record<string, any>>('copilot.groupAgentSettings.v1', {});
+    const settings = this.globalState.get<Record<string, any>>('copilot.groupAgentSettings.v1', {}) || {};
     const saved = settings[groupId];
     const selection = role === 'receiver' ? saved?.receiverModel : saved?.initiatorModel;
     if (!group || !saved?.enabled || !saved.toolsAuthorized || !selection) throw new Error('Configure and authorize this Group Agent role before marking it ready.');
+    if (role === 'initiator' && !this.groupAgentControl) throw new Error('Group reviewer control services are unavailable in this host.');
     const host = loadGroupAgentHost();
     if (!host) throw new Error('The trusted local VS Code host/workspace is offline.');
     const probeKey = JSON.stringify(selection);
@@ -196,11 +211,9 @@ export class CopilotModelService implements vscode.Disposable {
       const initiatorModel = saved.initiatorModel;
       const host = loadGroupAgentHost();
       const ready = (role: 'receiver' | 'initiator', ref: unknown) => {
-        // Reviewer control calls must be bound to the real reviewer session; until
-        // that transport exists a probed model alone is not reviewer readiness.
-        if (role === 'initiator') return false;
+        if (role === 'initiator' && !this.groupAgentControl) return false;
         const probe = saved[`${role}Probe`];
-        return Boolean(ref && host && probe && probe.model === JSON.stringify(ref) && probe.revision === saved.revision && probe.hostGeneration === host.generation);
+        return Boolean(ref && host && probe && probe.model === JSON.stringify(ref) && probe.hostGeneration === host.generation);
       };
       return {
         id: this.getGroupAgentId(group.id), groupId: group.id, name: group.name,
@@ -341,6 +354,7 @@ export class CopilotModelService implements vscode.Disposable {
     token: vscode.CancellationToken,
     onChildPid?: (pid: number | undefined) => void,
     role: 'developer' | 'reviewer' | 'bootstrap' = 'developer',
+    controlContext?: { threadId?: string; extraEnv?: NodeJS.ProcessEnv },
   ): Promise<GroupAgentRunResult> {
     if (!vscode.workspace.isTrusted || vscode.env.uiKind === vscode.UIKind.Web || vscode.env.remoteName)
       throw new Error('Group Agent execution requires a trusted local desktop workspace.');
@@ -349,13 +363,14 @@ export class CopilotModelService implements vscode.Disposable {
     if (!group) throw new Error('The Group Agent binding was removed.');
     const binding = loadGroupAgentConfig()?.agents.find((entry) => entry.groupId === groupId);
     const configuredModel = role === 'developer' ? binding?.receiverModel : binding?.initiatorModel;
-    if (!binding?.enabled || !binding.toolsAuthorized || !configuredModel || JSON.stringify(configuredModel) !== JSON.stringify(modelRef))
+    if (!binding?.enabled || !binding.toolsAuthorized || !configuredModel)
       throw new Error('The Group Agent role binding changed or is not authorized.');
-    if (modelRef.source === 'openai-compatible' && (group.source !== 'openai-compatible' || modelRef.origin !== new URL(group.baseUrl).origin || modelRef.bindingRevision !== binding.revision))
-      throw new Error('The pinned Group Agent endpoint origin or binding revision changed.');
+    if (modelRef.source === 'openai-compatible' && (group.source !== 'openai-compatible' || modelRef.origin !== new URL(group.baseUrl).origin))
+      throw new Error('The pinned Group Agent endpoint origin changed.');
     const runtime = new GroupAgentRuntime({
       bridgeHome: getBridgeHome(),
       onChildPid,
+      ...(this.groupAgentControl ? { controlTool: (name, input) => this.groupAgentControl!({ groupId, sessionId, role, ...controlContext }, name, input) } : {}),
       request: async (messages, tools, signal) => {
         const selected = group.source === 'vscode-lm'
           ? modelRef.source === 'vscode-lm' && group.models.some((ref) => ref.id === modelRef.id && ref.vendor === modelRef.vendor)
@@ -424,7 +439,24 @@ export class CopilotModelService implements vscode.Disposable {
     const aborter = new AbortController();
     const subscription = token.onCancellationRequested(() => aborter.abort());
     try {
-      return await runtime.run(sessionId, cwd, prompt, aborter.signal);
+      const result = await runtime.run(sessionId, cwd, prompt, aborter.signal, role);
+      const collectedAt = new Date().toISOString();
+      const tokenUsage: TokenUsageMetrics = {
+        uncachedInputTokens: result.usage?.uncachedInputTokens ?? 0,
+        cacheReadTokens: result.usage?.cacheReadTokens ?? 0,
+        cacheWriteTokens: result.usage?.cacheWriteTokens ?? 0,
+        promptTokens: result.usage?.promptTokens ?? 0,
+        outputTokens: result.usage?.outputTokens ?? 0,
+        totalTokens: result.usage?.totalTokens ?? 0,
+        ...(result.usage?.nativeTotalTokens !== undefined ? { nativeTotalTokens: result.usage.nativeTotalTokens } : {}),
+        agent: this.getGroupAgentId(groupId), model: modelRef.id,
+        source: result.usage ? 'native_reported' : 'unavailable',
+        available: Boolean(result.usage), partial: result.usageRequests < result.modelRequests,
+        attempts: result.modelRequests,
+        ...(!result.usage ? { notes: 'The provider did not report native usage; input and output are unknown.' } : {}),
+        collectedAt,
+      };
+      return { ...result, tokenUsage };
     } finally {
       subscription.dispose();
     }

@@ -24,7 +24,7 @@ export async function completeCompatibleTools(options: {
   apiKey: string;
   signal: AbortSignal;
   fetchImpl?: typeof fetch;
-}): Promise<{ text: string; toolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown> }>; finishReason: 'stop' | 'tool_calls' }> {
+}): Promise<{ text: string; toolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown> }>; finishReason: 'stop' | 'tool_calls'; usage?: { uncachedInputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; promptTokens: number; outputTokens: number; totalTokens: number; nativeTotalTokens?: number } }> {
   if (options.messages.length > 500 || options.tools.length > 16) throw new Error('Model tool request exceeds its limits.');
   const base = validateCompatibleBaseUrl(options.baseUrl);
   const controller = new AbortController();
@@ -63,6 +63,19 @@ export async function completeCompatibleTools(options: {
     const reason = choice?.finish_reason;
     if (reason !== 'stop' && reason !== 'tool_calls') throw new Error('Endpoint returned an unsupported finish reason.');
     if ((reason === 'tool_calls') !== (toolCalls.length > 0)) throw new Error('Endpoint finish reason does not match its tool calls.');
+    const nativeUsage = parsed?.usage;
+    const promptTokens = Number(nativeUsage?.prompt_tokens);
+    const outputTokens = Number(nativeUsage?.completion_tokens);
+    if (Number.isSafeInteger(promptTokens) && promptTokens >= 0 && Number.isSafeInteger(outputTokens) && outputTokens >= 0) {
+      const cacheReadTokens = Number.isSafeInteger(nativeUsage?.prompt_tokens_details?.cached_tokens)
+        ? Math.min(promptTokens, Math.max(0, Number(nativeUsage.prompt_tokens_details.cached_tokens))) : 0;
+      const totalTokens = promptTokens + outputTokens;
+      return { text, toolCalls, finishReason: reason, usage: {
+        uncachedInputTokens: promptTokens - cacheReadTokens, cacheReadTokens, cacheWriteTokens: 0,
+        promptTokens, outputTokens, totalTokens,
+        ...(Number.isSafeInteger(nativeUsage?.total_tokens) && nativeUsage.total_tokens >= 0 ? { nativeTotalTokens: nativeUsage.total_tokens } : {}),
+      } };
+    }
     return { text, toolCalls, finishReason: reason };
   } catch (error) {
     if (controller.signal.aborted) throw new Error(options.signal.aborted ? 'Request cancelled.' : 'Request timed out.');

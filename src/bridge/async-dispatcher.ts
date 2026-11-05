@@ -139,7 +139,7 @@ export class AsyncDispatcher {
       : requesterAgent;
     if (reviewFlow !== 'dedicated' && defaultReviewer !== 'caller')
       throw new Error('A non-caller default sender requires dedicated review. Select dedicated in agentMeshBridge.reviewFlow.');
-    if (reviewFlow === 'dedicated') assertCanExecute(initiatorAgent, 'review delegated tasks');
+    if (reviewFlow === 'dedicated') assertCanExecute(initiatorAgent, 'review delegated tasks', 'initiator');
     if (reviewFlow !== 'dedicated' && knownInitiator && targetAgent === knownInitiator) {
       throw new Error(`Refusing to dispatch "${params.title}" to its own caller session: self-dispatch requires the dedicated reviewer flow.`);
     }

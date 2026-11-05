@@ -303,11 +303,11 @@ export function registerCopilotModelCommands(
       toolsAuthorized: side === 'receiver' ? true : binding?.toolsAuthorized === true,
       ...(side === 'receiver' ? { receiverModel: selected } : { initiatorModel: selected }),
     });
-    if (side === 'receiver') await service.markGroupAgentRoleReady(group.id, side);
+    await service.markGroupAgentRoleReady(group.id, side);
     if (side === 'receiver') {
       await vscode.window.showInformationMessage(`Bridge Agent ${group.name} is enabled for developer tasks. Its configured model and authorization are pinned for each new task.`);
     } else {
-      await vscode.window.showWarningMessage(`The sender model is saved for ${group.name}, but Group reviewer sessions are not available yet. This group cannot be selected as a default sender.`);
+      await vscode.window.showInformationMessage(`Bridge Group Agent ${group.name} is ready for dedicated reviewer sessions on the configured sender model.`);
     }
   };
   const manageGroup = async (group?: CopilotModelGroup) => {

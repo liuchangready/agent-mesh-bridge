@@ -21,12 +21,7 @@ import {
 } from './model-catalog';
 import { resolveDispatchModel } from './model-approval';
 import { buildFinalSummary, isTerminalThreadStatus } from './task-summary';
-import {
-  clearReviewerBootstrapToken,
-  findReviewerBootstrapByHostPid,
-  findSolePendingBootstrap,
-  readReviewerBootstrapToken,
-} from './reviewer-bootstrap';
+import { findReviewerBootstrapByHostPid, findSolePendingBootstrap, confirmReviewerBootstrapTask } from './reviewer-bootstrap';
 import {
   AgentId,
   DelegationRound,
@@ -1034,82 +1029,7 @@ export class MCPServer {
     threadId: string,
     credential: { token?: string; hostPid?: number },
   ): any {
-    this.taskStore.loadFromDisk();
-    let thread = this.taskStore.getTask(threadId);
-    if (!thread) {
-      throw new Error(`Reviewer bootstrap thread not found: ${threadId}`);
-    }
-    if (thread.status !== 'queued') {
-      throw new Error(
-        `Reviewer bootstrap for ${threadId} cannot confirm while task status is "${thread.status}". ` +
-          `Only a queued task may be dispatched; resume it after a pause or retry after a failure.`,
-      );
-    }
-    if (thread.reviewFlow !== 'dedicated') {
-      throw new Error(
-        `Thread ${threadId} is not a dedicated reviewer task; refusing bootstrap dispatch.`,
-      );
-    }
-    const phase = thread.reviewBootstrap?.phase;
-    if (phase === 'confirmed') {
-      throw new Error(`Thread ${threadId} was already dispatched by its reviewer.`);
-    }
-    if (phase === 'failed') {
-      throw new Error(
-        `Thread ${threadId} failed its reviewer bootstrap; it cannot be dispatched anymore.`,
-      );
-    }
-    const record = readReviewerBootstrapToken(threadId);
-    if (!record) {
-      throw new Error(
-        `Reviewer bootstrap token for ${threadId} is missing or was already consumed; ` +
-          `the reviewer cannot dispatch this task again.`,
-      );
-    }
-    if (credential.token) {
-      if (record.token !== credential.token) {
-        throw new Error(
-          `Reviewer bootstrap token mismatch for ${threadId}: this process is not the task's reviewer.`,
-        );
-      }
-    } else if (credential.hostPid) {
-      if (record.hostPid !== credential.hostPid) {
-        throw new Error(
-          `Reviewer bootstrap process mismatch for ${threadId}: this process was not launched as that task's reviewer.`,
-        );
-      }
-    } else {
-      throw new Error(`Reviewer bootstrap credential missing for ${threadId}.`);
-    }
-    if (record.agent !== thread.initiatorAgent) {
-      throw new Error(
-        `Reviewer bootstrap agent mismatch for ${threadId}: expected ${thread.initiatorAgent}.`,
-      );
-    }
-
-    // Re-read immediately before consuming the credential. A pause/delete may
-    // have arrived from another bridge process while the launch record was
-    // being validated; in that case leave the one-shot token available for a
-    // later explicit resume.
-    this.taskStore.loadFromDisk();
-    const latest = this.taskStore.getTask(threadId);
-    if (!latest || latest.status !== 'queued') {
-      throw new Error(
-        `Reviewer bootstrap for ${threadId} was stopped before confirmation; ` +
-          `the task is ${latest?.status || 'deleted'} and its token was not consumed.`,
-      );
-    }
-    thread = latest;
-
-    clearReviewerBootstrapToken(threadId);
-    thread.reviewBootstrap = {
-      ...(thread.reviewBootstrap || { phase: 'pending', attempts: 0 }),
-      phase: 'confirmed',
-    };
-    thread.status = 'queued';
-    thread.summary.lastOutputSnippet =
-      'Reviewer dispatched the task; waiting for the bootstrap process to persist its native session.';
-    this.taskStore.upsertTask(thread);
+    const thread = confirmReviewerBootstrapTask(this.taskStore, threadId, credential);
 
     const stopInstruction =
       'STOP NOW — the task is dispatched. End your turn immediately; the bridge resumes THIS ' +
@@ -1136,7 +1056,7 @@ export class MCPServer {
    */
   private assertActiveReviewerRole(threadId: string): void {
     const thread = this.taskStore.getTask(threadId);
-    if (thread) assertCanExecute(thread.initiatorAgent, 'review or approve tasks');
+    if (thread) assertCanExecute(thread.initiatorAgent, 'review or approve tasks', 'initiator');
     const owner = new TaskRoleLock().getOwner(threadId);
     if (!owner || owner.role !== 'reviewer') {
       throw new Error(

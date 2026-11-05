@@ -23,7 +23,7 @@ import { AgentId, isValidSessionId, isMergePending } from './bridge/types';
 import { TaskSupervisor } from './bridge/task-supervisor';
 import { TaskControlService } from './bridge/task-control';
 import { TaskArchiveService } from './bridge/task-archive';
-import { ReviewerBootstrapService } from './bridge/reviewer-bootstrap';
+import { ReviewerBootstrapService, confirmReviewerBootstrapTask } from './bridge/reviewer-bootstrap';
 import { TaskExecutionRegistry } from './bridge/task-execution-registry';
 import { registerCopilotMcpProvider } from './copilot/copilot-mcp-provider';
 import { isCopilotRequester } from './copilot/copilot-projection';
@@ -426,6 +426,7 @@ export function activate(context: vscode.ExtensionContext) {
         options.agent.slice('copilot_group:'.length), options.modelRef,
         options.receiverSessionId, options.cwd, options.prompt, source.token, options.onChildPid,
         options.role || 'developer',
+        { threadId: options.taskThreadId, extraEnv: options.extraEnv },
       );
     } finally {
       signal.removeEventListener('abort', abort);
@@ -433,6 +434,7 @@ export function activate(context: vscode.ExtensionContext) {
     }
   });
   const callbackManager = new CallbackManager(detector);
+  callbackManager.setAutonomousRunner(runner);
   // A deferred wake must re-read the thread when it is replayed.
   callbackManager.setTaskStore(taskStore);
 
@@ -506,6 +508,39 @@ export function activate(context: vscode.ExtensionContext) {
     true,
   );
   context.subscriptions.push({ dispose: () => reworkController.dispose() });
+  copilotModelService.setGroupAgentControlHandler(async (controlContext, name, input) => {
+    if (controlContext.role === 'bootstrap') {
+      const threadId = controlContext.extraEnv?.MESH_REVIEW_THREAD_ID;
+      const token = controlContext.extraEnv?.MESH_REVIEW_BOOTSTRAP_TOKEN;
+      if (!threadId || !token || input.threadId !== threadId || input.token !== token)
+        throw new Error('Group reviewer bootstrap credentials do not match this prepared task.');
+      const prepared = taskStore.getTask(threadId);
+      if (!prepared || prepared.initiatorAgent !== `copilot_group:${controlContext.groupId}`)
+        throw new Error('The prepared task belongs to a different registered Group Agent.');
+      const thread = confirmReviewerBootstrapTask(taskStore, threadId, { token });
+      return JSON.stringify({ threadId, status: 'DISPATCHED', nextAction: 'END_TURN_AND_WAIT_FOR_CALLBACK' });
+    }
+    const threadId = controlContext.threadId;
+    if (controlContext.role !== 'reviewer' || !threadId || input.threadId !== threadId)
+      throw new Error('Group reviewer controls are limited to the active task in this reviewer turn.');
+    taskStore.loadFromDisk();
+    const thread = taskStore.getTask(threadId);
+    const owner = new TaskRoleLock().getOwner(threadId);
+    if (!thread || thread.reviewFlow !== 'dedicated' || thread.initiatorAgent !== `copilot_group:${controlContext.groupId}` ||
+        thread.reviewerSessionId !== controlContext.sessionId || owner?.role !== 'reviewer' || owner.conversationId !== controlContext.sessionId)
+      throw new Error('Group reviewer session does not own the current task reviewer lease.');
+    if (name === 'request_rework') {
+      if (typeof input.feedback !== 'string' || !input.feedback.trim()) throw new Error('Review feedback is required.');
+      const result = await reworkController.requestRework({ threadId, feedback: input.feedback, callerSessionId: controlContext.sessionId });
+      return JSON.stringify(result);
+    }
+    if (name === 'approve_task') {
+      const result = reworkController.approveTask({ threadId, remarks: typeof input.remarks === 'string' ? input.remarks : undefined });
+      reworkController.resumePendingMerges();
+      return JSON.stringify(result);
+    }
+    throw new Error(`Unsupported Group reviewer control: ${name}`);
+  });
   const taskControl = new TaskControlService(taskStore, runner);
   const configSync = new ConfigSyncService(undefined, dshProvider);
   configSync.setAgentMcpEnv(agentMcpEnvFor(dshProvider));

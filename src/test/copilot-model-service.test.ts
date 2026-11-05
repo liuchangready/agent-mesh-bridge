@@ -4,6 +4,9 @@ import { AddressInfo } from 'node:net';
 const Module = require('module');
 const http = require('node:http');
 const net = require('node:net');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 test('registered commands and tree nodes preserve exact host identity; invoke settles on cancellation', async () => {
   let selected = 0;
@@ -177,6 +180,9 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
   const address = server.address() as AddressInfo;
   const baseUrl = `http://127.0.0.1:${address.port}/v1`;
   const originalLoad = Module._load;
+  const originalBridgeHome = process.env.AGENT_MESH_BRIDGE_HOME;
+  const bridgeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-settings-'));
+  process.env.AGENT_MESH_BRIDGE_HOME = bridgeHome;
   Module._load = function (request: string, parent: unknown, isMain: boolean) {
     return request === 'vscode' ? fakeVscode : originalLoad.call(this, request, parent, isMain);
   };
@@ -204,7 +210,7 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     await service.refreshHostModels();
     assert.equal(selected, 1);
     const group = await service.groups.save({
-      id: 'group',
+      id: '11111111-2222-4333-8444-555555555557',
       name: 'Host group',
       source: 'vscode-lm',
       models: [
@@ -269,6 +275,28 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     assert.match(shownResult, /remote-model/);
     assert.equal(shownResult.includes('integration-secret'), false);
 
+    await service.configureGroupAgent(apiGroup.id, { enabled: true, toolsAuthorized: true, receiverModel: 'remote-model' });
+    const pinnedReceiver = service.getAgentBinding(apiGroup.id)!.receiverModel;
+    await service.configureGroupAgent(apiGroup.id, { enabled: true, toolsAuthorized: true, initiatorModel: 'remote-model' });
+    let savedBinding = service.getAgentBinding(apiGroup.id)!;
+    assert.deepEqual(savedBinding.receiverModel, pinnedReceiver, 'saving sender settings must not rewrite a pinned receiver model');
+    assert.ok(savedBinding, fs.readFileSync(path.join(bridgeHome, 'group-agent-config.json'), 'utf8'));
+    assert.equal(savedBinding.receiverModel?.source, 'openai-compatible');
+    assert.equal(savedBinding.initiatorModel?.source, 'openai-compatible');
+    await service.configureGroupAgent(apiGroup.id, { enabled: true, toolsAuthorized: true, receiverModel: null });
+    savedBinding = service.getAgentBinding(apiGroup.id)!;
+    assert.equal(savedBinding.receiverModel, undefined);
+    assert.equal(savedBinding.initiatorModel?.id, 'remote-model');
+    await service.configureGroupAgent(apiGroup.id, { enabled: true, toolsAuthorized: true, receiverModel: 'remote-model' });
+    const pinnedSender = service.getAgentBinding(apiGroup.id)!.initiatorModel;
+    await service.configureGroupAgent(apiGroup.id, { enabled: false, toolsAuthorized: true });
+    assert.deepEqual(service.getAgentBinding(apiGroup.id)!.initiatorModel, pinnedSender, 'changing enabled state must preserve the other side model reference');
+    await service.configureGroupAgent(apiGroup.id, { enabled: true, toolsAuthorized: true });
+    await service.configureGroupAgent(apiGroup.id, { enabled: true, toolsAuthorized: true, initiatorModel: null });
+    savedBinding = service.getAgentBinding(apiGroup.id)!;
+    assert.equal(savedBinding.receiverModel?.id, 'remote-model');
+    assert.equal(savedBinding.initiatorModel, undefined);
+
     const pendingToken = new CancellationTokenSource();
     const pendingCall = service.invoke(group, { id: 'opaque-1', vendor: 'vendor-a' }, 'pending-send', pendingToken.token as any);
     await sendStarted;
@@ -313,6 +341,9 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     for (const disposable of commandDisposables) disposable.dispose();
   } finally {
     Module._load = originalLoad;
+    if (originalBridgeHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME;
+    else process.env.AGENT_MESH_BRIDGE_HOME = originalBridgeHome;
+    fs.rmSync(bridgeHome, { recursive: true, force: true });
     await new Promise<void>((resolve, reject) =>
       server.close((error: Error | undefined) => (error ? reject(error) : resolve())),
     );

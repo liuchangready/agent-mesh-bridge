@@ -2,6 +2,11 @@ import * as childProcess from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { killPidTree } from '../bridge/platform';
+import type { TokenUsageMetrics } from '../bridge/types';
+
+export type GroupProviderUsage = Pick<TokenUsageMetrics,
+  'uncachedInputTokens' | 'cacheReadTokens' | 'cacheWriteTokens' | 'promptTokens' | 'outputTokens' | 'totalTokens'> &
+  Pick<Partial<TokenUsageMetrics>, 'nativeTotalTokens'>;
 
 export type GroupMessage = {
   role: 'user' | 'assistant' | 'tool';
@@ -21,14 +26,23 @@ export interface GroupTurnResponse {
   text: string;
   toolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown> }>;
   finishReason: 'stop' | 'tool_calls';
+  usage?: GroupProviderUsage;
 }
 
-export interface GroupAgentRunResult { text: string; toolCallsCompleted: number }
+export interface GroupAgentRunResult {
+  text: string;
+  toolCallsCompleted: number;
+  modelRequests: number;
+  usageRequests: number;
+  usage?: GroupProviderUsage;
+  tokenUsage?: TokenUsageMetrics;
+}
 
 export interface GroupAgentRuntimeOptions {
   bridgeHome: string;
   request: (messages: GroupMessage[], tools: GroupTool[], signal: AbortSignal) => Promise<GroupTurnResponse>;
   onChildPid?: (pid: number | undefined) => void;
+  controlTool?: (name: string, input: Record<string, unknown>) => Promise<string>;
   commandTimeoutMs?: number;
   maxToolOutputBytes?: number;
 }
@@ -37,6 +51,8 @@ const MAX_TURNS = 24;
 const MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
 const MAX_SESSION_BYTES = 32 * 1024 * 1024;
 const MAX_TOOL_OUTPUT = 256 * 1024;
+const MAX_CONTEXT_MESSAGES = 500;
+const MAX_CONTEXT_BYTES = 2 * 1024 * 1024;
 function redactToolOutput(value: string): string {
   return value
     .replace(/(\b[A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*\s*[:=]\s*)([^\r\n]+)/gim, '$1[redacted]')
@@ -50,6 +66,18 @@ const GROUP_TOOLS: GroupTool[] = [
   { name: 'write_file', description: 'Write a UTF-8 file in the task worktree.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } },
   { name: 'run_command', description: 'Run a command in the task worktree.', inputSchema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
 ];
+const REVIEWER_TOOLS: GroupTool[] = [
+  ...GROUP_TOOLS.filter((tool) => ['list_files', 'read_file', 'search_files'].includes(tool.name)),
+  { name: 'request_rework', description: 'Return the task to its developer with review feedback.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, feedback: { type: 'string' } }, required: ['threadId', 'feedback'], additionalProperties: false } },
+  { name: 'approve_task', description: 'Approve the reviewed task through the Bridge task service.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, remarks: { type: 'string' } }, required: ['threadId'], additionalProperties: false } },
+];
+const BOOTSTRAP_TOOLS: GroupTool[] = [{
+  name: 'dispatch_task', description: 'Confirm the one prepared task using its one-time reviewer bootstrap token.',
+  inputSchema: { type: 'object', anyOf: [
+    { properties: { threadId: { type: 'string' }, token: { type: 'string' } }, required: ['threadId', 'token'], additionalProperties: false },
+    { properties: { reviewBootstrap: { type: 'object', properties: { threadId: { type: 'string' }, token: { type: 'string' } }, required: ['threadId', 'token'], additionalProperties: false } }, required: ['reviewBootstrap'], additionalProperties: false },
+  ] },
+}];
 
 export class GroupAgentSessionStore {
   private readonly directory: string;
@@ -103,7 +131,7 @@ export class GroupAgentRuntime {
     this.sessions = new GroupAgentSessionStore(options.bridgeHome);
   }
 
-  async run(sessionId: string, cwd: string, prompt: string, signal?: AbortSignal): Promise<GroupAgentRunResult> {
+  async run(sessionId: string, cwd: string, prompt: string, signal?: AbortSignal, role: 'developer' | 'reviewer' | 'bootstrap' = 'developer'): Promise<GroupAgentRunResult> {
     if (this.active.has(sessionId)) throw new Error('This Group Agent session already has an active run.');
     const root = fs.realpathSync(cwd);
     const controller = new AbortController();
@@ -118,15 +146,34 @@ export class GroupAgentRuntime {
       const messages = this.readMessages(sessionId);
       const completedCalls = new Set<string>();
       const intents = new Set<string>();
+      let usage: GroupProviderUsage | undefined;
+      let modelRequests = 0;
+      let usageRequests = 0;
+      const tools = role === 'bootstrap' ? BOOTSTRAP_TOOLS : role === 'reviewer' ? REVIEWER_TOOLS : GROUP_TOOLS;
       for (let turn = 0; turn < MAX_TURNS; turn++) {
         if (controller.signal.aborted) throw new Error('Group Agent run cancelled.');
-        const response = await this.options.request(messages, GROUP_TOOLS, controller.signal);
+        const response = await this.options.request(messages, tools, controller.signal);
+        if (controller.signal.aborted) throw new Error('Group Agent run cancelled.');
+        modelRequests++;
+        if (response.usage) {
+          usageRequests++;
+          usage = usage ? {
+            uncachedInputTokens: usage.uncachedInputTokens + response.usage.uncachedInputTokens,
+            cacheReadTokens: usage.cacheReadTokens + response.usage.cacheReadTokens,
+            cacheWriteTokens: usage.cacheWriteTokens + response.usage.cacheWriteTokens,
+            promptTokens: usage.promptTokens + response.usage.promptTokens,
+            outputTokens: usage.outputTokens + response.usage.outputTokens,
+            totalTokens: usage.totalTokens + response.usage.totalTokens,
+            ...((usage.nativeTotalTokens !== undefined || response.usage.nativeTotalTokens !== undefined)
+              ? { nativeTotalTokens: (usage.nativeTotalTokens || 0) + (response.usage.nativeTotalTokens || 0) } : {}),
+          } : { ...response.usage };
+        }
         const calls = response.toolCalls || [];
         this.sessions.append(sessionId, { role: 'assistant', content: response.text || '', ...(calls.length ? { toolCalls: calls } : {}) });
         messages.push({ role: 'assistant', content: response.text || '', ...(calls.length ? { toolCalls: calls } : {}) });
         if (response.finishReason === 'stop') {
           if (!response.text.trim()) throw new Error('Group Agent returned an empty final answer.');
-          return { text: response.text, toolCallsCompleted: completedCalls.size };
+          return { text: response.text, toolCallsCompleted: completedCalls.size, modelRequests, usageRequests, ...(usage ? { usage } : {}) };
         }
         if (!calls.length) throw new Error('Group Agent requested tools without structured tool calls.');
         for (const call of calls) {
@@ -136,10 +183,17 @@ export class GroupAgentRuntime {
             throw new Error('Group Agent tool arguments exceed 32 KB.');
           intents.add(call.id);
           this.sessions.append(sessionId, { role: 'intent', callId: call.id, name: call.name, arguments: call.arguments });
-          const result = redactToolOutput(await this.executeTool(root, call.name, call.arguments, controller));
+          const isControl = role === 'bootstrap' || (role === 'reviewer' && ['request_rework', 'approve_task'].includes(call.name));
+          const controlInput = call.name === 'dispatch_task' && call.arguments.reviewBootstrap && typeof call.arguments.reviewBootstrap === 'object'
+            ? call.arguments.reviewBootstrap as Record<string, unknown>
+            : call.arguments;
+          const result = redactToolOutput(isControl
+            ? await this.options.controlTool?.(call.name, controlInput) ?? (() => { throw new Error('Group reviewer control service is unavailable.'); })()
+            : await this.executeTool(root, call.name, call.arguments, controller));
           this.sessions.append(sessionId, { role: 'tool', toolCallId: call.id, toolName: call.name, content: result });
           messages.push({ role: 'tool', toolCallId: call.id, toolName: call.name, content: result });
           completedCalls.add(call.id);
+          if (isControl) return { text: result, toolCallsCompleted: completedCalls.size, modelRequests, usageRequests, ...(usage ? { usage } : {}) };
         }
       }
       throw new Error('Group Agent exceeded the tool-call turn limit.');
@@ -154,8 +208,29 @@ export class GroupAgentRuntime {
   }
 
   private readMessages(sessionId: string): GroupMessage[] {
-    const lines = this.sessions.read(sessionId, 0, 500).filter((event) => ['user', 'assistant', 'tool'].includes(event.role));
-    return lines.map(({ role, content, toolCalls, toolCallId, toolName }) => ({ role, content, toolCalls, toolCallId, toolName }));
+    const all: GroupMessage[] = [];
+    for (let offset = 0; ; offset += 500) {
+      const page = this.sessions.read(sessionId, offset, 500);
+      all.push(...page.filter((event) => ['user', 'assistant', 'tool'].includes(event.role)));
+      if (page.length < 500) break;
+    }
+    const turns: GroupMessage[][] = [];
+    for (const message of all) {
+      if (message.role === 'user') turns.push([]);
+      turns.at(-1)?.push(message);
+    }
+    let selected: GroupMessage[] = [];
+    let size = 0;
+    for (let index = turns.length - 1; index >= 0; index--) {
+      const turn = turns[index];
+      const turnSize = turn.reduce((total, message) => total + Buffer.byteLength(JSON.stringify(message)), 0);
+      if (selected.length && (selected.length + turn.length > MAX_CONTEXT_MESSAGES || size + turnSize > MAX_CONTEXT_BYTES)) break;
+      if (turn.length > MAX_CONTEXT_MESSAGES || turnSize > MAX_CONTEXT_BYTES)
+        throw new Error('The latest complete Group Agent conversation turn exceeds the context limit.');
+      selected = turn.concat(selected);
+      size += turnSize;
+    }
+    return selected;
   }
 
   private async executeTool(root: string, name: string, input: Record<string, unknown>, controller: AbortController): Promise<string> {

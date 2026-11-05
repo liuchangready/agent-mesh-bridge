@@ -27,6 +27,8 @@ import { detectRateLimitSignal } from './autonomous-runner';
 import { ReviewerLogWriter, createReviewerLogWriter } from './reviewer-log';
 import { cachedCodexResumeSupport, codexResumeArgument, extractCodexThreadId } from './codex-session';
 import { assertCanExecute } from './agent-capabilities';
+import { AutonomousRunner } from './autonomous-runner';
+import { isGroupAgentId } from './group-agent-registry';
 
 /**
  * How many times one task may wake its caller about failures.
@@ -40,6 +42,7 @@ const MAX_FAILURE_NOTIFICATIONS = 3;
 
 export class CallbackManager extends EventEmitter {
   private detector: AgentDetector;
+  private runner?: AutonomousRunner;
   private wakeQueue: CallerWakeQueue;
   private taskStore?: TaskStore;
 
@@ -56,6 +59,8 @@ export class CallbackManager extends EventEmitter {
   public setTaskStore(store: TaskStore): void {
     this.taskStore = store;
   }
+
+  public setAutonomousRunner(runner: AutonomousRunner): void { this.runner = runner; }
 
   /** Rate-limit state shared with the agent nodes / status bar. */
   public getRateLimitTracker() {
@@ -420,7 +425,7 @@ export class CallbackManager extends EventEmitter {
     release: () => void,
     onChildPid?: (pid: number | undefined) => void,
   ): boolean {
-    assertCanExecute(thread.initiatorAgent, 'resume as a reviewer');
+    assertCanExecute(thread.initiatorAgent, 'resume as a reviewer', 'initiator');
     const initiator = thread.initiatorAgent;
     const cwd = thread.workspacePath || process.cwd();
     // Wake the caller on its SENDER-side default model, which is configured
@@ -504,6 +509,41 @@ export class CallbackManager extends EventEmitter {
         fs.writeSync(outFd, text);
       } catch {}
     };
+
+    if (isGroupAgentId(initiator)) {
+      if (!this.runner) {
+        release();
+        reviewerLog.writeOutcome({ error: 'Group reviewer runner is not attached.' });
+        reviewerLog.close();
+        if (typeof outFd === 'number') try { fs.closeSync(outFd); } catch {}
+        return false;
+      }
+      void this.runner.execute({
+        agent: initiator, prompt: promptMessage, isRework: true, receiverSessionId: callerSessionId,
+        title: thread.title, cwd, taskThreadId: thread.threadId, taskRound: round.round,
+        model: thread.reviewerModel, modelRef: thread.reviewerModelRef || thread.initiatorModelRef,
+        role: 'reviewer', markAsReceiver: false, onChildPid,
+        onStdoutChunk: (chunk) => tee(chunk),
+      }).then((result) => {
+        if (result.extractedOutput) tee(result.extractedOutput);
+        const outcome = { exitCode: result.assessment?.success ? 0 : -1,
+          error: result.assessment?.success ? undefined : result.error || result.assessment?.errorCode,
+          output: result.extractedOutput || '' };
+        reviewerLog.writeOutcome(outcome);
+        reviewerLog.close();
+        if (typeof outFd === 'number') try { fs.closeSync(outFd); } catch {}
+        release();
+        this.finalizeWake(thread, round, callerSessionId, outcome, wakeKind);
+      }).catch((error) => {
+        const outcome = { error: error instanceof Error ? error.message : String(error) };
+        reviewerLog.writeOutcome(outcome);
+        reviewerLog.close();
+        if (typeof outFd === 'number') try { fs.closeSync(outFd); } catch {}
+        release();
+        this.finalizeWake(thread, round, callerSessionId, outcome, wakeKind);
+      });
+      return true;
+    }
 
     const attachErrorLogging = (child: child_process.ChildProcess) => {
       // Hand the detached child to the role lock before anything else: it is the

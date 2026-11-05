@@ -7,6 +7,7 @@ src/**
 tsconfig.json
 **/*.map
 out/test/**
+out/review-*.log
 
 # Development-only material: never needed at runtime, would only bloat the .vsix.
 AGENTS.md
