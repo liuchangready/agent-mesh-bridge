@@ -3,6 +3,7 @@
 src/**
 .git/**
 .gitignore
+.agent-mesh-task.json
 tsconfig.json
 **/*.map
 out/test/**

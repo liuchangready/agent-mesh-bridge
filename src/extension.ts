@@ -28,6 +28,8 @@ import { TaskExecutionRegistry } from './bridge/task-execution-registry';
 import { registerCopilotMcpProvider } from './copilot/copilot-mcp-provider';
 import { isCopilotRequester } from './copilot/copilot-projection';
 import { claimCopilotTerminalNotification } from './copilot/copilot-notifications';
+import { CopilotModelService } from './copilot/model-service';
+import { registerCopilotModelCommands } from './copilot/model-commands';
 import { saveBridgePolicy, AgentLogDirectories } from './bridge/bridge-policy';
 import { probeCodexResumeSupport } from './bridge/codex-session';
 import {
@@ -540,7 +542,8 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(statusBar.getStatusBarItem());
 
   // 4. Tree Views
-  const agentNodesProvider = new AgentNodesProvider(detector, resolver);
+  const copilotModelService = new CopilotModelService(context);
+  const agentNodesProvider = new AgentNodesProvider(detector, resolver, copilotModelService);
   const activeTreeProvider = new TaskTreeProvider(taskStore, 'active');
   const recentTreeProvider = new TaskTreeProvider(taskStore, 'all');
 
@@ -558,6 +561,7 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   context.subscriptions.push(agentNodesTreeView, activeTreeView, recentTreeView);
+  context.subscriptions.push(...registerCopilotModelCommands(context, copilotModelService));
 
   // Track completed tasks to announce when a task transitions to completed
   const knownCompletedThreadIds = new Set<string>();
