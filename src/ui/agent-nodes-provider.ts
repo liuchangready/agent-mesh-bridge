@@ -297,7 +297,11 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
           child.description = ref.vendor;
           child.contextValue = 'copilot_model';
           child.iconPath = new vscode.ThemeIcon('symbol-misc');
-          child.command = { command: 'agent-mesh-bridge.callCopilotModel', title: 'Call Model', arguments: [group, ref.id] };
+          child.command = {
+            command: 'agent-mesh-bridge.callCopilotModel',
+            title: 'Call Model',
+            arguments: [group, ref],
+          };
           return child;
         });
       } else {

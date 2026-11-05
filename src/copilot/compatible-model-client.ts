@@ -35,8 +35,10 @@ export function validateCompatibleBaseUrl(value: string): URL {
 }
 
 function endpoint(base: URL, suffix: string): URL {
-  const path = base.pathname.replace(/\/+$/, '');
-  return new URL(`${path}/${suffix}`, base.origin);
+  const url = new URL(base.origin);
+  url.pathname = `${base.pathname.replace(/\/+$/, '')}/${suffix}`;
+  if (url.origin !== base.origin) throw new Error('Endpoint URL changed origin unexpectedly.');
+  return url;
 }
 
 function safeError(message: string, secret: string): string {

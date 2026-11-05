@@ -5,21 +5,29 @@ const Module = require('module');
 const http = require('node:http');
 const net = require('node:net');
 
-test('service refreshes only on request and resolves a host model by exact vendor and id', async () => {
+test('registered commands and tree nodes preserve exact host identity; invoke settles on cancellation', async () => {
   let selected = 0;
-  let calls = 0;
+  let vendorACalls = 0;
+  let vendorBCalls = 0;
+  let releasePendingSend: (() => void) | undefined;
+  let releasePendingStream: (() => void) | undefined;
+  let pendingSendStarted!: () => void;
+  let pendingStreamStarted!: () => void;
+  const sendStarted = new Promise<void>((resolve) => (pendingSendStarted = resolve));
+  const streamStarted = new Promise<void>((resolve) => (pendingStreamStarted = resolve));
   let provider: any;
   let shownResult = '';
   let apiAuthorization = '';
+  const uiErrors: string[] = [];
   const registeredCommands = new Map<string, (...args: any[]) => any>();
-  const listeners = new Set<() => void>();
   class EventEmitter<T> {
+    private listeners = new Set<() => void>();
     event = (listener: () => void) => {
-      listeners.add(listener);
-      return { dispose: () => listeners.delete(listener) };
+      this.listeners.add(listener);
+      return { dispose: () => this.listeners.delete(listener) };
     };
     fire() {
-      for (const listener of listeners) listener();
+      for (const listener of this.listeners) listener();
     }
     dispose() {}
   }
@@ -38,33 +46,76 @@ test('service refreshes only on request and resolves a host model by exact vendo
     }
     dispose() {}
   }
+  class TreeItem {
+    label: string;
+    collapsibleState: number;
+    constructor(label: string, collapsibleState: number) {
+      this.label = label;
+      this.collapsibleState = collapsibleState;
+    }
+  }
+  const responseText = (text: string) => ({
+    text: (async function* () {
+      yield text;
+    })(),
+  });
   const models = [
     {
       id: 'opaque-1',
       vendor: 'vendor-a',
       name: 'Same',
       sendRequest: async (messages: any[]) => {
-        calls++;
+        vendorACalls++;
+        const prompt = messages[0].content;
+        if (prompt === 'pending-send') {
+          pendingSendStarted();
+          return await new Promise<any>((resolve) => {
+            releasePendingSend = () => resolve(responseText('late answer'));
+          });
+        }
+        if (prompt === 'pending-stream') {
+          pendingStreamStarted();
+          let pending = true;
+          return {
+            text: {
+              [Symbol.asyncIterator]() {
+                return {
+                  next: () =>
+                    pending
+                      ? new Promise<IteratorResult<string>>((resolve) => {
+                          releasePendingStream = () => {
+                            pending = false;
+                            resolve({ done: false, value: 'late chunk' });
+                          };
+                        })
+                      : Promise.resolve({ done: true, value: undefined }),
+                };
+              },
+            },
+          };
+        }
         assert.deepEqual(messages, [{ role: 'user', content: 'question' }]);
-        return {
-          text: (async function* () {
-            yield 'exact answer';
-          })(),
-        };
+        return responseText('vendor a answer');
       },
     },
     {
       id: 'opaque-1',
       vendor: 'vendor-b',
       name: 'Same',
-      sendRequest: async () => {
-        throw new Error('wrong vendor called');
+      sendRequest: async (messages: any[]) => {
+        vendorBCalls++;
+        assert.deepEqual(messages, [{ role: 'user', content: 'question' }]);
+        return responseText('vendor b answer');
       },
     },
   ];
   const fakeVscode = {
     EventEmitter,
     CancellationTokenSource,
+    TreeItem,
+    TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
+    ThemeIcon: class { constructor(public id: string, public color?: unknown) {} },
+    ThemeColor: class { constructor(public id: string) {} },
     lm: {
       onDidChangeChatModels: () => ({ dispose() {} }),
       selectChatModels: async () => {
@@ -74,6 +125,7 @@ test('service refreshes only on request and resolves a host model by exact vendo
     },
     workspace: {
       isTrusted: true,
+      getConfiguration: () => ({ get: (_key: string, fallback?: unknown) => fallback }),
       registerTextDocumentContentProvider: (_scheme: string, contentProvider: any) => {
         provider = contentProvider;
         return { dispose() {} };
@@ -92,6 +144,7 @@ test('service refreshes only on request and resolves a host model by exact vendo
     LanguageModelChatMessage: { User: (content: string) => ({ role: 'user', content }) },
     window: {
       showQuickPick: async (items: any[]) =>
+        items.find((item) => item.ref?.vendor === 'vendor-b') ??
         items.find((item) => item.source === 'openai-compatible'),
       showInputBox: async (options: any) => {
         if (options.prompt === 'Group display name') return 'Local API';
@@ -112,7 +165,7 @@ test('service refreshes only on request and resolves a host model by exact vendo
       showInformationMessage: async () => undefined,
       showWarningMessage: async () => undefined,
       showErrorMessage: (message: string) => {
-        throw new Error(message);
+        uiErrors.push(message);
       },
     },
   };
@@ -154,18 +207,59 @@ test('service refreshes only on request and resolves a host model by exact vendo
       id: 'group',
       name: 'Host group',
       source: 'vscode-lm',
-      models: [{ id: 'opaque-1', vendor: 'vendor-a' }],
+      models: [
+        { id: 'opaque-1', vendor: 'vendor-a' },
+        { id: 'opaque-1', vendor: 'vendor-b' },
+      ],
     });
     const token = {
       isCancellationRequested: false,
       onCancellationRequested: () => ({ dispose() {} }),
     } as any;
-    const result = await service.invoke(group, 'opaque-1', 'question', token);
-    assert.deepEqual(result.text, 'exact answer');
-    assert.equal(calls, 1);
+    const result = await service.invoke(group, { id: 'opaque-1', vendor: 'vendor-a' }, 'question', token);
+    assert.equal(result.text, 'vendor a answer');
+    assert.equal(vendorACalls, 1);
+    assert.equal(vendorBCalls, 0);
     assert.match(service.getLastCall(), /Succeeded/);
+    const secondVendorResult = await service.invoke(
+      group,
+      { id: 'opaque-1', vendor: 'vendor-b' },
+      'question',
+      token,
+    );
+    assert.equal(secondVendorResult.text, 'vendor b answer');
     const { registerCopilotModelCommands } = require('../copilot/model-commands');
     const commandDisposables = registerCopilotModelCommands(context as any, service);
+    await registeredCommands.get('agent-mesh-bridge.callCopilotModel')!(group);
+    assert.equal(vendorBCalls, 2, 'QuickPick must invoke vendor-b when both vendors share an id');
+
+    const { AgentNodesProvider } = require('../ui/agent-nodes-provider');
+    const info = (id: string, name: string) => ({ id, name, status: 'online', available: true });
+    const providerNodes = new AgentNodesProvider(
+      {
+        probeAll: async () => ({
+          antigravity: info('antigravity', 'agy'),
+          codex: info('codex', 'Codex'),
+          claude_code: info('claude_code', 'Claude'),
+          deepseek_harness: info('deepseek_harness', 'DSH'),
+          vscode_chat: info('vscode_chat', 'Copilot'),
+        }),
+      } as any,
+      { resolveActiveAgent: async () => ({ agent: 'codex' }) } as any,
+      service,
+    );
+    const nodes = await providerNodes.getChildren();
+    const copilotNode = nodes.find((node: any) => node.info?.id === 'vscode_chat');
+    const hostGroupNode = copilotNode?.subItems?.find((node: any) => node.label === 'Host group');
+    const vendorBNode = hostGroupNode?.subItems?.find((node: any) => node.description === 'vendor-b');
+    assert.ok(vendorBNode);
+    assert.deepEqual(vendorBNode.command.arguments[1], { id: 'opaque-1', vendor: 'vendor-b' });
+    const treeCall = registeredCommands.get(vendorBNode.command.command);
+    assert.ok(treeCall);
+    await treeCall(...vendorBNode.command.arguments);
+    assert.deepEqual(uiErrors, []);
+    assert.equal(vendorBCalls, 3, 'tree command must call the exact vendor-b reference');
+
     await registeredCommands.get('agent-mesh-bridge.addCopilotModelGroup')!();
     const apiGroup = service.groups.getAll().find((item: any) => item.name === 'Local API');
     assert.ok(apiGroup);
@@ -174,8 +268,49 @@ test('service refreshes only on request and resolves a host model by exact vendo
     assert.match(shownResult, /integrated answer/);
     assert.match(shownResult, /remote-model/);
     assert.equal(shownResult.includes('integration-secret'), false);
-    for (const disposable of commandDisposables) disposable.dispose();
+
+    const pendingToken = new CancellationTokenSource();
+    const pendingCall = service.invoke(group, { id: 'opaque-1', vendor: 'vendor-a' }, 'pending-send', pendingToken.token as any);
+    await sendStarted;
+    pendingToken.cancel();
+    await assert.rejects(pendingCall, /Request cancelled/);
+    releasePendingSend!();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.match(service.getLastCall(), /Failed/);
+
+    const streamToken = new CancellationTokenSource();
+    const pendingStream = service.invoke(group, { id: 'opaque-1', vendor: 'vendor-a' }, 'pending-stream', streamToken.token as any);
+    await streamStarted;
+    service.cancelGroup(group.id);
+    await assert.rejects(pendingStream, /Request cancelled/);
+    releasePendingStream!();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.match(service.getLastCall(), /Failed/);
+
+    const alreadyCancelled = new CancellationTokenSource();
+    alreadyCancelled.cancel();
+    const callsBeforeCancelledInvoke = vendorACalls;
+    await assert.rejects(
+      service.invoke(group, { id: 'opaque-1', vendor: 'vendor-a' }, 'question', alreadyCancelled.token as any),
+      /Request cancelled/,
+    );
+    assert.equal(vendorACalls, callsBeforeCancelledInvoke, 'an already-cancelled token must not call a provider');
+
+    const disposeToken = new CancellationTokenSource();
+    let disposeStarted!: () => void;
+    const disposeStartedPromise = new Promise<void>((resolve) => (disposeStarted = resolve));
+    const disposeRequestModel = models[0];
+    const originalSend = disposeRequestModel.sendRequest;
+    disposeRequestModel.sendRequest = async () => {
+      disposeStarted();
+      return await new Promise<any>(() => {});
+    };
+    const pendingDispose = service.invoke(group, { id: 'opaque-1', vendor: 'vendor-a' }, 'pending-dispose', disposeToken.token as any);
+    await disposeStartedPromise;
     service.dispose();
+    await assert.rejects(pendingDispose, /Request cancelled/);
+    disposeRequestModel.sendRequest = originalSend;
+    for (const disposable of commandDisposables) disposable.dispose();
   } finally {
     Module._load = originalLoad;
     await new Promise<void>((resolve, reject) =>

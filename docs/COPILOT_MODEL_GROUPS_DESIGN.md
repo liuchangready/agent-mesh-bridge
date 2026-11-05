@@ -1,7 +1,7 @@
 # Bridge Copilot Custom Model Groups and Calls
 
-> Date: 2026-11-06 (Asia/Shanghai)  
-> Status: design input for the implementation in this task.  
+> Date: 2026-11-06 (Asia/Shanghai)
+> Status: design input for the implementation in this task.
 > Baseline: `master` / `origin/master` at `8f697e9`. This is an addition to `COPILOT_VSCODE_AGENT_DESIGN.md`; it does not replace the requester-only task flow.
 
 ## 1. Goal and scope

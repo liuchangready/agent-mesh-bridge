@@ -81,6 +81,44 @@ test('explicit model listing uses GET /models, deduplicates ids, and never follo
   );
 });
 
+test('double slashes in a base path never become an authority for either API route', async () => {
+  const seen: Array<{ url: string; authorization: string | null }> = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = input instanceof URL ? input : new URL(String(input));
+    seen.push({ url: url.toString(), authorization: new Headers(init?.headers).get('authorization') });
+    return new Response(
+      url.pathname.endsWith('/models')
+        ? JSON.stringify({ data: [] })
+        : JSON.stringify({ choices: [{ message: { content: 'ok' } }] }),
+      { headers: { 'content-type': 'application/json' } },
+    );
+  };
+  const baseUrl = 'https://trusted.example//other.example/v1';
+  await fetchCompatibleModels({ baseUrl, apiKey: 'origin-secret', fetchImpl });
+  await completeCompatibleChat({
+    baseUrl,
+    model: 'model-x',
+    prompt: 'hello',
+    apiKey: 'origin-secret',
+    fetchImpl,
+  });
+  assert.deepEqual(
+    seen.map(({ url, authorization }) => ({ url: new URL(url).href, origin: new URL(url).origin, authorization })),
+    [
+      {
+        url: 'https://trusted.example//other.example/v1/models',
+        origin: 'https://trusted.example',
+        authorization: 'Bearer origin-secret',
+      },
+      {
+        url: 'https://trusted.example//other.example/v1/chat/completions',
+        origin: 'https://trusted.example',
+        authorization: 'Bearer origin-secret',
+      },
+    ],
+  );
+});
+
 test('HTTP failures, empty responses, and echoed secrets are sanitized', async () => {
   await withServer(
     (_request, response) => {

@@ -69,10 +69,11 @@ export class CopilotModelService implements vscode.Disposable {
 
   async invoke(
     group: CopilotModelGroup,
-    modelId: string,
+    selection: HostModelRef | string,
     prompt: string,
     token: vscode.CancellationToken,
   ): Promise<{ text: string; elapsedMs: number }> {
+    if (token.isCancellationRequested) throw new Error('Request cancelled.');
     if (
       !vscode.workspace.isTrusted ||
       vscode.env.uiKind === vscode.UIKind.Web ||
@@ -89,12 +90,20 @@ export class CopilotModelService implements vscode.Disposable {
     if (JSON.stringify(validateGroup(current)) !== JSON.stringify(validateGroup(group)))
       throw new Error('This model group changed; reopen it and select the model again.');
     group = validateGroup(current);
+    const modelId = typeof selection === 'string' ? selection : selection.id;
     const started = Date.now();
     const aborter = new AbortController();
     const requestToken = new vscode.CancellationTokenSource();
     const parentSubscription = token.onCancellationRequested(() => requestToken.cancel());
     this.active.set(aborter, { groupId: group.id, cancel: () => requestToken.cancel() });
-    const subscription = requestToken.token.onCancellationRequested(() => aborter.abort());
+    let rejectCancelled!: (error: Error) => void;
+    const cancellationPromise = new Promise<never>((_resolve, reject) => {
+      rejectCancelled = reject;
+    });
+    const subscription = requestToken.token.onCancellationRequested(() => {
+      aborter.abort();
+      rejectCancelled(new Error('Request cancelled.'));
+    });
     let timedOut = false;
     let timeout: NodeJS.Timeout | undefined;
     const timeoutPromise = new Promise<never>((_resolve, reject) => {
@@ -107,7 +116,11 @@ export class CopilotModelService implements vscode.Disposable {
     try {
       const perform = async () => {
         if (group!.source === 'vscode-lm') {
-          const ref = group!.models.find((model) => model.id === modelId);
+          if (typeof selection === 'string')
+            throw new Error('Host model calls require the selected vendor and id.');
+          const ref = group!.models.find(
+            (model) => model.id === selection.id && model.vendor === selection.vendor,
+          );
           if (!ref) throw new Error('The selected model is no longer in this group.');
           const model = this.hostModels.find(
             (candidate) => candidate.id === ref.id && candidate.vendor === ref.vendor,
@@ -128,7 +141,9 @@ export class CopilotModelService implements vscode.Disposable {
           }
           return output;
         }
-        const model = group!.models.find((item) => item.id === modelId);
+        if (typeof selection !== 'string')
+          throw new Error('Endpoint model calls require a model id.');
+        const model = group!.models.find((item) => item.id === selection);
         if (!model) throw new Error('The selected model is no longer in this group.');
         const key = await this.groups.getApiKey(group!);
         if (!key) throw new Error('API key is missing; configure a key for this endpoint group.');
@@ -140,7 +155,7 @@ export class CopilotModelService implements vscode.Disposable {
           signal: aborter.signal,
         });
       };
-      const text = await Promise.race([perform(), timeoutPromise]);
+      const text = await Promise.race([perform(), timeoutPromise, cancellationPromise]);
       if (requestToken.token.isCancellationRequested) throw new Error('Request cancelled.');
       if (!text.trim()) throw new Error('The model returned no text.');
       const latest = this.groups.getAll().find((item) => item.id === group!.id);

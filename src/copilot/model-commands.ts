@@ -2,6 +2,7 @@ import * as fs from 'fs/promises';
 import * as vscode from 'vscode';
 import {
   CopilotModelGroup,
+  HostModelRef,
   importGroupNames,
   newModelGroupId,
   validateGroup,
@@ -63,8 +64,8 @@ export function registerCopilotModelCommands(
   };
   const chooseModel = async (
     group: CopilotModelGroup,
-    preselect?: string,
-  ): Promise<string | undefined> => {
+    preselect?: HostModelRef | string,
+  ): Promise<HostModelRef | string | undefined> => {
     if (group.source === 'vscode-lm') {
       const refs = group.models;
       const host = service.getHostModels();
@@ -77,13 +78,16 @@ export function registerCopilotModelCommands(
           description: `${ref.vendor} · ${ref.id}${model ? '' : ' · unavailable — refresh catalog'}`,
           ref,
           disabled: !model,
-          picked: ref.id === preselect,
+          picked:
+            typeof preselect === 'object' &&
+            ref.id === preselect.id &&
+            ref.vendor === preselect.vendor,
         };
       });
       const selected = await vscode.window.showQuickPick(items, {
         placeHolder: 'Choose the exact host model',
       });
-      return selected?.ref.id;
+      return selected?.ref;
     }
     const selected = await vscode.window.showQuickPick(
       group.models.map((model) => ({
@@ -98,13 +102,14 @@ export function registerCopilotModelCommands(
   const runCall = async (
     group: CopilotModelGroup | undefined,
     test: boolean,
-    selectedModel?: string,
+    selectedModel?: HostModelRef | string,
   ) => {
     if (!canConfigure()) return;
     group = await chooseGroup(group);
     if (!group) return;
-    const modelId = selectedModel || (await chooseModel(group));
-    if (!modelId) return;
+    const selection = selectedModel ?? (await chooseModel(group));
+    if (!selection) return;
+    const modelId = typeof selection === 'string' ? selection : selection.id;
     if (test) {
       const confirm = await vscode.window.showWarningMessage(
         `Send a short test prompt to ${modelId}? The provider may charge for this request.`,
@@ -128,7 +133,7 @@ export function registerCopilotModelCommands(
       },
       async (progress, token) => {
         try {
-          const { text, elapsedMs } = await service.invoke(group!, modelId!, prompt, token);
+          const { text, elapsedMs } = await service.invoke(group!, selection, prompt, token);
           const uri = documents.put(
             `# ${group!.name}\n\n- Source: ${group!.source}\n- Model: ${modelId}\n- Status: completed\n- Duration: ${elapsedMs} ms\n\n---\n\n${text}`,
           );
@@ -526,7 +531,9 @@ export function registerCopilotModelCommands(
     ),
     vscode.commands.registerCommand(
       'agent-mesh-bridge.callCopilotModel',
-      guarded((group?: CopilotModelGroup, modelId?: string) => runCall(group, false, modelId)),
+      guarded((group?: CopilotModelGroup, selection?: HostModelRef | string) =>
+        runCall(group, false, selection),
+      ),
     ),
   ];
   return disposables;
