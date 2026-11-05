@@ -89,3 +89,19 @@ Codex 0.164.0-alpha.11.1、`openai` provider、已配置的 `gpt-6-luna` 在 `%T
 已落地：Codex 私有 stdio compaction 客户端及同 ID 持久历史复查；Codex UUID/rollout 归一化 session 写租约原语；paused task 的显式手动维护入口；维护操作记录、确定性恢复文件、维护日志、按 operation 去重的轮级计量组件；bridge policy 镜像、详情状态、维护日志分页读取与归档收集；其他 Agent 能力显示为 `unsupported`，Codex 显示 `needs_validation`，自动模式默认 off。
 
 本次交付尚未实现为完整闭环：普通 developer 的三条执行链尚未统一持有 session 租约，也未在维护后把恢复资料注入下一业务 prompt 并在成功落账后标记 delivered；dedicated reviewer 唤醒尚未增加异步 prepare；自动阈值维护未接入；宿主崩溃后的 `running/unknown` 对账恢复、暂停/删除中止与状态复查、维护文件删除清理、归档活动检查及跨进程 stale 合并专测仍缺。虽然真实 Codex 临时 session 验证已通过，但执行工具/hooks 的完整隔离还未证明，因此不得把该 adapter 标为 certified，也不得打开自动维护。此状态不满足本设计的完整验收标准。
+
+## 12. 第 2 轮实现状态（2026-11-06）
+
+本节更新第 1 轮状态；前述批准设计与硬约束继续有效。当前代码已将三条 developer 执行路径汇入 `AutonomousRunner.execute()` 的共享准备阶段：恢复同 session 写租约、读取待交付恢复资料、注入当前业务 prompt（不改 `round.prompt`）、成功后才确认恢复版本 delivered 并去重累计业务 turn。首轮捕获 session ID 时先绑定现存子进程 PID，再发布账本绑定。dedicated reviewer wake 在 launch 前 await prepare，并重读任务状态、session/model/worktree、取消信号和角色 token；session 租约保持到 reviewer 子进程 `close`。
+
+已修复旧 Claude 成本重复聚合；旧轮 usage 迁移与维护费用使用同一 `legacy-business-round-N` component ID，component 合并保护较高 usage；游标只对当前账本 session 绑定有效，并按 revision 合并。stale owner 回收通过 reaper gate 串行化；真实多进程 stale-owner 竞争测试只允许一个新 owner。恢复后的 `prepared/running` operation 会落为 `unknown` 并保留恢复资料，不重放压缩。归档前获取 bound developer/dedicated-reviewer session 租约，活动写入时拒绝归档；既有分页、归档和任务前缀清理规则覆盖维护日志及恢复资料。
+
+Codex stdio 客户端共享总活跃时间预算、取消与 HostSuspensionGuard；stderr 被消费、输入行与事件缓冲有界；终止后未确认 PID 退出时保留租约，待实际退出才释放。压缩 ACK 不作成功；仍要求本次 thread 的 contextCompaction item、对应 completed turn、关闭后同 ID 持久历史复查。
+
+仍未达到完整验收：Codex 虽有临时测试会话的真实压缩/持久化/同 ID `exec resume` 证据（`%TEMP%/agent-mesh-native-session-e2e-79d4c84ef1bc41cdbff2744d0510a75e/native-compaction-evidence.json`、`persisted-history.json`），但当前环境尚未证明 MCP/hooks/动态工具隔离、外部 CLI 并发写安全及全 Bridge 生命周期端到端；故 Codex 仍为 `needs_validation`，自动维护默认 `off`，其他 Agent 为 `unsupported`，不得声称认证。原生自动压缩事件识别/去重、unknown 操作的独立只读可恢复性探测与不可恢复时自动暂停、专门 reviewer/三入口/取消竞态集成测试、reaper gate 自身崩溃恢复，仍需后续完成。启用 `auto` 而能力未认证时会明确跳过并告警，不发压缩 RPC。
+
+### 第 2 轮后续安全收口
+
+reviewer bootstrap 也显式标记为 `nativeSessionRole: reviewer` 并共用 runner session 租约；bootstrap 首次捕获时先租约绑定再发布 reviewer/caller session。`prepared/running` 崩溃恢复会记为 `unknown`，因为当前没有通过认证的只读 session 恢复探针，prepare 会保留恢复资料并将任务暂停，不重放压缩或继续业务。
+
+仍须后续补齐：原生自动压缩事件识别及去重；Codex 同 ID 只读可恢复性探针；dedicated reviewer wake 与开发者三入口的专用集成竞态测试；CallerWakeQueue 与 session 写入租约的单一准入整合；stale reaper gate 自身崩溃后的安全恢复。以上缺口不改变 `needs_validation` / 默认 `off` 发布状态。

@@ -15,6 +15,10 @@ import {
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { TaskStore } from '../bridge/task-store';
 import { ContextCompactor } from '../bridge/context-compactor';
+import { getWorkerLogDir } from '../bridge/round-log';
+import { CancellationRegistry } from '../bridge/cancellation-registry';
+import { NativeSessionLock } from '../bridge/native-session-lock';
+import { NativeSessionCompactor } from '../bridge/native-session-compactor';
 import { DelegationRound, DelegationThread, TokenUsageMetrics } from '../bridge/types';
 
 const cleanups: Array<() => void> = [];
@@ -286,6 +290,21 @@ describe('token usage - accumulation and rollup', () => {
     assert.strictEqual(summary.isPartialOrEstimated, true);
   });
 
+  test('legacy Claude result cost is counted once', () => {
+    const usage = collectTokenUsage({
+      agent: 'claude_code',
+      stdout: JSON.stringify({
+        type: 'result', subtype: 'success', total_cost_usd: 0.0152,
+        usage: { input_tokens: 8420, output_tokens: 650, cache_read_input_tokens: 6200, cache_creation_input_tokens: 1200 },
+      }),
+    });
+    const summary = aggregateThreadTokenUsage([{
+      round: 1, type: 'initial', prompt: 'p', durationMs: 1, status: 'completed',
+      timestamp: new Date().toISOString(), executorAgent: 'claude_code', tokenUsage: usage,
+    }]);
+    assert.equal(summary.totalCostUsd, 0.0152);
+  });
+
   test('a reviewer compaction component is counted once and grouped by its own agent/model', () => {
     const developer = usage(1_200, 1_000, 200);
     developer.agent = 'codex';
@@ -421,5 +440,157 @@ describe('token usage - durability', () => {
     const stored = store.getTask(thread.threadId)!.rounds[0];
     assert.strictEqual(stored.tokenUsage?.totalTokens, 777);
     assert.strictEqual(stored.executorAgent, 'codex');
+  });
+
+  test('TaskStore migrates legacy round usage once before merging a maintenance component', () => {
+    const { store, dir } = makeStore();
+    const business = usage(110);
+    business.uncachedInputTokens = 100;
+    business.promptTokens = 100;
+    business.outputTokens = 10;
+    const thread = makeThread([{
+      round: 1, type: 'initial', prompt: 'p', output: 'done', durationMs: 1,
+      status: 'completed', timestamp: new Date().toISOString(), tokenUsage: business,
+    }]);
+    store.upsertTask(thread);
+    const task = store.getTask(thread.threadId)!;
+    const round = task.rounds[0];
+    round.tokenUsage = appendTokenUsageComponent(round.tokenUsage, {
+      id: 'operation-1', kind: 'native_compaction', role: 'reviewer', agent: 'claude_code', model: 'sonnet',
+      uncachedInputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 5,
+      source: 'native_reported', available: true,
+    }, 'legacy-business-round-1');
+    store.upsertTask(task);
+
+    const reopened = new TaskStore(dir);
+    reopened.loadFromDisk();
+    const persisted = reopened.getTask(thread.threadId)!.rounds[0].tokenUsage!;
+    assert.equal(persisted.totalTokens, 135);
+    assert.deepEqual(persisted.components?.map((component) => component.id).sort(), ['legacy-business-round-1', 'operation-1']);
+    const stale = JSON.parse(JSON.stringify(thread)) as DelegationThread;
+    stale.rounds[0].tokenUsage = appendTokenUsageComponent(business, {
+      id: 'operation-1', kind: 'native_compaction', role: 'reviewer', agent: 'claude_code', model: 'sonnet',
+      uncachedInputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 1,
+      source: 'native_reported', available: true,
+    }, 'legacy-business-round-1');
+    store.upsertTask(stale);
+    assert.equal(store.getTask(thread.threadId)!.rounds[0].tokenUsage!.totalTokens, 135);
+    reopened.dispose();
+  });
+
+  test('a stale task snapshot cannot restore the pre-retarget session cursor', () => {
+    const { store } = makeStore();
+    const thread = makeThread([{
+      round: 1, type: 'initial', prompt: 'p', output: 'done', durationMs: 1,
+      status: 'completed', timestamp: new Date().toISOString(), tokenUsage: usage(100),
+      nativeSessionCompactions: [{
+        id: 'old-operation', role: 'developer', agent: 'codex', sessionId: 'old-session',
+        reason: 'manual', phase: 'succeeded', revision: 2, startedAt: new Date().toISOString(),
+        recoveryPath: 'old.json', logPath: 'old.log',
+      }],
+    }]);
+    thread.receiverSessionId = 'old-session';
+    thread.receiverSessionCaptured = true;
+    thread.nativeSessionCompaction = { developer: { revision: 2, sessionId: 'old-session', lastOperationId: 'old-operation', turnsSinceCompaction: 0 } };
+    store.upsertTask(thread);
+    const stale = JSON.parse(JSON.stringify(thread)) as DelegationThread;
+    const current = JSON.parse(JSON.stringify(thread)) as DelegationThread;
+    current.receiverSessionId = 'new-session';
+    current.receiverSessionCaptured = false;
+    current.retargets = [{
+      fromAgent: 'codex', toAgent: 'codex', fromModel: 'gpt-6-luna', toModel: 'gpt-6-luna',
+      sessionReset: true, previousReceiverSessionId: 'old-session', reason: 'test', at: new Date().toISOString(),
+    }];
+    current.nativeSessionCompaction = { developer: { revision: 3, sessionId: 'new-session', turnsSinceCompaction: 0 } };
+    store.upsertTask(current);
+    store.upsertTask(stale);
+    const saved = store.getTask(thread.threadId)!;
+    assert.equal(saved.receiverSessionId, 'new-session');
+    assert.equal(saved.nativeSessionCompaction?.developer?.sessionId, 'new-session');
+    assert.equal(saved.nativeSessionCompaction?.developer?.lastOperationId, undefined);
+    assert.equal(saved.rounds[0].tokenUsage?.totalTokens, 100);
+  });
+
+  test('runner repeats pending recovery until a carried business turn succeeds and holds one session lease', async () => {
+    const { store, dir } = makeStore();
+    const sessionId = '01a1acc2-877d-71e3-9bf1-5e668c1f2183';
+    const thread = makeThread([{
+      round: 1, type: 'rework', prompt: 'full unmodified instruction', output: 'review evidence',
+      durationMs: 1, status: 'completed', timestamp: new Date().toISOString(),
+      nativeSessionCompactions: [{ id: 'op-recovery', role: 'developer', agent: 'codex', sessionId,
+        reason: 'manual', phase: 'succeeded', revision: 2, startedAt: new Date().toISOString(),
+        recoveryPath: path.join(getWorkerLogDir('codex', dir), 'recovery.json'),
+        logPath: path.join(getWorkerLogDir('codex', dir), 'native.log') }],
+    }]);
+    thread.status = 'running';
+    thread.receiverSessionId = sessionId;
+    thread.receiverSessionCaptured = true;
+    thread.targetModel = 'gpt-6-luna';
+    thread.nativeSessionCompaction = { developer: { revision: 2, sessionId, lastOperationId: 'op-recovery',
+      turnsSinceCompaction: 0, recoveryVersion: 'op-recovery' } };
+    const recoveryPath = thread.rounds[0].nativeSessionCompactions![0].recoveryPath;
+    fs.mkdirSync(path.dirname(recoveryPath), { recursive: true });
+    fs.writeFileSync(recoveryPath, '{"constraints":"keep task identity"}', 'utf8');
+    store.upsertTask(thread);
+
+    const runner = new AutonomousRunner({} as any, 10_000, new CancellationRegistry(dir), store);
+    const prompts: string[] = [];
+    let attempt = 0;
+    (runner as any).executeOnce = async (options: any) => {
+      prompts.push(options.prompt);
+      assert.equal(new NativeSessionLock(dir).acquire('codex', sessionId), undefined, 'business execution must hold the lease');
+      attempt++;
+      return attempt === 1
+        ? { exitCode: 1, stdout: '', stderr: 'retryable test result', extractedOutput: '', durationMs: 1, assessment: { success: false }, actualSessionId: sessionId }
+        : { exitCode: 0, stdout: 'done', stderr: '', extractedOutput: 'done', durationMs: 1,
+            assessment: { success: true }, actualSessionId: sessionId };
+    };
+    const common = { agent: 'codex' as const, prompt: 'full unmodified instruction', isRework: true,
+      receiverSessionId: sessionId, taskThreadId: thread.threadId, taskRound: 1, model: 'gpt-6-luna',
+      maxRetries: 0 };
+    await runner.execute(common);
+    assert.match(prompts[0], /keep task identity/);
+    assert.match(prompts[0], /full unmodified instruction/);
+    assert.notEqual(store.getTask(thread.threadId)!.nativeSessionCompaction?.developer?.recoveryDeliveredVersion, 'op-recovery');
+
+    await runner.execute(common);
+    assert.match(prompts[1], /keep task identity/);
+    const cursor = store.getTask(thread.threadId)!.nativeSessionCompaction!.developer!;
+    assert.equal(cursor.recoveryDeliveredVersion, 'op-recovery');
+    assert.equal(cursor.turnsSinceCompaction, 1);
+    const released = new NativeSessionLock(dir).acquire('codex', sessionId);
+    assert.ok(released);
+    new NativeSessionLock(dir).release(released!);
+  });
+
+  test('a recovered running maintenance operation becomes unknown and is never replayed', async () => {
+    const { store, dir } = makeStore();
+    const sessionId = '01a1acc2-877d-71e3-9bf1-5e668c1f2183';
+    const recoveryPath = path.join(getWorkerLogDir('codex', dir), 'crash.recovery.json');
+    fs.mkdirSync(path.dirname(recoveryPath), { recursive: true });
+    fs.writeFileSync(recoveryPath, '{"recover":true}', 'utf8');
+    const thread = makeThread([{
+      round: 1, type: 'rework', prompt: 'continue', output: 'prior work', durationMs: 1,
+      status: 'completed', timestamp: new Date().toISOString(),
+      nativeSessionCompactions: [{ id: 'crashed-op', role: 'developer', agent: 'codex', sessionId,
+        reason: 'manual', phase: 'running', revision: 2, startedAt: new Date().toISOString(),
+        recoveryPath, logPath: path.join(getWorkerLogDir('codex', dir), 'crash.log') }],
+    }]);
+    thread.status = 'running'; thread.receiverSessionId = sessionId; thread.receiverSessionCaptured = true;
+    thread.targetModel = 'gpt-6-luna';
+    thread.nativeSessionCompaction = { developer: { sessionId, revision: 2, lastOperationId: 'crashed-op',
+      turnsSinceCompaction: 0, recoveryVersion: 'crashed-op' } };
+    store.upsertTask(thread);
+
+    const prepared = await new NativeSessionCompactor(store, {} as any).prepareBeforeResume(thread.threadId, 'developer', 'gpt-6-luna');
+    assert.match(prepared.pauseReason || '', /no validated read-only recovery probe/);
+    const saved = store.getTask(thread.threadId)!;
+    assert.equal(saved.rounds[0].nativeSessionCompactions?.[0].phase, 'unknown');
+    assert.equal(saved.rounds[0].nativeSessionCompactions?.[0].revision, 3);
+    assert.equal(saved.status, 'paused');
+    assert.equal(saved.nativeSessionCompaction?.developer?.recoveryDeliveredVersion, undefined);
+    const lease = new NativeSessionLock(dir).acquire('codex', sessionId);
+    assert.ok(lease, 'the failed preparation releases its lease without launching a writer');
+    new NativeSessionLock(dir).release(lease!);
   });
 });

@@ -2,7 +2,7 @@ import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { afterEach, test } from 'node:test';
 import { NativeSessionLock } from '../bridge/native-session-lock';
 
@@ -40,4 +40,24 @@ test('a live owner is never reclaimed from a stale heartbeat', () => {
   owner.updatedAt = 0;
   fs.writeFileSync(lease.path, JSON.stringify(owner));
   assert.equal(lock.acquire('codex', 'thread-test'), undefined);
+});
+
+test('concurrent stale-owner recovery grants only one lease across processes', async () => {
+  const root = tempRoot();
+  const lock = new NativeSessionLock(root);
+  const oldLease = lock.acquire('codex', 'stale-race')!;
+  lock.release(oldLease);
+  fs.writeFileSync(oldLease.path, JSON.stringify({ ...oldLease.owner, pid: 2_147_000_000, childPid: undefined }));
+  const modulePath = path.resolve(__dirname, '../bridge/native-session-lock.js');
+  const script = `const {NativeSessionLock}=require(${JSON.stringify(modulePath)}); const l=new NativeSessionLock(${JSON.stringify(root)}); const x=l.acquire('codex','stale-race'); console.log(x?'acquired':'busy'); if(x) setTimeout(()=>{},800);`;
+  const results = await Promise.all(Array.from({ length: 8 }, () => new Promise<string>((resolve, reject) => {
+    const child = spawn(process.execPath, ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    let error = '';
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.stderr.on('data', (chunk) => { error += chunk; });
+    child.once('error', reject);
+    child.once('close', (code) => code === 0 ? resolve(output.trim()) : reject(new Error(error || `child exit ${code}`)));
+  })));
+  assert.equal(results.filter((value) => value === 'acquired').length, 1, results.join(','));
 });

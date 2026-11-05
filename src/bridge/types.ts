@@ -326,12 +326,14 @@ export interface NativeSessionCompactionOperation {
 }
 
 export interface NativeSessionCompactionCursor {
+  revision?: number;
   sessionId: string;
   lastOperationId?: string;
   turnsSinceCompaction: number;
   recoveryVersion?: string;
   recoveryDeliveredVersion?: string;
   autoDisabledReason?: string;
+  recentBusinessTurnIds?: string[];
 }
 
 /**

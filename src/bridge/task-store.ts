@@ -22,6 +22,7 @@ import {
   removeTaskArtifacts,
 } from './task-summary';
 import { cleanupThreadNativeSessions } from './native-session-cleanup';
+import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
 
 export const MAX_STORED_TASKS = 1000;
 
@@ -52,15 +53,17 @@ function canEvictForCapacity(task: DelegationThread): boolean {
 function preferTokenUsage(
   existing: TokenUsageMetrics | undefined,
   incoming: TokenUsageMetrics | undefined,
+  legacyId: string,
 ): TokenUsageMetrics | undefined {
   if (!existing) return incoming;
   if (!incoming) return existing;
   if (existing.components?.length || incoming.components?.length) {
     const components = new Map<string, TokenUsageComponent>();
-    for (const item of existing.components || []) components.set(item.id, item);
-    for (const item of incoming.components || []) components.set(item.id, item);
-    if (!existing.components?.length) components.set('legacy-business', legacyUsageComponent(existing));
-    if (!incoming.components?.length && !existing.components?.length) components.set('legacy-business', legacyUsageComponent(incoming));
+    for (const item of existing.components || [legacyUsageComponent(existing, legacyId)]) components.set(item.id, item);
+    for (const item of incoming.components || [legacyUsageComponent(incoming, legacyId)]) {
+      const current = components.get(item.id);
+      components.set(item.id, current ? preferUsageComponent(current, item) : item);
+    }
     const values = [...components.values()];
     const measured = values.filter((item) => item.available);
     const uncachedInputTokens = measured.reduce((sum, item) => sum + item.uncachedInputTokens, 0);
@@ -94,14 +97,27 @@ function preferTokenUsage(
   return (incoming.totalTokens ?? 0) >= (existing.totalTokens ?? 0) ? incoming : existing;
 }
 
-function legacyUsageComponent(usage: TokenUsageMetrics): TokenUsageComponent {
+function legacyUsageComponent(usage: TokenUsageMetrics, id: string): TokenUsageComponent {
   return {
-    id: 'legacy-business', kind: 'business', role: 'developer', agent: usage.agent,
+    id, kind: 'business', role: 'developer', agent: usage.agent,
     model: usage.model, uncachedInputTokens: usage.uncachedInputTokens,
     cacheReadTokens: usage.cacheReadTokens, cacheWriteTokens: usage.cacheWriteTokens,
     outputTokens: usage.outputTokens, reasoningTokens: usage.reasoningTokens,
     nativeTotalTokens: usage.nativeTotalTokens, costUsd: usage.costUsd,
     costSource: usage.costSource, source: usage.source, available: usage.available, partial: usage.partial,
+  };
+}
+
+function preferUsageComponent(existing: TokenUsageComponent, incoming: TokenUsageComponent): TokenUsageComponent {
+  if (!existing.available) return incoming.available ? incoming : existing;
+  if (!incoming.available) return existing;
+  const total = (value: TokenUsageComponent) => value.uncachedInputTokens + value.cacheReadTokens + value.cacheWriteTokens + value.outputTokens;
+  if (total(incoming) < total(existing)) return existing;
+  return {
+    ...incoming,
+    nativeTotalTokens: Math.max(existing.nativeTotalTokens || 0, incoming.nativeTotalTokens || 0) || undefined,
+    costUsd: Math.max(existing.costUsd || 0, incoming.costUsd || 0) || undefined,
+    costSource: incoming.costUsd !== undefined || existing.costUsd !== undefined ? 'native' : undefined,
   };
 }
 
@@ -123,7 +139,11 @@ function mergeRoundPreferringCompaction(
   const merged: DelegationRound = { ...incoming };
 
   // Durable execution metadata: never lose it to an older copy.
-  merged.tokenUsage = preferTokenUsage(incomingExisting?.tokenUsage, incoming.tokenUsage);
+  merged.tokenUsage = preferTokenUsage(
+    incomingExisting?.tokenUsage,
+    incoming.tokenUsage,
+    `legacy-business-round-${incoming.round}`,
+  );
   if (merged.executorAgent === undefined && incomingExisting?.executorAgent !== undefined) {
     merged.executorAgent = incomingExisting.executorAgent;
   }
@@ -171,36 +191,63 @@ function mergeNativeCompactions(
 function mergeNativeCursors(
   prior: DelegationThread['nativeSessionCompaction'],
   incoming: DelegationThread['nativeSessionCompaction'],
+  boundSessions: { developer?: string; reviewer?: string },
 ): DelegationThread['nativeSessionCompaction'] {
-  if (!prior) return incoming;
-  if (!incoming) return prior;
-  const merged = { ...incoming };
+  const merged: NonNullable<DelegationThread['nativeSessionCompaction']> = {};
   for (const role of ['developer', 'reviewer'] as const) {
-    const oldCursor = prior[role];
-    const nextCursor = incoming[role];
-    if (!oldCursor) continue;
-    if (!nextCursor) {
-      merged[role] = oldCursor;
-    } else if (oldCursor.sessionId !== nextCursor.sessionId) {
-      // A changed session is an explicit retarget/rebind; stale snapshots must not restore the old session cursor.
-      merged[role] = nextCursor;
-    } else if (oldCursor.lastOperationId !== nextCursor.lastOperationId) {
-      // Only a cursor still pointing at the old operation can be considered stale.
-      if (!nextCursor.lastOperationId) merged[role] = oldCursor;
-    } else {
-      const sameRecovery = oldCursor.recoveryVersion === nextCursor.recoveryVersion;
-      merged[role] = {
-        ...nextCursor,
-        turnsSinceCompaction: Math.max(oldCursor.turnsSinceCompaction, nextCursor.turnsSinceCompaction),
-        recoveryVersion: nextCursor.recoveryVersion || oldCursor.recoveryVersion,
+    const oldCursor = prior?.[role];
+    const nextCursor = incoming?.[role];
+    const bound = boundSessions[role];
+    const oldValid = oldCursor && bound && oldCursor.sessionId === bound ? oldCursor : undefined;
+    const nextValid = nextCursor && bound && nextCursor.sessionId === bound ? nextCursor : undefined;
+    if (!oldValid) { if (nextValid) merged[role] = nextValid; continue; }
+    if (!nextValid) { merged[role] = oldValid; continue; }
+    if (oldValid.sessionId !== nextValid.sessionId) {
+      merged[role] = nextValid.revision && nextValid.revision > (oldValid.revision || 0) ? nextValid : oldValid;
+      continue;
+    }
+    const chosen = (nextValid.revision || 0) >= (oldValid.revision || 0) ? nextValid : oldValid;
+    const other = chosen === nextValid ? oldValid : nextValid;
+    const sameRecovery = chosen.recoveryVersion === other.recoveryVersion;
+    merged[role] = {
+        ...chosen,
+        recentBusinessTurnIds: Array.from(new Set([...(oldValid.recentBusinessTurnIds || []), ...(nextValid.recentBusinessTurnIds || [])])).slice(-64),
+        turnsSinceCompaction: Math.max(oldValid.turnsSinceCompaction, nextValid.turnsSinceCompaction),
+        recoveryVersion: chosen.recoveryVersion || other.recoveryVersion,
         recoveryDeliveredVersion: sameRecovery
-          ? (nextCursor.recoveryDeliveredVersion || oldCursor.recoveryDeliveredVersion)
-          : nextCursor.recoveryDeliveredVersion,
-        autoDisabledReason: oldCursor.autoDisabledReason || nextCursor.autoDisabledReason,
+          ? (oldValid.recoveryDeliveredVersion === chosen.recoveryVersion || nextValid.recoveryDeliveredVersion === chosen.recoveryVersion
+            ? chosen.recoveryVersion
+            : undefined)
+          : chosen.recoveryDeliveredVersion,
+        autoDisabledReason: chosen.autoDisabledReason || other.autoDisabledReason,
       };
+  }
+  return Object.keys(merged).length ? merged : undefined;
+}
+
+function bindingRank(thread: DelegationThread, role: 'developer' | 'reviewer'): [number, number, number] {
+  const retargets = role === 'developer' ? (thread.retargets || []).length : 0;
+  const captured = role === 'developer' ? thread.receiverSessionCaptured : thread.reviewerSessionCaptured;
+  return [retargets, captured ? 1 : 0, Date.parse(thread.updatedAt) || 0];
+}
+
+function preferBinding(current: DelegationThread, prior: DelegationThread): void {
+  for (const role of ['developer', 'reviewer'] as const) {
+    const a = bindingRank(current, role);
+    const b = bindingRank(prior, role);
+    const priorWins = b.some((value, index) => value !== a[index] && value > a[index] && b.slice(0, index).every((x, i) => x === a[i]));
+    if (!priorWins) continue;
+    if (role === 'developer') {
+      current.targetAgent = prior.targetAgent;
+      current.targetModel = prior.targetModel;
+      current.receiverSessionId = prior.receiverSessionId;
+      current.receiverSessionCaptured = prior.receiverSessionCaptured;
+      current.retargets = prior.retargets;
+    } else {
+      current.reviewerSessionId = prior.reviewerSessionId;
+      current.reviewerSessionCaptured = prior.reviewerSessionCaptured;
     }
   }
-  return merged;
 }
 
 /** Directory holding one JSON file per thread (the authoritative ledger). */
@@ -554,9 +601,15 @@ export class TaskStore extends EventEmitter {
     } catch {}
     const inMemory = this.tasks.get(thread.threadId);
     if ((onDisk || inMemory) && onDisk !== thread) {
+      const authority = [inMemory, onDisk].filter(Boolean) as DelegationThread[];
+      for (const prior of authority) preferBinding(thread, prior);
       thread.nativeSessionCompaction = mergeNativeCursors(
-        mergeNativeCursors(inMemory?.nativeSessionCompaction, onDisk?.nativeSessionCompaction),
+        mergeNativeCursors(inMemory?.nativeSessionCompaction, onDisk?.nativeSessionCompaction, {
+          developer: thread.receiverSessionId,
+          reviewer: thread.reviewerSessionId,
+        }),
         thread.nativeSessionCompaction,
+        { developer: thread.receiverSessionId, reviewer: thread.reviewerSessionId },
       );
       // Merge rounds from every known copy to prevent losing rounds added by
       // another process or by an earlier in-memory state. Duplicate round
@@ -844,6 +897,21 @@ export class TaskStore extends EventEmitter {
     this.ensureUpToDate();
     const thread = this.tasks.get(threadId);
     if (!thread || thread.archivedAt || !isTerminalThreadStatus(thread.status)) return undefined;
+    const nativeLock = new NativeSessionLock(this.storageDir);
+    const leases: NativeSessionLease[] = [];
+    const sessions = [
+      thread.receiverSessionCaptured ? [thread.targetAgent, thread.receiverSessionId] as const : undefined,
+      thread.reviewFlow === 'dedicated' && thread.reviewerSessionCaptured ? [thread.initiatorAgent, thread.reviewerSessionId] as const : undefined,
+    ].filter((entry): entry is readonly [DelegationThread['targetAgent'], string | undefined] => !!entry && !!entry[1]);
+    for (const [agent, sessionId] of sessions) {
+      const lease = nativeLock.acquire(agent, sessionId!);
+      if (!lease) {
+        for (const held of leases) nativeLock.release(held);
+        return undefined;
+      }
+      leases.push(lease);
+    }
+    try {
     // Read the session ids BEFORE they are stripped: archival is the "keep only
     // the summary" boundary, so the native conversations and bridge logs are
     // removed now. Best-effort: a missing conversation is not an error.
@@ -864,6 +932,9 @@ export class TaskStore extends EventEmitter {
     this.writeAggregate();
     this.emit('changed', Array.from(this.tasks.values()));
     return thread;
+    } finally {
+      for (const lease of leases) nativeLock.release(lease);
+    }
   }
 
   /**

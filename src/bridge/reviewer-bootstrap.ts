@@ -455,6 +455,7 @@ export class ReviewerBootstrapService {
         cwd: thread.workspacePath,
         taskThreadId: thread.threadId,
         taskRound: 0,
+        nativeSessionRole: 'reviewer',
         model: thread.reviewerModel,
         markAsReceiver: false,
         timeoutMs: this.deps.timeoutMs ?? 3 * 60 * 1000,

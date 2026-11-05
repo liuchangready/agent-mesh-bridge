@@ -27,6 +27,10 @@ import { detectRateLimitSignal } from './autonomous-runner';
 import { ReviewerLogWriter, createReviewerLogWriter } from './reviewer-log';
 import { cachedCodexResumeSupport, codexResumeArgument, extractCodexThreadId } from './codex-session';
 import { assertCanExecute } from './agent-capabilities';
+import { NativeSessionCompactor } from './native-session-compactor';
+import { NativeSessionLock } from './native-session-lock';
+import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
+import { CancellationRegistry } from './cancellation-registry';
 
 /**
  * How many times one task may wake its caller about failures.
@@ -202,6 +206,53 @@ export class CallbackManager extends EventEmitter {
       return false;
     }
 
+    let reviewerPreparation: Awaited<ReturnType<NativeSessionCompactor['prepareBeforeResume']>> | undefined;
+    const nativeLock = new NativeSessionLock(this.taskStore ? path.dirname(this.taskStore.getStoragePath()) : undefined);
+    if (thread.reviewFlow === 'dedicated' && this.taskStore) {
+      try {
+        const reviewerModel = thread.reviewerModel || resolveConfiguredModel(thread.initiatorAgent, undefined, 'initiator');
+        reviewerPreparation = await new NativeSessionCompactor(this.taskStore, this.detector)
+          .prepareBeforeResume(thread.threadId, 'reviewer', reviewerModel);
+      } catch (error: any) {
+        roleLock.release(roleLease);
+        this.wakeQueue.release(callerSessionId);
+        console.warn(`[CallbackManager] Reviewer prepare skipped launch for ${thread.threadId}: ${error?.message || error}`);
+        return false;
+      }
+    }
+    const executionRegistry = new TaskExecutionRegistry(this.taskStore ? path.dirname(this.taskStore.getStoragePath()) : undefined);
+    let executionRegistration: TaskExecutionRegistration | undefined;
+    try {
+      executionRegistration = executionRegistry.begin(thread.threadId, reviewRound.round, thread.initiatorAgent, thread.workspacePath);
+    } catch (error: any) {
+      if (reviewerPreparation?.lease) nativeLock.release(reviewerPreparation.lease);
+      roleLock.release(roleLease);
+      this.wakeQueue.release(callerSessionId);
+      executionRegistry.dispose();
+      console.warn(`[CallbackManager] Reviewer execution registration failed for ${thread.threadId}: ${error?.message || error}`);
+      return false;
+    }
+
+    if (reviewerPreparation?.lease && this.taskStore) {
+      this.taskStore.loadFromDisk();
+      const fresh = this.taskStore.getTask(thread.threadId);
+      const owner = roleLock.getOwner(thread.threadId);
+      const bindingMatches = fresh?.reviewerSessionId === callerSessionId && fresh.reviewerSessionCaptured &&
+        fresh.initiatorAgent === thread.initiatorAgent && fresh.reviewerModel === thread.reviewerModel &&
+        JSON.stringify(fresh.worktree) === JSON.stringify(thread.worktree);
+      if (!fresh || fresh.archivedAt || fresh.status !== 'waiting_review' || !bindingMatches ||
+          owner?.token !== roleLease.token || new CancellationRegistry(path.dirname(this.taskStore.getStoragePath())).peek(thread.threadId)) {
+        nativeLock.release(reviewerPreparation.lease);
+        roleLock.release(roleLease);
+        this.wakeQueue.release(callerSessionId);
+        if (executionRegistration) executionRegistry.end(executionRegistration);
+        executionRegistry.dispose();
+        console.warn(`[CallbackManager] Reviewer state changed during prepare for ${thread.threadId}; launch was cancelled.`);
+        return false;
+      }
+      thread = fresh;
+    }
+
     this.emit('taskCompleted', { thread, round: reviewRound });
 
     const preview = reviewRound.output
@@ -238,14 +289,32 @@ export class CallbackManager extends EventEmitter {
     const launched = this.launchCaller(
       thread,
       callerSessionId,
-      promptMessage,
+      reviewerPreparation?.recoveryPrefix
+        ? `<bridge_recovery_document version="${reviewerPreparation.recoveryVersion}">\n${reviewerPreparation.recoveryPrefix}\n</bridge_recovery_document>\n\n${promptMessage}`
+        : promptMessage,
       reviewRound,
       'review',
       release,
-      (childPid) => roleLock.attachChild(roleLease, childPid),
+      (childPid) => {
+        if (executionRegistration) executionRegistry.attachChildPid(childPid, executionRegistration);
+        roleLock.attachChild(roleLease, childPid);
+        if (reviewerPreparation?.lease) {
+          if (childPid) nativeLock.attachChild(reviewerPreparation.lease, childPid);
+          else nativeLock.release(reviewerPreparation.lease);
+        }
+        if (!childPid && executionRegistration) {
+          executionRegistry.end(executionRegistration);
+          executionRegistration = undefined;
+          executionRegistry.dispose();
+        }
+      },
+      reviewerPreparation?.recoveryVersion,
     );
     if (!launched) {
       release();
+      if (reviewerPreparation?.lease) nativeLock.release(reviewerPreparation.lease);
+      if (executionRegistration) executionRegistry.end(executionRegistration);
+      executionRegistry.dispose();
     }
     return launched;
   }
@@ -419,6 +488,7 @@ export class CallbackManager extends EventEmitter {
     wakeKind: 'review' | 'failure',
     release: () => void,
     onChildPid?: (pid: number | undefined) => void,
+    recoveryVersion?: string,
   ): boolean {
     assertCanExecute(thread.initiatorAgent, 'resume as a reviewer');
     const initiator = thread.initiatorAgent;
@@ -522,6 +592,20 @@ export class CallbackManager extends EventEmitter {
             ...outcome,
             output: capture.text(),
           }, wakeKind);
+          if (outcome.exitCode === 0 && wakeKind === 'review' && thread.reviewFlow === 'dedicated' && this.taskStore) {
+            this.taskStore.loadFromDisk();
+            const current = this.taskStore.getTask(thread.threadId);
+            if (current && current.status !== 'waiting_review' && current.status !== 'failed' && current.status !== 'review_failed') {
+              const cursor = current.nativeSessionCompaction?.reviewer;
+              new NativeSessionCompactor(this.taskStore, this.detector).recordBusinessSuccess(
+                thread.threadId,
+                'reviewer',
+                callerSessionId,
+                `review:${thread.threadId}:${round.round}:${Date.now()}`,
+                cursor?.sessionId === callerSessionId && recoveryVersion ? recoveryVersion : undefined,
+              );
+            }
+          }
           if (state) {
             console.warn(
               `[CallbackManager] Wake for ${thread.threadId} failed: ${state.lastError}` +
@@ -536,6 +620,7 @@ export class CallbackManager extends EventEmitter {
 
       child.stdout?.on('data', (chunk: Buffer) => tee(chunk));
       child.stderr?.on('data', (chunk: Buffer) => tee(chunk));
+      child.once('close', () => onChildPid?.(undefined));
 
       child.on('error', (err) => {
         console.error(`[CallbackManager] Failed to launch ${initiator} callback:`, err);

@@ -22,6 +22,7 @@ import { TaskStore } from '../bridge/task-store';
 import { AgentDetector } from '../bridge/agent-detector';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
+import { NativeSessionLock } from '../bridge/native-session-lock';
 import { DelegationThread, isReviewerBootstrapPending } from '../bridge/types';
 import { saveBridgePolicy } from '../bridge/bridge-policy';
 
@@ -177,10 +178,14 @@ test('pending dedicated task is bootstrapped by a fresh reviewer session', async
     dir,
   );
 
-  const runner = new AutonomousRunner(new AgentDetector(), 5_000);
+  const runner = new AutonomousRunner(new AgentDetector(), 5_000, undefined, store);
   const calls: any[] = [];
-  runner.execute = async (options: any) => {
+  const reviewerSessionId = '9f11aa6d-9b53-43b3-b4d5-20472922c912';
+  (runner as any).executeOnce = async (options: any) => {
     calls.push(options);
+    options.onNativeSessionId?.(reviewerSessionId);
+    assert.equal(store.getTask(thread.threadId)?.reviewerSessionCaptured, true, 'capture is durably bound before the runner continues');
+    assert.equal(new NativeSessionLock(dir).acquire('codex', reviewerSessionId), undefined, 'the captured live session is already leased');
     // Simulate the reviewer's dispatch_task call confirming the token.
     const fresh = store.getTask(thread.threadId)!;
     fresh.reviewBootstrap = { phase: 'confirmed', attempts: 1 };
@@ -191,7 +196,8 @@ test('pending dedicated task is bootstrapped by a fresh reviewer session', async
       stderr: '',
       extractedOutput: 'dispatched',
       durationMs: 10,
-      actualSessionId: 'reviewer-session-9',
+      assessment: { success: true },
+      actualSessionId: reviewerSessionId,
     };
   };
 
@@ -201,21 +207,26 @@ test('pending dedicated task is bootstrapped by a fresh reviewer session', async
   });
   await service.tick();
   service.stop();
+  for (let i = 0; i < 100 && settled === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
 
   assert.strictEqual(calls.length, 1);
   const options = calls[0];
   assert.strictEqual(options.agent, 'codex');
   assert.strictEqual(options.model, 'gpt-6-pro');
+  assert.strictEqual(options.nativeSessionRole, 'reviewer');
   assert.strictEqual(options.markAsReceiver, false);
   assert.strictEqual(options.extraEnv.MESH_REVIEW_BOOTSTRAP_TOKEN, 'token-1');
   assert.strictEqual(options.extraEnv.MESH_REVIEW_THREAD_ID, thread.threadId);
 
   const stored = store.getTask(thread.threadId)!;
   assert.strictEqual(stored.reviewBootstrap?.phase, 'confirmed');
-  assert.strictEqual(stored.callerSessionId, 'reviewer-session-9');
-  assert.strictEqual(stored.reviewerSessionId, 'reviewer-session-9');
+  assert.strictEqual(stored.callerSessionId, reviewerSessionId);
+  assert.strictEqual(stored.reviewerSessionId, reviewerSessionId);
   assert.strictEqual(stored.reviewerSessionCaptured, true);
   assert.strictEqual(stored.status, 'queued');
+  const after = new NativeSessionLock(dir).acquire('codex', reviewerSessionId);
+  assert.ok(after, 'the business handoff releases bootstrap ownership only after the runner process exits');
+  new NativeSessionLock(dir).release(after!);
   assert.strictEqual(readReviewerBootstrapToken(thread.threadId, dir), undefined);
   assert.strictEqual(settled, 1);
 

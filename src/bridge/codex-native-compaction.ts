@@ -35,6 +35,14 @@ export class CodexNativeCompaction {
     }
     if (!request.cwd || !request.model) throw new Error('Codex compaction requires the existing worktree and resolved model.');
     const timeoutMs = request.timeoutMs ?? 120_000;
+    const guard = new HostSuspensionGuard();
+    guard.start();
+    const startedAt = monotonicNowMs();
+    const remainingMs = () => {
+      guard.sync();
+      const now = monotonicNowMs();
+      return timeoutMs - (now - startedAt - guard.suspendedWithin(startedAt, now));
+    };
     const child = childProcess.spawn(request.executable, ['app-server', '--listen', 'stdio://', '-c', 'mcp_servers={}', '-c', 'hooks={}'], {
       cwd: request.cwd,
       windowsHide: true,
@@ -42,11 +50,15 @@ export class CodexNativeCompaction {
       env: { ...process.env },
     });
     if (!child.stdin || !child.stdout) throw new Error('Codex app-server stdio is unavailable.');
-    request.onChildPid?.(child.pid);
-    const guard = new HostSuspensionGuard();
-    guard.start();
+    let activeChildPid = child.pid;
+    let compactSettled = false;
+    const reportPid = (pid: number | undefined) => { activeChildPid = pid; request.onChildPid?.(pid); };
+    const reportMainExit = () => { if (compactSettled && activeChildPid === child.pid) reportPid(undefined); };
+    child.once('exit', reportMainExit);
+    reportPid(child.pid);
     let nextId = 0;
     const notifications: RpcMessage[] = [];
+    let protocolError: Error | undefined;
     const waiters = new Map<string, { resolve: (message: RpcMessage) => void; reject: (error: Error) => void }>();
     const lineReader = readline.createInterface({ input: child.stdout });
     const rejectServerRequests = (message: RpcMessage): void => {
@@ -55,6 +67,11 @@ export class CodexNativeCompaction {
       child.kill();
     };
     lineReader.on('line', (line) => {
+      if (Buffer.byteLength(line, 'utf8') > 1 << 20) {
+        protocolError = new Error('Codex app-server emitted a line larger than 1 MiB.');
+        try { child.kill(); } catch {}
+        return;
+      }
       let message: RpcMessage;
       try { message = JSON.parse(line); } catch { return; }
       if (message.id !== undefined && waiters.has(String(message.id))) {
@@ -62,19 +79,28 @@ export class CodexNativeCompaction {
         waiters.delete(String(message.id));
         waiter.resolve(message);
       } else if (message.method && message.id === undefined) {
-        notifications.push(message);
+        if (message.params?.threadId === threadId && ['item/completed', 'turn/completed', 'thread/tokenUsage/updated'].includes(message.method)) {
+          notifications.push(message);
+          if (notifications.length > 2048) notifications.shift();
+        }
       } else {
         rejectServerRequests(message);
       }
     });
-    child.on('error', (error) => { for (const waiter of waiters.values()) waiter.reject(error); waiters.clear(); });
+    child.stderr?.on('data', () => {});
+    child.on('error', (error) => { protocolError = error; for (const waiter of waiters.values()) waiter.reject(error); waiters.clear(); });
+    child.on('exit', (code) => {
+      const error = protocolError || new Error(`Codex app-server exited before completing the request (code ${code ?? -1}).`);
+      for (const waiter of waiters.values()) waiter.reject(error);
+      waiters.clear();
+    });
     const rpc = async (method: string, params: unknown): Promise<RpcMessage> => {
       if (request.cancelled?.()) throw new Error('Native compaction cancelled.');
       const id = ++nextId;
-      const started = monotonicNowMs();
       child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
-      while (monotonicNowMs() - started - guard.suspendedWithin(started, monotonicNowMs()) < timeoutMs) {
+      while (remainingMs() > 0) {
         if (request.cancelled?.()) throw new Error('Native compaction cancelled.');
+        if (protocolError) throw protocolError;
         const response = await new Promise<RpcMessage | undefined>((resolve, reject) => {
           const timer = setTimeout(() => resolve(undefined), 100);
           waiters.set(String(id), { resolve: (message) => { clearTimeout(timer); resolve(message); }, reject });
@@ -83,27 +109,34 @@ export class CodexNativeCompaction {
         if (response.error) throw new Error(response.error.message || `${method} failed (${response.error.code ?? 'unknown'}).`);
         return response;
       }
-      throw new Error(`${method} timed out after ${timeoutMs} active milliseconds.`);
+      throw new Error(`${method} exceeded the ${timeoutMs} ms total active maintenance budget.`);
     };
     const waitForTurn = async (from: number): Promise<any> => {
-      const started = monotonicNowMs();
-      while (monotonicNowMs() - started - guard.suspendedWithin(started, monotonicNowMs()) < timeoutMs) {
+      while (remainingMs() > 0) {
         if (request.cancelled?.()) throw new Error('Native compaction cancelled.');
+        if (protocolError) throw protocolError;
         const completed = notifications.slice(from).find((message) => message.method === 'turn/completed' && message.params?.threadId === threadId);
         if (completed) return completed.params.turn;
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
-      throw new Error('Codex did not complete the native compaction turn.');
+      throw new Error('Codex did not complete the compaction turn within the total active maintenance budget.');
     };
     const close = async (): Promise<number> => {
       lineReader.close();
       if (child.exitCode !== null) return child.exitCode ?? -1;
       child.stdin?.end();
-      const exited = await new Promise<number>((resolve) => {
-        const timer = setTimeout(() => { child.kill(); resolve(-1); }, 5_000);
-        child.once('exit', (code) => { clearTimeout(timer); resolve(code ?? -1); });
-      });
-      return exited;
+      let killedAt: number | undefined;
+      const closeDeadline = monotonicNowMs() + Math.max(0, Math.min(remainingMs(), 5_000));
+      while (child.exitCode === null) {
+        guard.sync();
+        const now = monotonicNowMs();
+        if (request.cancelled?.() || remainingMs() <= 0 || monotonicNowMs() >= closeDeadline) {
+          if (killedAt === undefined) { killedAt = now - guard.suspendedWithin(startedAt, now); try { child.kill(); } catch {} }
+        }
+        if (killedAt !== undefined && now - guard.suspendedWithin(startedAt, now) - killedAt >= 5_000) throw new Error('Could not confirm Codex app-server process exit after termination.');
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return child.exitCode ?? -1;
     };
 
     try {
@@ -134,28 +167,53 @@ export class CodexNativeCompaction {
       const usage = usageEvent ? codexCompactionUsage(usageEvent.params.tokenUsage.last, request) : undefined;
       const exitCode = await close();
       if (exitCode !== 0) throw new Error(`Codex app-server exited ${exitCode} after reporting compaction completion.`);
-      await this.verifyPersisted(request, turn.id, thread.modelProvider);
+      await this.verifyPersisted({ ...request, onChildPid: reportPid }, turn.id, thread.modelProvider, remainingMs, guard);
+      if (activeChildPid === child.pid) reportPid(undefined);
       return { threadId, nativeTurnId: turn.id, model: thread.model, provider: thread.modelProvider, processExitCode: exitCode, usage };
     } catch (error) {
       try { child.kill(); } catch {}
-      try { await close(); } catch {}
-      request.onChildPid?.(undefined);
+      try {
+        await close();
+        request.onChildPid?.(undefined);
+      } catch (closeError: any) {
+        throw new Error(`${String((error as any)?.message || error)}; ${closeError?.message || closeError}`);
+      }
       throw error;
     } finally {
+      compactSettled = true;
+      reportMainExit();
       guard.stop();
     }
   }
 
-  private async verifyPersisted(request: CodexCompactionRequest, turnId: string, provider: string): Promise<void> {
+  private async verifyPersisted(
+    request: CodexCompactionRequest,
+    turnId: string,
+    provider: string,
+    remainingMs: () => number,
+    guard: HostSuspensionGuard,
+  ): Promise<void> {
+    const verifierStartedAt = monotonicNowMs();
+    const verifierActiveNow = () => {
+      guard.sync();
+      const now = monotonicNowMs();
+      return now - guard.suspendedWithin(verifierStartedAt, now);
+    };
     const child = childProcess.spawn(request.executable, ['app-server', '--listen', 'stdio://', '-c', 'mcp_servers={}', '-c', 'hooks={}'], {
       cwd: request.cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env },
     });
     if (!child.stdin || !child.stdout) throw new Error('Codex persistence verifier stdio is unavailable.');
+    let verifierSettled = false;
+    const reportVerifierExit = () => { if (verifierSettled) request.onChildPid?.(undefined); };
+    child.once('exit', reportVerifierExit);
     request.onChildPid?.(child.pid);
     const reader = readline.createInterface({ input: child.stdout });
     const waiters = new Map<string, { resolve: (value: RpcMessage) => void; reject: (error: Error) => void }>();
     let id = 0;
+    let processError: Error | undefined;
+    let exited = false;
     reader.on('line', (line) => {
+      if (Buffer.byteLength(line, 'utf8') > 1 << 20) { processError = new Error('Codex persistence verifier line exceeded 1 MiB.'); try { child.kill(); } catch {}; return; }
       let message: RpcMessage;
       try { message = JSON.parse(line); } catch { return; }
       if (message.id !== undefined) {
@@ -163,12 +221,43 @@ export class CodexNativeCompaction {
         if (waiter) { waiters.delete(String(message.id)); waiter.resolve(message); }
       }
     });
-    const rpc = (method: string, params: unknown): Promise<RpcMessage> => new Promise((resolve, reject) => {
-      const requestId = ++id;
-      const timer = setTimeout(() => { waiters.delete(String(requestId)); reject(new Error(`Codex persistence check timed out at ${method}.`)); }, 30_000);
-      waiters.set(String(requestId), { resolve: (message) => { clearTimeout(timer); resolve(message); }, reject });
-      child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', id: requestId, method, params })}\n`);
+    child.on('error', (error) => { processError = error; for (const waiter of waiters.values()) waiter.reject(error); waiters.clear(); });
+    child.on('exit', (code) => {
+      const error = processError || new Error(`Codex persistence verifier exited before completion (code ${code ?? -1}).`);
+      for (const waiter of waiters.values()) waiter.reject(error);
+      waiters.clear();
     });
+    const rpc = async (method: string, params: unknown): Promise<RpcMessage> => {
+      const requestId = ++id;
+      waiters.set(String(requestId), { resolve: () => {}, reject: () => {} });
+      child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', id: requestId, method, params })}\n`);
+      while (remainingMs() > 0) {
+        if (request.cancelled?.()) throw new Error('Codex persistence check cancelled.');
+        if (processError) throw processError;
+        const response = await new Promise<RpcMessage | undefined>((resolve, reject) => {
+          const timer = setTimeout(() => resolve(undefined), 100);
+          waiters.set(String(requestId), { resolve: (message) => { clearTimeout(timer); resolve(message); }, reject });
+        });
+        if (response) return response;
+      }
+      throw new Error(`Codex persistence check exceeded the total active maintenance budget at ${method}.`);
+    };
+    const close = async () => {
+      reader.close();
+      if (child.exitCode !== null) { exited = true; return; }
+      child.stdin?.end();
+      let killedAt: number | undefined;
+      const closeDeadline = verifierActiveNow() + Math.max(0, Math.min(remainingMs(), 5_000));
+      while (child.exitCode === null) {
+        const activeNow = verifierActiveNow();
+        if (request.cancelled?.() || remainingMs() <= 0 || activeNow >= closeDeadline) {
+          if (killedAt === undefined) { killedAt = activeNow; try { child.kill(); } catch {} }
+        }
+        if (killedAt !== undefined && activeNow - killedAt >= 5_000) throw new Error('Could not confirm Codex persistence verifier process exit.');
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      exited = true;
+    };
     try {
       await rpc('initialize', { clientInfo: { name: 'agent-mesh-bridge', title: 'Agent Mesh Bridge', version: '1.0.0' }, capabilities: null });
       child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} })}\n`);
@@ -185,22 +274,15 @@ export class CodexNativeCompaction {
           thread?.model !== request.model || thread?.modelProvider !== provider || !persisted) {
         throw new Error('Codex did not reload the same model, provider, worktree, and completed compaction item.');
       }
-      reader.close();
-      child.stdin.end();
-      const exitCode = await new Promise<number>((resolve) => {
-        const timer = setTimeout(() => { child.kill(); resolve(-1); }, 5_000);
-        child.once('exit', (code) => { clearTimeout(timer); resolve(code ?? -1); });
-      });
-      if (exitCode !== 0) throw new Error(`Codex persistence verifier exited ${exitCode}.`);
+      await close();
+      if (child.exitCode !== 0) throw new Error(`Codex persistence verifier exited ${child.exitCode ?? -1}.`);
     } catch (error) {
       try { child.kill(); } catch {}
-      await new Promise<void>((resolve) => {
-        if (child.exitCode !== null) return resolve();
-        child.once('exit', () => resolve());
-      });
+      if (!exited) await close();
       throw error;
     } finally {
-      request.onChildPid?.(undefined);
+      verifierSettled = true;
+      if (exited || child.exitCode !== null) request.onChildPid?.(undefined);
     }
   }
 }

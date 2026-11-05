@@ -52,14 +52,34 @@ export class NativeSessionLock {
     } catch (error: any) {
       if (error?.code !== 'EEXIST') throw error;
     }
-    let current: NativeSessionOwner | undefined;
-    try { current = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as NativeSessionOwner; } catch {}
-    if (!current || pidAlive(current.pid) || pidAlive(current.childPid)) return undefined;
-    try { fs.unlinkSync(lockPath); } catch { return undefined; }
+    const gatePath = `${lockPath}.reaper`;
+    const gate = { token: crypto.randomUUID(), pid: process.pid };
     try {
-      fs.writeFileSync(lockPath, JSON.stringify(owner), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-      return { token: owner.token, path: lockPath, owner };
-    } catch { return undefined; }
+      fs.writeFileSync(gatePath, JSON.stringify(gate), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    } catch (error: any) {
+      if (error?.code !== 'EEXIST') throw error;
+      let currentGate: { token?: string; pid?: number } | undefined;
+      try { currentGate = JSON.parse(fs.readFileSync(gatePath, 'utf8')); } catch {}
+      if (!currentGate || pidAlive(currentGate.pid)) return undefined;
+      try { fs.unlinkSync(gatePath); } catch { return undefined; }
+      try { fs.writeFileSync(gatePath, JSON.stringify(gate), { encoding: 'utf8', flag: 'wx', mode: 0o600 }); }
+      catch { return undefined; }
+    }
+    try {
+      let current: NativeSessionOwner | undefined;
+      try { current = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as NativeSessionOwner; } catch {}
+      if (current && (pidAlive(current.pid) || pidAlive(current.childPid))) return undefined;
+      try { fs.unlinkSync(lockPath); } catch (error: any) { if (error?.code !== 'ENOENT') return undefined; }
+      try {
+        fs.writeFileSync(lockPath, JSON.stringify(owner), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+        return { token: owner.token, path: lockPath, owner };
+      } catch { return undefined; }
+    } finally {
+      try {
+        const currentGate = JSON.parse(fs.readFileSync(gatePath, 'utf8'));
+        if (currentGate.token === gate.token) fs.unlinkSync(gatePath);
+      } catch {}
+    }
   }
 
   attachChild(lease: NativeSessionLease, childPid?: number): void {
@@ -74,7 +94,7 @@ export class NativeSessionLock {
   release(lease: NativeSessionLease): void {
     try {
       const current = JSON.parse(fs.readFileSync(lease.path, 'utf8')) as NativeSessionOwner;
-      if (current.token === lease.token) fs.unlinkSync(lease.path);
+      if (current.token === lease.token && !pidAlive(current.childPid)) fs.unlinkSync(lease.path);
     } catch {}
   }
 }

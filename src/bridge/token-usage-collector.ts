@@ -587,10 +587,6 @@ export function aggregateThreadTokenUsage(rounds: DelegationRound[]): ThreadToke
     if (usage.source !== 'native_reported' || usage.partial) {
       summary.isPartialOrEstimated = true;
     }
-    if (!usage.components?.length && usage.costUsd !== undefined) {
-      summary.totalCostUsd = (summary.totalCostUsd ?? 0) + usage.costUsd;
-      summary.costSource = 'native';
-    }
   }
 
   if (summary.totalCostUsd !== undefined) {

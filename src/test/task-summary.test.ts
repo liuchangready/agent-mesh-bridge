@@ -14,6 +14,7 @@ import {
 import { TaskStore } from '../bridge/task-store';
 import { TaskArchiveService } from '../bridge/task-archive';
 import { DelegationThread } from '../bridge/types';
+import { NativeSessionLock } from '../bridge/native-session-lock';
 
 function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread {
   return {
@@ -223,6 +224,22 @@ test('TaskStore.archiveTask strips rounds, logs and persists the digest', () => 
   assert.deepStrictEqual(reloaded.getTask(thread.threadId)?.rounds, []);
   store.dispose();
   reloaded.dispose();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('TaskStore does not archive while a native session write lease is active', () => {
+  const dir = makeTempDir('bridge-archive-active-native-');
+  const store = new TaskStore(dir);
+  const sessionId = '01a1acc2-877d-71e3-9bf1-5e668c1f2183';
+  const thread = makeThread({ status: 'completed', receiverSessionId: sessionId, receiverSessionCaptured: true });
+  store.upsertTask(thread);
+  const lock = new NativeSessionLock(dir);
+  const lease = lock.acquire(thread.targetAgent, sessionId)!;
+  assert.equal(store.archiveTask(thread.threadId), undefined);
+  assert.equal(store.getTask(thread.threadId)?.archivedAt, undefined);
+  lock.release(lease);
+  assert.ok(store.archiveTask(thread.threadId)?.archivedAt);
+  store.dispose();
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
