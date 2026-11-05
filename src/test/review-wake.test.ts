@@ -178,7 +178,7 @@ describe('CallbackManager records stalled reviewer wakes', () => {
     store.dispose();
   });
 
-  test('a clean exit clears the stall record', () => {
+  test('a clean exit without a ledger verdict is a retryable no-decision', () => {
     const { store, manager } = setup();
     const thread = makeThread();
     store.upsertTask(thread);
@@ -193,11 +193,116 @@ describe('CallbackManager records stalled reviewer wakes', () => {
       store.getTask(thread.threadId)!,
       thread.rounds[0],
       'caller-session-1',
-      { exitCode: 0, output: 'review complete: approved' },
+      { exitCode: 0, output: 'review complete: approved, no permission needed' },
     );
 
-    assert.strictEqual(cleared, undefined);
-    assert.strictEqual(store.getTask(thread.threadId)!.reviewWake, undefined);
+    assert.ok(cleared);
+    assert.match(cleared!.lastError, /REVIEW_NO_DECISION/);
+    assert.strictEqual(cleared!.attempts, 2);
+    assert.strictEqual(store.getTask(thread.threadId)!.status, 'waiting_review');
+    assert.strictEqual(store.getTask(thread.threadId)!.reviewWake!.attempts, 2);
+    store.dispose();
+  });
+
+  test('clears the round wake only after a recorded approval, rework, or park', () => {
+    const { store, manager } = setup();
+    const wake = {
+      round: 1,
+      attempts: 2,
+      lastAttemptAt: new Date().toISOString(),
+      lastError: 'prior timeout',
+      autoRetryAttempts: 1,
+    };
+
+    const approvedThread = makeThread({ threadId: 'thread_wake_approved', reviewWake: wake });
+    store.upsertTask(approvedThread);
+    const approved = store.getTask(approvedThread.threadId)!;
+    approved.status = 'completed';
+    store.upsertTask(approved);
+    manager.finalizeWake(approvedThread, approvedThread.rounds[0], 'caller-session-1', {
+      exitCode: 1,
+      output: 'late error',
+    });
+    assert.strictEqual(store.getTask(approvedThread.threadId)!.status, 'completed');
+    assert.strictEqual(store.getTask(approvedThread.threadId)!.reviewWake, undefined);
+
+    const reworkThread = makeThread({ threadId: 'thread_wake_rework', reviewWake: wake });
+    reworkThread.status = 'waiting_review';
+    reworkThread.currentRound = 2;
+    reworkThread.rounds.push({ ...reworkThread.rounds[0], round: 2, type: 'rework' });
+    reworkThread.reviewWake = {
+      round: 2,
+      attempts: 1,
+      lastAttemptAt: new Date().toISOString(),
+      lastError: 'new round failure',
+      autoRetryAttempts: 0,
+    };
+    store.upsertTask(reworkThread);
+    manager.finalizeWake(reworkThread, reworkThread.rounds[0], 'caller-session-1', {
+      exitCode: 0,
+      output: 'approved',
+    });
+    assert.strictEqual(store.getTask(reworkThread.threadId)!.reviewWake!.round, 2, 'late callback keeps the new round plan');
+
+    const parkedThread = makeThread({ threadId: 'thread_wake_park' });
+    parkedThread.reviewBlocked = {
+      waitingForThreadId: 'thread_wake_park_dependency',
+      reason: 'waiting for dependency',
+      at: new Date().toISOString(),
+      by: 'caller',
+    };
+    const dependency = makeThread({ threadId: 'thread_wake_park_dependency', status: 'running' });
+    dependency.rounds[0].status = 'running';
+    store.upsertTask(dependency);
+    store.upsertTask(parkedThread);
+    assert.strictEqual(
+      manager.finalizeWake(parkedThread, parkedThread.rounds[0], 'caller-session-1', {
+        exitCode: 0,
+        output: 'parked',
+      }),
+      undefined,
+    );
+    const parked = store.getTask(parkedThread.threadId)!;
+    assert.strictEqual(parked.currentRound, 1, 'parking does not create a round');
+    assert.strictEqual(parked.reviewBlocked?.waitingForThreadId, dependency.threadId);
+    assert.strictEqual(parked.reviewWake, undefined);
+    store.dispose();
+  });
+
+  test('does not rewrite paused, archived, deleted, or failure-notification tasks', () => {
+    const { store, manager } = setup();
+    const thread = makeThread();
+    thread.reviewWake = {
+      round: 1,
+      attempts: 3,
+      lastAttemptAt: new Date().toISOString(),
+      lastError: 'keep this record',
+      autoRetryAttempts: 2,
+    };
+    store.upsertTask(thread);
+
+    const paused = store.getTask(thread.threadId)!;
+    paused.status = 'paused';
+    store.upsertTask(paused);
+    manager.finalizeWake(thread, thread.rounds[0], 'caller-session-1', { exitCode: 0 }, 'review');
+    assert.strictEqual(store.getTask(thread.threadId)!.status, 'paused');
+    assert.strictEqual(store.getTask(thread.threadId)!.reviewWake!.lastError, 'keep this record');
+
+    const archived = store.getTask(thread.threadId)!;
+    archived.status = 'completed';
+    archived.archivedAt = new Date().toISOString();
+    store.upsertTask(archived);
+    manager.finalizeWake(thread, thread.rounds[0], 'caller-session-1', { exitCode: 1 }, 'review');
+    assert.strictEqual(store.getTask(thread.threadId)!.status, 'completed');
+
+    store.deleteTask(thread.threadId);
+    assert.strictEqual(manager.finalizeWake(thread, thread.rounds[0], 'caller-session-1', { exitCode: 1 }), undefined);
+    assert.strictEqual(store.getTask(thread.threadId), undefined);
+
+    const failed = makeThread({ threadId: 'thread_review_wake_failure_notice', status: 'failed', reviewWake: thread.reviewWake });
+    store.upsertTask(failed);
+    manager.finalizeWake(failed, failed.rounds[0], 'caller-session-1', { exitCode: 0 }, 'failure');
+    assert.strictEqual(store.getTask(failed.threadId)!.reviewWake!.lastError, 'keep this record');
     store.dispose();
   });
 });
@@ -284,6 +389,109 @@ describe('ReviewWakeScheduler', () => {
     assert.ok(Date.parse(stored.reviewWake!.autoRetryAt!) > nowMs);
     scheduler.dispose();
     store.dispose();
+  });
+
+  test('keeps the fifth launch in flight and exhausts only after its recorded outcome', async () => {
+    const run = async (verdict: 'none' | 'approve') => {
+      const nowMs = Date.parse('2026-10-23T12:00:00.000Z');
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-review-fifth-'));
+      const tracker = new RateLimitTracker(dir);
+      const store = new TaskStore(dir);
+      const manager = new CallbackManager(new AgentDetector(undefined, tracker), dir);
+      manager.setTaskStore(store);
+      let now = nowMs;
+      let active = false;
+      let calls = 0;
+      let finishWake: (() => void) | undefined;
+      (manager as any).launchCaller = (...args: any[]) => {
+        calls++;
+        active = true;
+        finishWake = args[5];
+        if (calls === REVIEW_WAKE_MAX_AUTO_RETRIES && verdict === 'approve') {
+          const approved = store.getTask('thread_review_wake_sched')!;
+          approved.status = 'completed';
+          store.upsertTask(approved);
+          finishWake?.();
+          active = false;
+        }
+        return true;
+      };
+      const scheduler = new ReviewWakeScheduler(store, manager, {
+        now: () => now,
+        isReviewerActive: () => active,
+        stallTimeoutMs: 1,
+      });
+      const thread = makeThread({ autoRetryAt: new Date(now - 1_000).toISOString() });
+      thread.callerSessionId = '11111111-1111-4111-8111-111111111111';
+      thread.updatedAt = new Date(now - 60 * 60_000).toISOString();
+      thread.rounds[0].timestamp = thread.updatedAt;
+      store.upsertTask(thread);
+
+      for (let attempt = 1; attempt <= REVIEW_WAKE_MAX_AUTO_RETRIES; attempt++) {
+        if (attempt > 1) {
+          const due = store.getTask(thread.threadId)!;
+          due.reviewWake!.autoRetryAt = new Date(now - 1_000).toISOString();
+          store.upsertTask(due);
+        }
+        assert.strictEqual(await scheduler.runDue(), 1);
+        const launched = store.getTask(thread.threadId)!;
+        assert.strictEqual(launched.status, verdict === 'approve' && attempt === 5 ? 'completed' : 'waiting_review');
+        assert.strictEqual(launched.reviewWake!.autoRetryAttempts, attempt);
+        if (attempt < 5) {
+          finishWake?.();
+          finishWake = undefined;
+          active = false;
+          manager.finalizeWake(launched, launched.rounds[0], 'caller-session-1', {
+            exitCode: 1,
+            output: `retry ${attempt} failed`,
+          });
+        }
+        now += 1_000;
+      }
+
+      const fifth = store.getTask(thread.threadId)!;
+      assert.strictEqual(calls, 5);
+      assert.strictEqual(fifth.reviewWake!.gaveUp, false, 'the fifth retry is still in flight');
+      assert.strictEqual(await scheduler.runWatchdog(), 0, 'an active final reviewer must not be failed early');
+      assert.strictEqual(await scheduler.runDue(), 0, 'there is no sixth automatic launch');
+
+      if (verdict === 'none') {
+        finishWake?.();
+        finishWake = undefined;
+        active = false;
+        const result = manager.finalizeWake(fifth, fifth.rounds[0], 'caller-session-1', {
+          exitCode: 0,
+          output: 'approved',
+        });
+        assert.ok(result);
+        assert.match(result!.lastError, /REVIEW_NO_DECISION/);
+        const failed = store.getTask(thread.threadId)!;
+        assert.strictEqual(failed.status, 'review_failed');
+        assert.strictEqual(failed.reviewWake!.autoRetryAttempts, 5);
+        assert.strictEqual(failed.reviewWake!.gaveUp, true);
+        assert.strictEqual(await scheduler.runDue(), 0);
+        assert.strictEqual(calls, 5);
+      } else {
+        const approved = store.getTask(thread.threadId)!;
+        assert.strictEqual(approved.status, 'completed');
+        manager.finalizeWake(fifth, fifth.rounds[0], 'caller-session-1', {
+          exitCode: 0,
+          output: 'approved',
+        });
+        assert.strictEqual(store.getTask(thread.threadId)!.reviewWake, undefined);
+        manager.finalizeWake(fifth, fifth.rounds[0], 'caller-session-1', {
+          exitCode: 1,
+          output: 'late failure',
+        });
+        assert.strictEqual(store.getTask(thread.threadId)!.status, 'completed');
+        assert.strictEqual(store.getTask(thread.threadId)!.reviewFailure, undefined);
+      }
+      scheduler.dispose();
+      store.dispose();
+    };
+
+    await run('none');
+    await run('approve');
   });
 
   test('retries against the newest completed work round, never an approval round', async () => {

@@ -494,7 +494,7 @@ export interface ReviewWakeState {
   kind?: 'wake_failed' | 'timeout';
   /** Round the reviewer still has to inspect. */
   round: number;
-  /** Failed wake attempts since the last successful one. */
+  /** Failed wake attempts since the last recorded review handoff. */
   attempts: number;
   lastAttemptAt: string;
   /** First line of the caller's output, or the spawn error. */
@@ -673,8 +673,8 @@ export interface DelegationThread {
   /**
    * Why the last reviewer wake-up failed, and when the bridge will retry.
    *
-   * Cleared as soon as a wake ends cleanly (or the task leaves
-   * `waiting_review`), so its presence means "the review is stalled".
+   * Cleared only after a same-round verdict/handoff is recorded or a review is
+   * explicitly reopened for new work; a clean process exit alone is not a verdict.
    */
   reviewWake?: ReviewWakeState;
 

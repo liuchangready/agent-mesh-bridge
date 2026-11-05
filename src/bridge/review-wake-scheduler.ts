@@ -254,6 +254,7 @@ export class ReviewWakeScheduler extends EventEmitter {
     for (const thread of tasks) {
       try {
         if (thread.status !== 'waiting_review') continue;
+        if (this.isReviewerActive(thread.threadId)) continue;
         const state = thread.reviewWake;
         if (state) {
           // A record from an older round is stale, not "review in progress".
@@ -261,6 +262,9 @@ export class ReviewWakeScheduler extends EventEmitter {
             this.clear(thread);
             continue;
           }
+          // The retry budget is only exhausted once its last launched reviewer
+          // has exited. A successful tool handoff updates the task directly;
+          // otherwise the callback or this watchdog records the final failure.
           // Heal ledgers written before `review_failed` existed: a wake plan that
           // already gave up means no reviewer is coming. Rows used to stay
           // `waiting_review` forever in that shape (the old watchdog skipped any
@@ -286,6 +290,12 @@ export class ReviewWakeScheduler extends EventEmitter {
                 );
               }
             }
+          } else if ((state.autoRetryAttempts || 0) >= REVIEW_WAKE_MAX_AUTO_RETRIES) {
+            this.persist(thread, { ...state, gaveUp: true, autoRetryAt: undefined }, {
+              kind: 'retries_exhausted',
+              reason:
+                `Review produced no verdict after ${state.attempts} failed attempts: ${state.lastError || 'unknown reason'}`,
+            });
           }
           continue;
         }
@@ -309,7 +319,6 @@ export class ReviewWakeScheduler extends EventEmitter {
           !!dependencyId && !this.taskStore.getTask(dependencyId);
         const unresolvablePark = parkedWithoutDependency || parkedOnDeletedDependency;
         if (thread.reviewBlocked && !unresolvablePark) continue;
-        if (this.isReviewerActive(thread.threadId)) continue;
         if (this.reviewAgeMs(thread, now) < this.stallTimeoutMs) continue;
 
         const minutes = Math.max(1, Math.round(this.stallTimeoutMs / 60_000));
