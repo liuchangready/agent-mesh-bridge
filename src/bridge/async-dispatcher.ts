@@ -39,6 +39,7 @@ import { readStoredRoundUsage } from './token-usage-collector';
 import { concurrencyPolicy } from './bridge-policy';
 import {
   ModelApprovalHandler,
+  resolveDispatchGroupModelRef,
   resolveDispatchModel,
 } from './model-approval';
 import { assertCanExecute } from './agent-capabilities';
@@ -110,8 +111,12 @@ export class AsyncDispatcher {
     let targetAgent: AgentId;
 
     if (!params.targetAgent || params.targetAgent === 'default') {
-      const resolved = await this.resolver.resolveActiveAgent();
-      targetAgent = resolved.agent;
+      const configuredGroupReceiver = loadGroupAgentConfig()?.defaultAgent;
+      if (configuredGroupReceiver) targetAgent = configuredGroupReceiver as AgentId;
+      else {
+        const resolved = await this.resolver.resolveActiveAgent();
+        targetAgent = resolved.agent;
+      }
     } else {
       targetAgent = params.targetAgent;
     }
@@ -195,17 +200,23 @@ export class AsyncDispatcher {
     let modelResolution: Awaited<ReturnType<typeof resolveDispatchModel>>;
     if (isGroupAgentId(targetAgent)) {
       const entry = loadGroupAgentConfig()?.agents.find((item) => item.id === targetAgent);
-      targetModelRef = entry?.receiverModel;
-      if (params.modelRef && JSON.stringify(params.modelRef) !== JSON.stringify(targetModelRef))
-        throw new Error('A non-default Group Agent model requires the user model-approval flow.');
-      if (params.model || !targetModelRef) {
-        throw new Error('Group Agent tasks require its configured exact receiver model; model switching needs a structured user approval flow.');
-      }
-      if (targetModelRef.source === 'vscode-lm' && entry?.source !== 'vscode-lm')
+      if (!entry?.receiverModel || !entry.enabled || !entry.toolsAuthorized) throw new Error('The Group Agent has no enabled receiver model binding.');
+      if (params.model) throw new Error('Group Agent model selection requires a structured modelRef; CLI model strings remain supported for CLI agents.');
+      if (params.modelRef && !entry.models?.some((member) => member.source === params.modelRef!.source && member.id === params.modelRef!.id &&
+          (member.source === 'vscode-lm' ? params.modelRef!.source === 'vscode-lm' && member.vendor === params.modelRef!.vendor : params.modelRef!.source === 'openai-compatible' && member.origin === params.modelRef!.origin && params.modelRef!.bindingRevision === member.bindingRevision)))
+        throw new Error('The selected structured Group Agent modelRef is not a current member of this group binding.');
+      if (entry.receiverModel.source === 'vscode-lm' && entry.source !== 'vscode-lm')
         throw new Error('The selected model source does not match this Group Agent.');
-      if (targetModelRef.source === 'openai-compatible' && (entry?.source !== 'openai-compatible' || targetModelRef.origin !== entry.baseUrl && targetModelRef.origin !== (entry.baseUrl ? new URL(entry.baseUrl).origin : '')))
+      if (entry.receiverModel.source === 'openai-compatible' && (entry.source !== 'openai-compatible' || entry.receiverModel.origin !== entry.baseUrl && entry.receiverModel.origin !== (entry.baseUrl ? new URL(entry.baseUrl).origin : '')))
         throw new Error('The selected endpoint model does not match this Group Agent origin.');
-      modelResolution = { model: targetModelRef.id, notice: undefined, approval: undefined } as any;
+      const groupResolution = await resolveDispatchGroupModelRef({
+        targetAgent, requestedModelRef: params.modelRef, defaultModelRef: entry.receiverModel,
+        requestedByUser: params.modelRequestedByUser === true, initiatorAgent, title: params.title,
+        handler: this.modelApprovalHandler,
+      });
+      targetModelRef = groupResolution.modelRef;
+      modelResolution = { model: targetModelRef?.id, notice: groupResolution.notice, approval: groupResolution.approval };
+      if (!targetModelRef) throw new Error('The user selected the Group Agent default, but that binding is no longer configured.');
     } else {
       modelResolution = await resolveDispatchModel({
         targetAgent, requestedModel: params.model,

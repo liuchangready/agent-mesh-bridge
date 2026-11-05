@@ -21,6 +21,7 @@ import {
   removeTaskArtifacts,
 } from './task-summary';
 import { cleanupThreadNativeSessions } from './native-session-cleanup';
+import { cleanupGroupAgentTaskArtifacts } from './group-agent-mailbox';
 
 export const MAX_STORED_TASKS = 1000;
 
@@ -746,6 +747,9 @@ export class TaskStore extends EventEmitter {
     // removed now. Best-effort: a missing conversation is not an error.
     try {
       cleanupThreadNativeSessions(thread);
+    } catch {}
+    try {
+      cleanupGroupAgentTaskArtifacts(thread, this.storageDir);
     } catch {}
     try {
       archiveCompletedTaskLogs(thread, this.storageDir);

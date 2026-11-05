@@ -30,7 +30,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import { AgentId, ModelApprovalRecord, ModelApprovalStatus } from './types';
+import { AgentId, GroupModelRef, ModelApprovalRecord, ModelApprovalStatus } from './types';
 import {
   getBridgeHome,
   loadModelApprovalRequired,
@@ -47,12 +47,78 @@ export interface ModelApprovalRequest {
   requestedModel: string;
   /** The agent's configured default, i.e. what runs unless this is approved. */
   defaultModel?: string;
+  requestedModelRef?: GroupModelRef;
+  defaultModelRef?: GroupModelRef;
   initiatorAgent?: AgentId;
   /** Task title / prompt snippet, so the dialog says what this switch is for. */
   title?: string;
   at: string;
   /** After this instant the request is stale and must not be shown anymore. */
   expiresAt: string;
+}
+
+function describeModelRef(ref: GroupModelRef): string {
+  return ref.source === 'vscode-lm' ? `${ref.vendor}/${ref.id}` : `openai-compatible:${ref.id} (${ref.origin})`;
+}
+
+function modelRefKey(ref: GroupModelRef): string {
+  return ref.source === 'vscode-lm'
+    ? JSON.stringify([ref.source, ref.vendor, ref.id])
+    : JSON.stringify([ref.source, ref.id, ref.origin, ref.bindingRevision]);
+}
+
+export async function resolveDispatchGroupModelRef(options: {
+  targetAgent: AgentId;
+  requestedModelRef?: GroupModelRef;
+  defaultModelRef?: GroupModelRef;
+  requestedByUser?: boolean;
+  initiatorAgent?: AgentId;
+  title?: string;
+  dir?: string;
+  requireApproval?: boolean;
+  timeoutMs?: number;
+  pollMs?: number;
+  handler?: ModelApprovalHandler;
+  requestId?: string;
+  now?: () => Date;
+}): Promise<{ modelRef?: GroupModelRef; notice?: string; approval?: ModelApprovalRecord }> {
+  const requested = options.requestedModelRef;
+  const configured = options.defaultModelRef;
+  if (!requested || (configured && modelRefKey(requested) === modelRefKey(configured))) return { modelRef: configured };
+  const requestedModel = describeModelRef(requested);
+  const defaultModel = configured ? describeModelRef(configured) : undefined;
+  if (options.requestedByUser !== true) return { modelRef: configured, notice: `Requested model ${requestedModel} was ignored because it is not the configured default; using ${defaultModel || '(no configured model)'}.` };
+  if (options.requireApproval === false || (options.requireApproval === undefined && !loadModelApprovalRequired(options.dir ?? getBridgeHome()))) return { modelRef: requested };
+  const dir = options.dir ?? getBridgeHome();
+  const now = options.now ?? (() => new Date());
+  const id = options.requestId ?? newModelApprovalId();
+  const timeoutMs = options.timeoutMs ?? defaultTimeoutMs();
+  const at = now();
+  const request: ModelApprovalRequest = {
+    id, targetAgent: options.targetAgent, requestedModel, defaultModel, requestedModelRef: requested, defaultModelRef: configured,
+    initiatorAgent: options.initiatorAgent, title: options.title, at: at.toISOString(), expiresAt: new Date(at.getTime() + timeoutMs).toISOString(),
+  };
+  const decision = options.handler ? await options.handler(request) : await requestModelApproval(request, { dir, timeoutMs, pollMs: options.pollMs });
+  const record: ModelApprovalRecord = {
+    id, status: decision.status, requestedModel, defaultModel, requestedModelRef: requested, ...(configured ? { defaultModelRef: configured } : {}),
+    at: decision.at || new Date().toISOString(),
+  };
+  switch (decision.status) {
+    case 'approved':
+      appendModelApprovalLog({ event: 'outcome', ...record }, dir);
+      return { modelRef: requested, approval: record };
+    case 'use_default':
+      appendModelApprovalLog({ event: 'outcome', ...record }, dir);
+      return { modelRef: configured, approval: record, notice: `The user kept the configured Group Agent model (${defaultModel || 'unset'}).` };
+    case 'cancelled':
+      appendModelApprovalLog({ event: 'outcome', ...record }, dir);
+      throw new ModelApprovalError(MODEL_APPROVAL_DENIED_CODE, `The user declined the Group Agent model switch (${defaultModel || 'unset'} -> ${requestedModel}).`);
+    case 'timeout':
+    default:
+      appendModelApprovalLog({ event: 'outcome', ...record }, dir);
+      if (decision.channelError) return { modelRef: configured, approval: record, notice: `The model switch could not be confirmed; using the configured Group Agent model (${defaultModel || 'unset'}).` };
+      throw new ModelApprovalError(MODEL_APPROVAL_TIMEOUT_CODE, `The Group Agent model switch was not confirmed within ${Math.round(timeoutMs / 1000)}s.`);
+  }
 }
 
 export interface ModelApprovalDecision {

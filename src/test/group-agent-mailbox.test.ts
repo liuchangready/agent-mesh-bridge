@@ -4,14 +4,14 @@ import * as childProcess from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { claimGroupAgentRuns, GroupAgentMailboxClient, publishGroupAgentResult } from '../bridge/group-agent-mailbox';
+import { claimGroupAgentRuns, cleanupGroupAgentTaskArtifacts, groupAgentRunState, GroupAgentMailboxClient, hasGroupAgentCancel, publishGroupAgentFailure, publishGroupAgentPid, publishGroupAgentRun, publishGroupAgentResult } from '../bridge/group-agent-mailbox';
 import { saveGroupAgentConfig, writeGroupAgentHost } from '../bridge/group-agent-registry';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { CancellationRegistry } from '../bridge/cancellation-registry';
 import { TaskRoleLock } from '../bridge/task-role-lock';
 import { TaskStore } from '../bridge/task-store';
 import { DelegationThread, GroupAgentBindingSnapshot } from '../bridge/types';
-import { GroupAgentRuntime } from '../copilot/group-agent-runtime';
+import { GroupAgentRuntime, GroupAgentRuntimeError } from '../copilot/group-agent-runtime';
 
 test('independent runner process exchanges one pinned Group run through the durable mailbox', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-mailbox-process-'));
@@ -46,7 +46,17 @@ test('independent runner process exchanges one pinned Group run through the dura
     assert.equal(claimed[0].threadId, request.threadId);
     assert.equal(claimed[0].round, request.round);
     assert.deepEqual(claimed[0].modelRef, modelRef);
+    fs.writeFileSync(path.join(root, 'group-agent-mailbox', 'requests', `${claimed[0].runId}.json`), JSON.stringify(claimed[0]));
+    assert.deepEqual(claimGroupAgentRuns(host, root), [], 'a redelivered claimed run must not be accepted twice');
+    assert.equal(groupAgentRunState(claimed[0].runId, root), 'running');
     publishGroupAgentResult(claimed[0].runId, host.generation, { text: 'same task resumed', toolCallsCompleted: 2, modelRequests: 3 });
+    assert.equal(publishGroupAgentRun({ ...request, runId: claimed[0].runId }, host, root), claimed[0].runId);
+    assert.deepEqual(claimGroupAgentRuns(host, root), [], 'terminal runs must not be replayed after a broker restart');
+    assert.equal(groupAgentRunState(claimed[0].runId, root), 'terminal');
+    const restart = childProcess.spawnSync(process.execPath, ['-e', `const m=require(${JSON.stringify(path.resolve(__dirname, '../bridge/group-agent-mailbox.js'))}); const r=require(${JSON.stringify(path.resolve(__dirname, '../bridge/group-agent-registry.js'))}); const h=r.loadGroupAgentHost(); process.stdout.write(JSON.stringify({claimed:m.claimGroupAgentRuns(h),state:m.groupAgentRunState(${JSON.stringify(claimed[0].runId)})}));`],
+      { cwd: process.cwd(), env: { ...process.env, AGENT_MESH_BRIDGE_HOME: root }, encoding: 'utf8', windowsHide: true });
+    assert.equal(restart.status, 0, restart.stderr);
+    assert.deepEqual(JSON.parse(restart.stdout), { claimed: [], state: 'terminal' });
     const exitCode = await new Promise<number | null>((resolve, reject) => {
       child.once('error', reject);
       child.once('exit', resolve);
@@ -57,6 +67,37 @@ test('independent runner process exchanges one pinned Group run through the dura
     if (child.exitCode === null) child.kill();
     if (oldHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME;
     else process.env.AGENT_MESH_BRIDGE_HOME = oldHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('two broker processes racing for one request produce one durable run claim', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-mailbox-claim-race-'));
+  const oldHome = process.env.AGENT_MESH_BRIDGE_HOME;
+  process.env.AGENT_MESH_BRIDGE_HOME = root;
+  const host = { version: 1 as const, hostInstanceId: 'host-claim-race', generation: 5, pid: process.pid,
+    workspaceUri: 'file:///workspace', repositoryCommonDir: root, trusted: true as const, localDesktop: true as const, updatedAt: Date.now() };
+  const agent = 'copilot_group:11111111-2222-4333-8444-55555555555e' as const;
+  const modelRef = { source: 'vscode-lm' as const, vendor: 'vendor-race', id: 'model-race' };
+  writeGroupAgentHost(host, root);
+  try {
+    const runId = publishGroupAgentRun({ threadId: 'thread_claim_race', round: 1, role: 'developer', agent,
+      sessionId: 'session-claim-race', worktree: root, prompt: 'race', modelRef,
+      bindingSnapshot: { agentId: agent, revision: 1, source: 'vscode-lm', modelRef }, isRework: false, timeoutMs: 5000 }, host, root);
+    const script = `const m=require(${JSON.stringify(path.resolve(__dirname, '../bridge/group-agent-mailbox.js'))}); const r=require(${JSON.stringify(path.resolve(__dirname, '../bridge/group-agent-registry.js'))}); process.stdout.write(JSON.stringify(m.claimGroupAgentRuns(r.loadGroupAgentHost()).map(x=>x.runId)));`;
+    const launch = () => childProcess.spawn(process.execPath, ['-e', script], { cwd: process.cwd(), env: { ...process.env, AGENT_MESH_BRIDGE_HOME: root }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const children = [launch(), launch()];
+    const results = await Promise.all(children.map((child) => new Promise<string>((resolve, reject) => {
+      let stdout = ''; let stderr = '';
+      child.stdout.setEncoding('utf8').on('data', (chunk) => stdout += chunk);
+      child.stderr.setEncoding('utf8').on('data', (chunk) => stderr += chunk);
+      child.once('error', reject);
+      child.once('exit', (code) => code === 0 ? resolve(stdout) : reject(new Error(stderr)));
+    })));
+    assert.deepEqual(results.map((result) => JSON.parse(result)).flat(), [runId]);
+    assert.equal(groupAgentRunState(runId, root), 'running');
+  } finally {
+    if (oldHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME; else process.env.AGENT_MESH_BRIDGE_HOME = oldHome;
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
@@ -82,9 +123,122 @@ test('mailbox client rejects a structurally inconsistent native usage result', a
       if (!claimed.length) await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.equal(claimed.length, 1);
-    publishGroupAgentResult(claimed[0].runId, host.generation, { text: 'done', toolCallsCompleted: 0,
-      tokenUsage: { uncachedInputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, promptTokens: 1, outputTokens: 2, totalTokens: 3, agent, available: true, partial: false, source: 'native_reported' } as any });
+    fs.writeFileSync(path.join(root, 'group-agent-mailbox', 'responses', `${claimed[0].runId}.json`), JSON.stringify({ version: 1,
+      runId: claimed[0].runId, hostGeneration: host.generation, sequence: 1, completedAt: Date.now(), result: { text: 'done', toolCallsCompleted: 0,
+        tokenUsage: { uncachedInputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, promptTokens: 1, outputTokens: 2, totalTokens: 3, agent, available: true, partial: false, source: 'native_reported' } } }));
     await assert.rejects(execution, /no valid result/);
+  } finally {
+    if (oldHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME; else process.env.AGENT_MESH_BRIDGE_HOME = oldHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an aborted unclaimed mailbox run is atomically cancelled and settles without a broker', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-mailbox-no-broker-'));
+  const oldHome = process.env.AGENT_MESH_BRIDGE_HOME;
+  process.env.AGENT_MESH_BRIDGE_HOME = root;
+  const host = { version: 1 as const, hostInstanceId: 'host-no-broker', generation: 3, pid: process.pid,
+    workspaceUri: 'file:///workspace', repositoryCommonDir: root, trusted: true as const, localDesktop: true as const, updatedAt: Date.now() };
+  const agent = 'copilot_group:11111111-2222-4333-8444-55555555555b' as const;
+  const modelRef = { source: 'vscode-lm' as const, vendor: 'vendor-a', id: 'model-a' };
+  const request = { threadId: 'thread_mailbox_no_broker', round: 1, role: 'developer' as const, agent,
+    sessionId: 'session-no-broker', worktree: root, prompt: 'run', modelRef,
+    bindingSnapshot: { agentId: agent, revision: 1, source: 'vscode-lm' as const, modelRef }, isRework: false, timeoutMs: 5000 };
+  writeGroupAgentHost(host, root);
+  const aborter = new AbortController();
+  try {
+    const execution = new GroupAgentMailboxClient(root).execute(request, host, aborter.signal);
+    aborter.abort(new Error('Task paused.'));
+    await assert.rejects(execution, /Task paused/);
+    assert.equal(groupAgentRunState(fs.readdirSync(path.join(root, 'group-agent-mailbox', 'states'))[0], root), 'terminal');
+    assert.deepEqual(fs.readdirSync(path.join(root, 'group-agent-mailbox', 'requests')), []);
+    assert.equal(fs.readdirSync(path.join(root, 'group-agent-mailbox', 'cancelled')).length, 1);
+  } finally {
+    if (oldHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME; else process.env.AGENT_MESH_BRIDGE_HOME = oldHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('claimed mailbox cancellation waits for child shutdown and forwards failure usage across host generations', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-mailbox-running-cancel-'));
+  const oldHome = process.env.AGENT_MESH_BRIDGE_HOME;
+  process.env.AGENT_MESH_BRIDGE_HOME = root;
+  const host = { version: 1 as const, hostInstanceId: 'host-running-old', generation: 12, pid: process.pid,
+    workspaceUri: 'file:///workspace', repositoryCommonDir: root, trusted: true as const, localDesktop: true as const, updatedAt: Date.now() };
+  const agent = 'copilot_group:11111111-2222-4333-8444-55555555555c' as const;
+  const modelRef = { source: 'vscode-lm' as const, vendor: 'vendor-a', id: 'model-a' };
+  const request = { runId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', threadId: 'thread_mailbox_running_cancel', round: 1,
+    role: 'developer' as const, agent, sessionId: 'session-running-cancel', worktree: root, prompt: 'run', modelRef,
+    bindingSnapshot: { agentId: agent, revision: 1, source: 'vscode-lm' as const, modelRef }, isRework: false, timeoutMs: 5000 };
+  writeGroupAgentHost(host, root);
+  const aborter = new AbortController();
+  let child: childProcess.ChildProcess | undefined;
+  try {
+    const execution = new GroupAgentMailboxClient(root).execute(request, host, aborter.signal);
+    const deadline = Date.now() + 2000;
+    let claimed: ReturnType<typeof claimGroupAgentRuns> = [];
+    while (!claimed.length && Date.now() < deadline) {
+      claimed = claimGroupAgentRuns(host, root);
+      if (!claimed.length) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(claimed.length, 1);
+    child = childProcess.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
+    await new Promise<void>((resolve, reject) => { child!.once('spawn', resolve); child!.once('error', reject); });
+    publishGroupAgentPid(request.runId, 1, child.pid, root);
+    writeGroupAgentHost({ ...host, hostInstanceId: 'host-running-new', generation: 13, updatedAt: Date.now() }, root);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(hasGroupAgentCancel(request.runId, root), true);
+    const settled = execution.then(() => true, () => true);
+    assert.equal(await Promise.race([settled, new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 50))]), false,
+      'generation change must not settle while the old child is still running');
+    child.kill();
+    await new Promise<void>((resolve) => child!.once('exit', () => resolve()));
+    publishGroupAgentFailure(request.runId, host.generation, {
+      message: 'host executor stopped after cancellation', modelRequests: 2,
+      tokenUsage: { uncachedInputTokens: 4, cacheReadTokens: 1, cacheWriteTokens: 0, promptTokens: 5, outputTokens: 2, totalTokens: 7,
+        agent, model: modelRef.id, source: 'native_reported', available: true, partial: true, attempts: 2, collectedAt: new Date().toISOString() },
+      interruption: { kind: 'paused', reason: 'Host generation changed.', at: new Date().toISOString(), by: 'test-host' },
+      sessionId: request.sessionId,
+    }, root);
+    await assert.rejects(execution, (error: any) => error.modelRequests === 2 && error.tokenUsage?.totalTokens === 7 && error.interruption?.kind === 'paused');
+    assert.equal(groupAgentRunState(request.runId, root), 'terminal');
+  } finally {
+    if (child && child.exitCode === null) child.kill();
+    if (oldHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME; else process.env.AGENT_MESH_BRIDGE_HOME = oldHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('task artifact cleanup removes only Bridge-owned Group sessions and terminal mailbox records', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-mailbox-cleanup-'));
+  const oldHome = process.env.AGENT_MESH_BRIDGE_HOME;
+  process.env.AGENT_MESH_BRIDGE_HOME = root;
+  const uuid = '11111111-2222-4333-8444-55555555555d';
+  const agent = `copilot_group:${uuid}` as const;
+  const modelRef = { source: 'vscode-lm' as const, vendor: 'vendor-cleanup', id: 'model-cleanup' };
+  const host = { version: 1 as const, hostInstanceId: 'host-cleanup', generation: 2, pid: process.pid,
+    workspaceUri: 'file:///workspace', repositoryCommonDir: root, trusted: true as const, localDesktop: true as const, updatedAt: Date.now() };
+  const thread = { threadId: 'thread_group_cleanup', title: 'cleanup', initiatorAgent: agent, targetAgent: agent,
+    reviewFlow: 'dedicated' as const, status: 'completed' as const, currentRound: 1, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    requesterSessionId: 'native-requester-session', receiverSessionId: 'group-developer-session', callerSessionId: 'group-reviewer-session',
+    reviewerSessionId: 'group-reviewer-session', workspacePath: root, rounds: [], summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 } } as unknown as DelegationThread;
+  const bridgeSessions = path.join(root, 'group-agent-sessions');
+  fs.mkdirSync(bridgeSessions);
+  for (const id of ['group-developer-session', 'group-reviewer-session', 'native-requester-session'])
+    fs.writeFileSync(path.join(bridgeSessions, `${id}.jsonl`), 'owned history');
+  writeGroupAgentHost(host, root);
+  const request = { threadId: thread.threadId, round: 1, role: 'developer' as const, agent,
+    sessionId: thread.receiverSessionId, worktree: root, prompt: 'work', modelRef,
+    bindingSnapshot: { agentId: agent, revision: 1, source: 'vscode-lm' as const, modelRef }, isRework: false, timeoutMs: 5000 };
+  try {
+    const runId = publishGroupAgentRun(request, host, root);
+    assert.equal(claimGroupAgentRuns(host, root).length, 1);
+    publishGroupAgentResult(runId, host.generation, { text: 'finished', toolCallsCompleted: 0, modelRequests: 1 });
+    cleanupGroupAgentTaskArtifacts(thread, root);
+    assert.equal(fs.existsSync(path.join(bridgeSessions, 'group-developer-session.jsonl')), false);
+    assert.equal(fs.existsSync(path.join(bridgeSessions, 'group-reviewer-session.jsonl')), false);
+    assert.equal(fs.existsSync(path.join(bridgeSessions, 'native-requester-session.jsonl')), true);
+    assert.equal(groupAgentRunState(runId, root), undefined);
   } finally {
     if (oldHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME; else process.env.AGENT_MESH_BRIDGE_HOME = oldHome;
     fs.rmSync(root, { recursive: true, force: true });
@@ -198,7 +352,11 @@ test('host broker validates the real task lease and runs structured tools in its
   let broker: { start(intervalMs?: number): void; dispose(): void } | undefined;
   try {
     const { GroupAgentHostBroker } = require('../copilot/group-agent-host-broker');
+    let failAfterUsage = false;
     const runtime = new GroupAgentRuntime({ bridgeHome: root, request: async (_messages, tools) => {
+      if (failAfterUsage) return { text: '', finishReason: 'tool_calls', toolCalls: [
+        { id: 'fail-after-usage', name: 'read_file', arguments: { path: 'missing-after-usage.txt' } },
+      ], usage: { uncachedInputTokens: 4, cacheReadTokens: 0, cacheWriteTokens: 0, promptTokens: 4, outputTokens: 1, totalTokens: 5 } };
       if (tools.length && !fs.existsSync(path.join(root, 'from-agent.txt'))) return {
         text: '', finishReason: 'tool_calls', toolCalls: [
           { id: 'write-file', name: 'write_file', arguments: { path: 'from-agent.txt', content: 'written by bridge runtime\n' } },
@@ -219,6 +377,15 @@ test('host broker validates the real task lease and runs structured tools in its
           const usage = result.usage;
           return { ...result, ...(usage ? { tokenUsage: { ...usage, agent, model: modelRef.id, source: 'native_reported' as const, available: true, partial: false, attempts: result.modelRequests, collectedAt: new Date().toISOString() } } : {}) };
         }
+        catch (error) {
+          if (error instanceof GroupAgentRuntimeError) throw Object.assign(new Error(error.message), {
+            modelRequests: error.modelRequests,
+            tokenUsage: { ...(error.usage || { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, promptTokens: 0, outputTokens: 0, totalTokens: 0 }),
+              agent, model: modelRef.id, source: error.usage ? 'native_reported' as const : 'unavailable' as const,
+              available: Boolean(error.usage), partial: true, attempts: error.modelRequests, collectedAt: new Date().toISOString() },
+          });
+          throw error;
+        }
         finally { sub.dispose(); }
       },
     };
@@ -229,9 +396,25 @@ test('host broker validates the real task lease and runs structured tools in its
       cwd: root, taskThreadId: threadId, taskRound: 1, modelRef, role: 'developer', timeoutMs: 3000 });
     assert.equal(result.assessment?.success, true);
     assert.equal(result.tokenUsage?.promptTokens, 8);
+    if (result.assessment?.transport !== 'bridge-agent') throw new Error('Expected a Bridge Agent assessment.');
+    const successfulRunId = result.assessment.runId;
+    assert.ok(successfulRunId);
+    assert.equal(groupAgentRunState(successfulRunId!, root), 'terminal');
     assert.equal(fs.readFileSync(path.join(root, 'from-agent.txt'), 'utf8'), 'written by bridge runtime\n');
     assert.equal(fs.readFileSync(path.join(root, 'command-test.txt'), 'utf8'), 'passed');
     assert.equal(childProcess.execFileSync('git', ['status', '--short'], { cwd: root, encoding: 'utf8' }).includes('from-agent.txt'), true);
+
+    failAfterUsage = true;
+    const failed = await runner.execute({ agent, prompt: 'resume and diagnose the missing file', isRework: true, receiverSessionId: thread.receiverSessionId,
+      cwd: root, taskThreadId: threadId, taskRound: 1, modelRef, role: 'developer', timeoutMs: 3000, previousTokenUsage: result.tokenUsage });
+    assert.equal(failed.assessment?.success, false);
+    if (failed.assessment?.transport !== 'bridge-agent') throw new Error('Expected a Bridge Agent failure assessment.');
+    assert.equal(failed.tokenUsage?.totalTokens, 17, 'the resumed round keeps prior usage and adds the failed mailbox attempt');
+    const failedRequest = JSON.parse(fs.readFileSync(path.join(root, 'group-agent-mailbox', 'claimed', `${failed.assessment.runId}.json`), 'utf8'));
+    assert.equal(failedRequest.runId, failed.assessment.runId, 'round assessment uses the mailbox request runId');
+    const failureRecord = JSON.parse(fs.readFileSync(path.join(root, 'group-agent-mailbox', 'responses', `${failed.assessment.runId}.json`), 'utf8'));
+    assert.equal(failureRecord.failure.tokenUsage.totalTokens, 5);
+    assert.equal(failureRecord.failure.sessionId, thread.receiverSessionId);
   } finally {
     broker?.dispose();
     Module._load = originalLoad;
@@ -399,8 +582,8 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
       `const {CallbackManager}=require(${JSON.stringify(path.resolve(__dirname, '../bridge/callback-manager.js'))});` +
       `const {AsyncDispatcher}=require(${JSON.stringify(path.resolve(__dirname, '../bridge/async-dispatcher.js'))});` +
       `const d=new AgentDetector(),s=new TaskStore(${JSON.stringify(storage)}),r=new ActiveAgentResolver(d);` +
-      `r.setManualOverride(${JSON.stringify(agent)});const run=new AutonomousRunner(d,60000,undefined,s),c=new CallbackManager(d);` +
-      `const x=new AsyncDispatcher(s,r,run,c,d);x.dispatchTask({targetAgent:'default',title:'Group full cycle',prompt:'Create and validate result.txt',workspacePath:${JSON.stringify(repo)}})` +
+      `const run=new AutonomousRunner(d,60000,undefined,s),c=new CallbackManager(d);` +
+      `const x=new AsyncDispatcher(s,r,run,c,d);x.dispatchTask({initiatorAgent:'codex',targetAgent:'default',title:'Group full cycle',prompt:'Create and validate result.txt',workspacePath:${JSON.stringify(repo)}})` +
       `.then(v=>process.stdout.write(JSON.stringify(v))).catch(e=>{process.stderr.write(e.stack||e);process.exitCode=1}).finally(()=>s.dispose());`;
     const child = childProcess.spawn(process.execPath, ['-e', script], { cwd: process.cwd(), env: { ...process.env,
       AGENT_MESH_BRIDGE_HOME: root, HOME: root, USERPROFILE: root }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
@@ -412,7 +595,9 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
     const dispatch = JSON.parse(out);
     hostThreadId = dispatch.threadId;
     assert.equal(dispatch.targetAgent, agent);
+    assert.equal(dispatch.modelRouting?.initiatorAgent, agent, 'the configured Group reviewer is distinct from the CLI requester');
     assert.equal(store.getTask(hostThreadId)?.initiatorAgent, agent, 'default reviewer must be the Group Agent');
+    assert.equal(store.getTask(hostThreadId)?.requesterAgent, 'codex');
     const deadline = Date.now() + 15_000;
     while (Date.now() < deadline && store.getTask(hostThreadId)?.status !== 'completed')
       await new Promise((resolve) => setTimeout(resolve, 50));

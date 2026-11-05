@@ -810,6 +810,7 @@ export class AutonomousRunner {
           : await (async () => {
               if (!options.taskThreadId || !options.cwd) throw new Error('Group Agent mailbox requests require a task id and task worktree.');
               return new GroupAgentMailboxClient().execute({
+              runId,
               threadId: options.taskThreadId || '', round: options.taskRound ?? thread?.currentRound ?? 1,
               role: options.role || 'developer', agent: groupAgentId, sessionId: options.receiverSessionId,
               worktree: options.cwd || '', prompt: options.prompt, modelRef, bindingSnapshot: snapshot,
@@ -854,7 +855,8 @@ export class AutonomousRunner {
       } catch (error) {
         if (options.taskThreadId) cancellation = this.consumeCancellation(options.taskThreadId) || cancellation;
         const ended = new Date().toISOString();
-        const interrupted: TaskInterruption | undefined = timedOut
+        const executorInterruption = (error as { interruption?: TaskInterruption } | null)?.interruption;
+        const interrupted: TaskInterruption | undefined = executorInterruption || (timedOut
           ? { kind: 'timeout', reason: 'Group Agent task timed out.', at: ended, by: 'runner' }
           : /Group Agent host (?:is offline|generation changed)/i.test(error instanceof Error ? error.message : String(error))
             ? { kind: 'paused', reason: error instanceof Error ? error.message : String(error), at: ended, by: 'group-agent-host' }
@@ -862,7 +864,7 @@ export class AutonomousRunner {
             ? { kind: cancellation.action === 'pause' ? 'paused' : cancellation.action === 'delete' ? 'deleted' : 'stopped', reason: cancellation.reason, at: cancellation.at, by: cancellation.by }
             : aborter.signal.aborted
               ? { kind: 'stopped', reason: error instanceof Error ? error.message : String(error), at: ended, by: 'runner' }
-              : undefined;
+              : undefined);
         const failedUsage = (error as { tokenUsage?: TokenUsageMetrics; modelRequests?: number } | null)?.tokenUsage;
         const tokenUsage = failedUsage
           ? accumulateTokenUsage(options.previousTokenUsage, failedUsage)
@@ -881,7 +883,7 @@ export class AutonomousRunner {
             stream: { chunkCount: 0, stdoutBytes: 0, stderrBytes: 0, maxGapMs: 0, gapThresholdMs: DEFAULT_SILENCE_TIMEOUT_MS, hasActualOutput: false, continuous: false },
             exitCode: -1,
             runId, sessionId: options.receiverSessionId, finalEvent: false,
-            toolCallsCompleted: 0, startedAt, completedAt: ended,
+            toolCallsCompleted: (error as { toolCallsCompleted?: number } | null)?.toolCallsCompleted || 0, startedAt, completedAt: ended,
             reason: interrupted?.reason || (error instanceof Error ? error.message : String(error)),
           },
         };

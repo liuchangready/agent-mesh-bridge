@@ -209,6 +209,7 @@ export class CopilotModelService implements vscode.Disposable {
       const saved = settings[group.id] || {};
       const receiverModel = saved.receiverModel;
       const initiatorModel = saved.initiatorModel;
+      const revision = Number.isInteger(saved.revision) ? saved.revision : 0;
       const host = loadGroupAgentHost();
       const ready = (role: 'receiver' | 'initiator', ref: unknown) => {
         if (role === 'initiator' && !this.groupAgentControl) return false;
@@ -220,7 +221,10 @@ export class CopilotModelService implements vscode.Disposable {
         source: group.source, ...(group.source === 'openai-compatible' ? { baseUrl: group.baseUrl } : {}),
         enabled: saved.enabled === true, toolsAuthorized: saved.toolsAuthorized === true,
         receiverReady: ready('receiver', receiverModel), initiatorReady: ready('initiator', initiatorModel),
-        revision: Number.isInteger(saved.revision) ? saved.revision : 0,
+        revision,
+        models: group.source === 'vscode-lm'
+          ? group.models.map((model) => ({ source: 'vscode-lm' as const, vendor: model.vendor, id: model.id }))
+          : group.models.map((model) => ({ source: 'openai-compatible' as const, id: model.id, origin: new URL(group.baseUrl).origin, bindingRevision: revision })),
         ...(receiverModel ? { receiverModel } : {}),
         ...(initiatorModel ? { initiatorModel } : {}),
       };

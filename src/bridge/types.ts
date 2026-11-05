@@ -829,6 +829,8 @@ export interface ModelApprovalRecord {
   requestedModel: string;
   /** The agent's configured default (what runs unless approved). */
   defaultModel?: string;
+  requestedModelRef?: GroupModelRef;
+  defaultModelRef?: GroupModelRef;
   at: string;
 }
 

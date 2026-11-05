@@ -8,8 +8,8 @@ import { TaskRoleLock } from '../bridge/task-role-lock';
 import { DelegationThread, isValidSessionId } from '../bridge/types';
 import { TaskStore } from '../bridge/task-store';
 import {
-  GroupAgentMailboxRequest, claimGroupAgentRuns, hasGroupAgentCancel,
-  publishGroupAgentPid, publishGroupAgentResult,
+  GroupAgentMailboxFailure, GroupAgentMailboxRequest, claimGroupAgentRuns, hasGroupAgentCancel, hasUnsettledGroupAgentRun,
+  publishGroupAgentFailure, publishGroupAgentPid, publishGroupAgentResult,
 } from '../bridge/group-agent-mailbox';
 import { CopilotModelService } from './model-service';
 
@@ -99,6 +99,8 @@ export class GroupAgentHostBroker implements vscode.Disposable {
       throw new Error('Group Agent request does not hold the task role lease.');
     if (!afterHandoff && request.role === 'reviewer' && owner?.conversationId !== request.sessionId)
       throw new Error('Group reviewer session does not match its task role lease.');
+    if (!afterHandoff && hasUnsettledGroupAgentRun(request.threadId, request.sessionId, request.runId))
+      throw new Error('An earlier Group Agent run for this task session has an unconfirmed outcome. Inspect its worktree before resuming.');
     if (request.role !== 'bootstrap' && !isValidSessionId(request.sessionId))
       throw new Error('Group Agent request has an invalid native session id.');
     if (this.cancellations.peek(request.threadId)) throw new Error('Group Agent task has a pending cancellation.');
@@ -117,7 +119,7 @@ export class GroupAgentHostBroker implements vscode.Disposable {
           const currentHost = loadGroupAgentHost();
           if (!currentHost || currentHost.hostInstanceId !== request.hostInstanceId || currentHost.generation !== request.hostGeneration ||
               hasGroupAgentCancel(request.runId) || this.cancellations.peek(request.threadId) || !thread ||
-              thread.status === 'paused' || thread.currentRound !== request.round)
+              thread.status === 'paused' || (request.role !== 'bootstrap' && thread.currentRound !== request.round))
             source.cancel();
         } catch { source.cancel(); }
       }, 100);
@@ -133,12 +135,27 @@ export class GroupAgentHostBroker implements vscode.Disposable {
       if (latest.status === 'paused')
         throw new Error('Group Agent result is stale or cancelled.');
       if (source.token.isCancellationRequested || hasGroupAgentCancel(request.runId)) throw new Error('Group Agent run was cancelled before its result could be accepted.');
+      onPid(undefined);
       publishGroupAgentResult(request.runId, request.hostGeneration, result);
     } catch (error) {
-      try { publishGroupAgentResult(request.runId, request.hostGeneration, undefined, safeError(error)); } catch {}
+      const detail = error as { tokenUsage?: import('../bridge/types').TokenUsageMetrics; modelRequests?: number; interruption?: GroupAgentMailboxFailure['interruption']; toolCallsCompleted?: number };
+      const cancellation = this.cancellations.peek(request.threadId);
+      const latestHost = loadGroupAgentHost();
+      const hostChanged = !latestHost || latestHost.hostInstanceId !== request.hostInstanceId || latestHost.generation !== request.hostGeneration;
+      const kind: 'deleted' | 'paused' | 'stopped' | undefined = cancellation?.action === 'delete' ? 'deleted' : cancellation?.action === 'pause' || hostChanged ? 'paused' : source.token.isCancellationRequested ? 'stopped' : undefined;
+      const interruption = detail.interruption && ['paused', 'deleted', 'timeout', 'stopped'].includes(detail.interruption.kind || '')
+        ? { kind: detail.interruption.kind as 'paused' | 'deleted' | 'timeout' | 'stopped', reason: detail.interruption.reason || safeError(error), at: detail.interruption.at || new Date().toISOString(), by: detail.interruption.by }
+        : kind ? { kind, reason: hostChanged ? 'The Group Agent host generation changed; the executor stopped before task handoff.' : cancellation?.reason || 'Group Agent execution was cancelled after the host confirmed it stopped.', at: cancellation?.at || new Date().toISOString(), by: hostChanged ? 'group-agent-host' : cancellation?.by || 'group-agent-host' } : undefined;
+      try { onPid(undefined); } catch {}
+      try {
+        publishGroupAgentFailure(request.runId, request.hostGeneration, {
+          message: safeError(error), modelRequests: detail.modelRequests, tokenUsage: detail.tokenUsage,
+          ...(interruption ? { interruption } : {}), sessionId: request.sessionId,
+          ...(detail.toolCallsCompleted !== undefined ? { toolCallsCompleted: detail.toolCallsCompleted } : {}),
+        });
+      } catch (publishError) { console.warn(`[GroupAgentHostBroker] Could not persist failure for run ${request.runId}:`, safeError(publishError)); }
     } finally {
       if (cancelPoll) clearInterval(cancelPoll);
-      onPid(undefined);
       this.active.delete(request.runId);
       source.dispose();
     }
