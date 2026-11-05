@@ -22,6 +22,7 @@
  */
 
 import * as crypto from 'crypto';
+import * as path from 'path';
 import {
   AgentId,
   DelegationThread,
@@ -42,6 +43,7 @@ import {
 import { normalizeModelId, resolveConfiguredModel } from './model-catalog';
 import { assertCanExecute, assertGroupModelReady } from './agent-capabilities';
 import { isGroupAgentId, loadGroupAgentConfig } from './group-agent-registry';
+import { cleanupOwnedGroupAgentSession } from './group-agent-mailbox';
 
 function sameModelRef(left?: GroupModelRef, right?: GroupModelRef): boolean {
   return !!left && !!right && left.source === right.source && left.id === right.id &&
@@ -130,7 +132,6 @@ export class TaskRetargetService {
         (left.source === 'vscode-lm' ? right.source === 'vscode-lm' && left.vendor === right.vendor : right.source === 'openai-compatible' && left.origin === right.origin && left.bindingRevision === right.bindingRevision);
       if (params.modelRef && !sameRef(params.modelRef, binding.receiverModel) && !binding.models?.some((member) => sameRef(member, params.modelRef!)))
         throw new Error('The selected Group Agent modelRef is not a current member of this group binding.');
-      assertGroupModelReady(nextAgent, 'receiver', params.modelRef || binding.receiverModel);
       const approval = await resolveDispatchGroupModelRef({
         targetAgent: nextAgent, requestedModelRef: params.modelRef, defaultModelRef: binding.receiverModel,
         requestedByUser: params.modelRequestedByUser === true, initiatorAgent: thread.initiatorAgent,
@@ -299,6 +300,8 @@ export class TaskRetargetService {
     thread.summary.lastOutputSnippet = `Executor switched: ${direction}`;
 
     this.taskStore.upsertTask(thread);
+    if (sessionReset && isGroupAgentId(previousAgent) && previousReceiverSessionId)
+      cleanupOwnedGroupAgentSession(previousReceiverSessionId, thread.threadId, previousAgent, path.dirname(this.taskStore.getStoragePath()));
 
     return {
       threadId: thread.threadId,

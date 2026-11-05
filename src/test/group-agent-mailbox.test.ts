@@ -261,6 +261,8 @@ test('task artifact cleanup removes only Bridge-owned Group sessions and termina
   fs.mkdirSync(bridgeSessions);
   for (const id of ['group-developer-session', 'group-reviewer-session', 'native-requester-session'])
     fs.writeFileSync(path.join(bridgeSessions, `${id}.jsonl`), 'owned history');
+  for (const [id, ownerAgentId] of [['group-developer-session', agent], ['group-reviewer-session', agent]] as const)
+    fs.writeFileSync(path.join(bridgeSessions, `${id}.jsonl.owner.json`), JSON.stringify({ version: 1, transport: 'bridge-agent', ownerAgentId, threadId: thread.threadId, workspace: root }));
   writeGroupAgentHost(host, root);
   const request = { threadId: thread.threadId, round: 1, role: 'developer' as const, agent,
     sessionId: thread.receiverSessionId, worktree: root, prompt: 'work', modelRef,
@@ -365,7 +367,8 @@ test('host broker validates the real task lease and runs structured tools in its
     rounds: [{ round: 1, type: 'initial', prompt: 'work', durationMs: 0, status: 'running', timestamp: new Date().toISOString() }],
   };
   saveGroupAgentConfig({ version: 1, updatedAt: Date.now(), agents: [{ id: agent, groupId: groupUuid, name: 'Host group', source: 'vscode-lm',
-    enabled: true, toolsAuthorized: true, receiverReady: true, initiatorReady: false, revision: 2, receiverModel: modelRef }] }, root);
+    enabled: true, toolsAuthorized: true, receiverReady: true, initiatorReady: false, revision: 2, receiverModel: modelRef,
+    models: [modelRef], modelProbes: [{ role: 'receiver', modelRef, revision: 2, hostGeneration: host.generation }] }] }, root);
   writeGroupAgentHost(host, root);
   store.upsertTask(thread);
   const lease = new TaskRoleLock(root).tryAcquire(threadId, 'developer');
@@ -484,19 +487,37 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
 
   const groupUuid = '11111111-2222-4333-8444-555555555558';
   const agent = `copilot_group:${groupUuid}` as const;
+  const developerGroupUuid = '11111111-2222-4333-8444-555555555560';
+  const developerAgent = `copilot_group:${developerGroupUuid}` as const;
   const receiverModel = { source: 'vscode-lm' as const, vendor: 'fake-host', id: 'developer-model' };
+  const approvedReceiverModel = { source: 'vscode-lm' as const, vendor: 'fake-host', id: 'approved-developer-model' };
+  const secondGroupModel = { source: 'vscode-lm' as const, vendor: 'fake-host', id: 'second-group-developer' };
   const initiatorModel = { source: 'vscode-lm' as const, vendor: 'fake-host', id: 'reviewer-model' };
   const host = { version: 1 as const, hostInstanceId: 'host-vertical', generation: 22, pid: process.pid,
     workspaceUri: `file://${repo}`, repositoryCommonDir: path.join(repo, '.git'), trusted: true as const, localDesktop: true as const, updatedAt: Date.now() };
   saveGroupAgentConfig({ version: 1, updatedAt: Date.now(), defaultAgent: agent, defaultReviewer: agent, agents: [{
     id: agent, groupId: groupUuid, name: 'Vertical Group', source: 'vscode-lm', enabled: true, toolsAuthorized: true,
     receiverReady: true, initiatorReady: true, revision: 3, receiverModel, initiatorModel,
+    models: [receiverModel, approvedReceiverModel, initiatorModel],
+    modelProbes: [{ role: 'receiver', modelRef: receiverModel, revision: 3, hostGeneration: host.generation }, { role: 'receiver', modelRef: approvedReceiverModel, revision: 3, hostGeneration: host.generation }, { role: 'initiator', modelRef: initiatorModel, revision: 3, hostGeneration: host.generation }],
+  }, {
+    id: developerAgent, groupId: developerGroupUuid, name: 'Second Developer Group', source: 'vscode-lm', enabled: true, toolsAuthorized: true,
+    receiverReady: true, initiatorReady: false, revision: 3, receiverModel: secondGroupModel, models: [secondGroupModel],
+    modelProbes: [{ role: 'receiver', modelRef: secondGroupModel, revision: 3, hostGeneration: host.generation }],
   }] }, root);
   require('../bridge/bridge-policy').saveBridgePolicy({ reviewFlow: 'dedicated' }, path.join(root, '.agent-mesh-bridge'));
   writeGroupAgentHost(host, root);
 
   const store = new TaskStore(storage);
   const detector = new (require('../bridge/agent-detector').AgentDetector)();
+  const fakeCliDir = path.join(root, 'fake-codex');
+  fs.mkdirSync(fakeCliDir);
+  const fakeClaude = process.platform === 'win32' ? path.join(fakeCliDir, 'claude.cmd') : path.join(fakeCliDir, 'claude');
+  const fakeClaudeJs = path.join(fakeCliDir, 'fake-claude.js');
+  fs.writeFileSync(fakeClaudeJs, `const fs=require('fs');const args=process.argv.slice(2);const resume=args.indexOf('--resume');const session=resume>=0?args[resume+1]:'fake-claude-session-001';const first=!fs.existsSync('result.md');fs.writeFileSync('result.md',first?'first pass\\n':'reworked\\n');fs.writeFileSync('command-check.md','passed');process.stdout.write(JSON.stringify({type:'system',subtype:'init',session_id:session})+'\\n');process.stdout.write(JSON.stringify({type:'assistant',message:{content:[{type:'text',text:'CLI implemented and tested the requested file.'}]}})+'\\n');process.stdout.write(JSON.stringify({type:'result',result:'CLI completed the task.',usage:{input_tokens:3,output_tokens:2}})+'\\n');`);
+  if (process.platform === 'win32') fs.writeFileSync(fakeClaude, `@echo off\r\nnode "%~dp0fake-claude.js" %*\r\n`);
+  else { fs.writeFileSync(fakeClaude, `#!/usr/bin/env node\nrequire(${JSON.stringify(fakeClaudeJs)});\n`); fs.chmodSync(fakeClaude, 0o755); }
+  detector.setCustomPath('claude_code', fakeClaude);
   const { AutonomousRunner } = require('../bridge/autonomous-runner');
   const { CallbackManager } = require('../bridge/callback-manager');
   const { TaskExecutionRegistry } = require('../bridge/task-execution-registry');
@@ -516,11 +537,14 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
   let reviewerTurns = 0;
   const sessionsByRole: Record<string, string[]> = { developer: [], reviewer: [], bootstrap: [] };
   const fakeModels = {
-    getAgentBinding: () => ({ id: agent, source: 'vscode-lm', enabled: true, toolsAuthorized: true,
-      revision: 3, receiverReady: true, initiatorReady: true, receiverModel, initiatorModel }),
-    async runGroupAgent(_groupId: string, modelRef: unknown, sessionId: string, cwd: string, prompt: string,
+    getAgentBinding: (groupId: string) => groupId === developerGroupUuid
+      ? ({ id: developerAgent, source: 'vscode-lm', enabled: true, toolsAuthorized: true, revision: 3, receiverReady: true, initiatorReady: false, receiverModel: secondGroupModel })
+      : ({ id: agent, source: 'vscode-lm', enabled: true, toolsAuthorized: true, revision: 3, receiverReady: true, initiatorReady: true, receiverModel, initiatorModel }),
+    async runGroupAgent(groupId: string, modelRef: any, sessionId: string, cwd: string, prompt: string,
       token: any, onPid: (pid?: number) => void, role: 'developer' | 'reviewer' | 'bootstrap', context: any) {
       sessionsByRole[role].push(sessionId);
+      const expectedModel = role === 'developer' ? groupId === developerGroupUuid ? secondGroupModel : approvedReceiverModel : initiatorModel;
+      assert.deepEqual(modelRef, expectedModel, 'the actual model request must use the explicitly approved/pinned role reference');
       const control = async (name: string, input: Record<string, unknown>) => {
         if (role === 'bootstrap') {
           const thread = confirmReviewerBootstrapTask(store, String(input.threadId), { token: String(input.token) }, storage);
@@ -567,12 +591,12 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
             if (messages.at(-1)?.role === 'tool') {
               if (messages.at(-1)?.toolName === 'read_file') {
                 return reviewerTurns === 1
-                  ? call('review-rework', 'request_rework', { threadId: hostThreadId, feedback: 'Update result.txt to say reworked.' })
+                  ? call('review-rework', 'request_rework', { threadId: hostThreadId, feedback: `Update ${store.getTask(hostThreadId)?.targetAgent === 'claude_code' ? 'result.md' : 'result.txt'} to say reworked.` })
                   : call('review-approve', 'approve_task', { threadId: hostThreadId, remarks: 'Reviewed and approved.' });
               }
             }
             reviewerTurns++;
-            return call(`review-read-${reviewerTurns}`, 'read_file', { path: 'result.txt' });
+            return call(`review-read-${reviewerTurns}`, 'read_file', { path: store.getTask(hostThreadId)?.targetAgent === 'claude_code' ? 'result.md' : 'result.txt' });
           }
           return final('unexpected role');
         },
@@ -610,24 +634,32 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
       storageDir: storage, timeoutMs: 10_000, onSettled: () => supervisor.checkPendingTasks() });
     bootstrap.start(30);
 
-    const script = `const {TaskStore}=require(${JSON.stringify(path.resolve(__dirname, '../bridge/task-store.js'))});` +
+    const buildDispatchScript = (requestedModel?: typeof approvedReceiverModel, targetAgent = 'default') => `const {TaskStore}=require(${JSON.stringify(path.resolve(__dirname, '../bridge/task-store.js'))});` +
       `const {AgentDetector}=require(${JSON.stringify(path.resolve(__dirname, '../bridge/agent-detector.js'))});` +
       `const {ActiveAgentResolver}=require(${JSON.stringify(path.resolve(__dirname, '../bridge/active-agent-resolver.js'))});` +
       `const {AutonomousRunner}=require(${JSON.stringify(path.resolve(__dirname, '../bridge/autonomous-runner.js'))});` +
       `const {CallbackManager}=require(${JSON.stringify(path.resolve(__dirname, '../bridge/callback-manager.js'))});` +
       `const {AsyncDispatcher}=require(${JSON.stringify(path.resolve(__dirname, '../bridge/async-dispatcher.js'))});` +
+      `const {MCPServer}=require(${JSON.stringify(path.resolve(__dirname, '../bridge/mcp-server.js'))});` +
+      `const {ReworkController}=require(${JSON.stringify(path.resolve(__dirname, '../bridge/rework-controller.js'))});` +
+      `const {TaskExecutionRegistry}=require(${JSON.stringify(path.resolve(__dirname, '../bridge/task-execution-registry.js'))});` +
       `const d=new AgentDetector(),s=new TaskStore(${JSON.stringify(storage)}),r=new ActiveAgentResolver(d);` +
-      `const run=new AutonomousRunner(d,60000,undefined,s),c=new CallbackManager(d);` +
-      `const x=new AsyncDispatcher(s,r,run,c,d);x.dispatchTask({initiatorAgent:'codex',targetAgent:'default',title:'Group full cycle',prompt:'Create and validate result.txt',workspacePath:${JSON.stringify(repo)}})` +
+      `const run=new AutonomousRunner(d,60000,undefined,s),c=new CallbackManager(d),g=new TaskExecutionRegistry(${JSON.stringify(storage)});` +
+      `const x=new AsyncDispatcher(s,r,run,c,d,g),rw=new ReworkController(s,run,c,d,g);` +
+      `x.setModelApprovalHandler(async request=>({id:request.id,status:'approved',at:new Date().toISOString(),by:'test-user'}));` +
+      `const m=new MCPServer(x,rw,s,d,r,run);m.handleToolCall('dispatch_task',{initiatorAgent:'codex',targetAgent:${JSON.stringify(targetAgent)},title:'Group full cycle',prompt:'Create and validate result.txt',workspacePath:${JSON.stringify(repo)},modelRef:${JSON.stringify(requestedModel)},modelRequestedByUser:${Boolean(requestedModel)}})` +
       `.then(v=>process.stdout.write(JSON.stringify(v))).catch(e=>{process.stderr.write(e.stack||e);process.exitCode=1}).finally(()=>s.dispose());`;
-    const child = childProcess.spawn(process.execPath, ['-e', script], { cwd: process.cwd(), env: { ...process.env,
+    const runIndependentDispatch = async (requestedModel?: typeof approvedReceiverModel, targetAgent = 'default') => {
+    const child = childProcess.spawn(process.execPath, ['-e', buildDispatchScript(requestedModel, targetAgent)], { cwd: process.cwd(), env: { ...process.env,
       AGENT_MESH_BRIDGE_HOME: root, HOME: root, USERPROFILE: root }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let out = ''; let err = '';
     child.stdout.setEncoding('utf8').on('data', (chunk) => out += chunk);
     child.stderr.setEncoding('utf8').on('data', (chunk) => err += chunk);
     const childCode = await new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('exit', resolve); });
     assert.equal(childCode, 0, err);
-    const dispatch = JSON.parse(out);
+    return JSON.parse(out);
+    };
+    const dispatch = await runIndependentDispatch(approvedReceiverModel);
     hostThreadId = dispatch.threadId;
     assert.equal(dispatch.targetAgent, agent);
     assert.equal(dispatch.modelRouting?.initiatorAgent, agent, 'the configured Group reviewer is distinct from the CLI requester');
@@ -640,7 +672,8 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
     assert.equal(finished.status, 'completed', JSON.stringify({ status: finished.status, snippet: finished.summary.lastOutputSnippet,
       rounds: finished.rounds.map((r) => ({ round: r.round, type: r.type, status: r.status, error: r.error })) }));
     assert.equal(finished.worktree?.integration?.phase, 'merged');
-    assert.equal(finished.targetModelRef?.id, receiverModel.id);
+    assert.deepEqual(finished.targetModelRef, approvedReceiverModel);
+    assert.equal(finished.modelApproval?.status, 'approved', 'the public MCP request and user approval are persisted on the task');
     assert.equal(finished.reviewerModelRef?.id, initiatorModel.id);
     assert.equal(finished.reviewerSessionId, finished.callerSessionId);
     assert.equal(finished.receiverSessionId, dispatch.receiverSessionId);
@@ -649,6 +682,37 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
     assert.ok(finished.rounds.some((r) => r.type === 'rework'));
     assert.equal(fs.readFileSync(path.join(finished.worktree!.path, 'result.txt'), 'utf8'), 'reworked\n');
     assert.equal(fs.readFileSync(path.join(finished.worktree!.path, 'command-check.txt'), 'utf8'), 'passed');
+
+    // Switch only the default receiver for a second real mailbox cycle: the
+    // dedicated reviewer remains Group A while developer work runs in Group B.
+    developerTurns = 0; reviewerTurns = 0;
+    const groupConfig = require('../bridge/group-agent-registry').loadGroupAgentConfig(root);
+    require('../bridge/group-agent-registry').saveGroupAgentConfig({ ...groupConfig, defaultAgent: developerAgent, updatedAt: Date.now() }, root);
+    const crossDispatch = await runIndependentDispatch();
+    const crossDeadline = Date.now() + 15_000;
+    while (Date.now() < crossDeadline && store.getTask(crossDispatch.threadId)?.status !== 'completed') await new Promise((resolve) => setTimeout(resolve, 50));
+    const crossFinished = store.getTask(crossDispatch.threadId)!;
+    assert.equal(crossFinished.status, 'completed', JSON.stringify({ status: crossFinished.status, rounds: crossFinished.rounds.map((round) => ({ status: round.status, error: round.error })) }));
+    assert.equal(crossFinished.initiatorAgent, agent);
+    assert.equal(crossFinished.targetAgent, developerAgent);
+    assert.equal(crossFinished.worktree?.integration?.phase, 'merged');
+    assert.equal(crossFinished.rounds.some((round) => round.type === 'rework'), true);
+    assert.equal(fs.readFileSync(path.join(crossFinished.worktree!.path, 'result.txt'), 'utf8'), 'reworked\n');
+    assert.equal(sessionsByRole.developer.length, 4, 'both Group receivers retain one session each across their rework');
+    assert.equal(sessionsByRole.reviewer.length, 4, 'the Group sender resumes each dedicated reviewer session');
+
+    reviewerTurns = 0;
+    const groupCliDispatch = await runIndependentDispatch(undefined, 'claude_code');
+    const cliDeadline = Date.now() + 15_000;
+    while (Date.now() < cliDeadline && store.getTask(groupCliDispatch.threadId)?.status !== 'completed') await new Promise((resolve) => setTimeout(resolve, 50));
+    const groupCliFinished = store.getTask(groupCliDispatch.threadId)!;
+    assert.equal(groupCliFinished.status, 'completed', JSON.stringify({ status: groupCliFinished.status, rounds: groupCliFinished.rounds.map((round) => ({ status: round.status, error: round.error, assessment: round.assessment })), files: fs.readdirSync(groupCliFinished.worktree!.path), git: childProcess.execFileSync('git', ['status', '--short'], { cwd: groupCliFinished.worktree!.path, encoding: 'utf8' }) }));
+    assert.equal(groupCliFinished.initiatorAgent, agent, 'the Group sender remains the dedicated reviewer for a CLI receiver');
+    assert.equal(groupCliFinished.targetAgent, 'claude_code');
+    assert.equal(groupCliFinished.worktree?.integration?.phase, 'merged');
+    assert.equal(groupCliFinished.rounds.some((round) => round.type === 'rework'), true);
+    assert.equal(groupCliFinished.receiverSessionId, 'fake-claude-session-001', 'CLI rework resumes its original native session id');
+    assert.equal(fs.readFileSync(path.join(groupCliFinished.worktree!.path, 'result.md'), 'utf8'), 'reworked\n');
   } finally {
     bootstrap?.stop(); broker?.dispose(); supervisor.dispose(); rework.dispose(); callback.dispose?.(); store.dispose();
     if (heartbeat) clearInterval(heartbeat);
@@ -656,7 +720,13 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
     if (oldHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME; else process.env.AGENT_MESH_BRIDGE_HOME = oldHome;
     if (oldUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = oldUserProfile;
     if (oldHomeEnv === undefined) delete process.env.HOME; else process.env.HOME = oldHomeEnv;
-    fs.rmSync(root, { recursive: true, force: true });
+    for (let attempt = 0; ; attempt++) {
+      try { fs.rmSync(root, { recursive: true, force: true }); break; }
+      catch (error) {
+        if (attempt >= 4 || !['ENOTEMPTY', 'EBUSY', 'EPERM'].includes((error as NodeJS.ErrnoException).code || '')) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
   }
 });
 
@@ -679,7 +749,7 @@ test('a lost Group host pauses the existing task and resumes it with the same se
     workspaceUri: `file://${root}`, repositoryCommonDir: path.join(root, '.git'), trusted: true as const, localDesktop: true as const, updatedAt: Date.now() };
   saveGroupAgentConfig({ version: 1, updatedAt: Date.now(), agents: [{ id: agent, groupId: groupUuid, name: 'Recovery group',
     source: 'vscode-lm', enabled: true, toolsAuthorized: true, receiverReady: true, initiatorReady: false,
-    revision: 6, receiverModel: modelRef }] }, root);
+    revision: 6, receiverModel: modelRef, models: [modelRef], modelProbes: [{ role: 'receiver', modelRef, revision: 6, hostGeneration: host.generation }] }] }, root);
   writeGroupAgentHost(host, root);
   const store = new TaskStore(storage);
   const threadId = 'thread_group_host_recovery';
@@ -731,6 +801,9 @@ test('a lost Group host pauses the existing task and resumes it with the same se
       await new Promise((resolve) => setTimeout(resolve, 10));
     assert.ok(fs.existsSync(requestsDir) && fs.readdirSync(requestsDir).length, 'runner should publish to the mailbox before host loss');
     writeGroupAgentHost({ ...host, generation: 2, hostInstanceId: 'host-recovery-returned', updatedAt: Date.now() }, root);
+    saveGroupAgentConfig({ version: 1, updatedAt: Date.now(), agents: [{ id: agent, groupId: groupUuid, name: 'Recovery group',
+      source: 'vscode-lm', enabled: true, toolsAuthorized: true, receiverReady: true, initiatorReady: false,
+      revision: 6, receiverModel: modelRef, models: [modelRef], modelProbes: [{ role: 'receiver', modelRef, revision: 6, hostGeneration: 2 }] }] }, root);
     const interrupted = await first;
     assert.equal(interrupted.interruption?.kind, 'paused');
     assert.equal(interrupted.actualSessionId, sessionId);

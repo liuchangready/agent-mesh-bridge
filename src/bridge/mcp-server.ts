@@ -10,7 +10,6 @@ import { ActiveAgentResolver } from './active-agent-resolver';
 import { AutonomousRunner } from './autonomous-runner';
 import { TaskSupervisor } from './task-supervisor';
 import { TaskControlService } from './task-control';
-import { TaskRetargetService } from './task-retarget';
 import { CallerPollGuard, progressSignature } from './caller-poll-guard';
 import { TaskRoleLock } from './task-role-lock';
 import {
@@ -93,7 +92,6 @@ export class MCPServer {
   private runner: AutonomousRunner;
   private taskControl: TaskControlService;
   private modelCatalog: ModelCatalog;
-  private retargetService: TaskRetargetService;
   /** Starves polling loops on tasks this process dispatched itself. */
   private pollGuard = new CallerPollGuard();
   private readonly copilotProfile = process.env.MESH_MCP_PROFILE === 'copilot-requester';
@@ -114,7 +112,6 @@ export class MCPServer {
     this.runner = runner;
     this.taskControl = new TaskControlService(taskStore, runner);
     this.modelCatalog = new ModelCatalog(detector);
-    this.retargetService = new TaskRetargetService(taskStore);
   }
 
   /** Directory holding the mirrored ledger; archives/logs live beside it. */
@@ -618,6 +615,7 @@ export class MCPServer {
               description:
                 'Set true only when the user themselves named the model; the bridge then asks them to confirm the switch in VS Code.',
             },
+            modelRef: groupModelRefSchema,
             reason: {
               type: 'string',
               description: 'Why the executor is being switched (recorded on the task).',
@@ -1265,15 +1263,12 @@ export class MCPServer {
       }
 
       case 'retarget_task': {
-        const result = await this.retargetService.retargetTask({
-          threadId: args.threadId,
+        const result = await this.reworkController.retargetTask(args.threadId, {
           targetAgent: args.targetAgent,
           model: args.model,
           modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
-          reason: args.reason,
-          by: (process.env.MESH_CALLER_AGENT as string) || 'caller',
-        });
+        }, args.reason, (process.env.MESH_CALLER_AGENT as string) || 'caller');
         return result;
       }
 
@@ -1281,6 +1276,7 @@ export class MCPServer {
         const retried = await this.reworkController.retryFailedRound(args.threadId, {
           targetAgent: args.targetAgent,
           model: args.model,
+          modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
         });
         const thread = this.taskStore.getTask(args.threadId);

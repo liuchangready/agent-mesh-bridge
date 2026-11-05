@@ -1,10 +1,22 @@
 import * as vscode from 'vscode';
+import { createHash } from 'crypto';
 import { completeCompatibleChat, completeCompatibleTools, fetchCompatibleModels } from './compatible-model-client';
 import { CopilotModelGroup, CopilotModelGroups, HostModelRef, validateGroup } from './model-groups';
 import { GroupAgentRuntime, GroupAgentRunResult, GroupAgentRuntimeError, GroupMessage } from './group-agent-runtime';
 import { GroupModelRef, TokenUsageMetrics } from '../bridge/types';
+import { isTerminalThreadStatus } from '../bridge/task-summary';
+import { TaskStore } from '../bridge/task-store';
 import { getBridgeHome } from '../bridge/model-catalog';
 import { saveGroupAgentConfig, loadGroupAgentConfig, loadGroupAgentHost, GroupAgentBinding } from '../bridge/group-agent-registry';
+
+function groupBindingSignature(group: CopilotModelGroup): string {
+  return JSON.stringify({ source: group.source, ...(group.source === 'openai-compatible' ? { baseUrl: group.baseUrl } : {}),
+    models: group.models.map((model) => group.source === 'vscode-lm' ? [(model as HostModelRef).vendor, model.id] : [model.id]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))) });
+}
+
+function groupBindingRevision(group: CopilotModelGroup): number {
+  return createHash('sha256').update(groupBindingSignature(group)).digest().readUInt32BE(0) & 0x7fffffff || 1;
+}
 
 export class CopilotModelService implements vscode.Disposable {
   readonly groups: CopilotModelGroups;
@@ -20,6 +32,7 @@ export class CopilotModelService implements vscode.Disposable {
   private groupAgentControl?: (context: { groupId: string; sessionId: string; threadId?: string; role: 'developer' | 'reviewer' | 'bootstrap'; extraEnv?: NodeJS.ProcessEnv }, name: string, input: Record<string, unknown>) => Promise<string>;
   private readonly modelAccess: vscode.LanguageModelAccessInformation;
   private readonly globalState: vscode.Memento;
+  private taskStore?: TaskStore;
 
   constructor(context: vscode.ExtensionContext) {
     this.modelAccess = context.languageModelAccessInformation;
@@ -87,6 +100,34 @@ export class CopilotModelService implements vscode.Disposable {
     return loadGroupAgentConfig()?.agents.find((entry) => entry.groupId === groupId);
   }
 
+  setTaskStore(taskStore: TaskStore): void { this.taskStore = taskStore; }
+
+  private assertGroupHasNoUnmergedTask(groupId: string): void {
+    const agentId = this.getGroupAgentId(groupId);
+    const task = this.taskStore?.getAllTasks().find((item) => {
+      if (item.targetAgent !== agentId && item.initiatorAgent !== agentId) return false;
+      if (!isTerminalThreadStatus(item.status)) return true;
+      return !!item.worktree && !['merged', 'no_changes'].includes(item.worktree.integration?.phase || '');
+    });
+    if (task) throw new Error(`Cannot disable or delete this Group Agent while task ${task.threadId} is active or has unmerged work.`);
+  }
+
+  async deleteGroup(groupId: string): Promise<void> {
+    this.assertGroupHasNoUnmergedTask(groupId);
+    const group = this.groups.getAll().find((entry) => entry.id === groupId);
+    if (!group) return;
+    await this.groups.delete(groupId);
+    const all = this.globalState.get<Record<string, any>>('copilot.groupAgentSettings.v1', {}) || {};
+    const { [groupId]: _deleted, ...remaining } = all;
+    await this.globalState.update('copilot.groupAgentSettings.v1', remaining);
+    const configuration = vscode.workspace.getConfiguration('agentMeshBridge');
+    const id = this.getGroupAgentId(groupId);
+    if (configuration.get('defaultAgent') === id) await configuration.update('defaultAgent', 'auto', vscode.ConfigurationTarget.Global);
+    if (configuration.get('defaultReviewer') === id) await configuration.update('defaultReviewer', 'caller', vscode.ConfigurationTarget.Global);
+    this.publishAgentConfig();
+    this.changed.fire();
+  }
+
   setGroupAgentControlHandler(handler: typeof this.groupAgentControl): void {
     this.groupAgentControl = handler;
     this.publishAgentConfig();
@@ -101,8 +142,10 @@ export class CopilotModelService implements vscode.Disposable {
   }): Promise<void> {
     const group = this.groups.getAll().find((entry) => entry.id === groupId);
     if (!group) throw new Error('The model group no longer exists.');
+    if (!settings.enabled) this.assertGroupHasNoUnmergedTask(groupId);
     const previous = (this.globalState.get<Record<string, any>>('copilot.groupAgentSettings.v1', {}) || {})[groupId] || {};
-    const revision = (previous.revision || 0) + 1;
+    const signature = groupBindingSignature(group);
+    const revision = groupBindingRevision(group);
     const modelRef = (selection: HostModelRef | GroupModelRef | string | null | undefined): GroupModelRef | undefined => {
       if (selection === undefined || selection === null) return undefined;
       if (group.source === 'vscode-lm') {
@@ -133,6 +176,7 @@ export class CopilotModelService implements vscode.Disposable {
       enabled: settings.enabled,
       toolsAuthorized: settings.toolsAuthorized,
       revision,
+      bindingSignature: signature,
     };
     if (settings.receiverModel !== undefined) {
       const receiverRef = modelRef(settings.receiverModel);
@@ -150,11 +194,12 @@ export class CopilotModelService implements vscode.Disposable {
     this.changed.fire();
   }
 
-  async probeToolCalling(groupId: string, selection: HostModelRef | string, token: vscode.CancellationToken): Promise<void> {
+  async probeToolCalling(groupId: string, selection: HostModelRef | string, token: vscode.CancellationToken, role: 'receiver' | 'initiator' = 'receiver'): Promise<void> {
     const group = this.groups.getAll().find((entry) => entry.id === groupId);
     if (!group) throw new Error('The model group was deleted.');
     const nonce = require('crypto').randomUUID() as string;
     const tool = { name: 'bridge_capability_probe', description: 'Return the supplied nonce unchanged. Do not request any other tool.', inputSchema: { type: 'object', properties: { nonce: { type: 'string' } }, required: ['nonce'], additionalProperties: false } };
+    let exactRef: GroupModelRef;
     if (group.source === 'vscode-lm') {
       if (typeof selection === 'string' || !group.models.some((ref) => ref.id === selection.id && ref.vendor === selection.vendor))
         throw new Error('Select an exact host model that belongs to this group.');
@@ -169,6 +214,7 @@ export class CopilotModelService implements vscode.Disposable {
         if (calls.length !== 1 || calls[0].name !== tool.name || (calls[0].input as Record<string, unknown>)?.nonce !== nonce)
           throw new Error('The selected host model did not return the exact structured capability probe.');
       } finally { cancel.dispose(); source.dispose(); }
+      exactRef = { source: 'vscode-lm', vendor: selection.vendor, id: selection.id };
     } else {
       if (typeof selection !== 'string' || !group.models.some((model) => model.id === selection)) throw new Error('Select an exact endpoint model that belongs to this group.');
       const apiKey = await this.groups.getApiKey(group);
@@ -184,7 +230,20 @@ export class CopilotModelService implements vscode.Disposable {
         if (result.finishReason !== 'tool_calls' || result.toolCalls.length !== 1 || result.toolCalls[0].name !== tool.name || result.toolCalls[0].arguments.nonce !== nonce)
           throw new Error('The selected endpoint model did not return the exact structured capability probe.');
       } finally { cancel.dispose(); }
+      exactRef = { source: 'openai-compatible', id: selection, origin: new URL(group.baseUrl).origin, bindingRevision: groupBindingRevision(group) };
     }
+    if (token.isCancellationRequested) throw new Error('Capability probe cancelled.');
+    const settings = this.globalState.get<Record<string, any>>('copilot.groupAgentSettings.v1', {}) || {};
+    const saved = settings[groupId] || {};
+    const signature = groupBindingSignature(group);
+    const revision = groupBindingRevision(group);
+    const host = loadGroupAgentHost();
+    if (!host) throw new Error('The trusted local VS Code host/workspace is offline.');
+    const probes = (saved.modelProbes || []).filter((probe: any) => probe.role !== role || JSON.stringify(probe.modelRef) !== JSON.stringify(exactRef));
+    probes.push({ role, modelRef: exactRef, revision, hostGeneration: host.generation });
+    await this.globalState.update('copilot.groupAgentSettings.v1', { ...settings, [groupId]: { ...saved, bindingSignature: signature, revision, modelProbes: probes } });
+    this.publishAgentConfig();
+    this.changed.fire();
   }
 
   async markGroupAgentRoleReady(groupId: string, role: 'receiver' | 'initiator'): Promise<void> {
@@ -196,9 +255,9 @@ export class CopilotModelService implements vscode.Disposable {
     if (role === 'initiator' && !this.groupAgentControl) throw new Error('Group reviewer control services are unavailable in this host.');
     const host = loadGroupAgentHost();
     if (!host) throw new Error('The trusted local VS Code host/workspace is offline.');
-    const probeKey = JSON.stringify(selection);
-    const next = { ...saved, [`${role}Probe`]: { model: probeKey, revision: saved.revision, hostGeneration: host.generation } };
-    await this.globalState.update('copilot.groupAgentSettings.v1', { ...settings, [groupId]: next });
+    const ref = role === 'receiver' ? saved.receiverModel : saved.initiatorModel;
+    const proof = (saved.modelProbes || []).some((probe: any) => probe.role === role && JSON.stringify(probe.modelRef) === JSON.stringify(ref) && probe.revision === saved.revision && probe.hostGeneration === host.generation);
+    if (!proof) throw new Error('Run the explicit structured-tool probe for this exact role model before marking it ready.');
     this.publishAgentConfig();
     this.changed.fire();
   }
@@ -209,12 +268,16 @@ export class CopilotModelService implements vscode.Disposable {
       const saved = settings[group.id] || {};
       const receiverModel = saved.receiverModel;
       const initiatorModel = saved.initiatorModel;
-      const revision = Number.isInteger(saved.revision) ? saved.revision : 0;
+      const signature = groupBindingSignature(group);
+      const revision = groupBindingRevision(group);
       const host = loadGroupAgentHost();
-      const ready = (role: 'receiver' | 'initiator', ref: unknown) => {
+      const modelRefs: GroupModelRef[] = group.source === 'vscode-lm'
+        ? group.models.map((model) => ({ source: 'vscode-lm' as const, vendor: model.vendor, id: model.id }))
+        : group.models.map((model) => ({ source: 'openai-compatible' as const, id: model.id, origin: new URL(group.baseUrl).origin, bindingRevision: revision }));
+      const probes = (saved.modelProbes || []).filter((probe: any) => saved.bindingSignature === signature && probe.revision === revision && probe.hostGeneration === host?.generation);
+      const ready = (role: 'receiver' | 'initiator', ref: GroupModelRef | undefined) => {
         if (role === 'initiator' && !this.groupAgentControl) return false;
-        const probe = saved[`${role}Probe`];
-        return Boolean(ref && host && probe && probe.model === JSON.stringify(ref) && probe.hostGeneration === host.generation);
+        return Boolean(ref && host && probes.some((probe: any) => probe.role === role && JSON.stringify(probe.modelRef) === JSON.stringify(ref)));
       };
       return {
         id: this.getGroupAgentId(group.id), groupId: group.id, name: group.name,
@@ -222,9 +285,7 @@ export class CopilotModelService implements vscode.Disposable {
         enabled: saved.enabled === true, toolsAuthorized: saved.toolsAuthorized === true,
         receiverReady: ready('receiver', receiverModel), initiatorReady: ready('initiator', initiatorModel),
         revision,
-        models: group.source === 'vscode-lm'
-          ? group.models.map((model) => ({ source: 'vscode-lm' as const, vendor: model.vendor, id: model.id }))
-          : group.models.map((model) => ({ source: 'openai-compatible' as const, id: model.id, origin: new URL(group.baseUrl).origin, bindingRevision: revision })),
+        models: modelRefs, modelProbes: probes,
         ...(receiverModel ? { receiverModel } : {}),
         ...(initiatorModel ? { initiatorModel } : {}),
       };
@@ -443,7 +504,8 @@ export class CopilotModelService implements vscode.Disposable {
     const aborter = new AbortController();
     const subscription = token.onCancellationRequested(() => aborter.abort());
     try {
-      const result = await runtime.run(sessionId, cwd, prompt, aborter.signal, role);
+      const result = await runtime.run(sessionId, cwd, prompt, aborter.signal, role,
+        controlContext?.threadId ? { agentId: this.getGroupAgentId(groupId), threadId: controlContext.threadId } : undefined);
       const collectedAt = new Date().toISOString();
       const tokenUsage: TokenUsageMetrics = {
         uncachedInputTokens: result.usage?.uncachedInputTokens ?? 0,
@@ -489,6 +551,23 @@ export class CopilotModelService implements vscode.Disposable {
   readGroupAgentSession(sessionId: string, offset = 0, limit = 100): GroupMessage[] {
     if (!this.groupRuntime) this.groupRuntime = new GroupAgentRuntime({ bridgeHome: getBridgeHome(), request: async () => { throw new Error('Session history is read-only.'); } });
     return this.groupRuntime.sessions.read(sessionId, offset, limit);
+  }
+
+  listGroupAgentSessions(groupId: string): Array<{ threadId: string; title: string; role: 'developer' | 'reviewer'; sessionId: string; updatedAt: string }> {
+    if (!this.taskStore) return [];
+    if (!this.groupRuntime) this.groupRuntime = new GroupAgentRuntime({ bridgeHome: getBridgeHome(), request: async () => { throw new Error('Session history is read-only.'); } });
+    const agentId = this.getGroupAgentId(groupId);
+    return this.taskStore.getAllTasks().flatMap((thread) => {
+      const sessions: Array<{ threadId: string; title: string; role: 'developer' | 'reviewer'; sessionId: string; updatedAt: string }> = [];
+      if (thread.targetAgent === agentId && thread.receiverSessionId) sessions.push({ threadId: thread.threadId, title: thread.title, role: 'developer', sessionId: thread.receiverSessionId, updatedAt: thread.updatedAt });
+      const reviewerSession = thread.reviewerSessionId || (thread.reviewFlow === 'dedicated' ? thread.callerSessionId : undefined);
+      if (thread.reviewFlow === 'dedicated' && thread.initiatorAgent === agentId && reviewerSession && reviewerSession !== thread.requesterSessionId)
+        sessions.push({ threadId: thread.threadId, title: thread.title, role: 'reviewer', sessionId: reviewerSession, updatedAt: thread.updatedAt });
+      return sessions;
+    }).filter((session) => {
+      const owner = this.groupRuntime!.sessions.owner(session.sessionId);
+      return owner?.ownerAgentId === agentId && owner.threadId === session.threadId && owner.transport === 'bridge-agent';
+    }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 100);
   }
 
   async listCompatibleModels(

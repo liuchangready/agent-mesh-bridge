@@ -147,6 +147,35 @@ export function registerCopilotModelCommands(
       },
     );
   };
+  const viewAgentSessions = async (group: CopilotModelGroup) => {
+    const sessions = service.listGroupAgentSessions(group.id);
+    if (!sessions.length) {
+      await vscode.window.showInformationMessage(`No Bridge Agent sessions are recorded for ${group.name}.`);
+      return;
+    }
+    const selected = await vscode.window.showQuickPick(sessions.map((session) => ({
+      label: session.title || session.threadId,
+      description: `${session.role} | ${session.threadId} | ${session.updatedAt}`,
+      session,
+    })), { placeHolder: 'Bridge Group Agent sessions (owned by this group)' });
+    if (!selected) return;
+    let offset = 0;
+    for (;;) {
+      const events = service.readGroupAgentSession(selected.session.sessionId, offset, 100);
+      await vscode.window.showTextDocument(documents.put(JSON.stringify({
+        owner: `Bridge Group Agent ${group.name}`,
+        transport: 'bridge-agent', threadId: selected.session.threadId,
+        role: selected.session.role, sessionId: selected.session.sessionId,
+        offset, events,
+      }, null, 2)));
+      const action = await vscode.window.showQuickPick([
+        { label: 'Next page', value: 'next' }, { label: 'Previous page', value: 'previous' }, { label: 'Close', value: 'close' },
+      ], { placeHolder: `Session events ${offset + 1}–${offset + events.length}` });
+      if (!action || action.value === 'close') return;
+      if (action.value === 'next' && events.length === 100) offset += 100;
+      else if (action.value === 'previous') offset = Math.max(0, offset - 100);
+    }
+  };
   const refresh = async () => {
     if (!canConfigure()) return;
     try {
@@ -296,8 +325,17 @@ export function registerCopilotModelCommands(
       : undefined;
     const selected = await chooseModel(group, preselect);
     if (!selected) return;
+    const action = await vscode.window.showQuickPick([
+      { label: `Set as ${side === 'receiver' ? 'receiver' : 'sender'} default`, value: 'default' },
+      { label: `Probe for ${side === 'receiver' ? 'receiver' : 'sender'} use without changing defaults`, value: 'probe' },
+    ], { placeHolder: 'Choose whether to change this role default or only verify this member model' });
+    if (!action) return;
     await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Checking structured tools for ${group.name}` },
-      async (_progress, token) => service.probeToolCalling(group!.id, selected, token));
+      async (_progress, token) => service.probeToolCalling(group!.id, selected, token, side));
+    if (action.value === 'probe') {
+      await vscode.window.showInformationMessage(`The selected model passed the explicit ${side} tool probe; the configured default was not changed.`);
+      return;
+    }
     await service.configureGroupAgent(group.id, {
       enabled: side === 'receiver' ? true : binding?.enabled === true,
       toolsAuthorized: side === 'receiver' ? true : binding?.toolsAuthorized === true,
@@ -320,6 +358,7 @@ export function registerCopilotModelCommands(
         { label: 'Manage model members', id: 'members' },
         { label: 'Call model', id: 'call' },
         { label: 'Test connection', id: 'test' },
+        { label: 'View Bridge Agent session history', id: 'sessions' },
         { label: 'Enable / configure as Bridge Agent receiver', id: 'agent-receiver' },
         ...(service.getAgentBinding(group.id)?.enabled ? [
           { label: 'Configure Bridge Agent sender model', id: 'agent-sender' },
@@ -385,6 +424,7 @@ export function registerCopilotModelCommands(
       }
     } else if (action.id === 'call') await runCall(group, false);
     else if (action.id === 'test') await runCall(group, true);
+    else if (action.id === 'sessions') await viewAgentSessions(group);
     else if (action.id === 'agent-receiver') await configureGroupAgent(group, 'receiver');
     else if (action.id === 'agent-sender') await configureGroupAgent(group, 'initiator');
     else if (action.id === 'agent-disable') {
@@ -503,7 +543,7 @@ export function registerCopilotModelCommands(
       );
       if (confirm === 'Delete') {
         service.cancelGroup(group.id);
-        await service.groups.delete(group.id);
+        await service.deleteGroup(group.id);
       }
     }
     await service.refresh();

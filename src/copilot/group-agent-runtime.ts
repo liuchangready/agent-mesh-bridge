@@ -103,6 +103,24 @@ export class GroupAgentSessionStore {
     fs.appendFileSync(file, line, { encoding: 'utf8', mode: 0o600 });
   }
 
+  ensureOwner(sessionId: string, owner: { agentId: string; threadId: string; workspace: string }): void {
+    if (!owner.agentId.startsWith('copilot_group:') || !owner.threadId || owner.threadId.length > 128 || !path.isAbsolute(owner.workspace))
+      throw new Error('Invalid Bridge Group Agent session owner.');
+    const file = this.ownerFile(sessionId);
+    const record = { version: 1, transport: 'bridge-agent', ownerAgentId: owner.agentId, threadId: owner.threadId, workspace: path.resolve(owner.workspace) };
+    try {
+      const existing = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (existing.version !== 1 || existing.transport !== record.transport || existing.ownerAgentId !== record.ownerAgentId || existing.threadId !== record.threadId || existing.workspace !== record.workspace)
+        throw new Error('Bridge Group Agent session ownership cannot be changed.');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const temporary = `${file}.${process.pid}.${require('crypto').randomUUID()}.tmp`;
+      fs.writeFileSync(temporary, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      try { fs.linkSync(temporary, file); } catch (linkError) { if ((linkError as NodeJS.ErrnoException).code !== 'EEXIST') throw linkError; }
+      finally { try { fs.unlinkSync(temporary); } catch {} }
+    }
+  }
+
   read(sessionId: string, offset = 0, limit = 100): GroupMessage[] {
     if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 500)
       throw new Error('Invalid Group Agent session page.');
@@ -126,6 +144,16 @@ export class GroupAgentSessionStore {
     if (!/^[A-Za-z0-9_-]{8,128}$/.test(sessionId)) throw new Error('Invalid Bridge Agent session id.');
     return path.join(this.directory, `${sessionId}.jsonl`);
   }
+
+  owner(sessionId: string): { ownerAgentId: string; threadId: string; workspace: string; transport: 'bridge-agent' } | undefined {
+    try {
+      const value = JSON.parse(fs.readFileSync(this.ownerFile(sessionId), 'utf8'));
+      return value?.version === 1 && value.transport === 'bridge-agent' && typeof value.ownerAgentId === 'string' && typeof value.threadId === 'string' && typeof value.workspace === 'string'
+        ? { ownerAgentId: value.ownerAgentId, threadId: value.threadId, workspace: value.workspace, transport: 'bridge-agent' } : undefined;
+    } catch { return undefined; }
+  }
+
+  private ownerFile(sessionId: string): string { return `${this.file(sessionId)}.owner.json`; }
 }
 
 export class GroupAgentRuntime {
@@ -138,7 +166,7 @@ export class GroupAgentRuntime {
     this.sessions = new GroupAgentSessionStore(options.bridgeHome);
   }
 
-  async run(sessionId: string, cwd: string, prompt: string, signal?: AbortSignal, role: 'developer' | 'reviewer' | 'bootstrap' = 'developer'): Promise<GroupAgentRunResult> {
+  async run(sessionId: string, cwd: string, prompt: string, signal?: AbortSignal, role: 'developer' | 'reviewer' | 'bootstrap' = 'developer', owner?: { agentId: string; threadId: string }): Promise<GroupAgentRunResult> {
     if (this.active.has(sessionId)) throw new Error('This Group Agent session already has an active run.');
     const root = fs.realpathSync(cwd);
     const controller = new AbortController();
@@ -150,6 +178,7 @@ export class GroupAgentRuntime {
     let modelRequests = 0;
     let usageRequests = 0;
     try {
+      if (owner) this.sessions.ensureOwner(sessionId, { ...owner, workspace: cwd });
       if (this.sessions.hasUnresolvedIntent(sessionId))
         throw new Error('A previous tool call has an unknown outcome; inspect the task worktree before resuming this session.');
       this.sessions.append(sessionId, { role: 'user', content: prompt });

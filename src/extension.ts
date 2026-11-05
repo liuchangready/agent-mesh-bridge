@@ -414,6 +414,7 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(modelApprovalService);
   const timeoutMinutes = config.get<number>('taskTimeoutMinutes', 120);
   const copilotModelService = new CopilotModelService(context);
+  copilotModelService.setTaskStore(taskStore);
   const runner = new AutonomousRunner(detector, timeoutMinutes * 60 * 1000, undefined, taskStore);
   runner.setGroupAgentExecutor(async (options, signal) => {
     if (!options.agent.startsWith('copilot_group:') || !options.cwd || !options.modelRef)

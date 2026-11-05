@@ -187,7 +187,13 @@ export function claimGroupAgentRuns(host: GroupAgentHost, root?: string): GroupA
       try { fs.unlinkSync(source); } catch {}
       continue;
     }
-    try { fs.renameSync(source, target); } catch { continue; }
+    try {
+      fs.linkSync(source, target);
+      fs.unlinkSync(source);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') continue;
+      continue;
+    }
     writeRunState(runId, 'running', root);
     let request: GroupAgentMailboxRequest | undefined;
     try {
@@ -261,16 +267,13 @@ export function markGroupAgentRunUnknown(runIdValue: string, reason: string, roo
 }
 
 export function cleanupGroupAgentTaskArtifacts(thread: DelegationThread, root = getBridgeHome()): void {
-  const sessions = new Set<string>();
-  if (isGroupAgentId(thread.targetAgent)) sessions.add(thread.receiverSessionId);
+  const sessions: Array<{ id: string; agent: string }> = [];
+  if (isGroupAgentId(thread.targetAgent)) sessions.push({ id: thread.receiverSessionId, agent: thread.targetAgent });
   if (thread.reviewFlow === 'dedicated' && isGroupAgentId(thread.initiatorAgent)) {
     const reviewerSession = thread.reviewerSessionId || thread.callerSessionId;
-    if (reviewerSession && reviewerSession !== thread.requesterSessionId) sessions.add(reviewerSession);
+    if (reviewerSession && reviewerSession !== thread.requesterSessionId) sessions.push({ id: reviewerSession, agent: thread.initiatorAgent });
   }
-  for (const sessionId of sessions) {
-    if (!/^[A-Za-z0-9_-]{8,128}$/.test(sessionId)) continue;
-    try { fs.unlinkSync(path.join(root, 'group-agent-sessions', `${sessionId}.jsonl`)); } catch {}
-  }
+  for (const session of sessions) cleanupOwnedGroupAgentSession(session.id, thread.threadId, session.agent, root);
   const dirs = ensure(root);
   const runIds = new Set<string>();
   for (const dir of [dirs.requests, dirs.claimed, dirs.cancelled]) {
@@ -290,6 +293,19 @@ export function cleanupGroupAgentTaskArtifacts(thread: DelegationThread, root = 
       try { fs.rmSync(target, { recursive: true, force: true }); } catch {}
     }
   }
+}
+
+export function cleanupOwnedGroupAgentSession(sessionId: string, threadId: string, agentId: string, root = getBridgeHome()): boolean {
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(sessionId)) return false;
+  const base = path.join(root, 'group-agent-sessions', `${sessionId}.jsonl`);
+  const ownerFile = `${base}.owner.json`;
+  try {
+    const owner = readJson<{ version: number; transport: string; threadId: string; ownerAgentId: string }>(ownerFile, 4096);
+    if (owner.version !== 1 || owner.transport !== 'bridge-agent' || owner.threadId !== threadId || owner.ownerAgentId !== agentId) return false;
+    fs.rmSync(base, { force: true });
+    fs.rmSync(ownerFile, { force: true });
+    return true;
+  } catch { return false; }
 }
 
 export function hasUnsettledGroupAgentRun(threadId: string, sessionId: string, exceptRunId?: string, root?: string): boolean {

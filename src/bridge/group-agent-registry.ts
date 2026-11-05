@@ -19,6 +19,7 @@ export interface GroupAgentBinding {
   initiatorReady: boolean;
   revision: number;
   models?: GroupModelRef[];
+  modelProbes?: Array<{ role: 'receiver' | 'initiator'; modelRef: GroupModelRef; revision: number; hostGeneration: number }>;
   receiverModel?: GroupModelRef;
   initiatorModel?: GroupModelRef;
 }
@@ -65,6 +66,7 @@ export function loadGroupAgentConfig(dir = getBridgeHome()): GroupAgentConfig | 
         !Number.isInteger(agent.revision) ||
         typeof agent.receiverReady !== 'boolean' || typeof agent.initiatorReady !== 'boolean' ||
         (agent.models !== undefined && (!Array.isArray(agent.models) || agent.models.length > 200 || agent.models.some((model) => !model || !['vscode-lm', 'openai-compatible'].includes(model.source) || typeof model.id !== 'string' || !model.id || model.id.length > 256))) ||
+        (agent.modelProbes !== undefined && (!Array.isArray(agent.modelProbes) || agent.modelProbes.length > 400 || agent.modelProbes.some((probe) => !probe || !['receiver', 'initiator'].includes(probe.role) || !Number.isInteger(probe.revision) || !Number.isInteger(probe.hostGeneration) || !probe.modelRef || !['vscode-lm', 'openai-compatible'].includes(probe.modelRef.source) || typeof probe.modelRef.id !== 'string' || !probe.modelRef.id))) ||
         ids.has(agent.id)
       ) return undefined;
       ids.add(agent.id);

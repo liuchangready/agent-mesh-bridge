@@ -44,7 +44,7 @@ test('GroupAgentRuntime runs structured write and command calls in one real Git 
       },
     });
     try {
-      const answer = await runtime.run('session_test_123', worktree, 'Implement the task and run a check.');
+      const answer = await runtime.run('session_test_123', worktree, 'Implement the task and run a check.', undefined, 'developer', { agentId: 'copilot_group:11111111-2222-4333-8444-555555555555', threadId: 'thread_owner_test' });
       assert.equal(answer.text, 'Implemented and verified the change.');
       assert.equal(answer.toolCallsCompleted, 2);
       assert.equal(fs.readFileSync(path.join(worktree, 'task.txt'), 'utf8'), 'from group agent\n');
@@ -55,6 +55,7 @@ test('GroupAgentRuntime runs structured write and command calls in one real Git 
       assert.ok(history.some((event) => event.role === 'tool' && event.content.includes('Wrote task.txt')));
       assert.ok(history.some((event) => event.role === 'tool' && event.content.includes('[exit 0]')));
       assert.ok(fs.readFileSync(path.join(bridgeHome, 'group-agent-sessions', 'session_test_123.jsonl'), 'utf8').includes('"role":"intent"'));
+      assert.deepEqual(runtime.sessions.owner('session_test_123'), { ownerAgentId: 'copilot_group:11111111-2222-4333-8444-555555555555', threadId: 'thread_owner_test', workspace: worktree, transport: 'bridge-agent' });
     } finally {
       try { git(repo, 'worktree', 'remove', '--force', worktree); } catch {}
       fs.rmSync(root, { recursive: true, force: true });
@@ -279,7 +280,7 @@ test('an approved but unprobed Group member model is still rejected at receiver 
   const unprobed = { source: 'vscode-lm' as const, vendor: 'vendor-a', id: 'other-member' };
   saveGroupAgentConfig({ version: 1, updatedAt: Date.now(), agents: [{ id: agent, groupId: groupUuid, name: 'Group',
     source: 'vscode-lm', enabled: true, toolsAuthorized: true, receiverReady: true, initiatorReady: false, revision: 1,
-    receiverModel: ready, models: [ready, unprobed] }] }, root);
+      receiverModel: ready, models: [ready, unprobed], modelProbes: [{ role: 'receiver', modelRef: ready, revision: 1, hostGeneration: 1 }] }] }, root);
   writeGroupAgentHost({ version: 1, hostInstanceId: 'host-capability', generation: 1, pid: process.pid,
     workspaceUri: 'file:///workspace', repositoryCommonDir: root, trusted: true, localDesktop: true, updatedAt: Date.now() }, root);
   try {

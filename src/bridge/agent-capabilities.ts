@@ -13,13 +13,14 @@ export type AgentTaskRole = 'receiver' | 'initiator';
 export function assertGroupModelReady(agent: AgentId, role: AgentTaskRole, modelRef: GroupModelRef): void {
   if (!isGroupAgentId(agent)) throw new Error(`Structured modelRef is only valid for a Group Agent, not ${agent}.`);
   const binding = loadGroupAgentConfig()?.agents.find((entry) => entry.id === agent);
-  const configured = role === 'receiver' ? binding?.receiverModel : binding?.initiatorModel;
-  const ready = role === 'receiver' ? binding?.receiverReady : binding?.initiatorReady;
-  const same = configured?.source === modelRef.source && configured.id === modelRef.id &&
-    (configured.source === 'vscode-lm'
-      ? modelRef.source === 'vscode-lm' && configured.vendor === modelRef.vendor
-      : modelRef.source === 'openai-compatible' && configured.origin === modelRef.origin && configured.bindingRevision === modelRef.bindingRevision);
-  if (!binding?.enabled || !binding.toolsAuthorized || !ready || !same || !loadGroupAgentHost())
+  const host = loadGroupAgentHost();
+  const same = (left: GroupModelRef, right: GroupModelRef) => left.source === right.source && left.id === right.id &&
+    (left.source === 'vscode-lm' ? right.source === 'vscode-lm' && left.vendor === right.vendor :
+      right.source === 'openai-compatible' && left.origin === right.origin && left.bindingRevision === right.bindingRevision);
+  const member = binding?.models?.some((model) => same(model, modelRef));
+  const probed = binding?.modelProbes?.some((probe) => probe.role === role && probe.revision === binding.revision &&
+    probe.hostGeneration === host?.generation && same(probe.modelRef, modelRef));
+  if (!binding?.enabled || !binding.toolsAuthorized || !member || !probed || !host)
     throw new Error(`Group Agent ${agent} model ${modelRef.source === 'vscode-lm' ? `${modelRef.vendor}/${modelRef.id}` : `${modelRef.id} (${modelRef.origin})`} has no current ${role} structured-tool probe and authorization. Select it for that role and complete the explicit capability check first.`);
 }
 

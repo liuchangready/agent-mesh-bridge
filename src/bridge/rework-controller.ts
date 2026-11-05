@@ -95,6 +95,10 @@ export class ReworkController {
     this.retargetService.setModelApprovalHandler(handler);
   }
 
+  public retargetTask(threadId: string, overrides: ExecutorOverride, reason: string, by = 'caller') {
+    return this.retargetService.retargetTask({ threadId, ...overrides, reason, by });
+  }
+
   /**
    * Apply a rework/retry/resume executor override, if the caller asked for one.
    * A model-only request against the same agent keeps the native session; a new

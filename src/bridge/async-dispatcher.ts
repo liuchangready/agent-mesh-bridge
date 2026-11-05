@@ -210,7 +210,6 @@ export class AsyncDispatcher {
         throw new Error('The selected model source does not match this Group Agent.');
       if (entry.receiverModel.source === 'openai-compatible' && (entry.source !== 'openai-compatible' || entry.receiverModel.origin !== entry.baseUrl && entry.receiverModel.origin !== (entry.baseUrl ? new URL(entry.baseUrl).origin : '')))
         throw new Error('The selected endpoint model does not match this Group Agent origin.');
-      assertGroupModelReady(targetAgent, 'receiver', params.modelRef || entry.receiverModel);
       const groupResolution = await resolveDispatchGroupModelRef({
         targetAgent, requestedModelRef: params.modelRef, defaultModelRef: entry.receiverModel,
         requestedByUser: params.modelRequestedByUser === true, initiatorAgent, title: params.title,
@@ -235,6 +234,10 @@ export class AsyncDispatcher {
     // task. It must never fall back to the receiver default, or a same-agent task
     // would trivially review itself with the execution model.
     const reviewerModelRef = isGroupAgentId(initiatorAgent) ? initiatorModelRef : undefined;
+    if (reviewFlow === 'dedicated' && isGroupAgentId(initiatorAgent)) {
+      if (!reviewerModelRef) throw new Error(`Group reviewer ${initiatorAgent} has no configured sender-side model.`);
+      assertGroupModelReady(initiatorAgent, 'initiator', reviewerModelRef);
+    }
     const reviewerModel = reviewerModelRef?.id ??
       (reviewFlow === 'dedicated'
         ? resolveConfiguredModel(initiatorAgent, undefined, 'initiator')

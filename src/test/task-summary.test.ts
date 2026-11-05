@@ -226,6 +226,27 @@ test('TaskStore.archiveTask strips rounds, logs and persists the digest', () => 
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('Group Agent archive preserves owned Bridge session history in the archive before cleanup', async () => {
+  const dir = makeTempDir('bridge-group-session-archive-');
+  const store = new TaskStore(dir);
+  const agent = 'copilot_group:11111111-2222-4333-8444-5555555555aa' as const;
+  const sessionId = 'session_archive_group_1';
+  const thread = makeThread({ threadId: 'thread_group_session_archive', targetAgent: agent, receiverSessionId: sessionId, status: 'completed' });
+  store.upsertTask(thread);
+  const { GroupAgentRuntime } = require('../copilot/group-agent-runtime');
+  const runtime = new GroupAgentRuntime({ bridgeHome: dir, request: async () => ({ text: 'session content for archive', finishReason: 'stop', toolCalls: [] }) });
+  await runtime.run(sessionId, dir, 'archive prompt', undefined, 'developer', { agentId: agent, threadId: thread.threadId });
+  const archived = store.archiveTask(thread.threadId);
+  assert.ok(archived?.archivedAt);
+  const archive = path.join(dir, 'logs', 'Archive', `${thread.threadId}_archive.tar.gz`);
+  const data = require('zlib').gunzipSync(fs.readFileSync(archive)).toString('utf8');
+  assert.match(data, /session content for archive/);
+  assert.equal(fs.existsSync(path.join(dir, 'group-agent-sessions', `${sessionId}.jsonl`)), false);
+  assert.equal(fs.existsSync(path.join(dir, 'group-agent-sessions', `${sessionId}.jsonl.owner.json`)), false);
+  store.dispose();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('TaskArchiveService archives terminal tasks beyond the retention window', () => {
   const dir = makeTempDir('bridge-archive-service-');
   const store = new TaskStore(dir);

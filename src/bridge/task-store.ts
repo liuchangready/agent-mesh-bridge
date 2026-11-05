@@ -749,10 +749,10 @@ export class TaskStore extends EventEmitter {
       cleanupThreadNativeSessions(thread);
     } catch {}
     try {
-      cleanupGroupAgentTaskArtifacts(thread, this.storageDir);
+      archiveCompletedTaskLogs(thread, this.storageDir);
     } catch {}
     try {
-      archiveCompletedTaskLogs(thread, this.storageDir);
+      cleanupGroupAgentTaskArtifacts(thread, this.storageDir);
     } catch {}
     if (!archiveThreadData(thread)) return undefined;
     this.tasks.set(threadId, thread);
