@@ -59,6 +59,7 @@ export function resolveCodexProviderIdentity(
         section = table[1]; hasCustomProviders = true; continue;
       }
       if (line.startsWith('[model_providers]')) return undefined;
+      if (/model_providers/i.test(line)) return undefined;
       section = '!other';
       continue;
     }
@@ -74,6 +75,8 @@ export function resolveCodexProviderIdentity(
     if (key === 'model_provider') {
       if (section !== '') return undefined;
       providerId = value[2];
+    } else if (section === '!other') {
+      return undefined;
     } else if (section !== '!other' && section !== '') {
       if (providerId && section === providerId) providerBaseUrl = value[2];
     } else if (section === '') {

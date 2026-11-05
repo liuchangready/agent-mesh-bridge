@@ -401,6 +401,11 @@ describe('token usage - durability', () => {
     assert.notEqual(routeOne.providerRoute, routeTwo.providerRoute, 'different configured endpoints cannot share a certified identity');
     assert.equal(resolveCodexProviderIdentity("model_provider = 'openai'\n[model_providers.openai]\nbase_url = 'https://route-one.example/v1'", {}), undefined);
     assert.equal(resolveCodexProviderIdentity('model_provider = "openai"\n[model_providers."openai"]\nbase_url = "https://route-one.example/v1"', {}), undefined);
+    const quotedRouteOne = resolveCodexProviderIdentity('model_provider = "openai"\n["model_providers"."openai"]\nbase_url = "https://route-one.example/v1"', {});
+    const quotedRouteTwo = resolveCodexProviderIdentity('model_provider = "openai"\n["model_providers"."openai"]\nbase_url = "https://route-two.example/v1"', {});
+    assert.ok(!quotedRouteOne || !quotedRouteTwo || quotedRouteOne.providerRoute !== quotedRouteTwo.providerRoute);
+    assert.equal(resolveCodexProviderIdentity('model_provider = "openai"\n[custom]\nbase_url = "https://unknown.example/v1"', {}), undefined);
+    assert.deepEqual(resolveCodexProviderIdentity('model_provider = "openai"\n', {}), { providerId: 'openai', providerRoute: 'openai' });
     assert.equal(resolveCodexProviderIdentity('"model_provider" = "openai"\n[model_providers.openai]\nbase_url = "https://route-one.example/v1"', {}), undefined);
   });
 
