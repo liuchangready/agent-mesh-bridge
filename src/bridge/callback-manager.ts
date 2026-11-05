@@ -376,7 +376,17 @@ export class CallbackManager extends EventEmitter {
     // agent: waking the requester (or an unrelated conversation) would put the
     // review in the wrong chat and reintroduce the writer conflict.
     if (thread.reviewFlow === 'dedicated') {
-      return callerSessionId && isValidSessionId(callerSessionId) ? callerSessionId : undefined;
+      const reviewerSessionId = thread.reviewerSessionId;
+      if (
+        thread.reviewBootstrap?.phase !== 'confirmed' ||
+        thread.reviewerSessionCaptured !== true ||
+        !reviewerSessionId ||
+        !isValidSessionId(reviewerSessionId) ||
+        callerSessionId !== reviewerSessionId
+      ) {
+        return undefined;
+      }
+      return reviewerSessionId;
     }
 
     if ((!callerSessionId || !isValidSessionId(callerSessionId)) && this.detector) {

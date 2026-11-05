@@ -495,6 +495,10 @@ export class AgentDetector {
             // the ledger does not depend on which Codex build is installed.
             const base = extractCodexThreadId(rawBase);
             if (!excludeSet.has(base) && !excludeSet.has(rawBase)) {
+              const meta = readCodexSessionMeta(item.file);
+              if (!meta || !isCodexUserSession(meta)) continue;
+              if (extractCodexThreadId(String(meta.id || '')) !== base) continue;
+              if (workspacePath && !sameResolvedPath(meta.cwd, workspacePath)) continue;
               return base;
             }
           }
@@ -537,4 +541,45 @@ export class AgentDetector {
     } catch {}
     return results;
   }
+}
+
+const CODEX_SESSION_META_MAX_BYTES = 64 * 1024;
+
+/** Codex writes session_meta as the first JSONL record; never trust the filename alone. */
+function readCodexSessionMeta(file: string): Record<string, any> | undefined {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, 'r');
+    const buffer = Buffer.alloc(CODEX_SESSION_META_MAX_BYTES);
+    const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    const header = buffer.toString('utf8', 0, bytesRead).split(/\r?\n/, 1)[0];
+    if (!header) return undefined;
+    const record = JSON.parse(header);
+    return record?.type === 'session_meta' && record.payload && typeof record.payload === 'object'
+      ? record.payload
+      : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+function isCodexUserSession(meta: Record<string, any>): boolean {
+  const source = meta.source;
+  // `source.subagent` includes guardian sessions. These are the user-facing
+  // native sources seen in session_meta; unknown sources may be background agents.
+  return (
+    (source === 'cli' || source === 'exec' || source === 'vscode') &&
+    typeof meta.cwd === 'string' &&
+    !!meta.cwd.trim()
+  );
+}
+
+function sameResolvedPath(left: string, right: string): boolean {
+  const normalize = (value: string) => {
+    const resolved = path.normalize(path.resolve(value));
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  return normalize(left) === normalize(right);
 }
