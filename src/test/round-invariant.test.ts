@@ -379,4 +379,18 @@ describe('Round invariant - supervisor repairs and guards', () => {
       `round 3 must not start while round 5 is in flight (executed: ${executedPrompts.join(' | ') || 'none'})`,
     );
   });
+
+  test('executeThreadRound terminally refuses a historical unsupported agent without executing it', async () => {
+    const thread = makeThread([makeRound(1, 'running', 'initial')], 1);
+    thread.targetAgent = 'retired_agent' as DelegationThread['targetAgent'];
+    taskStore.upsertTask(thread);
+
+    await supervisor.executeThreadRound(thread, thread.rounds[0]);
+
+    const stored = taskStore.getTask(thread.threadId)!;
+    assert.strictEqual(stored.status, 'failed');
+    assert.strictEqual(stored.rounds[0].status, 'failed');
+    assert.match(stored.rounds[0].error || '', /no longer supported/);
+    assert.deepStrictEqual(executedPrompts, []);
+  });
 });

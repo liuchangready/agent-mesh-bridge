@@ -22,12 +22,10 @@
  */
 
 import * as crypto from 'crypto';
-import * as path from 'path';
 import {
   AgentId,
   DelegationThread,
   ExecutorOverride,
-  GroupModelRef,
   RetargetTaskResult,
   TaskRetargetRecord,
   describeRoundInFlight,
@@ -37,19 +35,10 @@ import {
 import { TaskStore } from './task-store';
 import {
   ModelApprovalHandler,
-  resolveDispatchGroupModelRef,
   resolveDispatchModel,
 } from './model-approval';
 import { normalizeModelId, resolveConfiguredModel } from './model-catalog';
-import { assertCanExecute, assertGroupModelReady } from './agent-capabilities';
-import { isGroupAgentId, loadGroupAgentConfig } from './group-agent-registry';
-import { cleanupOwnedGroupAgentSession } from './group-agent-mailbox';
-
-function sameModelRef(left?: GroupModelRef, right?: GroupModelRef): boolean {
-  return !!left && !!right && left.source === right.source && left.id === right.id &&
-    (left.source === 'vscode-lm' ? right.source === 'vscode-lm' && left.vendor === right.vendor :
-      right.source === 'openai-compatible' && left.origin === right.origin && left.bindingRevision === right.bindingRevision);
-}
+import { assertCanExecute } from './agent-capabilities';
 
 export interface RetargetTaskParams extends ExecutorOverride {
   threadId: string;
@@ -102,7 +91,6 @@ export class TaskRetargetService {
     const initialCurrentRound = thread.currentRound;
     const initialTargetAgent = thread.targetAgent;
     const initialTargetModel = thread.targetModel;
-    const initialTargetModelRef = thread.targetModelRef;
     const initialReceiverSessionId = thread.receiverSessionId;
     const initialReviewFlow = thread.reviewFlow;
     const initialBootstrapPhase = thread.reviewBootstrap?.phase;
@@ -118,39 +106,15 @@ export class TaskRetargetService {
 
     const agentChanged = nextAgent !== initialTargetAgent;
     const requested = normalizeModelId(params.model);
-    if (params.modelRef && requested) throw new Error('Choose either a CLI model string or a structured Group Agent modelRef.');
 
     // Resolve the model BEFORE touching the thread: a declined switch must leave
     // the task exactly as it was.
-    let selectedModelRef: GroupModelRef | undefined;
-    let resolution: { model?: string; notice?: string; approval?: import('./types').ModelApprovalRecord };
-    if (isGroupAgentId(nextAgent)) {
-      const binding = loadGroupAgentConfig()?.agents.find((entry) => entry.id === nextAgent);
-      if (!binding?.enabled || !binding.toolsAuthorized || !binding.receiverModel) throw new Error(`Group Agent ${nextAgent} is not ready as a receiver.`);
-      if (requested) throw new Error('Group Agent retargeting requires a structured modelRef, not a CLI model string.');
-      const sameRef = (left: GroupModelRef, right: GroupModelRef) => left.source === right.source && left.id === right.id &&
-        (left.source === 'vscode-lm' ? right.source === 'vscode-lm' && left.vendor === right.vendor : right.source === 'openai-compatible' && left.origin === right.origin && left.bindingRevision === right.bindingRevision);
-      if (params.modelRef && !sameRef(params.modelRef, binding.receiverModel) && !binding.models?.some((member) => sameRef(member, params.modelRef!)))
-        throw new Error('The selected Group Agent modelRef is not a current member of this group binding.');
-      const approval = await resolveDispatchGroupModelRef({
-        targetAgent: nextAgent, requestedModelRef: params.modelRef, defaultModelRef: binding.receiverModel,
-        requestedByUser: params.modelRequestedByUser === true, initiatorAgent: thread.initiatorAgent,
-        title: thread.title, handler: this.modelApprovalHandler,
-      });
-      selectedModelRef = params.modelRef ? approval.modelRef : (agentChanged ? binding.receiverModel : thread.targetModelRef);
-      if (!selectedModelRef) throw new Error(`Group Agent ${nextAgent} has no pinned receiver model.`);
-      assertGroupModelReady(nextAgent, 'receiver', selectedModelRef);
-      resolution = { model: selectedModelRef?.id, notice: approval.notice, approval: approval.approval };
-    } else {
-      if (params.modelRef) throw new Error('A structured Group Agent modelRef cannot be used for a CLI target.');
-      resolution = await resolveDispatchModel({
-        targetAgent: nextAgent, requestedModel: requested,
-        requestedByUser: params.modelRequestedByUser === true,
-        initiatorAgent: thread.initiatorAgent, title: thread.title,
-        handler: this.modelApprovalHandler,
-      });
-    }
-
+    const resolution = await resolveDispatchModel({
+      targetAgent: nextAgent, requestedModel: requested,
+      requestedByUser: params.modelRequestedByUser === true,
+      initiatorAgent: thread.initiatorAgent, title: thread.title,
+      handler: this.modelApprovalHandler,
+    });
     // Model approval is an async boundary. Re-read before writing so an approve,
     // pause, retry, or other executor change during the dialog cannot be replaced
     // by this stale snapshot.
@@ -164,7 +128,6 @@ export class TaskRetargetService {
       fresh.archivedAt || fresh.status === 'completed' || findInFlightRound(fresh) ||
       fresh.status !== initialStatus || fresh.currentRound !== initialCurrentRound ||
       fresh.targetAgent !== initialTargetAgent || fresh.targetModel !== initialTargetModel ||
-      JSON.stringify(fresh.targetModelRef) !== JSON.stringify(initialTargetModelRef) ||
       fresh.receiverSessionId !== initialReceiverSessionId ||
       fresh.reviewFlow !== initialReviewFlow ||
       fresh.reviewBootstrap?.phase !== initialBootstrapPhase ||
@@ -197,16 +160,15 @@ export class TaskRetargetService {
             `Pick a different executor agent.`,
         );
       }
-      const reviewerRef = thread.reviewerModelRef || thread.initiatorModelRef;
       const reviewerModel = thread.reviewerModel || resolveConfiguredModel(thread.initiatorAgent, undefined, 'initiator');
       const nextModel = resolution.model;
-      if ((!reviewerRef && !reviewerModel) || !nextModel) {
+      if (!reviewerModel || !nextModel) {
         throw new Error(
           `Cannot retarget ${thread.threadId} to its own agent ${nextAgent}: both the reviewer model and ` +
             `the executor model must be configured so they can be proven different.`,
         );
       }
-      const samePinnedModel = reviewerRef && selectedModelRef ? sameModelRef(reviewerRef, selectedModelRef) : reviewerModel === nextModel;
+      const samePinnedModel = reviewerModel === nextModel;
       if (samePinnedModel) {
         throw new Error(
           `Cannot retarget ${thread.threadId} to ${nextAgent}(${nextModel}): reviewer and executor would ` +
@@ -228,8 +190,7 @@ export class TaskRetargetService {
       nextModel = resolution.model;
     }
 
-    const previousModelRef = thread.targetModelRef;
-    const modelChanged = nextModel !== previousModel || JSON.stringify(selectedModelRef) !== JSON.stringify(previousModelRef);
+    const modelChanged = nextModel !== previousModel;
     const notice = requested ? resolution.notice : undefined;
 
     if (!agentChanged && !modelChanged) {
@@ -264,12 +225,6 @@ export class TaskRetargetService {
 
     thread.targetAgent = nextAgent;
     thread.targetModel = nextModel;
-    thread.targetModelRef = selectedModelRef;
-    if (isGroupAgentId(nextAgent) && selectedModelRef) {
-      const binding = loadGroupAgentConfig()?.agents.find((entry) => entry.id === nextAgent);
-      if (!binding?.enabled || !binding.toolsAuthorized) throw new Error(`Group Agent ${nextAgent} changed before retarget was committed.`);
-      thread.targetGroupBindingSnapshot = { agentId: nextAgent, revision: binding.revision, source: binding.source, ...(binding.baseUrl ? { baseUrl: binding.baseUrl } : {}), modelRef: selectedModelRef };
-    } else delete thread.targetGroupBindingSnapshot;
     thread.modelNotice = notice;
     if (resolution.approval) thread.modelApproval = resolution.approval;
     thread.updatedAt = nowIso;
@@ -282,8 +237,6 @@ export class TaskRetargetService {
       toAgent: nextAgent,
       fromModel: previousModel,
       toModel: nextModel,
-      fromModelRef: previousModelRef,
-      toModelRef: selectedModelRef,
       previousReceiverSessionId,
       sessionReset,
     };
@@ -300,8 +253,6 @@ export class TaskRetargetService {
     thread.summary.lastOutputSnippet = `Executor switched: ${direction}`;
 
     this.taskStore.upsertTask(thread);
-    if (sessionReset && isGroupAgentId(previousAgent) && previousReceiverSessionId)
-      cleanupOwnedGroupAgentSession(previousReceiverSessionId, thread.threadId, previousAgent, path.dirname(this.taskStore.getStoragePath()));
 
     return {
       threadId: thread.threadId,
@@ -326,7 +277,7 @@ export class TaskRetargetService {
 
   /** Convenience: apply an override only when the caller actually asked for one. */
   public hasOverride(params: ExecutorOverride): boolean {
-    return !!params.targetAgent || !!normalizeModelId(params.model) || !!params.modelRef;
+    return !!params.targetAgent || !!normalizeModelId(params.model);
   }
 }
 

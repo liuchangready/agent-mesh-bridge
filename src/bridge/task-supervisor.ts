@@ -11,7 +11,6 @@ import {
   DelegationThread,
   DelegationRound,
   isIsolatedTaskWorktree,
-  ThreadStatus,
   findInFlightRound,
   getInFlightRounds,
   isReviewerBootstrapPending,
@@ -21,7 +20,6 @@ import {
 import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
 import { TaskExecutionOwner, TaskExecutionRegistration, TaskExecutionRegistry } from './task-execution-registry';
 import { ConcurrencyPolicy, concurrencyPolicy } from './bridge-policy';
-import { QueueDrainer, QueuedExecution } from './queue-drainer';
 import { TaskRoleLock } from './task-role-lock';
 import { appendCompactionProtocol, compactRoundBestEffort } from './context-compactor';
 import { readStoredRoundUsage } from './token-usage-collector';
@@ -338,7 +336,6 @@ export class TaskSupervisor extends EventEmitter {
     this.taskStore.upsertTask(fresh);
   }
   public executeThreadRound(thread: DelegationThread, round: DelegationRound): Promise<void> {
-    assertCanExecute(thread.targetAgent, 'run a scheduled task round');
     if (this.activeTasks.has(thread.threadId)) {
       return this.activeTasks.get(thread.threadId)!;
     }
@@ -352,6 +349,23 @@ export class TaskSupervisor extends EventEmitter {
       console.warn(
         `[TaskSupervisor] Task ${thread.threadId} was deleted before round ${round.round} started.`,
       );
+      return Promise.resolve();
+    }
+    try {
+      assertCanExecute(stored.targetAgent, 'run a scheduled task round');
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (stored.status === 'queued' || stored.status === 'running' || stored.status === 'reworking') {
+        const pendingRound = findInFlightRound(stored);
+        if (pendingRound) {
+          pendingRound.status = 'failed';
+          pendingRound.error = reason;
+        }
+        stored.status = 'failed';
+        stored.summary.lastOutputSnippet = reason;
+        this.taskStore.upsertTask(stored);
+        console.warn(`[TaskSupervisor] Refusing unsupported agent for task ${stored.threadId}: ${reason}`);
+      }
       return Promise.resolve();
     }
     let fresh = stored;
@@ -506,7 +520,6 @@ export class TaskSupervisor extends EventEmitter {
           taskThreadId: thread.threadId,
           taskRound: roundNumber,
           model: thread.targetModel,
-          modelRef: thread.targetModelRef,
           role: 'developer',
           previousTokenUsage: readStoredRoundUsage(this.taskStore, thread.threadId, roundNumber),
           onChildPid: (pid) => {

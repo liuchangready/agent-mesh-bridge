@@ -47,8 +47,6 @@ import {
 } from './reviewer-log';
 import { aggregateThreadTokenUsage } from './token-usage-collector';
 import { assertCanExecute } from './agent-capabilities';
-import { isGroupAgentId, loadGroupAgentConfig, loadGroupAgentHost } from './group-agent-registry';
-import { COPILOT_MAX_ROUNDS, projectCopilotRoundTokenUsage, projectCopilotTaskDetails, projectCopilotTaskSummary, projectCopilotTokenUsage } from '../copilot/copilot-projection';
 
 /** Older non-compacted rounds are excerpted to this many characters. */
 const DETAIL_HISTORY_OUTPUT_MAX_CHARS = 4_000;
@@ -77,13 +75,6 @@ const CONTROL_TOOLS = new Set([
   'record_merge_request',
 ]);
 
-const groupModelRefSchema = {
-  type: 'object',
-  oneOf: [
-    { properties: { source: { const: 'vscode-lm' }, vendor: { type: 'string', minLength: 1, maxLength: 128 }, id: { type: 'string', minLength: 1, maxLength: 256 } }, required: ['source', 'vendor', 'id'], additionalProperties: false },
-    { properties: { source: { const: 'openai-compatible' }, id: { type: 'string', minLength: 1, maxLength: 256 }, origin: { type: 'string', minLength: 1, maxLength: 512 }, bindingRevision: { type: 'integer', minimum: 0 } }, required: ['source', 'id', 'origin', 'bindingRevision'], additionalProperties: false },
-  ],
-};
 
 export class MCPServer {
   private dispatcher: AsyncDispatcher;
@@ -96,7 +87,6 @@ export class MCPServer {
   private modelCatalog: ModelCatalog;
   /** Starves polling loops on tasks this process dispatched itself. */
   private pollGuard = new CallerPollGuard();
-  private readonly copilotProfile = process.env.MESH_MCP_PROFILE === 'copilot-requester';
 
   constructor(
     dispatcher: AsyncDispatcher,
@@ -429,7 +419,6 @@ export class MCPServer {
               description:
                 'Set true only when the user themselves named the model in `model` (e.g. "use deepseek flash"). Defaults to false, in which case a non-default `model` is ignored and the configured default is used. With true, the bridge shows the user a confirmation dialog; approval switches the task, "keep default" falls back, and no answer within 3 minutes aborts the dispatch.',
             },
-            modelRef: { ...groupModelRefSchema, description: 'Exact Group Agent model reference. Non-default references require modelRequestedByUser: true and the standard user approval.' },
             initiatorModel: {
               type: 'string',
               description:
@@ -501,7 +490,6 @@ export class MCPServer {
               description:
                 'Set true only when the user named this model; the bridge then asks them to confirm the switch.',
             },
-            modelRef: groupModelRefSchema,
           },
           required: ['threadId', 'feedback'],
         },
@@ -570,7 +558,6 @@ export class MCPServer {
               description:
                 'Set true only when the user named this model; the bridge then asks them to confirm the switch.',
             },
-            modelRef: groupModelRefSchema,
           },
           required: ['threadId'],
         },
@@ -601,7 +588,6 @@ export class MCPServer {
               description:
                 'Set true only when the user named this model; the bridge then asks them to confirm the switch.',
             },
-            modelRef: groupModelRefSchema,
           },
           required: ['threadId'],
         },
@@ -632,7 +618,6 @@ export class MCPServer {
               description:
                 'Set true only when the user themselves named the model; the bridge then asks them to confirm the switch in VS Code.',
             },
-            modelRef: groupModelRefSchema,
             reason: {
               type: 'string',
               description: 'Why the executor is being switched (recorded on the task).',
@@ -923,26 +908,6 @@ export class MCPServer {
       },
     ];
 
-    if (this.copilotProfile) {
-      const allowed = new Set(['submit_mesh_task', 'query_agent_mesh_status', 'list_agent_models', 'get_task_summary', 'get_thread_details', 'get_task_token_usage', 'list_recent_tasks']);
-      return tools.map((tool: any) => tool.name === 'dispatch_task' ? {
-        ...tool,
-        name: 'submit_mesh_task',
-        description: 'Submit one task to the configured CLI reviewer and end this Copilot turn. The original Copilot chat is not resumed; read results later from the Bridge task tree or summary. Do not poll.',
-        inputSchema: {
-          ...tool.inputSchema,
-          properties: Object.fromEntries(Object.entries(tool.inputSchema.properties)
-            .filter(([key]) => !['initiatorAgent', 'callerSessionId', 'initiatorModel', 'allowScopeOverlap', 'reviewBootstrap'].includes(key))
-            .concat([['submissionId', { type: 'string', description: 'Stable retry key for this submission; reuse it for transport retries of the same request.' }]])),
-          required: ['title', 'prompt', 'submissionId'],
-        },
-      } : tool).filter((tool: any) => allowed.has(tool.name)).map((tool: any) => {
-        if (tool.name !== 'get_thread_details') return tool;
-        const inputSchema = { ...tool.inputSchema, properties: Object.fromEntries(Object.entries(tool.inputSchema.properties || {}).filter(([key]) => key === 'threadId')) };
-        return { ...tool, description: 'Read a bounded task view with recent rounds and truncation hints.', inputSchema };
-      });
-    }
-
     // A receiver is executing one delegated task; hide new-work tools so the
     // model cannot even attempt recursive delegation. The runtime guard in
     // handleToolCall stays as the authoritative enforcement.
@@ -1155,33 +1120,6 @@ export class MCPServer {
    */
   public async handleToolCall(name: string, args: any): Promise<any> {
     this.assertReceiverMayCall(name, args);
-    if (this.copilotProfile) {
-      const allowed = new Set(['submit_mesh_task', 'query_agent_mesh_status', 'list_agent_models', 'get_task_summary', 'get_thread_details', 'get_task_token_usage', 'list_recent_tasks']);
-      if (!allowed.has(name)) throw new Error(`Tool ${name} is not available in the Copilot requester profile.`);
-      this.assertCopilotBinding();
-      const allowedArgs: Record<string, string[]> = {
-        submit_mesh_task: ['title', 'prompt', 'targetAgent', 'workspacePath', 'model', 'modelRequestedByUser', 'submissionId'],
-        query_agent_mesh_status: [],
-        list_agent_models: ['targetAgent', 'forceRefresh'],
-        get_task_summary: ['threadId'],
-        get_thread_details: ['threadId'],
-        get_task_token_usage: ['threadId', 'round'],
-        list_recent_tasks: ['limit', 'statusFilter'],
-      };
-      for (const key of Object.keys(args || {})) {
-        if (!allowedArgs[name].includes(key)) throw new Error(`Argument ${key} is not available in the Copilot requester profile.`);
-      }
-      if (['get_task_summary', 'get_thread_details', 'get_task_token_usage'].includes(name)) {
-        this.assertCopilotTaskAccess(args.threadId);
-      }
-      if (name === 'list_recent_tasks') {
-        if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1)) throw new Error('limit must be a positive integer.');
-        args.limit = Math.min(args.limit ?? 20, 20);
-      }
-      if (name === 'submit_mesh_task') return this.submitCopilotTask(args);
-    }
-    if (name === 'submit_mesh_task') throw new Error('submit_mesh_task is available only in the Copilot requester profile.');
-
     switch (name) {
       case 'dispatch_task':
       {
@@ -1207,7 +1145,6 @@ export class MCPServer {
           callerSessionId: args.callerSessionId,
           workspacePath: args.workspacePath,
           model: args.model,
-          modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
           initiatorModel: args.initiatorModel,
         });
@@ -1246,7 +1183,6 @@ export class MCPServer {
           callerSessionId: args.callerSessionId,
           targetAgent: args.targetAgent,
           model: args.model,
-          modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
         });
         // Reviewer decision submitted: hand the task role over to the
@@ -1275,7 +1211,6 @@ export class MCPServer {
         return this.reworkController.resumePausedTask(args.threadId, {
           targetAgent: args.targetAgent,
           model: args.model,
-          modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
         });
       }
@@ -1284,7 +1219,6 @@ export class MCPServer {
         const result = await this.reworkController.retargetTask(args.threadId, {
           targetAgent: args.targetAgent,
           model: args.model,
-          modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
         }, args.reason, (process.env.MESH_CALLER_AGENT as string) || 'caller');
         return result;
@@ -1294,7 +1228,6 @@ export class MCPServer {
         const retried = await this.reworkController.retryFailedRound(args.threadId, {
           targetAgent: args.targetAgent,
           model: args.model,
-          modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
         });
         const thread = this.taskStore.getTask(args.threadId);
@@ -1357,28 +1290,14 @@ export class MCPServer {
       case 'list_recent_tasks': {
         const limit = typeof args.limit === 'number' ? args.limit : 20;
         const statusFilter = args.statusFilter;
-        const tasks = this.copilotProfile
-          ? this.taskStore.listTasks(1000, statusFilter).filter((task) =>
-              task.requesterBinding?.workspaceUri === process.env.MESH_COPILOT_WORKSPACE_URI,
-            ).slice(0, Math.min(limit, 20))
-          : this.taskStore.listTasks(limit, statusFilter);
+        const tasks = this.taskStore.listTasks(limit, statusFilter);
         // Every task carries both ends of its model routing so a caller can see
         // which model it dispatched from and which model the receiver runs, plus
         // the derived token rollup so a list can be compared by cost.
-        return tasks.map((task) => this.copilotProfile ? ({
-          threadId: task.threadId, title: task.title, status: task.status,
-          requesterAgent: task.requesterAgent, initiatorAgent: task.initiatorAgent,
-          reviewerAgent: task.initiatorAgent,
-          requesterModel: task.requesterAgent === 'vscode_chat' ? null : (task.requesterModel || null),
-          targetAgent: task.targetAgent, updatedAt: task.updatedAt,
-          finalSummary: task.finalSummary?.summary?.slice(0, 1_000) || null,
-          tokenUsage: projectCopilotTokenUsage(aggregateThreadTokenUsage(task.rounds || [])),
-        }) : ({
+        return tasks.map((task) => ({
           ...task,
           modelRouting: getModelRouting(task),
           archived: !!task.archivedAt,
-          // Archived tasks keep only the digest; surface it directly so a list
-          // remains useful without a second call.
           finalSummary: task.finalSummary?.summary || null,
           tokenUsage: aggregateThreadTokenUsage(task.rounds || []),
         }));
@@ -1406,43 +1325,20 @@ export class MCPServer {
           }
           return {
             threadId: task.threadId,
-            title: this.copilotProfile ? task.title.slice(0, 240) : task.title,
+            title: task.title,
             round: roundNumber,
             executorAgent: round.executorAgent,
-            executorModel: this.copilotProfile ? round.executorModel?.slice(0, 200) : round.executorModel,
+            executorModel: round.executorModel,
             status: round.status,
             durationMs: round.durationMs,
-            tokenUsage: this.copilotProfile ? projectCopilotRoundTokenUsage(round.tokenUsage) : round.tokenUsage,
-            taskTotal: this.copilotProfile ? projectCopilotTokenUsage(summary) : summary,
+            tokenUsage: round.tokenUsage,
+            taskTotal: summary,
             note:
               'Counts are the RECEIVER (callee) side only. A round without usage data was ' +
               'not measured (source=unavailable); estimated values carry source=estimated.',
           };
         }
 
-        if (this.copilotProfile) {
-          const recentRounds = rounds.slice(-COPILOT_MAX_ROUNDS);
-          return {
-            threadId: task.threadId,
-            title: task.title.slice(0, 240),
-            status: task.status,
-            totalRounds: rounds.length,
-            tokenUsage: projectCopilotTokenUsage(summary),
-            rounds: recentRounds.map((round) => ({
-              round: round.round,
-              type: round.type,
-              status: round.status,
-              durationMs: round.durationMs,
-              executorAgent: round.executorAgent,
-              executorModel: round.executorModel?.slice(0, 200),
-              tokenUsage: projectCopilotRoundTokenUsage(round.tokenUsage),
-            })),
-            omittedRoundCount: rounds.length - recentRounds.length,
-            roundsTruncated: rounds.length > recentRounds.length,
-            ...(rounds.length > recentRounds.length ? { truncationHint: `Showing the most recent ${COPILOT_MAX_ROUNDS} of ${rounds.length} rounds; totals include all rounds.` } : {}),
-            note: 'Counts are the RECEIVER (callee) side only. A round without usage data was not measured (source=unavailable); estimated values carry source=estimated.',
-          };
-        }
         return {
           threadId: task.threadId,
           title: task.title,
@@ -1475,9 +1371,6 @@ export class MCPServer {
           return CallerPollGuard.repeatPayload(task, verdict.reads);
         }
 
-        if (this.copilotProfile) {
-          return projectCopilotTaskDetails(task, aggregateThreadTokenUsage(task.rounds || []));
-        }
 
         const includeRawLogs = args.includeRawLogs === true || args.includeFullHistory === true;
         if (includeRawLogs) {
@@ -1536,7 +1429,6 @@ export class MCPServer {
         const summary =
           task.finalSummary ||
           (isTerminalThreadStatus(task.status) ? buildFinalSummary(task) : undefined);
-        if (this.copilotProfile) return projectCopilotTaskSummary(task, summary);
         return {
           threadId: task.threadId,
           title: task.title,
@@ -1546,12 +1438,9 @@ export class MCPServer {
           createdAt: task.createdAt,
           updatedAt: task.updatedAt,
           reviewFlow: task.reviewFlow || 'legacy',
-          requesterAgent: task.requesterAgent || task.initiatorAgent,
           reviewerAgent: task.initiatorAgent,
           initiatorAgent: task.initiatorAgent,
           targetAgent: task.targetAgent,
-          requesterModel: task.requesterAgent === 'vscode_chat' ? null : (task.requesterModel || task.initiatorModel),
-          requesterModelSource: task.requesterAgent === 'vscode_chat' ? 'none' : (task.requesterModelSource || 'unknown'),
           reviewerModel: task.reviewerModel,
           targetModel: task.targetModel,
           mergeRequest: task.mergeRequest,
@@ -1601,31 +1490,6 @@ export class MCPServer {
 
         const agents: Record<string, any> = {};
         for (const agent of requested) {
-          if (isGroupAgentId(agent)) {
-            const entry = loadGroupAgentConfig()?.agents.find((item) => item.id === agent && item.enabled);
-            const host = loadGroupAgentHost();
-            if (!entry) continue;
-            const receiver = entry.receiverModel;
-            const initiator = entry.initiatorModel;
-            agents[agent] = {
-              configuredModel: receiver?.id || null,
-              configuredModelRef: receiver || null,
-              initiatorModel: initiator?.id || null,
-              initiatorModelRef: initiator || null,
-              models: (entry.models || [])
-                .map((modelRef: any) => ({ id: modelRef.id, modelRef, ...(modelRef.source === 'vscode-lm' ? { vendor: modelRef.vendor } : { origin: modelRef.origin }), ...(JSON.stringify(modelRef) === JSON.stringify(receiver) ? { hint: 'configured default' } : { capability: 'unknown until explicitly probed for this role' }) }))
-                .sort((left: any, right: any) => Number(right.hint === 'configured default') - Number(left.hint === 'configured default')),
-              source: entry.source,
-              capability: {
-                receiver: entry.receiverReady && !!host ? 'ready' : 'unknown',
-                initiator: entry.initiatorReady && !!host ? 'ready' : 'unknown',
-                host: host ? 'online' : 'offline',
-                toolsAuthorized: entry.toolsAuthorized,
-              },
-              updatedAt: new Date(loadGroupAgentConfig()?.updatedAt || Date.now()).toISOString(),
-            };
-            continue;
-          }
           const catalog = all[agent];
           if (!catalog) continue;
           const configuredModel = defaults[agent] || null;
@@ -1780,175 +1644,6 @@ export class MCPServer {
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
-  }
-
-  private assertCopilotBinding(): { workspacePath: string; workspaceUri: string; hostInstanceId: string } {
-    const file = process.env.MESH_COPILOT_BINDING_FILE;
-    if (!file) throw new Error('Copilot host binding is missing; reopen a trusted local workspace.');
-    let binding: any;
-    try { binding = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {
-      throw new Error('Copilot host binding is unavailable; reopen a trusted local workspace.');
-    }
-    const workspacePath = process.env.MESH_COPILOT_WORKSPACE_PATH || '';
-    const workspaceUri = process.env.MESH_COPILOT_WORKSPACE_URI || '';
-    const workspaceAuthority = process.env.MESH_COPILOT_WORKSPACE_AUTHORITY || '';
-    const hostInstanceId = process.env.MESH_COPILOT_HOST_ID || '';
-    if (!binding.enabled || binding.workspaceCount !== 1 || !['codex', 'claude_code', 'antigravity', 'deepseek_harness'].includes(binding.reviewer) ||
-        binding.reviewer !== process.env.MESH_COPILOT_REVIEWER || !binding.trusted || binding.remoteName || binding.uiKind !== 'desktop' || Date.now() - binding.updatedAt > 15_000 ||
-        binding.hostInstanceId !== hostInstanceId || binding.workspaceUri !== workspaceUri ||
-        binding.workspaceAuthority !== workspaceAuthority ||
-        binding.workspacePath !== workspacePath || !path.isAbsolute(workspacePath) ||
-        !fs.existsSync(workspacePath) || !workspaceUri.startsWith('file:')) {
-      throw new Error('Copilot requester requires a live trusted local desktop workspace. Remote, WSL and Web workspaces are unsupported.');
-    }
-    return { workspacePath: fs.realpathSync(workspacePath), workspaceUri, hostInstanceId };
-  }
-
-  private assertCopilotTaskAccess(threadId: unknown): void {
-    if (typeof threadId !== 'string') throw new Error('threadId is required.');
-    const binding = this.assertCopilotBinding();
-    const thread = this.taskStore.getTask(threadId);
-    if (!thread || thread.requesterAgent !== 'vscode_chat' || thread.requesterBinding?.kind !== 'vscode-copilot' ||
-        thread.requesterBinding.workspaceUri !== binding.workspaceUri) {
-      throw new Error(`Task ${threadId} is not available to this Copilot workspace.`);
-    }
-  }
-
-  private async submitCopilotTask(args: any): Promise<any> {
-    const binding = this.assertCopilotBinding();
-    const reviewer = process.env.MESH_COPILOT_REVIEWER as AgentId;
-    if (!['codex', 'claude_code', 'antigravity', 'deepseek_harness'].includes(reviewer)) {
-      throw new Error('Select a CLI reviewer in Copilot settings before submitting a task.');
-    }
-    if (typeof args.submissionId !== 'string' || !/^[A-Za-z0-9_-]{8,128}$/.test(args.submissionId)) {
-      throw new Error('submissionId must be a stable 8–128 character retry key; reuse it only for transport retries of this submission.');
-    }
-    const requestedWorkspace = args.workspacePath ? path.resolve(binding.workspacePath, args.workspacePath) : binding.workspacePath;
-    const fingerprint = crypto.createHash('sha256').update(JSON.stringify({
-      title: args.title, prompt: args.prompt, targetAgent: args.targetAgent || 'default',
-      workspacePath: requestedWorkspace,
-      model: args.model, modelRequestedByUser: args.modelRequestedByUser === true,
-    })).digest('hex');
-    const releaseSubmissionLock = await this.acquireCopilotSubmissionLock(`${binding.workspaceUri}\0${args.submissionId}`);
-    try {
-    const duplicate = this.taskStore.getAllTasks().find((task) =>
-      task.requesterSubmissionId === args.submissionId &&
-      task.requesterBinding?.workspaceUri === binding.workspaceUri,
-    );
-    if (duplicate) {
-      if (duplicate.requesterSubmissionFingerprint !== fingerprint) {
-        throw new Error('submissionId is already bound to a different task request; inspect that thread before starting another submission.');
-      }
-      releaseSubmissionLock();
-      return this.copilotDeliveryResult(duplicate, 'Returned the existing task for this submissionId.');
-    }
-    let workspacePath = binding.workspacePath;
-    if (args.workspacePath) {
-      const candidate = path.resolve(binding.workspacePath, args.workspacePath);
-      if (!fs.existsSync(candidate)) throw new Error('workspacePath does not exist inside the bound workspace.');
-      workspacePath = fs.realpathSync(candidate);
-    }
-    const rootPrefix = binding.workspacePath.endsWith(path.sep) ? binding.workspacePath : binding.workspacePath + path.sep;
-    const compare = (value: string) => process.platform === 'win32' ? value.toLowerCase() : value;
-    if (compare(workspacePath) !== compare(binding.workspacePath) && !compare(workspacePath).startsWith(compare(rootPrefix))) {
-      throw new Error('workspacePath must remain inside the workspace bound to this Copilot host.');
-    }
-    const submission = this.dispatcher.dispatchTask({
-      targetAgent: args.targetAgent || 'default', initiatorAgent: reviewer,
-      title: args.title, prompt: args.prompt, workspacePath,
-      model: args.model, modelRequestedByUser: args.modelRequestedByUser === true,
-      reviewFlow: 'dedicated',
-      requesterContext: {
-        agent: 'vscode_chat', submissionId: args.submissionId,
-        fingerprint,
-        binding: {
-          kind: 'vscode-copilot', hostInstanceId: binding.hostInstanceId,
-          workspaceUri: binding.workspaceUri, nativeWakeSupported: false,
-          notificationDelivery: 'vscode-ui',
-        },
-      },
-    }).then((result) => {
-      const task = this.taskStore.getTask(result.threadId);
-      if (!task) throw new Error('Task was submitted but could not be read from the ledger. Check the Bridge task tree before retrying.');
-      return this.copilotDeliveryResult(task, result.message);
-    });
-    const result = await submission;
-    releaseSubmissionLock();
-    return result;
-    } catch (error) {
-      releaseSubmissionLock();
-      throw error;
-    }
-  }
-
-  private async acquireCopilotSubmissionLock(key: string): Promise<() => void> {
-    const lockDir = path.join(path.dirname(this.taskStore.getStoragePath()), 'copilot-submission-locks');
-    fs.mkdirSync(lockDir, { recursive: true });
-    for (const name of fs.readdirSync(lockDir)) {
-      const stalePath = path.join(lockDir, name);
-      try {
-        if (!name.endsWith('.json')) continue;
-        const owner = JSON.parse(fs.readFileSync(stalePath, 'utf8'));
-        try { process.kill(owner.pid, 0); } catch { fs.unlinkSync(stalePath); }
-      } catch {
-        try { if (Date.now() - fs.statSync(stalePath).mtimeMs > 1_000) fs.unlinkSync(stalePath); } catch {}
-      }
-    }
-    const lockPath = path.join(lockDir, `${crypto.createHash('sha256').update(key).digest('hex')}.json`);
-    const ownerToken = crypto.randomUUID();
-    const started = Date.now();
-    while (true) {
-      try {
-        const fd = fs.openSync(lockPath, 'wx');
-        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, ownerToken, at: Date.now() }));
-        fs.closeSync(fd);
-        break;
-      } catch (error: any) {
-        if (error?.code !== 'EEXIST') throw error;
-        let stale = false;
-        try {
-          const owner = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-          try { process.kill(owner.pid, 0); } catch { stale = true; }
-        } catch {
-          try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > 1_000; }
-          catch { stale = true; }
-        }
-        if (stale) {
-          try { fs.unlinkSync(lockPath); } catch {}
-          continue;
-        }
-        if (Date.now() - started > 4 * 60_000) {
-          throw new Error('A submission with this ID is still in progress. Check the task tree, then retry with the same submissionId; the Bridge did not resend it.');
-        }
-        await new Promise((resolve) => setTimeout(resolve, 250));
-      }
-    }
-    const heartbeat = setInterval(() => {
-      try {
-        const owner = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-        if (owner.ownerToken === ownerToken) fs.utimesSync(lockPath, new Date(), new Date());
-      } catch {}
-    }, 5_000);
-    heartbeat.unref?.();
-    return () => {
-      clearInterval(heartbeat);
-      try {
-        const owner = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-        if (owner.ownerToken === ownerToken) fs.unlinkSync(lockPath);
-      } catch {}
-    };
-  }
-
-  private copilotDeliveryResult(task: any, message: string): any {
-    const stopInstruction = 'STOP NOW — end this Copilot turn and do not poll. The dedicated reviewer receives callbacks; this Copilot chat will not resume automatically. Results appear in the Agent Mesh Bridge panel.';
-    return {
-      threadId: task.threadId,
-      status: task.status === 'queued' ? 'QUEUED' : 'REVIEWER_STARTING',
-      targetAgent: task.targetAgent, requesterAgent: 'vscode_chat',
-      reviewerAgent: task.initiatorAgent, notificationDelivery: 'vscode-ui',
-      nativeChatWake: false, nextAction: 'END_TURN_AND_WAIT_FOR_CALLBACK',
-      stopInstruction, message: `${stopInstruction} ${message}`,
-    };
   }
 
   /** Handle incoming JSON-RPC 2.0 message. */

@@ -15,7 +15,7 @@ export class ActiveAgentResolver {
   }
 
   public setManualOverride(agent: AgentId | null): void {
-    if (agent && !agent.startsWith('copilot_group:')) assertCanExecute(agent, 'be selected as the default receiver');
+    if (agent) assertCanExecute(agent, 'be selected as the default receiver');
     this.manualOverride = agent;
   }
 

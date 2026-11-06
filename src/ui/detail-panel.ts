@@ -20,7 +20,6 @@ import {
   statReviewerLog,
 } from '../bridge/reviewer-log';
 import { aggregateThreadTokenUsage, formatTokenCount } from '../bridge/token-usage-collector';
-import { isCopilotRequester } from '../copilot/copilot-projection';
 import { nativeCompactionCapability } from '../bridge/native-session-compactor';
 
 export class TaskDetailPanel {
@@ -793,7 +792,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
 <body>
   <div class="header">
     <div class="title-row">
-      <h2 class="title">[${isCopilotRequester(thread) ? `GitHub Copilot requester | reviewer ${escapeHtml(thread.initiatorAgent)} -> ${escapeHtml(thread.targetAgent)}` : `${thread.requesterAgent ? `${escapeHtml(thread.requesterAgent)} requester | ` : ''}${escapeHtml(thread.initiatorAgent)} -> ${escapeHtml(thread.targetAgent)}`}] ${escapeHtml(thread.title)}</h2>
+      <h2 class="title">[${escapeHtml(thread.initiatorAgent)} -> ${escapeHtml(thread.targetAgent)}] ${escapeHtml(thread.title)}</h2>
       <span class="badge" style="background: ${badgeColor};">${escapeHtml(thread.status.toUpperCase())}</span>
     </div>
 
@@ -802,7 +801,6 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
         <div class="meta-label">Thread ID</div>
         <div class="meta-val">${escapeHtml(thread.threadId)}</div>
       </div>
-      ${thread.requesterAgent ? `<div class="meta-item"><div class="meta-label">Requester</div><div class="meta-val">${isCopilotRequester(thread) ? 'GitHub Copilot | VS Code | native session/model unknown | chat wake unsupported' : `${escapeHtml(thread.requesterAgent)} | model ${escapeHtml(thread.requesterModel || 'unknown')} | session ${escapeHtml(thread.requesterSessionId || 'unknown')}`}</div></div>` : ''}
       <div class="meta-item">
         <div class="meta-label">Initiator Agent / Session</div>
         <div class="meta-val">${escapeHtml(thread.initiatorAgent)} / ${escapeHtml(thread.callerSessionId || '未绑定 (点击唤醒)')}</div>
@@ -835,8 +833,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
           ${
             thread.reviewFlow === 'dedicated'
               ? `🧭 专用 reviewer 会话 ${escapeHtml(thread.reviewerSessionId || '（待捕获）')}
-                 · reviewer 模型 ${escapeHtml(thread.reviewerModel || 'Agent 默认')}
-                 · 请求方 ${escapeHtml(thread.requesterSessionId || '未知')}`
+                 · reviewer 模型 ${escapeHtml(thread.reviewerModel || 'Agent 默认')}`
               : 'legacy — 请求方会话审阅'
           }
           ${thread.archivedAt ? ` · 📦 已归档 (${escapeHtml(thread.archivedAt)})` : ''}

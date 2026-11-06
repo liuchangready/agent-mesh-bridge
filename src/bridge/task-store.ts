@@ -21,7 +21,6 @@ import {
   isTerminalThreadStatus,
   removeTaskArtifacts,
 } from './task-summary';
-import { cleanupGroupAgentTaskArtifacts } from './group-agent-mailbox';
 import { cleanupThreadNativeSessions, collectThreadSessionRefs } from './native-session-cleanup';
 import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
 
@@ -932,7 +931,6 @@ export class TaskStore extends EventEmitter {
     this.persistThread(thread);
     this.tasks.set(threadId, thread);
     try { cleanupThreadNativeSessions(source!); } catch {}
-    try { cleanupGroupAgentTaskArtifacts(source!, this.storageDir); } catch {}
     removeTaskArtifacts(threadId, this.storageDir, {
       keepArchive: true,
       targetAgent: thread.targetAgent,

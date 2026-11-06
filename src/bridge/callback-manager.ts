@@ -28,7 +28,6 @@ import { ReviewerLogWriter, createReviewerLogWriter } from './reviewer-log';
 import { cachedCodexResumeSupport, codexResumeArgument, extractCodexThreadId } from './codex-session';
 import { assertCanExecute } from './agent-capabilities';
 import { AutonomousRunner } from './autonomous-runner';
-import { isGroupAgentId } from './group-agent-registry';
 import { NativeSessionCompactor } from './native-session-compactor';
 import { NativeSessionLock } from './native-session-lock';
 import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
@@ -686,41 +685,6 @@ export class CallbackManager extends EventEmitter {
         fs.writeSync(outFd, text);
       } catch {}
     };
-
-    if (isGroupAgentId(initiator)) {
-      if (!this.runner) {
-        release();
-        reviewerLog.writeOutcome({ error: 'Group reviewer runner is not attached.' });
-        reviewerLog.close();
-        if (typeof outFd === 'number') try { fs.closeSync(outFd); } catch {}
-        return false;
-      }
-      void this.runner.execute({
-        agent: initiator, prompt: promptMessage, isRework: true, receiverSessionId: callerSessionId,
-        title: thread.title, cwd, taskThreadId: thread.threadId, taskRound: round.round,
-        model: thread.reviewerModel, modelRef: thread.reviewerModelRef || thread.initiatorModelRef,
-        role: 'reviewer', markAsReceiver: false, onChildPid,
-        onStdoutChunk: (chunk) => tee(chunk),
-      }).then((result) => {
-        if (result.extractedOutput) tee(result.extractedOutput);
-        const outcome = { exitCode: result.assessment?.success ? 0 : -1,
-          error: result.assessment?.success ? undefined : result.error || result.assessment?.errorCode,
-          output: result.extractedOutput || '' };
-        reviewerLog.writeOutcome(outcome);
-        reviewerLog.close();
-        if (typeof outFd === 'number') try { fs.closeSync(outFd); } catch {}
-        release();
-        this.finalizeWake(thread, round, callerSessionId, outcome, wakeKind);
-      }).catch((error) => {
-        const outcome = { error: error instanceof Error ? error.message : String(error) };
-        reviewerLog.writeOutcome(outcome);
-        reviewerLog.close();
-        if (typeof outFd === 'number') try { fs.closeSync(outFd); } catch {}
-        release();
-        this.finalizeWake(thread, round, callerSessionId, outcome, wakeKind);
-      });
-      return true;
-    }
 
     const attachErrorLogging = (child: child_process.ChildProcess) => {
       let settled = false;

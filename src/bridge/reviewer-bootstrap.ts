@@ -493,7 +493,6 @@ export class ReviewerBootstrapService {
         taskRound: 0,
         nativeSessionRole: 'reviewer',
         model: thread.reviewerModel,
-        modelRef: thread.reviewerModelRef,
         role: 'bootstrap',
         markAsReceiver: false,
         timeoutMs: this.deps.timeoutMs ?? 3 * 60 * 1000,
