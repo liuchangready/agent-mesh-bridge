@@ -102,6 +102,10 @@ export function buildFinalSummary(
   const error = work?.error || work?.interruption?.reason || reviewFailure?.reason;
   const output = work?.output;
   const tokens = aggregateThreadTokenUsage(thread.rounds || []);
+  const nativeOperations = (thread.rounds || []).flatMap((round) => round.nativeSessionCompactions || []);
+  const nativeWarnings = nativeOperations
+    .filter((operation) => ['failed', 'interrupted', 'unknown'].includes(operation.phase))
+    .map((operation) => `${operation.role}/${operation.agent}: ${operation.error || operation.errorCode || operation.phase}`);
   const changedFiles = uniqueFiles(thread);
   const mr = mergeRequest || thread.mergeRequest;
 
@@ -141,8 +145,11 @@ export function buildFinalSummary(
           totalTokens: tokens.totalTokens,
           promptTokens: tokens.totalPromptTokens,
           outputTokens: tokens.totalOutputTokens,
+          tokenUsageByAgent: tokens.byAgent,
+          tokenUsageByModel: tokens.byModel,
         }
       : {}),
+    ...(nativeOperations.length ? { nativeCompactions: { count: nativeOperations.filter((operation) => operation.phase === 'succeeded').length, warnings: nativeWarnings } } : {}),
   };
 }
 
@@ -169,6 +176,7 @@ export function archiveThreadData(thread: DelegationThread, now = new Date()): b
   thread.callerSessionId = undefined;
   thread.requesterSessionId = undefined;
   thread.receiverSessionId = '';
+  thread.nativeSessionCompaction = undefined;
   thread.receiverSessionCaptured = undefined;
   thread.reviewBootstrap = undefined;
   thread.reviewWake = undefined;
@@ -300,7 +308,7 @@ export function archiveCompletedTaskLogs(
     if (!fs.existsSync(dir)) continue;
     for (const name of fs.readdirSync(dir)) {
       if (!name.startsWith(`${safe}_round_`)) continue;
-      if (!name.endsWith('.log') && !name.endsWith('.output.md')) continue;
+      if (!name.endsWith('.log') && !name.endsWith('.output.md') && !name.endsWith('.recovery.json')) continue;
       if (foundFilenames.has(name)) continue;
       const full = path.join(dir, name);
       const content = fs.readFileSync(full);
@@ -322,7 +330,7 @@ export function archiveCompletedTaskLogs(
     if (!fs.existsSync(dir)) continue;
     for (const name of fs.readdirSync(dir)) {
       if (!name.startsWith(`${safe}_round_`) && !name.startsWith(`${safe}_bootstrap.log`)) continue;
-      if (!name.endsWith('.reviewer.log') && !name.endsWith('_bootstrap.log')) continue;
+      if (!name.endsWith('.reviewer.log') && !name.endsWith('_bootstrap.log') && !name.endsWith('.recovery.json')) continue;
       if (foundFilenames.has(name)) continue;
       const full = path.join(dir, name);
       const content = fs.readFileSync(full);

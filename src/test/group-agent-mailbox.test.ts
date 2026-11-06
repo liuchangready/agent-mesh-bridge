@@ -716,9 +716,14 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
     developerTurns = 0; reviewerTurns = 0;
     const groupCliDispatch = await runIndependentDispatch(undefined, 'claude_code');
     const cliDeadline = Date.now() + 15_000;
-    while (Date.now() < cliDeadline && store.getTask(groupCliDispatch.threadId)?.status !== 'completed') await new Promise((resolve) => setTimeout(resolve, 50));
+    while (Date.now() < cliDeadline && store.getTask(groupCliDispatch.threadId)?.status !== 'completed') {
+      if (store.getTask(groupCliDispatch.threadId)?.status === 'waiting_merge') rework.resumePendingMerges();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     const groupCliFinished = store.getTask(groupCliDispatch.threadId)!;
-    assert.equal(groupCliFinished.status, 'completed', JSON.stringify({ status: groupCliFinished.status, rounds: groupCliFinished.rounds.map((round) => ({ status: round.status, error: round.error, assessment: round.assessment })), files: fs.readdirSync(groupCliFinished.worktree!.path), git: childProcess.execFileSync('git', ['status', '--short'], { cwd: groupCliFinished.worktree!.path, encoding: 'utf8' }) }));
+    assert.equal(groupCliFinished.status, 'completed', JSON.stringify({ status: groupCliFinished.status, integration: groupCliFinished.worktree?.integration,
+      rounds: groupCliFinished.rounds.map((round) => ({ status: round.status, error: round.error, assessment: round.assessment })),
+      files: fs.readdirSync(groupCliFinished.worktree!.path), git: childProcess.execFileSync('git', ['status', '--short'], { cwd: groupCliFinished.worktree!.path, encoding: 'utf8' }) }));
     assert.equal(groupCliFinished.initiatorAgent, agent, 'the Group sender remains the dedicated reviewer for a CLI receiver');
     assert.equal(groupCliFinished.targetAgent, 'claude_code');
     assert.equal(groupCliFinished.worktree?.integration?.phase, 'merged');

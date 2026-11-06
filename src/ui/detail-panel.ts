@@ -21,6 +21,7 @@ import {
 } from '../bridge/reviewer-log';
 import { aggregateThreadTokenUsage, formatTokenCount } from '../bridge/token-usage-collector';
 import { isCopilotRequester } from '../copilot/copilot-projection';
+import { nativeCompactionCapability } from '../bridge/native-session-compactor';
 
 export class TaskDetailPanel {
   public static currentPanel: TaskDetailPanel | undefined;
@@ -83,6 +84,10 @@ export class TaskDetailPanel {
             break;
           case 'pauseTask':
             await vscode.commands.executeCommand('agent-mesh-bridge.pauseTask', this.currentThreadId);
+            this.update();
+            break;
+          case 'compactNativeSession':
+            await vscode.commands.executeCommand('agent-mesh-bridge.compactNativeSession', this.currentThreadId);
             this.update();
             break;
           case 'deleteTask':
@@ -408,6 +413,13 @@ export class TaskDetailPanel {
     // cross-process write.
     const tokenSummary = aggregateThreadTokenUsage(thread.rounds || []);
     const tokenTilde = tokenSummary.isPartialOrEstimated ? '~' : '';
+    const nativeOperations = (thread.rounds || []).flatMap((round) => round.nativeSessionCompactions || []);
+    const nativeStatus = (role: 'developer' | 'reviewer', agent: any, sessionId?: string) => {
+      const last = [...nativeOperations].reverse().find((operation) => operation.role === role);
+      const capability = nativeCompactionCapability(agent);
+      const cursor = thread.nativeSessionCompaction?.[role];
+      return `${role}: ${capability}${sessionId ? ` · session captured` : ' · session not captured'}${last ? ` · last ${last.phase}${last.nativeTurnId ? ` (${last.nativeTurnId})` : ''}` : ''}${cursor ? ` · turns ${cursor.turnsSinceCompaction}${cursor.recoveryVersion && cursor.recoveryVersion !== cursor.recoveryDeliveredVersion ? ' · recovery pending' : ''}` : ''}`;
+    };
 
     const roundsHtml = thread.rounds
       .map((r) => {
@@ -909,6 +921,11 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
         <div class="meta-label">Workspace</div>
         <div class="meta-val">${escapeHtml(thread.workspacePath)}</div>
       </div>
+      <div class="meta-item" style="grid-column:1/-1;">
+        <div class="meta-label">Native Session Compaction / 原生会话压缩</div>
+        <div class="meta-val">Bridge mode: off by default · ${escapeHtml(nativeStatus('developer', thread.targetAgent, thread.receiverSessionCaptured ? thread.receiverSessionId : undefined))}<br/>${escapeHtml(nativeStatus('reviewer', thread.initiatorAgent, thread.reviewerSessionCaptured ? thread.reviewerSessionId : undefined))}</div>
+        ${thread.status === 'paused' ? '<button class="secondary" style="margin-top:8px;" onclick="compactNativeSession()">Compress a captured task session…</button>' : ''}
+      </div>
       ${thread.worktree ? `
       <div class="meta-item" style="grid-column: 1 / -1;">
         <div class="meta-label">Local integration</div>
@@ -1127,6 +1144,10 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
 
     function pauseTask() {
       vscode.postMessage({ command: 'pauseTask' });
+    }
+
+    function compactNativeSession() {
+      vscode.postMessage({ command: 'compactNativeSession' });
     }
 
     function deleteTask() {

@@ -33,6 +33,7 @@ import { GroupAgentHostBroker } from './copilot/group-agent-host-broker';
 import { registerCopilotModelCommands } from './copilot/model-commands';
 import { saveBridgePolicy, AgentLogDirectories } from './bridge/bridge-policy';
 import { probeCodexResumeSupport } from './bridge/codex-session';
+import { NativeSessionCompactor } from './bridge/native-session-compactor';
 import {
   DSH_PROVIDER_ENV_HINT,
   DSH_PROVIDER_ID_HINT,
@@ -306,6 +307,7 @@ export function activate(context: vscode.ExtensionContext) {
   // 2. Initialize Core Services
   const taskStore = TaskStore.getInstance();
   const detector = new AgentDetector(customPaths);
+  const nativeSessionCompactor = new NativeSessionCompactor(taskStore, detector);
   // Ledger retention: keep the newest N tasks hot, archive older terminal ones.
   // Archival keeps the read-only digest and removes rounds/logs/session ids, so
   // the sidebar and get_task_summary stay useful without an ever-growing ledger.
@@ -392,6 +394,9 @@ export function activate(context: vscode.ExtensionContext) {
     const bridgeCfg = vscode.workspace.getConfiguration('agentMeshBridge');
     saveBridgePolicy({
       contextCompaction: bridgeCfg.get<boolean>('contextCompaction', true),
+      nativeSessionCompaction: {
+        mode: bridgeCfg.get<'off' | 'auto'>('nativeSessionCompaction.mode', 'off'),
+      },
       // New tasks get a dedicated reviewer conversation. `legacy` keeps the old
       // caller-resume flow and is the rollback switch; existing tasks stay on
       // whatever topology they were created with.
@@ -1007,6 +1012,52 @@ export function activate(context: vscode.ExtensionContext) {
       },
     ),
 
+    vscode.commands.registerCommand(
+      'agent-mesh-bridge.compactNativeSession',
+      async (itemOrThreadId?: TaskTreeItem | string) => {
+        let threadId = typeof itemOrThreadId === 'string' ? itemOrThreadId : itemOrThreadId?.thread?.threadId;
+        if (!threadId) {
+          taskStore.loadFromDisk();
+          const tasks = taskStore.listTasks().filter((task) => task.status === 'paused' && !task.archivedAt);
+          const picked = await vscode.window.showQuickPick(tasks.map((task) => ({
+            label: task.title,
+            description: task.threadId,
+            threadId: task.threadId,
+          })), { placeHolder: 'Select a paused task with a captured Codex session' });
+          if (!picked) return;
+          threadId = picked.threadId;
+        }
+        taskStore.loadFromDisk();
+        const thread = taskStore.getTask(threadId);
+        if (!thread || thread.status !== 'paused' || thread.archivedAt) {
+          vscode.window.showWarningMessage('Native session compaction requires an unarchived paused task.');
+          return;
+        }
+        const roles = [
+          ...(thread.receiverSessionCaptured ? [{ label: 'Developer', role: 'developer' as const }] : []),
+          ...(thread.reviewFlow === 'dedicated' && thread.reviewerSessionCaptured ? [{ label: 'Dedicated reviewer', role: 'reviewer' as const }] : []),
+        ];
+        if (!roles.length) {
+          vscode.window.showWarningMessage('This task has no eligible captured Bridge-owned session.');
+          return;
+        }
+        const selected = await vscode.window.showQuickPick(roles, { placeHolder: 'Choose the session to compact' });
+        if (!selected) return;
+        const operation = await vscode.window.withProgress({
+          location: vscode.ProgressLocation.Notification,
+          title: `Compacting ${selected.label} native session`,
+          cancellable: false,
+        }, () => nativeSessionCompactor.compactPausedTask(threadId!, selected.role));
+        activeTreeProvider.refresh();
+        recentTreeProvider.refresh();
+        TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
+        if (operation.phase === 'succeeded') {
+          vscode.window.showInformationMessage(`Native compaction completed for ${selected.label} (${operation.nativeTurnId}).`);
+        } else {
+          vscode.window.showWarningMessage(`Native compaction was ${operation.phase}: ${operation.error || operation.errorCode || 'result not confirmed'}.`);
+        }
+      },
+    ),
     vscode.commands.registerCommand(
       'agent-mesh-bridge.pauseTask',
       async (itemOrThreadId?: TaskTreeItem | string) => {
@@ -1780,6 +1831,7 @@ export function activate(context: vscode.ExtensionContext) {
         !e.affectsConfiguration('agentMeshBridge.logDirectories') &&
         !e.affectsConfiguration('agentMeshBridge.requireModelApproval') &&
         !e.affectsConfiguration('agentMeshBridge.contextCompaction') &&
+        !e.affectsConfiguration('agentMeshBridge.nativeSessionCompaction') &&
         !e.affectsConfiguration('agentMeshBridge.concurrency') &&
         !e.affectsConfiguration('agentMeshBridge.reviewStallTimeoutMinutes')
       ) {

@@ -491,6 +491,7 @@ export class ReviewerBootstrapService {
         cwd: thread.workspacePath,
         taskThreadId: thread.threadId,
         taskRound: 0,
+        nativeSessionRole: 'reviewer',
         model: thread.reviewerModel,
         modelRef: thread.reviewerModelRef,
         role: 'bootstrap',

@@ -3,6 +3,7 @@ import * as assert from 'node:assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+const childProcess = require('child_process') as typeof import('child_process');
 
 const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-review-wake-home-'));
 process.env.USERPROFILE = isolatedHome;
@@ -22,6 +23,9 @@ import {
 } from '../bridge/review-wake';
 import { DelegationRound, DelegationThread, isTaskUnfinished } from '../bridge/types';
 import { TaskRoleLock } from '../bridge/task-role-lock';
+import { NativeSessionCompactor } from '../bridge/native-session-compactor';
+import { CancellationRegistry } from '../bridge/cancellation-registry';
+import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 
 describe('Review wake failure policy', () => {
   const now = Date.parse('2026-10-23T12:00:00.000Z');
@@ -143,6 +147,153 @@ describe('CallbackManager records stalled reviewer wakes', () => {
     assert.strictEqual(stored.reviewWake!.round, 1);
     assert.strictEqual(stored.status, 'waiting_review');
     store.dispose();
+  });
+
+  test('a dedicated reviewer wake does not launch after prepare pauses an unknown native operation', async () => {
+    const { dir, store, manager } = setup();
+    const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1';
+    const thread = makeThread({
+      threadId: 'thread_unknown_native_review', reviewFlow: 'dedicated',
+      reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+      reviewerSessionId: sessionId, reviewerSessionCaptured: true, callerSessionId: sessionId,
+      nativeSessionCompaction: { reviewer: { sessionId, lastOperationId: 'unknown-op', revision: 2, turnsSinceCompaction: 0 } },
+    });
+    thread.rounds[0].nativeSessionCompactions = [{
+      id: 'unknown-op', role: 'reviewer', agent: 'codex', sessionId, reason: 'turn_budget',
+      phase: 'unknown', revision: 2, startedAt: new Date().toISOString(), recoveryPath: 'unused', logPath: 'unused',
+    } as any];
+    store.upsertTask(thread);
+    let launches = 0;
+    (manager as any).launchCaller = () => { launches++; return true; };
+    const stored = store.getTask(thread.threadId)!;
+    assert.equal(await manager.notifyCaller(stored, stored.rounds[0]), false);
+    assert.equal(store.getTask(thread.threadId)!.status, 'paused');
+    assert.equal(launches, 0);
+    assert.equal(new TaskExecutionRegistry(dir).getOwner(thread.threadId), undefined);
+    store.dispose();
+  });
+
+  test('a reviewer tail process keeps the native session lease after its role is handed off', async () => {
+    const { store, manager } = setup();
+    const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1';
+    const first = makeThread({ threadId: 'thread_live_reviewer_tail_1', reviewFlow: 'dedicated',
+      reviewBootstrap: { phase: 'confirmed', attempts: 1 }, reviewerSessionId: sessionId,
+      reviewerSessionCaptured: true, callerSessionId: sessionId, reviewerModel: 'gpt-6.1-pro' });
+    const second = makeThread({ ...first, threadId: 'thread_live_reviewer_tail_2' });
+    store.upsertTask(first); store.upsertTask(second);
+    let launches = 0;
+    let onChildPid: ((pid: number | undefined) => void) | undefined;
+    let release: (() => void) | undefined;
+    (manager as any).launchCaller = (...args: any[]) => {
+      launches++;
+      release = args[5];
+      onChildPid = args[6];
+      onChildPid?.(process.pid);
+      return true;
+    };
+    const storedFirst = store.getTask(first.threadId)!;
+    assert.equal(await manager.notifyCaller(storedFirst, storedFirst.rounds[0]), true);
+    // Simulate request_rework handing off the reviewer role while the CLI still
+    // has a live tail process; only process exit releases the session writer.
+    new TaskRoleLock(path.dirname(store.getStoragePath())).release(new TaskRoleLock(path.dirname(store.getStoragePath())).getOwner(first.threadId)!);
+    const storedSecond = store.getTask(second.threadId)!;
+    assert.equal(await manager.notifyCaller(storedSecond, storedSecond.rounds[0]), false);
+    assert.equal(launches, 1);
+    assert.equal((manager as any).wakeQueue.pendingCount(sessionId), 1);
+    (manager as any).wakeQueue.discard(sessionId, second.threadId);
+    onChildPid?.(undefined);
+    release?.();
+    store.dispose();
+  });
+
+  test('reviewer launch binding and exit cleanup failures kill or fail safely without escaping callbacks', async () => {
+    const originalSpawn = childProcess.spawn;
+    try {
+      for (const failure of ['bind', 'clear'] as const) {
+        const { store, manager } = setup();
+        const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1';
+        const tempWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'reviewer-child-workspace-'));
+        const thread = makeThread({ threadId: `thread_reviewer_pid_${failure}`, initiatorAgent: 'antigravity',
+          reviewFlow: 'dedicated', reviewerSessionId: sessionId, reviewerSessionCaptured: true, workspacePath: tempWorkspace });
+        store.upsertTask(thread);
+        let launchedPid: number | undefined;
+        let actualClose = false;
+        let killed = false;
+        (childProcess as any).spawn = (_command: string, _args: string[], options: any) => {
+          const script = failure === 'bind'
+            ? 'process.stdout.write("temporary reviewer child\\n");setInterval(()=>{},1000)'
+            : 'process.stdout.write("temporary reviewer child\\n");process.exit(0)';
+          const child: any = originalSpawn(process.execPath, ['-e', script], options);
+          launchedPid = child.pid;
+          const kill = child.kill.bind(child);
+          child.kill = (...args: any[]) => { killed = true; return kill(...args); };
+          child.once('close', () => { actualClose = true; });
+          return child;
+        };
+        let finish!: () => void;
+        const finished = new Promise<void>((resolve) => { finish = resolve; });
+        let releaseCalls = 0;
+        const onChildPid = (pid: number | undefined) => {
+          if (pid) {
+            if (failure === 'bind') throw new Error('PID bind rejected');
+          } else if (failure === 'clear') throw new Error('PID clear rejected');
+        };
+        let started = false;
+        try { started = (manager as any).launchCaller(thread, sessionId, 'review prompt', thread.rounds[0], 'review', () => {
+          releaseCalls++;
+          finish();
+          if (failure === 'clear') throw new Error('release rejected');
+        }, (pid: number | undefined) => {
+          onChildPid(pid);
+          if (!pid && failure === 'clear') finish();
+        }); } finally { await finished; }
+        try {
+          assert.equal(started, true);
+          assert.ok(launchedPid);
+          assert.equal(actualClose, true, 'cleanup/finalization follows the child close event');
+          assert.equal(killed, failure === 'bind', 'a child whose PID could not be durably bound is stopped');
+          assert.equal(releaseCalls, 1);
+          const saved = store.getTask(thread.threadId)!;
+          assert.ok(saved.reviewWake, 'ownership failures become a recorded failed wake');
+          assert.match(saved.reviewWake!.lastError, /Native child ownership failed/);
+          assert.notEqual(saved.status, 'completed');
+        } finally { store.dispose(); fs.rmSync(tempWorkspace, { recursive: true, force: true }); }
+      }
+    } finally { (childProcess as any).spawn = originalSpawn; }
+  });
+
+  test('dedicated reviewer launch rechecks cancellation, deletion, retargeting, and missing session lease', async () => {
+    const originalPrepare = NativeSessionCompactor.prototype.prepareBeforeResume;
+    try {
+      for (const mode of ['no-lease', 'cancel', 'delete', 'retarget'] as const) {
+        const { dir, store, manager } = setup();
+        const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1';
+        const thread = makeThread({ threadId: `thread_prepare_${mode}`, reviewFlow: 'dedicated',
+          reviewBootstrap: { phase: 'confirmed', attempts: 1 }, reviewerSessionId: sessionId,
+          reviewerSessionCaptured: true, callerSessionId: sessionId, reviewerModel: 'gpt-6.1-pro' });
+        store.upsertTask(thread);
+        NativeSessionCompactor.prototype.prepareBeforeResume = async function (threadId: string) {
+          if (mode === 'cancel') new CancellationRegistry(dir).request(threadId, 'pause', 'test cancellation');
+          if (mode === 'delete') store.deleteTask(threadId);
+          if (mode === 'retarget') {
+            const fresh = store.getTask(threadId)!;
+            fresh.reviewerSessionId = '9203c3bf-62c6-4aef-a661-2e164d39c10e';
+            fresh.callerSessionId = fresh.reviewerSessionId;
+            store.upsertTask(fresh);
+          }
+          return {};
+        } as any;
+        let launches = 0;
+        (manager as any).launchCaller = () => { launches++; return true; };
+        const candidate = store.getTask(thread.threadId)!;
+        assert.equal(await manager.notifyCaller(candidate, candidate.rounds[0]), false, mode);
+        assert.equal(launches, 0, mode);
+        assert.equal(new TaskRoleLock(dir).getOwner(thread.threadId), undefined, `role lease released: ${mode}`);
+        assert.equal(new TaskExecutionRegistry(dir).getOwner(thread.threadId), undefined, `execution registration released: ${mode}`);
+        assert.equal((manager as any).wakeQueue.isBusy(sessionId), false, `wake slot released: ${mode}`);
+        store.dispose();
+      }
+    } finally { NativeSessionCompactor.prototype.prepareBeforeResume = originalPrepare; }
   });
 
   test('a rework starts a fresh review budget instead of inheriting the old one', () => {
