@@ -5,6 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   AutonomousRunner,
+  BACKGROUND_WAIT_BUDGET_MS,
   DEFAULT_SILENCE_TIMEOUT_MS,
   clearStaleClaudeSessionLocks,
   detectRateLimitSignal,
@@ -26,6 +27,75 @@ describe('AutonomousRunner Tests', () => {
 
   test('should use a 10-minute silence watchdog by default', () => {
     assert.strictEqual(DEFAULT_SILENCE_TIMEOUT_MS, 600_000);
+    assert.ok(
+      BACKGROUND_WAIT_BUDGET_MS > DEFAULT_SILENCE_TIMEOUT_MS,
+      'a declared background wait must outlast the plain silence threshold',
+    );
+  });
+
+  test('a declared background wait is liveness, not a hang', async () => {
+    // Real failure this guards: antigravity printed
+    //   "root agent idle; waiting for 2 background task(s) to finish"
+    // and then ran an emulator/IL2CPP pipeline for ~25 minutes with no further
+    // bytes. The 10-minute silence watchdog killed the round (and the child
+    // pipeline with it). The declaration must be treated as liveness, while
+    // still being bounded.
+    const idleRunner = new AutonomousRunner(detector);
+    idleRunner.buildCommand = () => ({
+      command: process.execPath,
+      args: [
+        '-e',
+        [
+          "process.stdout.write('root agent idle; waiting for 2 background task(s) to finish\\n');",
+          // Silent well past the 3s threshold, but inside the park budget.
+          'setTimeout(() => { process.stdout.write(\"pipeline finished\\n\"); }, 6000);',
+        ].join(''),
+      ],
+      useShell: false,
+    });
+
+    const result = await idleRunner.execute({
+      agent: 'antigravity',
+      prompt: 'x',
+      isRework: false,
+      receiverSessionId: 'session-park',
+      timeoutMs: 120_000,
+      // Deliberately shorter than the wait: only the park budget can save it.
+      silenceTimeoutMs: 3_000,
+      retryBackoffMs: 10,
+    });
+
+    assert.strictEqual(
+      result.interruption?.kind,
+      undefined,
+      'a round parked on a declared background task must not be killed as silent',
+    );
+    assert.strictEqual(result.exitCode, 0);
+    assert.match(result.stdout, /pipeline finished/);
+  });
+
+  test('a silent round with no park declaration is still killed', async () => {
+    // The park budget must not turn the watchdog off for ordinary silence.
+    const silentRunner = new AutonomousRunner(detector);
+    silentRunner.buildCommand = () => ({
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => process.stdout.write("late\\n"), 20000);'],
+      useShell: false,
+    });
+
+    const result = await silentRunner.execute({
+      agent: 'antigravity',
+      prompt: 'x',
+      isRework: false,
+      receiverSessionId: 'session-silent',
+      timeoutMs: 120_000,
+      silenceTimeoutMs: 3_000,
+      retryBackoffMs: 10,
+    });
+
+    assert.strictEqual(result.interruption?.kind, 'watchdog');
+    assert.strictEqual(result.assessment?.success, false);
+    assert.strictEqual(result.assessment?.errorCode, 'WATCHDOG');
   });
 
   test('detects provider rate-limit signals in structured output and stderr text', () => {

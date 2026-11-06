@@ -5,7 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import { createRequire } from 'module';
-import { resolveGitRepository, createTaskWorktree, commitTaskChanges, gitOutput } from '../bridge/git-worktree';
+import { resolveGitRepository, createTaskWorktree, commitTaskChanges, gitOutput, removeTaskWorktree } from '../bridge/git-worktree';
 import { buildPosixLockHelperCommand, MergeCoordinator, MeshFileLock } from '../bridge/merge-coordinator';
 import { TaskRoleLock } from '../bridge/task-role-lock';
 import { TaskStore } from '../bridge/task-store';
@@ -81,7 +81,7 @@ test('POSIX helper command passes its channel path and acknowledges child regist
   t.after(async () => {
     if (helper.exitCode === null && helper.signalCode === null) helper.kill('SIGKILL');
     await waitForExit(helper);
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   await waitFor(`${channelPath}.ready`);
   helper.stdin!.write(`CHILD ${process.pid}\n`);
@@ -153,13 +153,77 @@ test('two tasks edit the same file in independent worktrees and integrate serial
   await waitFor(path.join(signals, 'thread_merge_B.entered'));
   process.env.MESH_VALIDATION_HOLD_THREAD = '';
   const resultB = await mergeB;
-  assert.strictEqual(resultB.status, 'merged');
+  assert.strictEqual(resultB.status, 'merged', resultB.message);
   assert.strictEqual(store.getTask('thread_merge_B')!.worktree!.integration!.targetOldCommit, commitA);
   const finalRef = gitOutput(repository, ['rev-parse', target.targetRef]);
   assert.strictEqual(finalRef, resultB.commit);
   const combined = git(repository, 'show', `${target.targetRef}:shared.txt`);
   assert.strictEqual(combined, 'A\nmiddle\nB');
-  assert.strictEqual(git(repository, 'rev-parse', 'feature/caller'), base, 'integration never moves the caller checked-out branch');
+  assert.strictEqual(git(repository, 'rev-parse', 'feature/caller'), resultB.commit, 'the pinned real delivery branch advances');
+  assert.strictEqual(fs.readFileSync(path.join(repository, 'shared.txt'), 'utf8').replace(/\r\n/g, '\n'), 'A\nmiddle\nB\n');
+  assert.equal(git(repository, 'status', '--porcelain'), '', 'the checked-out target directory is synchronized and clean');
+  assert.equal(path.resolve(store.getTask('thread_merge_B')!.worktree!.integration!.targetPath!), path.resolve(repository));
+  assert.equal(store.getTask('thread_merge_B')!.finalSummary?.gitDelivery?.targetBranch, 'feature/caller');
+  assert.equal(store.getTask('thread_merge_B')!.finalSummary?.gitDelivery?.validationStatus, 'cleaned');
+});
+
+test('a dirty checked-out delivery target blocks safely and preserves user files', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-dirty-delivery-'));
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, 'thread_dirty_delivery', storage);
+  fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A\nmiddle\nbeta\n', 'utf8');
+  worktree.headCommit = commitTaskChanges(worktree, 'approved change');
+  const originalTarget = git(repository, 'rev-parse', target.targetRef);
+  const userFile = path.join(repository, 'keep-me.txt'); fs.writeFileSync(userFile, 'uncommitted user data\n');
+  const store = new TaskStore(storage); store.upsertTask(thread('thread_dirty_delivery', worktree));
+  t.after(() => { store.dispose(); removeTaskWorktree(worktree); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const result = await new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock'))).mergeApproved('thread_dirty_delivery');
+  assert.equal(result.status, 'blocked');
+  assert.equal(git(repository, 'rev-parse', target.targetRef), originalTarget);
+  assert.equal(fs.readFileSync(userFile, 'utf8'), 'uncommitted user data\n');
+  const saved = store.getTask('thread_dirty_delivery')!;
+  assert.equal(saved.status, 'waiting_merge');
+  assert.equal(saved.worktree!.integration!.phase, 'blocked');
+  assert.match(saved.worktree!.integration!.error || '', /uncommitted files/i);
+  assert.equal(saved.worktree!.validation!.status, 'cleaned');
+  assert.ok(saved.worktree!.validation!.commit);
+  assert.equal(fs.existsSync(saved.worktree!.validation!.path), false);
+});
+
+test('delivery remains pinned after the user checks out a different branch', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-pinned-target-'));
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  git(repository, 'branch', 'other');
+  const target = resolveGitRepository(repository, storage, 'feature/caller'); const base = target.baseCommit;
+  const worktree = createTaskWorktree(target, 'thread_pinned_target', storage);
+  fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A\nmiddle\nbeta\n', 'utf8');
+  worktree.headCommit = commitTaskChanges(worktree, 'approved pinned change');
+  const store = new TaskStore(storage); store.upsertTask(thread('thread_pinned_target', worktree));
+  t.after(() => { store.dispose(); removeTaskWorktree(worktree); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  git(repository, 'checkout', 'other');
+  const result = await new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock'))).mergeApproved('thread_pinned_target');
+  assert.equal(result.status, 'merged');
+  assert.equal(git(repository, 'rev-parse', 'feature/caller'), result.commit);
+  assert.equal(git(repository, 'rev-parse', 'other'), base);
+  assert.equal(store.getTask('thread_pinned_target')!.worktree!.integration!.targetPath, undefined);
+  assert.equal(store.getTask('thread_pinned_target')!.worktree!.deliveryTarget!.checkoutPath, undefined);
+});
+
+test('legacy records without deliveryTarget keep their recorded targetRef semantics', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-legacy-target-'));
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const base = git(repository, 'rev-parse', 'HEAD'); const legacyRef = 'refs/heads/mesh/integration/legacy';
+  git(repository, 'update-ref', legacyRef, base);
+  const worktree = createTaskWorktree(resolveGitRepository(repository, storage), 'thread_legacy_target', storage);
+  worktree.targetRef = legacyRef; worktree.deliveryTarget = undefined;
+  fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A legacy result\nmiddle\nbeta\n', 'utf8');
+  worktree.headCommit = commitTaskChanges(worktree, 'approved legacy change');
+  const store = new TaskStore(storage); store.upsertTask(thread('thread_legacy_target', worktree));
+  t.after(() => { store.dispose(); removeTaskWorktree(worktree); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const result = await new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock'))).mergeApproved('thread_legacy_target');
+  assert.equal(result.status, 'merged');
+  assert.equal(git(repository, 'rev-parse', legacyRef), result.commit);
+  assert.equal(git(repository, 'rev-parse', 'feature/caller'), base);
 });
 
 test('the mesh lock serializes processes, preserves a live owner, and recovers after a process crash', async () => {
@@ -348,7 +412,7 @@ test('cancelling a same-instance lock waiter leaves the current owner lease inta
     if (protectedChild.exitCode === null) protectedChild.kill('SIGKILL');
     if (successor.exitCode === null) successor.kill('SIGKILL');
     await Promise.all([protectedChild, successor].map(waitForExit));
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   await new Promise((resolve) => setTimeout(resolve, 150));

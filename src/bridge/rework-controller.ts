@@ -594,6 +594,11 @@ export class ReworkController {
     const nowIso = new Date().toISOString();
     pausedRound.status = 'running';
     pausedRound.error = undefined;
+    // The round carries its own interruption marker as well as the thread-level
+    // one. Leaving it behind made a resumed round look paused at a stale time,
+    // so the supervisor's "task is paused" probe cancelled the fresh run on the
+    // very next pass.
+    pausedRound.interruption = undefined;
     pausedRound.timestamp = nowIso;
     thread.currentRound = Math.max(thread.currentRound || 1, pausedRound.round);
     thread.status = isRework ? 'reworking' : 'running';
@@ -810,6 +815,7 @@ export class ReworkController {
     this.taskStore.loadFromDisk();
     for (const thread of this.taskStore.getAllTasks()) {
       if (thread.status !== 'waiting_merge') continue;
+      if (thread.worktree?.integration?.phase === 'blocked') continue;
       const blockedAt = this.blockedMergeRetries.get(thread.threadId);
       if (blockedAt && blockedAt === thread.updatedAt) continue;
       if (blockedAt) this.blockedMergeRetries.delete(thread.threadId);

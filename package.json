@@ -2,7 +2,7 @@
   "name": "agent-mesh-bridge",
   "displayName": "Agent Mesh Bridge",
   "description": "Agent Mesh Bridge for Antigravity, Codex, Claude Code and DeepSeek Harness",
-  "version": "1.2.15",
+  "version": "1.2.18",
   "publisher": "agent-mesh",
   "author": "Antigravity Team",
   "license": "MIT",

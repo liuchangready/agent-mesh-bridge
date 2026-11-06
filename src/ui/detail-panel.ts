@@ -21,6 +21,7 @@ import {
 } from '../bridge/reviewer-log';
 import { aggregateThreadTokenUsage, formatTokenCount } from '../bridge/token-usage-collector';
 import { nativeCompactionCapability } from '../bridge/native-session-compactor';
+import { renderWorktreeDetails } from './worktree-details';
 
 export class TaskDetailPanel {
   public static currentPanel: TaskDetailPanel | undefined;
@@ -80,6 +81,9 @@ export class TaskDetailPanel {
             break;
           case 'resumeTask':
             await this.handleResumeTask(message.feedback);
+            break;
+          case 'retryMerge':
+            await this.handleRetryMerge();
             break;
           case 'pauseTask':
             await vscode.commands.executeCommand('agent-mesh-bridge.pauseTask', this.currentThreadId);
@@ -174,6 +178,15 @@ export class TaskDetailPanel {
     } catch (err: any) {
       vscode.window.showErrorMessage(`Approval failed: ${err.message}`);
     }
+  }
+
+  private async handleRetryMerge() {
+    try {
+      const result = await this.reworkController.mergeApproved(this.currentThreadId);
+      if (result.status === 'merged') vscode.window.showInformationMessage(`Task ${this.currentThreadId} merged into its pinned local target.`);
+      else vscode.window.showWarningMessage(result.message);
+    } catch (err: any) { vscode.window.showErrorMessage(`Merge retry failed: ${err.message}`); }
+    this.update();
   }
 
   private async handleRequestRework(feedback?: string) {
@@ -923,13 +936,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
         <div class="meta-val">Bridge mode: off by default · ${escapeHtml(nativeStatus('developer', thread.targetAgent, thread.receiverSessionCaptured ? thread.receiverSessionId : undefined))}<br/>${escapeHtml(nativeStatus('reviewer', thread.initiatorAgent, thread.reviewerSessionCaptured ? thread.reviewerSessionId : undefined))}</div>
         ${thread.status === 'paused' ? '<button class="secondary" style="margin-top:8px;" onclick="compactNativeSession()">Compress a captured task session…</button>' : ''}
       </div>
-      ${thread.worktree ? `
-      <div class="meta-item" style="grid-column: 1 / -1;">
-        <div class="meta-label">Local integration</div>
-        <div class="meta-val">${escapeHtml(thread.worktree.integration?.phase || 'ready')} · target ${escapeHtml(thread.worktree.targetRef || '')} · approved ${escapeHtml(thread.worktree.approvedCommit || 'none')} · head ${escapeHtml(thread.worktree.headCommit || 'unknown')}</div>
-        ${thread.worktree.integration?.error ? `<div class="meta-val" style="white-space:pre-wrap;color:#fca5a5;">${escapeHtml(thread.worktree.integration.error)}</div>` : ''}
-        ${thread.worktree.integration?.conflictFiles?.length ? `<div class="meta-val">Conflicts: ${escapeHtml(thread.worktree.integration.conflictFiles.join(', '))}</div>` : ''}
-      </div>` : ''}
+      ${thread.worktree ? renderWorktreeDetails(thread.worktree) : ''}
       <div class="meta-item">
         <div class="meta-label">Created At</div>
         <div class="meta-val">${new Date(thread.createdAt).toLocaleString()}</div>
@@ -1137,6 +1144,10 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
 
     function resumeTask() {
       vscode.postMessage({ command: 'resumeTask' });
+    }
+
+    function retryMerge() {
+      vscode.postMessage({ command: 'retryMerge' });
     }
 
     function pauseTask() {

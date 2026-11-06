@@ -36,6 +36,37 @@ import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-executi
 export const DEFAULT_SILENCE_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
+ * Antigravity asserts its own liveness when it parks the root agent:
+ *
+ *   root agent idle; waiting for 2 background task(s) to finish
+ *
+ * A build/emulator pipeline invoked through `run_command` then runs for tens of
+ * minutes with the agent deliberately emitting nothing. Treating that silence as
+ * a hang killed healthy rounds mid-build (and took the child pipeline process
+ * tree down with them), so the declaration is matched and given its own budget.
+ */
+const BACKGROUND_WAIT_LINE = /root agent idle;\s*waiting for \d+ background task/i;
+
+/**
+ * How long a declared background wait may last before silence counts as a hang
+ * again. Bounded so a wedged child process cannot park a round forever; the
+ * overall round timeout still applies on top.
+ */
+export const BACKGROUND_WAIT_BUDGET_MS = 45 * 60 * 1000;
+
+/**
+ * Per-agent silence thresholds, overriding the default.
+ *
+ * Single tool calls that legitimately print nothing for a long time:
+ * Antigravity drives headless emulator + IL2CPP builds, and DSH runs long shell
+ * pipelines. Both can exceed ten minutes with no intermediate bytes.
+ */
+const AGENT_SILENCE_TIMEOUT_MS: Partial<Record<string, number>> = {
+  antigravity: 25 * 60 * 1000,
+  deepseek_harness: 15 * 60 * 1000,
+};
+
+/**
  * Network/transport level failures that are worth one more attempt with the
  * very same prompt. Kept to explicit phrases and errno spellings so normal build
  * output (a diff mentioning "connection", a test name, `eof` handling code)
@@ -1335,7 +1366,10 @@ export class AutonomousRunner {
       const timeoutMs = options.timeoutMs || this.defaultTimeoutMs; // 2 hours default
       // Long model reasoning / silent tool waits can easily exceed 3 minutes.
       // Keep a 10-minute default; callers may still override per run.
-      const silenceTimeoutMs = options.silenceTimeoutMs || DEFAULT_SILENCE_TIMEOUT_MS;
+      const silenceTimeoutMs =
+        options.silenceTimeoutMs ||
+        AGENT_SILENCE_TIMEOUT_MS[String(options.agent).replace(/-/g, '_')] ||
+        DEFAULT_SILENCE_TIMEOUT_MS;
 
       const env: NodeJS.ProcessEnv = {
         ...process.env,
@@ -1380,6 +1414,8 @@ export class AutonomousRunner {
       let childBindingError: string | undefined;
       let childCleanupError: string | undefined;
       let lastActivityMono = startMono;
+      /** When the agent last declared it is waiting on a background task. */
+      let backgroundWaitStartedMono: number | undefined;
       let watchdogTriggered = false;
       let maxTimerTriggered = false;
 
@@ -1528,11 +1564,36 @@ export class AutonomousRunner {
           0,
           nowMono - lastActivityMono - suspension.suspendedWithin(lastActivityMono, nowMono),
         );
-        if (silentDuration > silenceTimeoutMs) {
+        // A round parked on a declared background task is not hung: the agent
+        // said it is waiting and the child pipeline is the work being paid for.
+        // It gets its own bounded budget instead of the normal silence threshold
+        // (a wedged child still cannot park the round forever).
+        //
+        // The budget is measured on the park itself, NOT on the general silence
+        // duration, because a normal threshold may already have been exceeded
+        // before the agent announced the wait.
+        const parkedFor =
+          backgroundWaitStartedMono === undefined
+            ? undefined
+            : Math.max(
+                0,
+                nowMono -
+                  backgroundWaitStartedMono -
+                  suspension.suspendedWithin(backgroundWaitStartedMono, nowMono),
+              );
+        const exceeded =
+          parkedFor !== undefined
+            ? parkedFor > BACKGROUND_WAIT_BUDGET_MS
+            : silentDuration > silenceTimeoutMs;
+        if (exceeded) {
           clearInterval(silenceInterval);
           watchdogTriggered = true;
           console.warn(
-            `[AutonomousRunner] Watchdog triggered: Process ${options.agent} silent for ${Math.round(silentDuration / 1000)}s. Terminating.`,
+            parkedFor !== undefined
+              ? `[AutonomousRunner] Watchdog triggered: ${options.agent} parked on a background task for ` +
+                  `${Math.round(parkedFor / 1000)}s, beyond the ${Math.round(BACKGROUND_WAIT_BUDGET_MS / 1000)}s budget. Terminating.`
+              : `[AutonomousRunner] Watchdog triggered: Process ${options.agent} silent for ` +
+                  `${Math.round(silentDuration / 1000)}s (threshold ${Math.round(silenceTimeoutMs / 1000)}s). Terminating.`,
           );
           try {
             this.killProcess(child);
@@ -1617,6 +1678,11 @@ export class AutonomousRunner {
         noteStreamChunk(data.length);
         const str = data.toString();
         stdoutData += str;
+        // A declared background wait is liveness, not a hang: record when the
+        // agent parked so the watchdog can grant it BACKGROUND_WAIT_BUDGET_MS.
+        if (BACKGROUND_WAIT_LINE.test(str)) {
+          backgroundWaitStartedMono = monotonicNowMs();
+        }
         stdoutPartialLine = scanLines(str, stdoutPartialLine, detectStructuredRateLimitSignal);
         const sessionLines = (sessionPartialLine + str).split(/\r?\n/);
         sessionPartialLine = sessionLines.pop() || '';

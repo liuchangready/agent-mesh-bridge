@@ -96,10 +96,10 @@ flowchart TD
 8. **`QueueDrainer`（回退候选扫描器）**：
    - 无常驻 supervisor 时扫描所有 ready 候选；因角色、bootstrap 或限额阻塞的候选不阻止扫描后续任务；
    - paused / waiting_review / blocked / bootstrap pending 只跳过自身，不形成全局或 workspace 队头。
-9. **Git worktree 与本地集成**：每个新任务使用独立分支和 worktree，记录 Git common dir、来源仓库目录、固定批次集成 ref、base/head/approved commit。任务目录中的新派发沿用记录的集成目标并基于最新目标 SHA 创建，不继承父任务未验收改动。`touchedFiles` 仅是工作区变化观察值。
-   - 审核批准绑定到干净的 `approvedCommit` 并转为 `waiting_merge`。reviewer 进程退出后，桥接取得 mesh 级跨进程文件锁，然后读取最新目标 SHA。
-   - 锁覆盖临时三方合并、真实 compile/test 验证、带旧 SHA 的 ref 更新与账本写入。该锁不覆盖开发、单任务测试、review 或远端推送。
-   - 事务持久化 source/target/candidate SHA 和阶段；目标已更新而账本未写完时按候选提交祖先关系恢复。冲突、验证失败或批准提交变化会返回原 reviewer 会话返修，不丢弃任一方改动。
+9. **Git worktree and local delivery**: Each new task records an isolated task branch/worktree and pins the real local delivery target (`targetBranch` if explicit, otherwise the source checkout branch), repository identity/path, and base/head/approved commits. Child tasks inherit the target and start from its current committed SHA, never parent unapproved changes. Under the global lock, merge against the latest target, run compile/test, then CAS-update the target ref. A checked-out target is synchronized only when clean; preserve dirty files and block delivery otherwise. Retain validation path/commit/cleanup metadata. Legacy tasks without `deliveryTarget` keep the old `targetRef` meaning.
+   - Approval binds to the clean `approvedCommit`. After reviewer exit, the bridge takes the mesh-wide lock before reading the real target SHA.
+   - The lock covers the temporary three-way merge, real compile/test, target ref CAS update and ledger persistence. It does not cover development, individual tests, review, or remote push.
+   - Persist source/target/candidate SHA and transaction phase for crash recovery. Conflicts and validation failures return to review; a dirty checked-out target is preserved and remains in blocked `waiting_merge` until an explicit retry.
    - `mergeRequest` 仅表示远端交付。未集成的成果不能自动归档、容量淘汰或普通删除；force 才可明确丢弃。旧任务不自动迁移。
 ### 2.1 运行时三条硬准则
 
@@ -178,7 +178,7 @@ interface ResponseAssessment {
 
 同一来源仓库共享一个桥接管理的集成 ref。任务分支从该 ref 最新已提交 SHA 创建，未提交用户改动不复制。隔离元数据缺失的历史任务保持原行为，不自动迁移。
 
-`waiting_merge` 表示 reviewer 已批准固定提交、等待后台本地集成，不是终态。全局跨进程锁在读取目标 SHA 前获取，并一直持有到真实组合验证、ref old-SHA 更新和账本写入完成。冲突或验证失败会清理临时合并目录并回到原 reviewer 会话返修。
+New tasks pin the real local delivery branch selected at dispatch (`targetBranch` or the source checkout branch), rather than sharing an internal integration ref. Task branches start from that pinned target commit. Legacy ledger entries without `deliveryTarget` retain their historical `targetRef` behavior.
 ### 2.5 MR 收口（调用者）
 
 任务或同一批任务验收通过后，MR 由**调用者/检视方**统一收口，不由开发者负责：

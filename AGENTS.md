@@ -16,7 +16,7 @@
   5. **同会话多轮返修**：A 对 B 结果不满意时，调用 `request_rework` 在 B 的**同一个原生会话中继续修改**，多轮迭代直至 A 认可。
   6. **1000 条任务账本**：容量上限 1,000 条；仅安全终态可淘汰，未合入成果保留，容量无安全淘汰对象时拒绝新任务。
   7. **全自动无人值守 (`skip-danger`)**：严格配置免交互与权限旁路参数，关闭标准输入，杜绝后台卡死。
-  8. **并发与 Git 隔离**：每个新代码任务在唯一 `mesh/task/<threadId>` 分支和独立 worktree 中执行；同一仓库任务可以并发修改同一文件。共享批次集成 ref 基于来源仓库身份固定，任务从其最新已提交 SHA 起步；用户 checkout 与未提交改动不参与任务输入。`touchedFiles` 仅作观测审计，不用于调度。
+  8. **Concurrent Git isolation**: Every new code task gets a unique `mesh/task/<threadId>` branch/worktree. Pin the real local delivery target at dispatch: explicit `targetBranch`, otherwise the source checkout branch. Child tasks inherit it. Start at the target branch commit; never use uncommitted checkout changes as task input. Under the global merge lock, merge against the latest target, validate, and CAS-update the real ref. Sync a checked-out target only when clean; preserve dirty user files and block delivery.
   9. **接收方禁止转发（当前策略）**：被派发的 Agent（receiver）只执行当前任务并回传结果，**不得**调用 `dispatch_task` / `invoke_agent` 把工作再转给其他 Agent，也不得驱动自己任务的 review 闭环。接收方进程由 `MESH_TASK_RECEIVER=1` 标记，MCP server 会隐藏并拒绝转发类工具。
   10. **权限旁路不可失效**：拆分/派发出去的任务必须真正无人值守。Codex 的 `--ask-for-approval` 是**全局参数，必须放在 `exec` 之前**；DSH 必须注入 `DSH_PERMISSION_MODE=danger-full-access`（否则 headless 默认 `workspace-write` + `approval: ask`，任务会卡在无人应答的权限询问上）。
   11. **可暂停、可删除、可追溯**：运行中的任务必须可以暂停（终止 Agent 进程并保留当前轮次以便恢复）、可以删除（先终止进程，再移除账本条目）；暂停、停止、看门狗、超时等非正常结束必须在 `thread.interruption` / `round.interruption` 中记录 `{ kind, reason, at, by }`，且保留 `interruptions[]` 历史。
@@ -40,7 +40,7 @@
       - `RunResult.assessment` 必须持久化到 `round.assessment`，字段包括 `success`、`errorCode`、`exitCode`、`warnings[]`、`stream.{chunkCount, stdoutBytes, stderrBytes, firstOutputAtMs, lastOutputAtMs, maxGapMs, rawMaxGapMs, excludedSuspensionMs, suspensionCount, gapThresholdMs, hasActualOutput, continuous, gapExceeded}`。
       - 任何 `exitCode === 0` 但不能提取实际输出（例如只有 JSON status/metadata）的轮次必须判定为 `failed`，不得进入 `waiting_review`，更不得唤醒 reviewer。
 
-  17. **每任务独立 Git worktree**：新代码任务记录仓库身份、来源目录、固定集成 ref、base/head/approved SHA、任务分支和 worktree；bootstrap、执行、检视、返修、重试与恢复始终使用同一 worktree。旧任务无隔离元数据时维持旧语义，不猜归属、不自动迁移；非 Git 或无有效 HEAD 时拒绝派发。开发退出后桥接创建本地交付提交，审核绑定固定提交；批准进入 `waiting_merge`，无改动任务用 `no_changes` 完成。全 mesh 文件锁在读取目标 SHA 前获取，覆盖三方合并、真实 compile/test、old-SHA ref 更新和账本持久化。冲突、验证失败或批准提交变化时回到原 reviewer 会话返修；MR 只代表远端交付。暂停/删除取消锁等待和验证；失败/暂停保留 worktree，丢弃未合入成果需 force，未合入任务不得归档或容量淘汰。
+  17. **Per-task Git worktree**: Record repository identity/path, pinned local delivery target, base/head/approved SHA, task branch and isolated worktree; all rounds use the same worktree. Old ledger entries without `deliveryTarget` retain their `targetRef` semantics and are not migrated. Refuse non-Git/no-HEAD workspaces, detached HEAD without an explicit target, and invalid or missing targets. Approval binds to one clean commit. Under the global lock, merge into the real target, run compile/test, CAS-update and persist. A checked-out target is synchronized only when clean; otherwise preserve files and keep the task in visible `waiting_merge` blocked state. Record the actual validation path/commit/cleanup state. Pause/delete cancel waits and validation.
   18. **模型默认优先、非默认必须用户点击同意（硬不变量）**：接收方模型的选择权属于用户，不属于 caller。
       - **接收者默认与下发者默认分开配置（硬不变量）**：`agentMeshBridge.models.*` 是**接收者默认**（该 Agent 执行被派发任务时用的模型），`agentMeshBridge.initiatorModels.*` 是**下发者默认**（该 Agent 作为下发者/检视者被唤醒时用的模型）。两者分别写入 `~/.agent-mesh-bridge/model-config.json` 的 `models` / `initiatorModels`，互不覆盖：`saveModelDefaults()` 在未显式传 `initiatorModels` 时**不得**抹掉已存的下发者配置，清空某一侧设置必须真的清空该侧。下发者与接收者的模型互不影响。**允许同一个 Agent 自派发**，但仅限专用 Reviewer 流程（第 22 条），且必须满足 reviewer 模型 ≠ 执行模型（同模型不得审阅自己的输出）。
       - 不传 `model` 一律使用该 Agent 的**接收者配置默认模型**（`agentMeshBridge.models.*`），这是唯一无需确认的路径。
@@ -206,7 +206,7 @@ src/
 
 | 工具名                    | 关键入参                                                           | 语义与行为                                                                                    |
 | :------------------------ | :----------------------------------------------------------------- | :-------------------------------------------------------------------------------------------- |
-| `dispatch_task` | `targetAgent`, `title`, `prompt`, `workspacePath?`, `callerSessionId?`, `model?`, `modelRequestedByUser?`, `initiatorModel?` | 自动创建隔离 task worktree 并异步派发；无有效 Git 仓库/HEAD 时拒绝。返回后立即结束 Turn，等待回调。
+| `dispatch_task` | `targetAgent`, `title`, `prompt`, `workspacePath?`, `targetBranch?`, `callerSessionId?`, `model?`, `modelRequestedByUser?`, `initiatorModel?` | Creates an isolated task worktree and pins the real local target (`targetBranch` or source checkout branch); children inherit it. Rejects invalid Git/HEAD/target. End the turn and wait for callback. |
 | `request_rework`          | `threadId`, `feedback`, `targetAgent?`, `model?`, `modelRequestedByUser?` | **在同一个原生会话中唤醒接收方返修**，进入第 N+1 轮；传 `targetAgent`/`model` 时先改派执行者再开新轮（换 Agent 会重置原生会话，见第 18 条） |
 | `approve_task`            | `threadId`, `remarks?`                                             | 验收通过，标记为 `COMPLETED`，归档任务                                                        |
 | `pause_task`              | `threadId`, `reason`                                               | 暂停运行中/排队中的任务：终止 Agent 进程、轮次标记 `paused`、记录中断原因，可随后恢复          |

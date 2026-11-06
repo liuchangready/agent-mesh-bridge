@@ -23,6 +23,7 @@ import {
 import {
   createReviewerLogWriter,
   findExistingReviewerLog,
+  listReviewerLogRounds,
   readReviewerLogTail,
   reviewerBootstrapLogPath,
   reviewerLogPath,
@@ -323,6 +324,32 @@ describe('Per-agent log directories with worker_log, reviewer_log, Archive', () 
       const stat = statReviewerLog(threadId, 1, root);
       assert.strictEqual(stat.exists, true);
       assert.ok(stat.sizeBytes > 0);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('finds structured logs written before custom log directories were configured', () => {
+    const root = makeTempDir('old-structured-logs');
+    try {
+      const threadId = 'thread_old_structured';
+      const workerLog = roundExecutionLogPath(threadId, 1, root, 'codex');
+      const outputArchive = roundOutputArchivePath(threadId, 1, root, 'codex');
+      const reviewLog = reviewerLogPath(threadId, 1, root, 'codex');
+      fs.writeFileSync(workerLog, 'old execution');
+      fs.writeFileSync(outputArchive, 'old output');
+      fs.writeFileSync(reviewLog, 'old review');
+      saveBridgePolicy({ logDirectories: {
+        default: path.join(root, 'new_default'),
+        codex: path.join(root, 'new_codex'),
+      } }, root);
+
+      assert.strictEqual(findExistingExecutionLog(threadId, 1, { root, agent: 'codex' }), workerLog);
+      assert.strictEqual(findExistingOutputArchive(threadId, 1, { root, agent: 'codex' }), outputArchive);
+      assert.strictEqual(findExistingReviewerLog(threadId, 1, { root, agent: 'codex' }), reviewLog);
+      assert.deepStrictEqual(listRoundArtifacts(threadId, root, 'codex').map(a => a.path), [workerLog, outputArchive]);
+      assert.deepStrictEqual(listReviewerLogRounds(threadId, root, 'codex'), [1]);
+      assert.match(readReviewerLogTail(threadId, 1, { root, agent: 'codex' })!.content, /old review/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
