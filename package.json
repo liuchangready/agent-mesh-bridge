@@ -2,7 +2,7 @@
   "name": "agent-mesh-bridge",
   "displayName": "Agent Mesh Bridge",
   "description": "Agent Mesh Bridge for Antigravity, Codex, Claude Code and DeepSeek Harness, with GitHub Copilot requester-only support in VS Code",
-  "version": "1.2.15",
+  "version": "1.2.16",
   "publisher": "agent-mesh",
   "author": "Antigravity Team",
   "license": "MIT",
@@ -82,6 +82,10 @@
       {
         "command": "agent-mesh-bridge.manageCopilotModelGroup",
         "title": "Copilot: Manage Model Group"
+      },
+      {
+        "command": "agent-mesh-bridge.configureCopilotGroupAgent",
+        "title": "Copilot: 配置分组 Agent 下发者 / 接收者"
       },
       {
         "command": "agent-mesh-bridge.callCopilotModel",

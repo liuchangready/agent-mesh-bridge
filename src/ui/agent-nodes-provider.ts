@@ -314,6 +314,22 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
           return child;
         });
       }
+      const binding = this.copilotModels!.getAgentBinding(group.id);
+      const roles = [
+        { side: 'receiver', label: '接收模型', model: binding?.receiverModel, ready: binding?.receiverReady, icon: 'arrow-down', purpose: '作为开发者执行任务' },
+        { side: 'initiator', label: '下发模型', model: binding?.initiatorModel, ready: binding?.initiatorReady, icon: 'arrow-up', purpose: '作为下发者/检视者' },
+      ] as const;
+      const roleItems = roles.map((role) => {
+        const model = role.model;
+        const modelLabel = model ? model.source === 'vscode-lm' ? `${model.vendor} / ${model.id}` : model.id : '未配置';
+        const roleNode = new AgentNodeItem(`${role.label}: ${modelLabel}`, vscode.TreeItemCollapsibleState.None);
+        const status = !model ? '未配置' : !binding?.enabled ? '未启用' : binding.toolsAuthorized && role.ready ? '就绪' : '待授权/能力验证';
+        roleNode.description = `${role.purpose} · ${status} · 点击配置`;
+        roleNode.iconPath = new vscode.ThemeIcon(role.icon);
+        roleNode.command = { command: 'agent-mesh-bridge.configureCopilotGroupAgent', title: `配置${role.label}`, arguments: [group, role.side] };
+        return roleNode;
+      });
+      groupNode.subItems = [...roleItems, ...(groupNode.subItems || [])];
       children.push(groupNode);
     }
     const actions = [
@@ -325,6 +341,15 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
       const child = new AgentNodeItem(label, vscode.TreeItemCollapsibleState.None);
       child.iconPath = new vscode.ThemeIcon(icon);
       child.command = { command, title: label };
+      children.push(child);
+    }
+    for (const role of [
+      { side: 'initiator', label: '配置下发者 / 检视者', icon: 'arrow-up' },
+      { side: 'receiver', label: '配置接收者 / 开发者', icon: 'arrow-down' },
+    ]) {
+      const child = new AgentNodeItem(role.label, vscode.TreeItemCollapsibleState.None);
+      child.iconPath = new vscode.ThemeIcon(role.icon);
+      child.command = { command: 'agent-mesh-bridge.configureCopilotGroupAgent', title: role.label, arguments: [undefined, role.side] };
       children.push(child);
     }
     item.subItems = children;

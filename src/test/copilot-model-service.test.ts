@@ -201,7 +201,7 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     const secrets = new Map<string, string>();
     const context = {
       globalState: {
-        get: (key: string) => state.get(key),
+        get: (key: string, fallback?: unknown) => state.has(key) ? state.get(key) : fallback,
         update: async (key: string, value: unknown) => {
           state.set(key, value);
         },
@@ -266,6 +266,11 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     const nodes = await providerNodes.getChildren();
     const copilotNode = nodes.find((node: any) => node.info?.id === 'vscode_chat');
     const hostGroupNode = copilotNode?.subItems?.find((node: any) => node.label === 'Host group');
+    const unconfiguredSender = hostGroupNode?.subItems?.find((node: any) => node.label === '下发模型: 未配置');
+    assert.ok(unconfiguredSender, 'sender configuration is visible before enabling a receiver');
+    assert.deepEqual(unconfiguredSender.command.arguments, [group, 'initiator']);
+    assert.ok(hostGroupNode?.subItems?.some((node: any) => node.label === '接收模型: 未配置'));
+    assert.ok(copilotNode?.subItems?.some((node: any) => node.label === '配置下发者 / 检视者'));
     const vendorBNode = hostGroupNode?.subItems?.find((node: any) => node.description === 'vendor-b');
     assert.ok(vendorBNode);
     assert.deepEqual(vendorBNode.command.arguments[1], { id: 'opaque-1', vendor: 'vendor-b' });
@@ -283,6 +288,47 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     assert.match(shownResult, /integrated answer/);
     assert.match(shownResult, /remote-model/);
     assert.equal(shownResult.includes('integration-secret'), false);
+
+    const hostRegistry = require('../bridge/group-agent-registry');
+    hostRegistry.writeGroupAgentHost({ version: 1, hostInstanceId: 'sender-ui-host', generation: 1, pid: process.pid,
+      workspaceUri: `file://${bridgeHome}`, repositoryCommonDir: bridgeHome, trusted: true, localDesktop: true, updatedAt: Date.now() }, bridgeHome);
+    service.setGroupAgentControlHandler(async () => ({}));
+    const originalQuickPick = fakeVscode.window.showQuickPick;
+    const originalWarning = fakeVscode.window.showWarningMessage;
+    let authorizeSender = false;
+    let senderMenuVisible = false;
+    (fakeVscode.window as any).showWarningMessage = async () => authorizeSender ? 'Authorize and enable' : undefined;
+    fakeVscode.window.showQuickPick = async (items: any[]) => {
+      if (items.some(item => item.id === 'agent-receiver')) {
+        senderMenuVisible = items.some(item => item.id === 'agent-sender');
+        return items.find(item => item.id === 'agent-sender');
+      }
+      return items.find(item => item.id === 'remote-model') ?? items.find(item => item.value === 'default');
+    };
+    try {
+      await registeredCommands.get('agent-mesh-bridge.manageCopilotModelGroup')!(apiGroup);
+      assert.equal(senderMenuVisible, true, 'sender menu is visible for a disabled group');
+      assert.equal(service.getAgentBinding(apiGroup.id)?.initiatorModel, undefined, 'declining tool authorization leaves the sender unconfigured');
+      authorizeSender = true;
+      const initialTree = await providerNodes.getChildren();
+      const apiNode = initialTree.find((node: any) => node.info?.id === 'vscode_chat')?.subItems?.find((node: any) => node.label === apiGroup.name);
+      const senderNode = apiNode.subItems.find((node: any) => node.label === '下发模型: 未配置');
+      await registeredCommands.get(senderNode.command.command)!(...senderNode.command.arguments);
+      const senderBinding = service.getAgentBinding(apiGroup.id)!;
+      assert.equal(senderBinding.enabled, true);
+      assert.equal(senderBinding.toolsAuthorized, true);
+      assert.equal(senderBinding.initiatorReady, true, 'the sender passes its real structured-tool probe');
+      assert.equal(senderBinding.initiatorModel?.id, 'remote-model');
+      assert.equal(senderBinding.receiverModel, undefined, 'sender-only setup must not require a receiver');
+      assert.equal(senderBinding.receiverReady, false);
+      const configuredTree = await providerNodes.getChildren();
+      const configuredGroup = configuredTree.find((node: any) => node.info?.id === 'vscode_chat')?.subItems?.find((node: any) => node.label === apiGroup.name);
+      assert.ok(configuredGroup.subItems.some((node: any) => node.label === '下发模型: remote-model' && node.description.includes('就绪')));
+      assert.deepEqual(uiErrors, []);
+    } finally {
+      fakeVscode.window.showQuickPick = originalQuickPick;
+      fakeVscode.window.showWarningMessage = originalWarning;
+    }
 
     await service.configureGroupAgent(apiGroup.id, { enabled: true, toolsAuthorized: true, receiverModel: 'remote-model' });
     const pinnedReceiver = service.getAgentBinding(apiGroup.id)!.receiverModel;

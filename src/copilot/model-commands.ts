@@ -312,7 +312,7 @@ export function registerCopilotModelCommands(
   };
   const configureGroupAgent = async (group: CopilotModelGroup, side: 'receiver' | 'initiator') => {
     const binding = service.getAgentBinding(group.id);
-    if (side === 'receiver' && !binding?.enabled) {
+    if (!binding?.toolsAuthorized) {
       const answer = await vscode.window.showWarningMessage(
         `Authorize ${group.name} to read and modify files and run commands in each explicitly assigned task worktree? Commands execute with your user permissions.`,
         { modal: true }, 'Authorize and enable',
@@ -337,8 +337,8 @@ export function registerCopilotModelCommands(
       return;
     }
     await service.configureGroupAgent(group.id, {
-      enabled: side === 'receiver' ? true : binding?.enabled === true,
-      toolsAuthorized: side === 'receiver' ? true : binding?.toolsAuthorized === true,
+      enabled: true,
+      toolsAuthorized: true,
       ...(side === 'receiver' ? { receiverModel: selected } : { initiatorModel: selected }),
     });
     await service.markGroupAgentRoleReady(group.id, side);
@@ -347,6 +347,28 @@ export function registerCopilotModelCommands(
     } else {
       await vscode.window.showInformationMessage(`Bridge Group Agent ${group.name} is ready for dedicated reviewer sessions on the configured sender model.`);
     }
+  };
+  const configureGroupRole = async (group?: CopilotModelGroup, side?: 'receiver' | 'initiator') => {
+    if (!canConfigure()) return;
+    if (!group && service.groups.getAll().length === 0) {
+      const action = await vscode.window.showInformationMessage(
+        '请先添加模型分组，再配置该组的下发者或接收者。', '添加模型分组',
+      );
+      if (action !== '添加模型分组') return;
+      await addGroup();
+      if (service.groups.getAll().length === 0) return;
+    }
+    group = await chooseGroup(group);
+    if (!group) return;
+    if (side !== 'receiver' && side !== 'initiator') {
+      const role = await vscode.window.showQuickPick([
+        { label: '下发模型 / 检视者', side: 'initiator' as const },
+        { label: '接收模型 / 开发者', side: 'receiver' as const },
+      ], { placeHolder: '选择要配置的角色；两侧模型独立保存' });
+      if (!role) return;
+      side = role.side;
+    }
+    await configureGroupAgent(group, side);
   };
   const manageGroup = async (group?: CopilotModelGroup) => {
     if (!canConfigure()) return;
@@ -360,8 +382,8 @@ export function registerCopilotModelCommands(
         { label: 'Test connection', id: 'test' },
         { label: 'View Bridge Agent session history', id: 'sessions' },
         { label: 'Enable / configure as Bridge Agent receiver', id: 'agent-receiver' },
+        { label: 'Configure Bridge Agent sender model / 配置下发模型', id: 'agent-sender' },
         ...(service.getAgentBinding(group.id)?.enabled ? [
-          { label: 'Configure Bridge Agent sender model', id: 'agent-sender' },
           { label: 'Disable Bridge Agent', id: 'agent-disable' },
         ] : []),
         { label: 'Set as default receiver', id: 'default-receiver' },
@@ -620,6 +642,10 @@ export function registerCopilotModelCommands(
     vscode.commands.registerCommand(
       'agent-mesh-bridge.manageCopilotModelGroup',
       guarded(manageGroup),
+    ),
+    vscode.commands.registerCommand(
+      'agent-mesh-bridge.configureCopilotGroupAgent',
+      guarded(configureGroupRole),
     ),
     vscode.commands.registerCommand(
       'agent-mesh-bridge.callCopilotModel',
