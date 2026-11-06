@@ -310,7 +310,7 @@ export function registerCopilotModelCommands(
     await service.refresh();
     return true;
   };
-  const configureGroupAgent = async (group: CopilotModelGroup, side: 'receiver' | 'initiator') => {
+  const configureGroupAgent = async (group: CopilotModelGroup, side: 'receiver' | 'initiator', selection?: HostModelRef | string) => {
     const binding = service.getAgentBinding(group.id);
     if (!binding?.toolsAuthorized) {
       const answer = await vscode.window.showWarningMessage(
@@ -323,7 +323,7 @@ export function registerCopilotModelCommands(
     const preselect: HostModelRef | string | undefined = previous
       ? previous.source === 'vscode-lm' ? { id: previous.id, vendor: previous.vendor } : previous.id
       : undefined;
-    const selected = await chooseModel(group, preselect);
+    const selected = selection ?? (await chooseModel(group, preselect));
     if (!selected) return;
     const action = await vscode.window.showQuickPick([
       { label: `Set as ${side === 'receiver' ? 'receiver' : 'sender'} default`, value: 'default' },
@@ -348,7 +348,7 @@ export function registerCopilotModelCommands(
       await vscode.window.showInformationMessage(`Bridge Group Agent ${group.name} is ready for dedicated reviewer sessions on the configured sender model.`);
     }
   };
-  const configureGroupRole = async (group?: CopilotModelGroup, side?: 'receiver' | 'initiator') => {
+  const configureGroupRole = async (group?: CopilotModelGroup, side?: 'receiver' | 'initiator', selection?: HostModelRef | string) => {
     if (!canConfigure()) return;
     if (!group && service.groups.getAll().length === 0) {
       const action = await vscode.window.showInformationMessage(
@@ -368,7 +368,16 @@ export function registerCopilotModelCommands(
       if (!role) return;
       side = role.side;
     }
-    await configureGroupAgent(group, side);
+    await configureGroupAgent(group, side, selection);
+  };
+  const configureHostModels = async (vendor?: string, side?: 'receiver' | 'initiator', selection?: HostModelRef) => {
+    if (!canConfigure()) return;
+    if (service.getHostState() === 'not-refreshed') await refresh();
+    if (!vendor) vendor = await vscode.window.showQuickPick(
+      [...new Set(service.getHostModels().map(model => model.vendor))], { placeHolder: '选择已发现的宿主模型分组' },
+    );
+    if (!vendor) return;
+    await configureGroupRole(await service.bindHostModelGroup(vendor), side, selection);
   };
   const manageGroup = async (group?: CopilotModelGroup) => {
     if (!canConfigure()) return;
@@ -646,6 +655,10 @@ export function registerCopilotModelCommands(
     vscode.commands.registerCommand(
       'agent-mesh-bridge.configureCopilotGroupAgent',
       guarded(configureGroupRole),
+    ),
+    vscode.commands.registerCommand(
+      'agent-mesh-bridge.configureCopilotHostModels',
+      guarded(configureHostModels),
     ),
     vscode.commands.registerCommand(
       'agent-mesh-bridge.callCopilotModel',

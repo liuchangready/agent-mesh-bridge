@@ -255,24 +255,6 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     lastCall.iconPath = new vscode.ThemeIcon('history');
     children.push(lastCall);
 
-    if (catalogState === 'available') {
-      const byVendor = new Map<string, vscode.LanguageModelChat[]>();
-      for (const model of this.copilotModels!.getHostModels()) {
-        const vendor = model.vendor || 'unknown';
-        byVendor.set(vendor, [...(byVendor.get(vendor) || []), model]);
-      }
-      for (const [vendor, models] of byVendor) {
-        const vendorNode = new AgentNodeItem(`Host models · ${vendor}`, vscode.TreeItemCollapsibleState.Collapsed);
-        vendorNode.subItems = models.map((model) => {
-          const child = new AgentNodeItem(model.name || model.id, vscode.TreeItemCollapsibleState.None);
-          child.description = `${vendor} · ${model.id}`;
-          child.iconPath = new vscode.ThemeIcon('symbol-misc');
-          return child;
-        });
-        children.push(vendorNode);
-      }
-    }
-
     let groups: CopilotModelGroup[];
     try { groups = this.copilotModels!.groups.getAll(); }
     catch (error) {
@@ -282,6 +264,28 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
       children.push(invalid);
       groups = [];
     }
+    if (catalogState === 'available') {
+      const byVendor = new Map<string, vscode.LanguageModelChat[]>();
+      for (const model of this.copilotModels!.getHostModels()) {
+        const vendor = model.vendor || 'unknown';
+        byVendor.set(vendor, [...(byVendor.get(vendor) || []), model]);
+      }
+      for (const [vendor, models] of byVendor) {
+        if (groups.some(group => group.source === 'vscode-lm' && group.vendor === vendor && group.models.length)) continue;
+        const vendorNode = new AgentNodeItem(`Host models · ${vendor}`, vscode.TreeItemCollapsibleState.Collapsed);
+        vendorNode.description = '点击配置下发者或接收者';
+        vendorNode.command = { command: 'agent-mesh-bridge.configureCopilotHostModels', title: '配置宿主模型分组', arguments: [vendor] };
+        vendorNode.subItems = models.map((model) => {
+          const child = new AgentNodeItem(model.name || model.id, vscode.TreeItemCollapsibleState.None);
+          child.description = `${vendor} · ${model.id}`;
+          child.iconPath = new vscode.ThemeIcon('symbol-misc');
+          child.command = { command: 'agent-mesh-bridge.configureCopilotHostModels', title: '选择模型角色', arguments: [vendor, undefined, this.copilotModels!.hostRef(model)] };
+          return child;
+        });
+        children.push(vendorNode);
+      }
+    }
+
     for (const group of groups) {
       const groupNode = new AgentNodeItem(group.name, vscode.TreeItemCollapsibleState.Collapsed);
       const keyStatus = group.source === 'openai-compatible' ? await this.copilotModels!.getKeyStatus(group) : undefined;

@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { createHash } from 'crypto';
 import { completeCompatibleChat, completeCompatibleTools, fetchCompatibleModels } from './compatible-model-client';
-import { CopilotModelGroup, CopilotModelGroups, HostModelRef, validateGroup } from './model-groups';
+import { CopilotModelGroup, CopilotModelGroups, HostModelRef, newModelGroupId, validateGroup } from './model-groups';
 import { GroupAgentRuntime, GroupAgentRunResult, GroupAgentRuntimeError, GroupMessage } from './group-agent-runtime';
 import { GroupModelRef, TokenUsageMetrics } from '../bridge/types';
 import { isTerminalThreadStatus } from '../bridge/task-summary';
@@ -72,6 +72,19 @@ export class CopilotModelService implements vscode.Disposable {
   }
   getHostState(): string {
     return this.hostState;
+  }
+
+  async bindHostModelGroup(vendor: string): Promise<CopilotModelGroup> {
+    const models = this.hostModels.filter(model => model.vendor === vendor);
+    if (!models.length) throw new Error('This host model group is no longer available. Refresh the model catalog.');
+    const existing = this.groups.getAll().find(group => group.source === 'vscode-lm' && group.vendor === vendor);
+    if (existing?.models.length) return existing;
+    const group = await this.groups.save({
+      id: existing?.id || newModelGroupId(), name: existing?.name || vendor,
+      source: 'vscode-lm', vendor, models: models.map(model => this.hostRef(model)),
+    });
+    await this.refresh();
+    return group;
   }
   getLastCall(): string {
     return this.lastCall;

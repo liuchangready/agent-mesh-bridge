@@ -9,6 +9,7 @@ export interface ModelAgentChoice extends vscode.QuickPickItem {
   agent: AgentId;
   group?: CopilotModelGroup;
   action?: 'configure-group';
+  hostVendor?: string;
 }
 
 export async function pickGroupReceiverModel(
@@ -52,7 +53,9 @@ export async function pickModelAgent(
   role: ModelRole,
   placeHolder: string,
 ): Promise<ModelAgentChoice | undefined> {
-  const groups = service.groups.getAll().map((group): ModelAgentChoice => {
+  if (service.getHostState() === 'not-refreshed') await service.refreshHostModels();
+  const savedGroups = service.groups.getAll();
+  const groups = savedGroups.map((group): ModelAgentChoice => {
     const binding = service.getAgentBinding(group.id);
     const model = role === 'initiator' ? binding?.initiatorModel : binding?.receiverModel;
     return {
@@ -63,7 +66,14 @@ export async function pickModelAgent(
       group,
     };
   });
-  const selected = await vscode.window.showQuickPick([...cliChoices, ...groups, {
+  const hostGroups: ModelAgentChoice[] = [...new Set(service.getHostModels().map(model => model.vendor))]
+    .filter(vendor => vendor && !savedGroups.some(group => group.source === 'vscode-lm' && group.vendor === vendor && group.models.length))
+    .map(vendor => ({
+      label: `$(library) ${vendor}`,
+      description: 'VS Code 已发现的模型分组 · 直接选择模型',
+      agent: 'vscode_chat', hostVendor: vendor,
+    }));
+  const selected = await vscode.window.showQuickPick([...cliChoices, ...groups, ...hostGroups, {
     label: '$(add) 添加 / 配置 Copilot 模型分组',
     description: '选择宿主模型或自定义 API；先配置分组，再用于任务',
     agent: 'vscode_chat' as const,
@@ -76,6 +86,11 @@ export async function pickModelAgent(
   if (selected?.action === 'configure-group') {
     await vscode.commands.executeCommand('agent-mesh-bridge.configureCopilotGroupAgent', undefined, role);
     return;
+  }
+  const vendor = selected?.hostVendor || (selected?.group?.source === 'vscode-lm' && !selected.group.models.length ? selected.group.vendor : undefined);
+  if (selected && vendor) {
+    const group = await service.bindHostModelGroup(vendor);
+    return { ...selected, agent: service.getGroupAgentId(group.id), group };
   }
   return selected;
 }

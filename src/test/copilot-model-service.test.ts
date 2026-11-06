@@ -57,6 +57,9 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
       this.collapsibleState = collapsibleState;
     }
   }
+  class ToolCallPart {
+    constructor(public callId: string, public name: string, public input: unknown) {}
+  }
   const responseText = (text: string) => ({
     text: (async function* () {
       yield text;
@@ -105,7 +108,11 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
       id: 'opaque-1',
       vendor: 'vendor-b',
       name: 'Same',
-      sendRequest: async (messages: any[]) => {
+      sendRequest: async (messages: any[], options?: any) => {
+        if (options?.tools?.[0]?.name === 'bridge_capability_probe') {
+          const nonce = /nonce ([a-f0-9-]+)/i.exec(messages[0].content)?.[1];
+          return { stream: (async function* () { yield new ToolCallPart('host-probe', 'bridge_capability_probe', { nonce }); })() };
+        }
         vendorBCalls++;
         assert.deepEqual(messages, [{ role: 'user', content: 'question' }]);
         return responseText('vendor b answer');
@@ -145,6 +152,7 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     ProgressLocation: { Notification: 1 },
     Uri: { parse: (value: string) => ({ toString: () => value }) },
     LanguageModelChatMessage: { User: (content: string) => ({ role: 'user', content }) },
+    LanguageModelToolCallPart: ToolCallPart,
     window: {
       showQuickPick: async (items: any[]) =>
         items.find((item) => item.ref?.vendor === 'vendor-b') ??
@@ -200,6 +208,7 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     const state = new Map<string, unknown>();
     const secrets = new Map<string, string>();
     const context = {
+      languageModelAccessInformation: { canSendRequest: (model: any) => model.vendor === 'vendor-b' },
       globalState: {
         get: (key: string, fallback?: unknown) => state.has(key) ? state.get(key) : fallback,
         update: async (key: string, value: unknown) => {
@@ -265,6 +274,9 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     );
     const nodes = await providerNodes.getChildren();
     const copilotNode = nodes.find((node: any) => node.info?.id === 'vscode_chat');
+    const discoveredVendor = copilotNode?.subItems?.find((node: any) => node.label === 'Host models · vendor-b');
+    assert.equal(discoveredVendor.command.command, 'agent-mesh-bridge.configureCopilotHostModels');
+    assert.deepEqual(discoveredVendor.subItems[0].command.arguments, ['vendor-b', undefined, { vendor: 'vendor-b', id: 'opaque-1' }]);
     const hostGroupNode = copilotNode?.subItems?.find((node: any) => node.label === 'Host group');
     assert.deepEqual(hostGroupNode?.group, group, 'group tree items retain their configuration identity');
     const { pickModelAgent, pickGroupReceiverModel } = require('../ui/model-agent-picker');
@@ -275,6 +287,19 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
       assert.equal(choice.agent, service.getGroupAgentId(group.id));
       assert.deepEqual(choice.group.models, group.models, 'unconfigured groups remain selectable with both exact vendor identities');
       assert.match(choice.description, /未配置/);
+      const beforeBinding = service.groups.getAll().length;
+      fakeVscode.window.showQuickPick = async (items: any[]) => items.find(item => item.hostVendor === 'vendor-b');
+      const discoveredChoice = await pickModelAgent(service, [], 'initiator', 'Use discovered host group');
+      assert.equal(discoveredChoice.group.source, 'vscode-lm');
+      assert.deepEqual(discoveredChoice.group.models, [{ vendor: 'vendor-b', id: 'opaque-1' }], 'a discovered vendor group binds only its exact public model identities');
+      assert.equal(service.groups.getAll().length, beforeBinding + 1);
+      assert.equal((await service.bindHostModelGroup('vendor-b')).id, discoveredChoice.group.id, 'reusing a discovered group keeps its stable Agent identity');
+      assert.equal(service.groups.getAll().length, beforeBinding + 1, 'repeated selection does not duplicate groups');
+      assert.equal(service.getAgentBinding(discoveredChoice.group.id)?.enabled, false, 'discovery never grants tool authorization or enables a role');
+      const boundTree = await providerNodes.getChildren();
+      const boundCopilot = boundTree.find((node: any) => node.info?.id === 'vscode_chat');
+      assert.ok(boundCopilot?.subItems?.some((node: any) => node.group?.id === discoveredChoice.group.id));
+      assert.equal(boundCopilot?.subItems?.some((node: any) => node.label === 'Host models · vendor-b'), false, 'a bound host group is rendered once with its role controls');
       fakeVscode.window.showQuickPick = async (items: any[]) => items.find(item => item.agent === 'codex');
       assert.equal((await pickModelAgent(service, [{ label: 'Codex', agent: 'codex' }], 'receiver', 'Choose receiver')).agent, 'codex');
       fakeVscode.window.showQuickPick = async () => undefined;
@@ -286,7 +311,7 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
         configuredRole = role;
       };
       fakeVscode.window.showQuickPick = async (items: any[]) => items.find(item => item.action === 'configure-group');
-      assert.equal(await pickModelAgent({ groups: { getAll: () => [] } }, [], 'initiator', 'Configure groups'), undefined);
+      assert.equal(await pickModelAgent({ groups: { getAll: () => [] }, getHostState: () => 'empty', getHostModels: () => [] }, [], 'initiator', 'Configure groups'), undefined);
       assert.equal(configuredRole, 'initiator', 'group setup is reachable from the shared model picker');
     } finally {
       fakeVscode.window.showQuickPick = savedPicker;
@@ -318,6 +343,18 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     hostRegistry.writeGroupAgentHost({ version: 1, hostInstanceId: 'sender-ui-host', generation: 1, pid: process.pid,
       workspaceUri: `file://${bridgeHome}`, repositoryCommonDir: bridgeHome, trusted: true, localDesktop: true, updatedAt: Date.now() }, bridgeHome);
     service.setGroupAgentControlHandler(async () => ({}));
+    const originalHostWarning = fakeVscode.window.showWarningMessage;
+    (fakeVscode.window as any).showWarningMessage = async () => 'Authorize and enable';
+    try {
+      await registeredCommands.get('agent-mesh-bridge.configureCopilotHostModels')!('vendor-b', 'initiator', { id: 'opaque-1', vendor: 'vendor-b' });
+      const hostBinding = service.getAgentBinding((await service.bindHostModelGroup('vendor-b')).id)!;
+      assert.equal(hostBinding.initiatorReady, true, 'the existing host group can become a sender without the add-group wizard');
+      assert.equal(hostBinding.initiatorModel?.vendor, 'vendor-b');
+      assert.equal(hostBinding.receiverModel, undefined);
+      assert.deepEqual(uiErrors, []);
+    } finally {
+      fakeVscode.window.showWarningMessage = originalHostWarning;
+    }
     const originalQuickPick = fakeVscode.window.showQuickPick;
     const originalWarning = fakeVscode.window.showWarningMessage;
     let authorizeSender = false;
