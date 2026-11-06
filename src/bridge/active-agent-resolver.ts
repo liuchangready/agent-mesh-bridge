@@ -195,3 +195,19 @@ export class ActiveAgentResolver {
     }
   }
 }
+
+/** Apply a persisted setting without letting a removed agent abort extension startup. */
+export function applyConfiguredAgentDefault(
+  resolver: ActiveAgentResolver,
+  selected: string | undefined,
+  onUnsupported: (selected: string | undefined) => void,
+): boolean {
+  try {
+    resolver.setManualOverride(selected && selected !== 'auto' ? selected as AgentId : null);
+    return true;
+  } catch {
+    resolver.setManualOverride(null);
+    onUnsupported(selected);
+    return false;
+  }
+}

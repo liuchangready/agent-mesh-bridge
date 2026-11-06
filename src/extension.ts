@@ -4,7 +4,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { TaskStore } from './bridge/task-store';
 import { AgentDetector } from './bridge/agent-detector';
-import { ActiveAgentResolver } from './bridge/active-agent-resolver';
+import { ActiveAgentResolver, applyConfiguredAgentDefault } from './bridge/active-agent-resolver';
 import { AutonomousRunner } from './bridge/autonomous-runner';
 import { CallbackManager } from './bridge/callback-manager';
 import { ReviewWakeScheduler } from './bridge/review-wake-scheduler';
@@ -527,10 +527,25 @@ export function activate(context: vscode.ExtensionContext) {
     recentTreeProvider.refresh();
   });
 
-  // Explicit defaults are revalidated at selection time.
   const applyAgentDefaults = () => {
-    const selected = vscode.workspace.getConfiguration('agentMeshBridge').get<string>('defaultAgent', 'auto');
-    resolver.setManualOverride(selected && selected !== 'auto' ? selected as AgentId : null);
+    const agentConfig = vscode.workspace.getConfiguration('agentMeshBridge');
+    const selected = agentConfig.get<string>('defaultAgent', 'auto');
+    applyConfiguredAgentDefault(resolver, selected, (unsupported) => {
+      vscode.window.showWarningMessage(
+        `The saved default agent "${unsupported}" is no longer supported. It was reset to Auto. Use the Agent Bridge status bar to choose Antigravity, Codex, Claude Code, DeepSeek Harness, or Auto.`,
+      );
+      const inspected = agentConfig.inspect<string>('defaultAgent');
+      const target = inspected?.workspaceFolderValue !== undefined
+        ? vscode.ConfigurationTarget.WorkspaceFolder
+        : inspected?.workspaceValue !== undefined
+          ? vscode.ConfigurationTarget.Workspace
+          : vscode.ConfigurationTarget.Global;
+      try {
+        void agentConfig.update('defaultAgent', 'auto', target).then(undefined, () => {});
+      } catch {
+        // Keep activation healthy even when VS Code cannot persist the migration.
+      }
+    });
   };
   applyAgentDefaults();
 
