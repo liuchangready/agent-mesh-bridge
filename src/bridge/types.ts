@@ -509,13 +509,20 @@ export interface TaskFinalSummary {
   tokenUsageByAgent?: Partial<Record<AgentId, number>>;
   tokenUsageByModel?: Record<string, number>;
   nativeCompactions?: { count: number; warnings: string[] };
+  gitDelivery?: {
+    taskBranch?: string; taskPath?: string; approvedCommit?: string;
+    targetBranch?: string; targetRef?: string; targetRepositoryPath?: string; targetPath?: string; targetCommit?: string;
+    mergeState?: string; blockedReason?: string;
+    validationPath?: string; validationCommit?: string; validationStatus?: string; validationResult?: string;
+  };
 }
 
 /**
  * Metadata for a task that ran in a temporary git worktree.
  *
- * `integration` records bridge-managed local integration into the shared batch
- * ref. An MR is separate remote-delivery metadata and never changes this state.
+ * `deliveryTarget` pins the real local branch for new tasks. Missing metadata
+ * keeps the historical `targetRef` meaning for existing ledger entries.
+ * An MR is separate remote-delivery metadata and never changes local delivery.
  */
 export interface WorktreeInfo {
   /** Absolute path of the temporary worktree the agent edited. */
@@ -525,13 +532,19 @@ export interface WorktreeInfo {
   commonDir?: string;
   repositoryPath?: string;
   targetRef?: string;
+  /** Real local branch selected at dispatch; absent on legacy tasks using an internal integration ref. */
+  deliveryTarget?: { branch: string; ref: string; repositoryPath: string; checkoutPath?: string; baseCommit?: string };
+  /** Actual combined-validation worktree, retained as an audit fact after cleanup. */
+  validation?: { path: string; commit?: string; status: 'passed' | 'failed' | 'cancelled' | 'cleaned' | 'present'; result?: 'passed' | 'failed' | 'cancelled'; updatedAt: string };
   taskBranch?: string;
   headCommit?: string;
   approvedCommit?: string;
   integration?: {
-    phase: 'ready' | 'no_changes' | 'waiting' | 'merging' | 'conflict' | 'validation_failed' | 'merged';
+    phase: 'ready' | 'no_changes' | 'waiting' | 'merging' | 'conflict' | 'validation_failed' | 'blocked' | 'merged';
     sourceCommit?: string;
     targetOldCommit?: string;
+    targetCommit?: string;
+    targetPath?: string;
     candidateCommit?: string;
     mergedCommit?: string;
     error?: string;
@@ -791,6 +804,8 @@ export interface DispatchTaskParams {
   callerSessionId?: string;
   initiatorAgent?: AgentId;
   workspacePath?: string;
+  /** Local branch to deliver into; omitted means the source checkout's branch. */
+  targetBranch?: string;
   /**
    * Model the receiver should run this task with. Omitted = the model configured
    * for that agent in the bridge settings.

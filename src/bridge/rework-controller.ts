@@ -815,6 +815,7 @@ export class ReworkController {
     this.taskStore.loadFromDisk();
     for (const thread of this.taskStore.getAllTasks()) {
       if (thread.status !== 'waiting_merge') continue;
+      if (thread.worktree?.integration?.phase === 'blocked') continue;
       const blockedAt = this.blockedMergeRetries.get(thread.threadId);
       if (blockedAt && blockedAt === thread.updatedAt) continue;
       if (blockedAt) this.blockedMergeRetries.delete(thread.threadId);

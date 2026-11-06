@@ -82,7 +82,7 @@ test('pre-ref merge infrastructure failure returns a concrete error to the origi
   const repo = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repo);
   const target = resolveGitRepository(repo, storage); const worktree = createTaskWorktree(target, 'thread_merge_review_error', storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'changed\n'); worktree.headCommit = commitTaskChanges(worktree, 'task change');
-  worktree.targetRef = 'refs/heads/missing-target';
+  worktree.targetRef = 'refs/heads/missing-target'; worktree.deliveryTarget = undefined;
   const store = new TaskStore(storage); const detector = new AgentDetector(); const callback = new CallbackManager(detector);
   const notified: DelegationThread[] = []; callback.notifyCaller = async (thread) => { notified.push(thread); return true; };
   const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector);

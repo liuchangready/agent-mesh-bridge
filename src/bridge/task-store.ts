@@ -651,6 +651,14 @@ export class TaskStore extends EventEmitter {
       const authoritative = [inMemory, onDisk].filter(Boolean) as DelegationThread[];
       for (const prior of authoritative) {
         if (!prior.worktree || !thread.worktree) continue;
+        const priorValidation = prior.worktree.validation;
+        const incomingValidation = thread.worktree.validation;
+        thread.worktree = {
+          ...thread.worktree,
+          deliveryTarget: thread.worktree.deliveryTarget || prior.worktree.deliveryTarget,
+          validation: priorValidation && (!incomingValidation || Date.parse(priorValidation.updatedAt) > Date.parse(incomingValidation.updatedAt))
+            ? priorValidation : incomingValidation,
+        };
         const priorPhase = prior.worktree.integration?.phase;
         const incomingPhase = thread.worktree.integration?.phase;
         if (incomingPhase === 'merged') {

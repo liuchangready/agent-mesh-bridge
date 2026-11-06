@@ -14,6 +14,7 @@ import { AsyncDispatcher } from '../bridge/async-dispatcher';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { MeshFileLock } from '../bridge/merge-coordinator';
 import { DelegationThread, pendingMerges } from '../bridge/types';
+import { createTaskWorktree, resolveGitRepository } from '../bridge/git-worktree';
 
 const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-wt-home-'));
 process.env.USERPROFILE = isolatedHome;
@@ -70,10 +71,37 @@ test('dispatch creates a separate task branch from committed target state and ig
   assert.notStrictEqual(path.resolve(task.workspacePath), path.resolve(repository));
   assert.strictEqual(task.worktree?.baseCommit, base);
   assert.strictEqual(task.worktree?.headCommit, base);
-  assert.match(task.worktree?.targetRef || '', /^refs\/heads\/mesh\/integration\/[a-f0-9]{12}$/);
+  assert.equal(task.worktree?.targetRef, 'refs/heads/feature/caller');
+  assert.equal(task.worktree?.deliveryTarget?.branch, 'feature/caller');
   assert.strictEqual(fs.readFileSync(path.join(task.workspacePath, 'tracked.txt'), 'utf8').replace(/\r\n/g, '\n'), 'committed input\n');
   assert.strictEqual(git(repository, 'rev-parse', 'feature/caller'), base);
   assert.strictEqual(fs.readFileSync(path.join(repository, 'tracked.txt'), 'utf8').replace(/\r\n/g, '\n'), 'uncommitted caller edit\n');
+});
+
+test('explicit delivery branch is pinned and task worktrees pass it to child tasks', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-target-inherit-'));
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  git(repository, 'branch', 'release');
+  const releaseHead = git(repository, 'rev-parse', 'release');
+  const first = createTaskWorktree(resolveGitRepository(repository, storage, 'release'), 'thread_target_parent', storage);
+  const childRepo = resolveGitRepository(first.path, storage, 'feature/caller');
+  const child = createTaskWorktree(childRepo, 'thread_target_child', storage);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  assert.equal(first.deliveryTarget?.branch, 'release');
+  assert.equal(first.baseCommit, releaseHead);
+  assert.equal(child.deliveryTarget?.branch, 'release', 'marker inheritance takes precedence over a later caller target');
+  assert.equal(child.targetRef, 'refs/heads/release');
+  assert.equal(child.baseCommit, releaseHead);
+});
+
+test('detached source requires an explicit existing local delivery branch', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-detached-target-'));
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  git(repository, 'checkout', '--detach', 'HEAD');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  assert.throws(() => resolveGitRepository(repository, storage), /detached HEAD|targetBranch/i);
+  assert.equal(resolveGitRepository(repository, storage, 'feature/caller').deliveryTarget?.branch, 'feature/caller');
+  assert.throws(() => resolveGitRepository(repository, storage, 'missing'), /does not exist/i);
 });
 
 test('new dispatch creates its worktree while final integration validation holds the mesh lock', async (t) => {

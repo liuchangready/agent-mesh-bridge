@@ -149,6 +149,16 @@ export function buildFinalSummary(
         }
       : {}),
     ...(nativeOperations.length ? { nativeCompactions: { count: nativeOperations.filter((operation) => operation.phase === 'succeeded').length, warnings: nativeWarnings } } : {}),
+    ...(thread.worktree ? { gitDelivery: {
+      taskBranch: thread.worktree.taskBranch, taskPath: thread.worktree.path, approvedCommit: thread.worktree.approvedCommit,
+      targetBranch: thread.worktree.deliveryTarget?.branch, targetRef: thread.worktree.deliveryTarget?.ref || thread.worktree.targetRef,
+      targetRepositoryPath: thread.worktree.deliveryTarget?.repositoryPath || thread.worktree.repositoryPath || thread.worktree.mainPath,
+      targetPath: thread.worktree.integration?.targetPath || thread.worktree.deliveryTarget?.checkoutPath,
+      targetCommit: thread.worktree.integration?.targetCommit || thread.worktree.integration?.targetOldCommit || thread.worktree.deliveryTarget?.baseCommit,
+      mergeState: thread.worktree.integration?.phase, blockedReason: thread.worktree.integration?.error,
+      validationPath: thread.worktree.validation?.path, validationCommit: thread.worktree.validation?.commit,
+      validationStatus: thread.worktree.validation?.status, validationResult: thread.worktree.validation?.result,
+    } } : {}),
   };
 }
 

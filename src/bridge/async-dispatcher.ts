@@ -207,7 +207,7 @@ export class AsyncDispatcher {
     if (!this.taskStore.canAcceptTask()) {
       throw new Error('The task ledger is full and every stored task contains active, unmerged, or otherwise non-evictable work. Merge or explicitly delete retained tasks before dispatching another.');
     }
-    const worktree: WorktreeInfo = createTaskWorktree(resolveGitRepository(repositoryPath, this.storageDir), threadId, this.storageDir);
+    const worktree: WorktreeInfo = createTaskWorktree(resolveGitRepository(repositoryPath, this.storageDir, params.targetBranch), threadId, this.storageDir);
     const workspacePath = worktree.path;
     const tempCandidate: DelegationThread = {
       threadId,

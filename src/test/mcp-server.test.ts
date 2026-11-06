@@ -156,6 +156,7 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(toolNames.includes('list_agent_models'));
     assert.ok(toolNames.includes('get_task_summary'));
     const dispatch = tools.find((t: any) => t.name === 'dispatch_task');
+    assert.equal(dispatch.inputSchema.properties.targetBranch.type, 'string');
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'expectedFiles'));
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'allowNoScope'));
     assert.strictEqual(toolNames.length, 19);

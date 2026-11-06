@@ -1,4 +1,3 @@
-import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -9,10 +8,11 @@ export interface GitRepository {
   commonDir: string;
   repositoryPath: string;
   targetRef: string;
+  deliveryTarget?: { branch: string; ref: string; repositoryPath: string };
   baseCommit: string;
 }
 
-interface TaskTargetMarker { targetRef: string; commonDir?: string; repositoryPath?: string; }
+interface TaskTargetMarker { targetRef: string; deliveryTarget?: { branch: string; ref: string; repositoryPath: string; checkoutPath?: string; baseCommit?: string }; commonDir?: string; repositoryPath?: string; }
 
 function git(cwd: string, args: string[]): string {
   const candidates = [process.env.MESH_GIT_PATH, process.env.GIT_EXECUTABLE, 'git.exe', 'git'].filter(Boolean) as string[];
@@ -34,32 +34,38 @@ function safePath(value: string): string {
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
-export function resolveGitRepository(startPath: string, storageDir: string): GitRepository {
+export function resolveGitRepository(startPath: string, storageDir: string, requestedTargetBranch?: string): GitRepository {
   let repositoryPath = path.resolve(startPath);
-  const initialCommonDir = path.resolve(git(repositoryPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+  let initialCommonDir: string;
+  try { initialCommonDir = path.resolve(git(repositoryPath, ['rev-parse', '--path-format=absolute', '--git-common-dir'])); }
+  catch (error) { throw new Error(`Workspace ${repositoryPath} is not a usable Git checkout. Open a Git repository with a committed HEAD before dispatching.`, { cause: error }); }
   const inherited = readTaskTarget(repositoryPath, storageDir);
   if (inherited?.repositoryPath) repositoryPath = path.resolve(inherited.repositoryPath);
   const commonDir = path.resolve(git(repositoryPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
   if (safePath(initialCommonDir) !== safePath(commonDir)) throw new Error('Task worktree points to a different Git repository identity than its recorded source repository.');
-  const head = git(repositoryPath, ['rev-parse', '--verify', 'HEAD^{commit}']);
+  try { git(repositoryPath, ['rev-parse', '--verify', 'HEAD^{commit}']); }
+  catch (error) { throw new Error(`Git checkout ${repositoryPath} has no valid committed HEAD. Create a commit before dispatching.`, { cause: error }); }
   let targetRef: string;
+  let deliveryTarget = inherited?.deliveryTarget;
   if (inherited) targetRef = inherited.targetRef;
   else {
-    const identity = crypto.createHash('sha1').update(safePath(commonDir)).digest('hex').slice(0, 12);
-    targetRef = `refs/heads/mesh/integration/${identity}`;
-    const exists = spawnSync(gitExecutable(), ['show-ref', '--verify', '--quiet', targetRef], {
-      cwd: repositoryPath, windowsHide: true, timeout: 30_000,
-    });
-    if (exists.status !== 0) {
-      try { git(repositoryPath, ['update-ref', targetRef, head, '0000000000000000000000000000000000000000']); }
-      catch {
-        // A concurrent first task may have created the shared ref after show-ref.
-        git(repositoryPath, ['rev-parse', '--verify', `${targetRef}^{commit}`]);
-      }
-    }
+    let sourceRef = '';
+    try { sourceRef = git(repositoryPath, ['symbolic-ref', '--quiet', '--short', 'HEAD']); } catch {}
+    const branch = (requestedTargetBranch || sourceRef).trim().replace(/^refs\/heads\//, '');
+    if (!branch || (!requestedTargetBranch && branch.startsWith('mesh/task/'))) throw new Error('Cannot choose a delivery target from a detached HEAD or mesh task branch. Check out a normal local branch or specify targetBranch.');
+    try { git(repositoryPath, ['check-ref-format', '--branch', branch]); }
+    catch { throw new Error(`Invalid local target branch "${branch}". Specify an existing local branch in this repository.`); }
+    const ref = `refs/heads/${branch}`;
+    try { git(repositoryPath, ['rev-parse', '--verify', `${ref}^{commit}`]); }
+    catch { throw new Error(`Local target branch "${branch}" does not exist in this Git repository. Create or check out it before dispatching.`); }
+    const targetRows = git(repositoryPath, ['worktree', 'list', '--porcelain']).split(/\r?\n\r?\n/);
+    const checkoutPath = targetRows.map((row) => ({ branch: row.match(/^branch (.+)$/m)?.[1], path: row.match(/^worktree (.+)$/m)?.[1] })).find((row) => row.branch === ref)?.path;
+    deliveryTarget = { branch, ref, repositoryPath, checkoutPath };
+    targetRef = ref;
   }
   const baseCommit = git(repositoryPath, ['rev-parse', '--verify', `${targetRef}^{commit}`]);
-  return { commonDir, repositoryPath, targetRef, baseCommit };
+  if (deliveryTarget) deliveryTarget.baseCommit = baseCommit;
+  return { commonDir, repositoryPath, targetRef, deliveryTarget, baseCommit };
 }
 
 function readTaskTarget(repositoryPath: string, storageDir: string): TaskTargetMarker | undefined {
@@ -84,7 +90,7 @@ function readTaskTarget(repositoryPath: string, storageDir: string): TaskTargetM
       for (const name of fs.readdirSync(tasksDir)) {
         const thread = JSON.parse(fs.readFileSync(path.join(tasksDir, name), 'utf8'));
         if (thread?.worktree?.path && safePath(thread.worktree.path) === safePath(repositoryPath) && thread.worktree.targetRef) {
-          return { targetRef: thread.worktree.targetRef, repositoryPath: thread.worktree.repositoryPath || thread.worktree.mainPath, commonDir: thread.worktree.commonDir };
+          return { targetRef: thread.worktree.targetRef, deliveryTarget: thread.worktree.deliveryTarget, repositoryPath: thread.worktree.repositoryPath || thread.worktree.mainPath, commonDir: thread.worktree.commonDir };
         }
       }
     } catch {}
@@ -103,7 +109,7 @@ export function createTaskWorktree(repo: GitRepository, threadId: string, storag
     const exclude = path.resolve(worktreePath, git(worktreePath, ['rev-parse', '--git-path', 'info/exclude']));
     fs.mkdirSync(path.dirname(exclude), { recursive: true });
     fs.appendFileSync(exclude, '\n/.agent-mesh-task.json\n', 'utf8');
-    const marker = { threadId, targetRef: repo.targetRef, commonDir: repo.commonDir, repositoryPath: repo.repositoryPath };
+    const marker = { threadId, targetRef: repo.targetRef, deliveryTarget: repo.deliveryTarget, commonDir: repo.commonDir, repositoryPath: repo.repositoryPath };
     fs.writeFileSync(path.join(worktreePath, '.agent-mesh-task.json'), JSON.stringify(marker), 'utf8');
   }
   catch (error) {
@@ -117,6 +123,7 @@ export function createTaskWorktree(repo: GitRepository, threadId: string, storag
     repositoryPath: repo.repositoryPath,
     commonDir: repo.commonDir,
     targetRef: repo.targetRef,
+    deliveryTarget: repo.deliveryTarget,
     branch: taskBranch,
     taskBranch,
     baseCommit: repo.baseCommit,

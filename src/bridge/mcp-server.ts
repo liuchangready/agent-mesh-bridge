@@ -409,6 +409,10 @@ export class MCPServer {
               type: 'string',
               description: 'Workspace root path (defaults to current working directory).',
             },
+            targetBranch: {
+              type: 'string',
+              description: 'Existing local branch to merge the approved task into. Defaults to the source checkout branch and is pinned for this task.',
+            },
             model: {
               type: 'string',
               description:
@@ -1144,6 +1148,7 @@ export class MCPServer {
           prompt: args.prompt,
           callerSessionId: args.callerSessionId,
           workspacePath: args.workspacePath,
+          targetBranch: args.targetBranch,
           model: args.model,
           modelRequestedByUser: args.modelRequestedByUser === true,
           initiatorModel: args.initiatorModel,
