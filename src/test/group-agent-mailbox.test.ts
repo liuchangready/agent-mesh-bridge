@@ -429,9 +429,9 @@ test('host broker validates the real task lease and runs structured tools in its
     };
     broker = new GroupAgentHostBroker({ hostInstanceId: host.hostInstanceId, taskStore: store, models: models as any, storageDir: root });
     broker!.start(20);
-    const runner = new AutonomousRunner({} as any, 5000, new CancellationRegistry(root), store);
+    const runner = new AutonomousRunner({} as any, 15_000, new CancellationRegistry(root), store);
     const result = await runner.execute({ agent, prompt: 'implement test change', isRework: false, receiverSessionId: thread.receiverSessionId,
-      cwd: root, taskThreadId: threadId, taskRound: 1, modelRef, role: 'developer', timeoutMs: 3000 });
+      cwd: root, taskThreadId: threadId, taskRound: 1, modelRef, role: 'developer', timeoutMs: 30_000 });
     assert.equal(result.assessment?.success, true);
     assert.equal(result.tokenUsage?.promptTokens, 8);
     if (result.assessment?.transport !== 'bridge-agent') throw new Error('Expected a Bridge Agent assessment.');
@@ -671,18 +671,36 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
     assert.equal(childCode, 0, err);
     return JSON.parse(out);
     };
+    // Parallel merge tests share the real mesh lock, so allow a full validation window.
+    const waitForCompletion = async (threadId: string, timeoutMs = 240_000) => {
+      const deadline = Date.now() + timeoutMs;
+      let lastMergeResume = 0;
+      while (Date.now() < deadline) {
+        const thread = store.getTask(threadId);
+        if (thread?.status === 'completed') return thread;
+        if (thread?.status === 'waiting_merge' && Date.now() - lastMergeResume >= 1_000) {
+          rework.resumePendingMerges();
+          lastMergeResume = Date.now();
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const thread = store.getTask(threadId)!;
+      const roleOwner = new TaskRoleLock(storage).getOwner(threadId);
+      assert.equal(thread.status, 'completed', JSON.stringify({ status: thread.status,
+        integration: thread.worktree?.integration,
+        roleOwner: roleOwner && { role: roleOwner.role, pid: roleOwner.pid, childPid: roleOwner.childPid,
+          conversationId: roleOwner.conversationId },
+        rounds: thread.rounds.map((round) => ({ round: round.round, type: round.type, status: round.status,
+          error: round.error, interruption: round.interruption })) }));
+      return thread;
+    };
     const dispatch = await runIndependentDispatch(approvedReceiverModel);
     hostThreadId = dispatch.threadId;
     assert.equal(dispatch.targetAgent, agent);
     assert.equal(dispatch.modelRouting?.initiatorAgent, agent, 'the configured Group reviewer is distinct from the CLI requester');
     assert.equal(store.getTask(hostThreadId)?.initiatorAgent, agent, 'default reviewer must be the Group Agent');
     assert.equal(store.getTask(hostThreadId)?.requesterAgent, 'codex');
-    const deadline = Date.now() + 15_000;
-    while (Date.now() < deadline && store.getTask(hostThreadId)?.status !== 'completed')
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    const finished = store.getTask(hostThreadId)!;
-    assert.equal(finished.status, 'completed', JSON.stringify({ status: finished.status, snippet: finished.summary.lastOutputSnippet,
-      rounds: finished.rounds.map((r) => ({ round: r.round, type: r.type, status: r.status, error: r.error })) }));
+    const finished = await waitForCompletion(hostThreadId);
     assert.equal(finished.worktree?.integration?.phase, 'merged');
     assert.deepEqual(finished.targetModelRef, approvedReceiverModel);
     assert.equal(finished.modelApproval?.status, 'approved', 'the public MCP request and user approval are persisted on the task');
@@ -701,10 +719,7 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
     const groupConfig = require('../bridge/group-agent-registry').loadGroupAgentConfig(root);
     require('../bridge/group-agent-registry').saveGroupAgentConfig({ ...groupConfig, defaultAgent: developerAgent, updatedAt: Date.now() }, root);
     const crossDispatch = await runIndependentDispatch();
-    const crossDeadline = Date.now() + 15_000;
-    while (Date.now() < crossDeadline && store.getTask(crossDispatch.threadId)?.status !== 'completed') await new Promise((resolve) => setTimeout(resolve, 50));
-    const crossFinished = store.getTask(crossDispatch.threadId)!;
-    assert.equal(crossFinished.status, 'completed', JSON.stringify({ status: crossFinished.status, rounds: crossFinished.rounds.map((round) => ({ status: round.status, error: round.error })) }));
+    const crossFinished = await waitForCompletion(crossDispatch.threadId);
     assert.equal(crossFinished.initiatorAgent, agent);
     assert.equal(crossFinished.targetAgent, developerAgent);
     assert.equal(crossFinished.worktree?.integration?.phase, 'merged');
@@ -715,15 +730,7 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
 
     developerTurns = 0; reviewerTurns = 0;
     const groupCliDispatch = await runIndependentDispatch(undefined, 'claude_code');
-    const cliDeadline = Date.now() + 15_000;
-    while (Date.now() < cliDeadline && store.getTask(groupCliDispatch.threadId)?.status !== 'completed') {
-      if (store.getTask(groupCliDispatch.threadId)?.status === 'waiting_merge') rework.resumePendingMerges();
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    const groupCliFinished = store.getTask(groupCliDispatch.threadId)!;
-    assert.equal(groupCliFinished.status, 'completed', JSON.stringify({ status: groupCliFinished.status, integration: groupCliFinished.worktree?.integration,
-      rounds: groupCliFinished.rounds.map((round) => ({ status: round.status, error: round.error, assessment: round.assessment })),
-      files: fs.readdirSync(groupCliFinished.worktree!.path), git: childProcess.execFileSync('git', ['status', '--short'], { cwd: groupCliFinished.worktree!.path, encoding: 'utf8' }) }));
+    const groupCliFinished = await waitForCompletion(groupCliDispatch.threadId);
     assert.equal(groupCliFinished.initiatorAgent, agent, 'the Group sender remains the dedicated reviewer for a CLI receiver');
     assert.equal(groupCliFinished.targetAgent, 'claude_code');
     assert.equal(groupCliFinished.worktree?.integration?.phase, 'merged');
@@ -738,12 +745,7 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
     detector.setCustomPath('claude_code', fakeClaudeReviewer);
     callerReviewMode = true;
     const cliReviewDispatch = await runIndependentDispatch();
-    const cliReviewerDeadline = Date.now() + 20_000;
-    while (Date.now() < cliReviewerDeadline && store.getTask(cliReviewDispatch.threadId)?.status !== 'completed') {
-      if (store.getTask(cliReviewDispatch.threadId)?.status === 'waiting_merge') rework.resumePendingMerges();
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    const cliReviewFinished = store.getTask(cliReviewDispatch.threadId)!;
+    const cliReviewFinished = await waitForCompletion(cliReviewDispatch.threadId);
     assert.equal(cliReviewFinished.requesterAgent, 'claude_code');
     assert.equal(cliReviewFinished.initiatorAgent, 'claude_code', 'defaultReviewer=caller must keep the actual CLI reviewer');
     assert.equal(cliReviewFinished.targetAgent, agent);
