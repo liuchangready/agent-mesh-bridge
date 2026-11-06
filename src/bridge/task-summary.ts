@@ -136,7 +136,6 @@ export function buildFinalSummary(
     rounds: (thread.rounds || []).filter((r) => r.type !== 'approval').length,
     ...(mr ? { mergeRequest: mr } : {}),
     reviewerAgent: thread.initiatorAgent,
-    ...(thread.requesterAgent ? { requesterAgent: thread.requesterAgent } : {}),
     ...(thread.reviewerModel ? { reviewerModel: thread.reviewerModel } : {}),
     executorAgent: thread.targetAgent,
     ...(thread.targetModel ? { executorModel: thread.targetModel } : {}),
@@ -174,7 +173,6 @@ export function archiveThreadData(thread: DelegationThread, now = new Date()): b
   thread.rounds = [];
   thread.currentRound = 0;
   thread.callerSessionId = undefined;
-  thread.requesterSessionId = undefined;
   thread.receiverSessionId = '';
   thread.nativeSessionCompaction = undefined;
   thread.receiverSessionCaptured = undefined;
@@ -280,21 +278,6 @@ export function archiveCompletedTaskLogs(
 
   const entries: Array<{ name: string; content: Buffer | string; mtime?: Date }> = [];
   const foundFilenames = new Set<string>();
-
-  for (const [sessionId, ownerAgentId] of [
-    [thread.targetAgent.startsWith('copilot_group:') ? thread.receiverSessionId : undefined, thread.targetAgent],
-    [thread.reviewFlow === 'dedicated' && thread.initiatorAgent.startsWith('copilot_group:') ? (thread.reviewerSessionId || thread.callerSessionId) : undefined, thread.initiatorAgent],
-  ] as Array<[string | undefined, string]>) {
-    if (!sessionId || !/^[A-Za-z0-9_-]{8,128}$/.test(sessionId)) continue;
-    const sessionDir = path.join(bridgeHomeDir(root), 'group-agent-sessions');
-    const sessionPath = path.join(sessionDir, `${sessionId}.jsonl`);
-    const ownerPath = `${sessionPath}.owner.json`;
-    const owner = JSON.parse(fs.readFileSync(ownerPath, 'utf8'));
-    if (owner.version !== 1 || owner.transport !== 'bridge-agent' || owner.threadId !== thread.threadId || owner.ownerAgentId !== ownerAgentId)
-      throw new Error(`Group Agent session ${sessionId} is not owned by task ${thread.threadId}.`);
-    entries.push({ name: `group-agent_sessions/${sessionId}.jsonl`, content: fs.readFileSync(sessionPath) });
-    entries.push({ name: `group-agent_sessions/${sessionId}.jsonl.owner.json`, content: fs.readFileSync(ownerPath) });
-  }
 
   // 1. Gather worker logs
   const workerDirs = Array.from(

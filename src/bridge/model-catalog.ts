@@ -456,16 +456,6 @@ export class ModelCatalog {
   }
 
   public async get(agent: AgentId, forceRefresh: boolean = false): Promise<AgentModelCatalog> {
-    if (agent === 'vscode_chat') {
-      return {
-        agent,
-        models: [],
-        source: 'builtin',
-        updatedAt: new Date().toISOString(),
-        error: 'Requester only; the active Copilot model is not exposed by the supported API.',
-      };
-    }
-
     const memoryHit = this.memory.get(agent);
     if (!forceRefresh && memoryHit && Date.now() - memoryHit.at < this.ttlMs) {
       return memoryHit.catalog;

@@ -257,7 +257,6 @@ describe('Reviewer stream capture', () => {
       thread.reviewBootstrap = { phase: 'confirmed', attempts: 1 };
       thread.reviewerSessionCaptured = true;
       thread.reviewerSessionId = reviewerSession;
-      thread.requesterSessionId = 'requester-session-1';
       thread.callerSessionId = reviewerSession;
 
       assert.strictEqual(await manager.notifyCaller(thread, thread.rounds[0]), true);

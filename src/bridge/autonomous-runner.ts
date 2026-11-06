@@ -9,8 +9,6 @@ import {
   MESH_TASK_ROUND_ENV,
   MESH_TASK_THREAD_ENV,
   ResponseAssessment,
-  BridgeAgentAssessment,
-  GroupModelRef,
   StreamAssessment,
   StreamGapPolicy,
   TaskInterruption,
@@ -30,8 +28,6 @@ import {
 } from './cancellation-registry';
 import type { TaskStore } from './task-store';
 import { assertCanExecute } from './agent-capabilities';
-import { isGroupAgentId, loadGroupAgentConfig, loadGroupAgentHost } from './group-agent-registry';
-import { GroupAgentMailboxClient } from './group-agent-mailbox';
 import { NativeSessionCompactor } from './native-session-compactor';
 import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
 import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
@@ -322,7 +318,6 @@ export interface RunOptions {
    * then to whatever default the CLI itself ships with.
    */
   model?: string;
-  modelRef?: GroupModelRef;
   role?: 'developer' | 'reviewer' | 'bootstrap';
   signal?: AbortSignal;
   /**
@@ -390,8 +385,6 @@ export class AutonomousRunner {
   private activeChildren: Map<string, child_process.ChildProcess> = new Map();
   private localCancellations: Map<string, CancellationRequest> = new Map();
   private executingThreads: Set<string> = new Set();
-  private groupAgentExecutor?: (options: RunOptions, signal: AbortSignal) => Promise<{ text: string; toolCallsCompleted: number; modelRequests?: number; tokenUsage?: TokenUsageMetrics }>;
-  private activeGroupCancels = new Map<string, () => void>();
   /** Where an unspecified model comes from; replaceable for tests. */
   private modelResolver: (agent: AgentId) => string | undefined = (agent) =>
     resolveConfiguredModel(agent);
@@ -429,7 +422,6 @@ export class AutonomousRunner {
       at: new Date().toISOString(),
       by,
     });
-    this.activeGroupCancels.get(threadId)?.();
     const child = this.activeChildren.get(threadId);
     if (child) {
       try {
@@ -779,161 +771,6 @@ export class AutonomousRunner {
   public async execute(options: RunOptions): Promise<RunResult> {
     const reviewer = options.role === 'reviewer' || options.role === 'bootstrap';
     assertCanExecute(options.agent, reviewer ? 'run as a reviewer' : 'run as an executor', reviewer ? 'initiator' : 'receiver');
-    if (isGroupAgentId(options.agent)) {
-      const groupAgentId = options.agent as `copilot_group:${string}`;
-      const binding = loadGroupAgentConfig()?.agents.find((entry) => entry.id === options.agent);
-      const modelRef = options.modelRef || (reviewer ? binding?.initiatorModel : binding?.receiverModel);
-      if (!binding?.enabled || !binding.toolsAuthorized || !modelRef)
-        throw new Error('The Group Agent is disabled, unauthorized, or has no model for this role.');
-      const host = loadGroupAgentHost();
-      const thread = options.taskThreadId ? this.taskStore?.getTask(options.taskThreadId) : undefined;
-      const snapshot = thread
-        ? (reviewer ? thread.initiatorGroupBindingSnapshot : thread.targetGroupBindingSnapshot)
-        : {
-            agentId: groupAgentId, revision: binding.revision, source: binding.source,
-            ...(binding.baseUrl ? { baseUrl: binding.baseUrl } : {}), modelRef,
-          };
-      if (!snapshot || snapshot.agentId !== options.agent || JSON.stringify(snapshot.modelRef) !== JSON.stringify(modelRef))
-        throw new Error('This task has no matching pinned Group Agent binding snapshot; explicitly retarget it to bind the current group.');
-      if (snapshot.source !== binding.source || snapshot.baseUrl !== binding.baseUrl)
-        throw new Error('The Group Agent source or endpoint changed; explicitly retarget this task to rebind it.');
-      const runId = require('crypto').randomUUID() as string;
-      const startedAt = new Date().toISOString();
-      const start = monotonicNowMs();
-      const suspension = new HostSuspensionGuard();
-      suspension.start();
-      const aborter = new AbortController();
-      const initialTaskExisted = options.taskThreadId && this.taskStore
-        ? Boolean(this.taskStore.getTask(options.taskThreadId)) : false;
-      let cancellation: CancellationRequest | undefined = options.taskThreadId
-        ? this.checkPendingCancellation(options.taskThreadId, initialTaskExisted) : undefined;
-      const externalAbort = () => aborter.abort(options.signal?.reason);
-      options.signal?.addEventListener('abort', externalAbort, { once: true });
-      if (options.signal?.aborted) externalAbort();
-      if (options.taskThreadId) this.activeGroupCancels.set(options.taskThreadId, () => aborter.abort());
-      const cancellationPoll = options.taskThreadId ? setInterval(() => {
-        cancellation ||= this.checkPendingCancellation(options.taskThreadId, initialTaskExisted);
-        if (cancellation) aborter.abort(new Error(cancellation.reason));
-      }, 100) : undefined;
-      let timeout: NodeJS.Timeout | undefined;
-      let timedOut = false;
-      const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
-      const checkTimeout = () => {
-        suspension.sync();
-        const now = monotonicNowMs();
-        const activeMs = now - start - suspension.suspendedWithin(start, now);
-        if (activeMs >= timeoutMs) {
-          timedOut = true;
-          aborter.abort(new Error('Group Agent task timed out.'));
-        } else {
-          timeout = setTimeout(checkTimeout, Math.min(1000, Math.max(50, timeoutMs - activeMs)));
-          timeout.unref?.();
-        }
-      };
-      timeout = setTimeout(checkTimeout, Math.min(1000, timeoutMs));
-      timeout.unref?.();
-      try {
-        if (!host) throw new Error('The trusted local VS Code Group Agent host is offline; resume this task in its original session when the host returns.');
-        if (options.taskThreadId && this.taskStore) {
-          const task = this.taskStore.getTask(options.taskThreadId);
-          if (!task) cancellation ||= { action: 'delete', reason: 'Task was deleted before Group Agent execution started', at: new Date().toISOString(), by: 'task_store' };
-          else if (options.role !== 'bootstrap' && options.taskRound !== undefined && task.currentRound !== options.taskRound)
-            throw new Error('The Group Agent round is no longer current.');
-        }
-        cancellation ||= options.taskThreadId ? this.checkPendingCancellation(options.taskThreadId, initialTaskExisted) : undefined;
-        if (cancellation) throw new Error(cancellation.reason);
-        if (aborter.signal.aborted) throw new Error('Group Agent execution was cancelled before it started.');
-        const runOptions = { ...options, modelRef, extraEnv: { ...options.extraEnv, MESH_GROUP_RUN_ID: runId } };
-        const output = this.groupAgentExecutor
-          ? await this.groupAgentExecutor(runOptions, aborter.signal)
-          : await (async () => {
-              if (!options.taskThreadId || !options.cwd) throw new Error('Group Agent mailbox requests require a task id and task worktree.');
-              return new GroupAgentMailboxClient().execute({
-              runId,
-              threadId: options.taskThreadId || '', round: options.taskRound ?? thread?.currentRound ?? 1,
-              role: options.role || 'developer', agent: groupAgentId, sessionId: options.receiverSessionId,
-              worktree: options.cwd || '', prompt: options.prompt, modelRef, bindingSnapshot: snapshot,
-              isRework: options.isRework, timeoutMs, previousTokenUsage: options.previousTokenUsage,
-              extraEnv: Object.fromEntries(Object.entries(options.extraEnv || {}).filter(([key, value]) => key.startsWith('MESH_REVIEW_') && typeof value === 'string')) as Record<string, string>,
-            }, host, aborter.signal, options.onChildPid);
-            })();
-        cancellation ||= options.taskThreadId ? this.checkPendingCancellation(options.taskThreadId, initialTaskExisted) : undefined;
-        if (options.taskThreadId && this.taskStore) {
-          const task = this.taskStore.getTask(options.taskThreadId);
-          if (!task) cancellation ||= { action: 'delete', reason: 'Task was deleted before the Group Agent result was accepted', at: new Date().toISOString(), by: 'task_store' };
-          else if (options.role !== 'bootstrap' && options.taskRound !== undefined && task.currentRound !== options.taskRound)
-            throw new Error('The Group Agent round changed before its result was accepted.');
-        }
-        if (cancellation) aborter.abort(new Error(cancellation.reason));
-        if (aborter.signal.aborted) throw new Error(timedOut ? 'Group Agent task timed out.' : cancellation?.reason || 'Group Agent task cancelled.');
-        const text = output.text;
-        const ended = new Date().toISOString();
-        const assessment: BridgeAgentAssessment = {
-          transport: 'bridge-agent', success: Boolean(text.trim()),
-          errorCode: text.trim() ? 'OK' : 'EMPTY_OUTPUT', runId,
-          stream: { chunkCount: 0, stdoutBytes: 0, stderrBytes: 0, maxGapMs: 0, gapThresholdMs: DEFAULT_SILENCE_TIMEOUT_MS, hasActualOutput: Boolean(text.trim()), continuous: true },
-          exitCode: -1,
-          sessionId: options.receiverSessionId, finalEvent: Boolean(text.trim()),
-          toolCallsCompleted: output.toolCallsCompleted, startedAt, completedAt: ended,
-        };
-        const tokenUsage = output.tokenUsage
-          ? accumulateTokenUsage(options.previousTokenUsage, output.tokenUsage)
-          : options.previousTokenUsage
-            ? { ...options.previousTokenUsage, partial: true, attempts: (options.previousTokenUsage.attempts ?? 1) + (output.modelRequests ?? 1), notes: [options.previousTokenUsage.notes, 'This execution returned no native usage metadata.'].filter(Boolean).join(' ') }
-            : {
-                uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
-                promptTokens: 0, outputTokens: 0, totalTokens: 0, agent: options.agent,
-                model: options.model, source: 'unavailable' as const, available: false, partial: true,
-                attempts: output.modelRequests ?? 1, notes: 'The model did not provide native usage metadata.', collectedAt: ended,
-              };
-        return {
-          exitCode: -1, stdout: '', stderr: '', extractedOutput: text, actualSessionId: options.receiverSessionId,
-          durationMs: Math.max(0, monotonicNowMs() - start), model: options.model,
-          transport: 'bridge-agent', assessment, tokenUsage,
-        };
-      } catch (error) {
-        if (options.taskThreadId) cancellation = this.consumeCancellation(options.taskThreadId) || cancellation;
-        const ended = new Date().toISOString();
-        const executorInterruption = (error as { interruption?: TaskInterruption } | null)?.interruption;
-        const interrupted: TaskInterruption | undefined = executorInterruption || (timedOut
-          ? { kind: 'timeout', reason: 'Group Agent task timed out.', at: ended, by: 'runner' }
-          : /Group Agent host (?:is offline|generation changed)/i.test(error instanceof Error ? error.message : String(error))
-            ? { kind: 'paused', reason: error instanceof Error ? error.message : String(error), at: ended, by: 'group-agent-host' }
-          : cancellation
-            ? { kind: cancellation.action === 'pause' ? 'paused' : cancellation.action === 'delete' ? 'deleted' : 'stopped', reason: cancellation.reason, at: cancellation.at, by: cancellation.by }
-            : aborter.signal.aborted
-              ? { kind: 'stopped', reason: error instanceof Error ? error.message : String(error), at: ended, by: 'runner' }
-              : undefined);
-        const failedUsage = (error as { tokenUsage?: TokenUsageMetrics; modelRequests?: number } | null)?.tokenUsage;
-        const tokenUsage = failedUsage
-          ? accumulateTokenUsage(options.previousTokenUsage, failedUsage)
-          : options.previousTokenUsage
-            ? { ...options.previousTokenUsage, partial: true, attempts: (options.previousTokenUsage.attempts ?? 1) + ((error as { modelRequests?: number } | null)?.modelRequests ?? 1), notes: [options.previousTokenUsage.notes, 'The interrupted execution returned no complete usage summary.'].filter(Boolean).join(' ') }
-            : undefined;
-        return {
-          exitCode: -1, stdout: '', stderr: '', extractedOutput: '', actualSessionId: options.receiverSessionId,
-          durationMs: Math.max(0, monotonicNowMs() - start),
-          error: error instanceof Error ? error.message : String(error),
-          transport: 'bridge-agent',
-          ...(interrupted ? { interruption: interrupted } : {}),
-          ...(tokenUsage ? { tokenUsage } : {}),
-          assessment: {
-            transport: 'bridge-agent', success: false, errorCode: interrupted ? interrupted.kind.toUpperCase() : 'BRIDGE_AGENT_ERROR',
-            stream: { chunkCount: 0, stdoutBytes: 0, stderrBytes: 0, maxGapMs: 0, gapThresholdMs: DEFAULT_SILENCE_TIMEOUT_MS, hasActualOutput: false, continuous: false },
-            exitCode: -1,
-            runId, sessionId: options.receiverSessionId, finalEvent: false,
-            toolCallsCompleted: (error as { toolCallsCompleted?: number } | null)?.toolCallsCompleted || 0, startedAt, completedAt: ended,
-            reason: interrupted?.reason || (error instanceof Error ? error.message : String(error)),
-          },
-        };
-      } finally {
-        options.signal?.removeEventListener('abort', externalAbort);
-        if (timeout) clearTimeout(timeout);
-        if (cancellationPoll) clearInterval(cancellationPoll);
-        suspension.stop();
-        if (options.taskThreadId) this.activeGroupCancels.delete(options.taskThreadId);
-      }
-    }
     const maxRetries = options.maxRetries ?? 3;
     const baseBackoffMs = options.retryBackoffMs ?? 2000;
     const taskThreadId = options.taskThreadId;
@@ -945,7 +782,7 @@ export class AutonomousRunner {
     let nativeLease: NativeSessionLease | undefined;
     let recoveryVersion: string | undefined;
     let preparationExecution: { registry: TaskExecutionRegistry; registration: TaskExecutionRegistration; owned: boolean } | undefined;
-    let runId = `${taskThreadId || 'run'}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const runId = `${taskThreadId || 'run'}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
     if (taskThreadId) {
       this.executingThreads.add(taskThreadId);
@@ -1232,10 +1069,6 @@ export class AutonomousRunner {
     }
   }
 
-  public setGroupAgentExecutor(executor: ((options: RunOptions, signal: AbortSignal) => Promise<{ text: string; toolCallsCompleted: number; modelRequests?: number; tokenUsage?: TokenUsageMetrics }>) | undefined): void {
-    this.groupAgentExecutor = executor;
-  }
-
   /**
    * Decides whether a failed attempt deserves another try.
    *
@@ -1302,7 +1135,7 @@ export class AutonomousRunner {
    * external command" instead of an actionable configuration error.
    */
   public describeMissingExecutable(agent: AgentId): string | undefined {
-    if (agent === 'vscode_chat') return undefined;
+    assertCanExecute(agent, 'run this task');
     if (this.detector.resolveExecutable(agent)) return undefined;
 
     const settingsHint: Partial<Record<AgentId, string>> = {
