@@ -290,6 +290,7 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
         : `Custom API · ${group.models.length} models · key ${keyStatus}`;
       groupNode.iconPath = new vscode.ThemeIcon(group.source === 'vscode-lm' ? 'library' : 'cloud');
       groupNode.contextValue = 'copilot_model_group';
+      groupNode.group = group;
       groupNode.command = { command: 'agent-mesh-bridge.manageCopilotModelGroup', title: 'Manage Model Group', arguments: [group] };
       if (group.source === 'vscode-lm') {
         groupNode.subItems = group.models.map((ref) => {
@@ -373,6 +374,7 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
 export class AgentNodeItem extends vscode.TreeItem {
   public subItems?: AgentNodeItem[];
   public info?: AgentInfo;
+  public group?: CopilotModelGroup;
 
   constructor(label: string, collapsibleState: vscode.TreeItemCollapsibleState, info?: AgentInfo) {
     super(label, collapsibleState);

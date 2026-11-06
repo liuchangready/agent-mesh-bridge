@@ -15,11 +15,12 @@ import { ConfigSyncService } from './config/config-sync';
 import { StatusBarController } from './ui/status-bar';
 import { TaskTreeProvider, TaskTreeItem } from './ui/task-tree-provider';
 import { AgentNodesProvider, AgentNodeItem } from './ui/agent-nodes-provider';
+import { pickModelAgent, pickGroupReceiverModel } from './ui/model-agent-picker';
 import { TaskDetailPanel } from './ui/detail-panel';
 import { ModelApprovalService } from './ui/model-approval-service';
 import { TaskRetargetService } from './bridge/task-retarget';
 import { TaskRoleLock } from './bridge/task-role-lock';
-import { AgentId, isValidSessionId, isMergePending } from './bridge/types';
+import { AgentId, GroupModelRef, isValidSessionId, isMergePending } from './bridge/types';
 import { TaskSupervisor } from './bridge/task-supervisor';
 import { TaskControlService } from './bridge/task-control';
 import { TaskArchiveService } from './bridge/task-archive';
@@ -1182,84 +1183,95 @@ export function activate(context: vscode.ExtensionContext) {
             agent,
           }),
         );
-        const agentPick = await vscode.window.showQuickPick(agentItems, {
-          placeHolder: `当前执行者：${AGENT_LABELS[thread.targetAgent]} · 选择新的接收 Agent`,
-          matchOnDescription: true,
-        });
+        const currentGroup = copilotModelService.groups.getAll().find(group => copilotModelService.getGroupAgentId(group.id) === thread.targetAgent);
+        const agentPick = await pickModelAgent(copilotModelService, agentItems, 'receiver',
+          `当前执行者：${currentGroup?.name || AGENT_LABELS[thread.targetAgent] || thread.targetAgent} · 选择新的接收 Agent`);
         if (!agentPick) return;
         const targetAgent = agentPick.agent;
         const agentChanged = targetAgent !== thread.targetAgent;
-
-        // 2) Which model of that agent (its configured default shown first).
-        let catalog;
-        try {
-          catalog = await vscode.window.withProgress(
-            {
-              location: vscode.ProgressLocation.Notification,
-              title: `Agent Bridge: 正在探测 ${AGENT_LABELS[targetAgent]} 可用模型...`,
-            },
-            () => modelCatalog.get(targetAgent, true),
-          );
-        } catch {
-          catalog = { models: [] as { id: string; hint?: string }[] };
-        }
-        const defaultModel = resolveConfiguredModel(targetAgent);
-
-        const modelItems: Array<{
-          label: string;
-          description?: string;
-          action: 'keep' | 'default' | 'model' | 'manual';
-          model?: string;
-        }> = [];
-        if (!agentChanged && thread.targetModel) {
-          modelItems.push({
-            label: `保持当前模型 ${thread.targetModel}`,
-            description: 'keep',
-            action: 'keep',
-          });
-        }
-        if (defaultModel) {
-          modelItems.push({
-            label: `${defaultModel}`,
-            description: '该 Agent 的配置默认',
-            action: 'default',
-            model: defaultModel,
-          });
-        }
-        for (const option of catalog.models) {
-          if (option.id === defaultModel) continue;
-          modelItems.push({ label: option.id, description: option.hint, action: 'model', model: option.id });
-        }
-        modelItems.push({ label: '$(edit) 手动输入模型 ID...', action: 'manual' });
-
-        const modelPick = await vscode.window.showQuickPick(modelItems, {
-          placeHolder: `为 ${AGENT_LABELS[targetAgent]} 选择模型（当前任务：${
-            thread.targetModel || 'Agent 默认'
-          }）`,
-          matchOnDescription: true,
-        });
-        if (!modelPick) return;
-
         let model: string | undefined;
-        if (modelPick.action === 'keep') {
-          model = undefined;
-        } else if (modelPick.action === 'manual') {
-          const input = await vscode.window.showInputBox({
-            prompt: `输入 ${AGENT_LABELS[targetAgent]} 要使用的模型 ID`,
-            value: thread.targetModel || '',
-            placeHolder: '例如 gpt-6.1-sol / sonnet / deepseek/deepseek-v4.1-flash',
-          });
-          if (input === undefined) return;
-          model = normalizeModelId(input);
-          if (!model) {
-            vscode.window.showWarningMessage('模型 ID 不能为空。');
+        let modelRef: GroupModelRef | undefined;
+        if (agentPick.group) {
+          try {
+            const selected = await pickGroupReceiverModel(copilotModelService, agentPick.group, agentChanged ? undefined : thread.targetModelRef);
+            if (!selected) return;
+            modelRef = selected.modelRef;
+          } catch (error: any) {
+            vscode.window.showErrorMessage(`Group model selection failed: ${error.message}`);
             return;
           }
-        } else if (modelPick.action === 'default') {
-          // Explicitly asking for the configured default: no model pin.
-          model = undefined;
         } else {
-          model = modelPick.model;
+          // 2) Which model of that agent (its configured default shown first).
+          let catalog;
+          try {
+            catalog = await vscode.window.withProgress(
+              {
+                location: vscode.ProgressLocation.Notification,
+                title: `Agent Bridge: 正在探测 ${AGENT_LABELS[targetAgent]} 可用模型...`,
+              },
+              () => modelCatalog.get(targetAgent, true),
+            );
+          } catch {
+            catalog = { models: [] as { id: string; hint?: string }[] };
+          }
+          const defaultModel = resolveConfiguredModel(targetAgent);
+
+          const modelItems: Array<{
+            label: string;
+            description?: string;
+            action: 'keep' | 'default' | 'model' | 'manual';
+            model?: string;
+          }> = [];
+          if (!agentChanged && thread.targetModel) {
+            modelItems.push({
+              label: `保持当前模型 ${thread.targetModel}`,
+              description: 'keep',
+              action: 'keep',
+            });
+          }
+          if (defaultModel) {
+            modelItems.push({
+              label: `${defaultModel}`,
+              description: '该 Agent 的配置默认',
+              action: 'default',
+              model: defaultModel,
+            });
+          }
+          for (const option of catalog.models) {
+            if (option.id === defaultModel) continue;
+            modelItems.push({ label: option.id, description: option.hint, action: 'model', model: option.id });
+          }
+          modelItems.push({ label: '$(edit) 手动输入模型 ID...', action: 'manual' });
+
+          const modelPick = await vscode.window.showQuickPick(modelItems, {
+            placeHolder: `为 ${AGENT_LABELS[targetAgent]} 选择模型（当前任务：${
+              thread.targetModel || 'Agent 默认'
+            }）`,
+            matchOnDescription: true,
+          });
+          if (!modelPick) return;
+
+          if (modelPick.action === 'keep') {
+            model = undefined;
+          } else if (modelPick.action === 'manual') {
+            const input = await vscode.window.showInputBox({
+              prompt: `输入 ${AGENT_LABELS[targetAgent]} 要使用的模型 ID`,
+              value: thread.targetModel || '',
+              placeHolder: '例如 gpt-6.1-sol / sonnet / deepseek/deepseek-v4.1-flash',
+            });
+            if (input === undefined) return;
+            model = normalizeModelId(input);
+            if (!model) {
+              vscode.window.showWarningMessage('模型 ID 不能为空。');
+              return;
+            }
+          } else if (modelPick.action === 'default') {
+            // Explicitly asking for the configured default: no model pin.
+            model = undefined;
+          } else {
+            model = modelPick.model;
+          }
+
         }
 
         // The user is picking here, so this click IS the model-switch consent:
@@ -1278,6 +1290,7 @@ export function activate(context: vscode.ExtensionContext) {
             threadId,
             targetAgent,
             model,
+            modelRef,
             modelRequestedByUser: true,
             reason: 'Switched from the VS Code executor picker',
             by: 'user',
@@ -1611,17 +1624,26 @@ export function activate(context: vscode.ExtensionContext) {
         const modelRole: ModelRole = role;
         const roleLabel = modelRole === 'initiator' ? '下发者默认模型' : '接收者默认模型';
 
+        if (item?.group) {
+          await vscode.commands.executeCommand('agent-mesh-bridge.configureCopilotGroupAgent', item.group, modelRole);
+          return;
+        }
+
         let agent = item?.info?.id;
         if (!agent || agent === 'vscode_chat') {
-          const pick = await vscode.window.showQuickPick(
+          const pick = await pickModelAgent(copilotModelService,
             targets.map((a) => ({
               label: AGENT_LABELS[a],
               description: resolveConfiguredModel(a, undefined, modelRole) || 'Agent 默认模型',
               agent: a,
             })),
-            { placeHolder: `选择要配置${roleLabel}的 Agent` },
+            modelRole, `选择要配置${roleLabel}的 Agent`,
           );
           if (!pick) return;
+          if (pick.group) {
+            await vscode.commands.executeCommand('agent-mesh-bridge.configureCopilotGroupAgent', pick.group, modelRole);
+            return;
+          }
           agent = pick.agent;
         }
         const targetAgent: AgentId = agent;

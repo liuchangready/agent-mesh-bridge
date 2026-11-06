@@ -266,6 +266,31 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     const nodes = await providerNodes.getChildren();
     const copilotNode = nodes.find((node: any) => node.info?.id === 'vscode_chat');
     const hostGroupNode = copilotNode?.subItems?.find((node: any) => node.label === 'Host group');
+    assert.deepEqual(hostGroupNode?.group, group, 'group tree items retain their configuration identity');
+    const { pickModelAgent, pickGroupReceiverModel } = require('../ui/model-agent-picker');
+    const savedPicker = fakeVscode.window.showQuickPick;
+    try {
+      fakeVscode.window.showQuickPick = async (items: any[]) => items.find(item => item.group?.id === group.id);
+      const choice = await pickModelAgent(service, [{ label: 'Codex', agent: 'codex' }], 'initiator', 'Choose sender');
+      assert.equal(choice.agent, service.getGroupAgentId(group.id));
+      assert.deepEqual(choice.group.models, group.models, 'unconfigured groups remain selectable with both exact vendor identities');
+      assert.match(choice.description, /未配置/);
+      fakeVscode.window.showQuickPick = async (items: any[]) => items.find(item => item.agent === 'codex');
+      assert.equal((await pickModelAgent(service, [{ label: 'Codex', agent: 'codex' }], 'receiver', 'Choose receiver')).agent, 'codex');
+      fakeVscode.window.showQuickPick = async () => undefined;
+      assert.equal(await pickModelAgent(service, [], 'receiver', 'Cancel'), undefined);
+      let configuredRole: unknown;
+      (fakeVscode.commands as any).executeCommand = async (command: string, selectedGroup: unknown, role: unknown) => {
+        assert.equal(command, 'agent-mesh-bridge.configureCopilotGroupAgent');
+        assert.equal(selectedGroup, undefined);
+        configuredRole = role;
+      };
+      fakeVscode.window.showQuickPick = async (items: any[]) => items.find(item => item.action === 'configure-group');
+      assert.equal(await pickModelAgent({ groups: { getAll: () => [] } }, [], 'initiator', 'Configure groups'), undefined);
+      assert.equal(configuredRole, 'initiator', 'group setup is reachable from the shared model picker');
+    } finally {
+      fakeVscode.window.showQuickPick = savedPicker;
+    }
     const unconfiguredSender = hostGroupNode?.subItems?.find((node: any) => node.label === '下发模型: 未配置');
     assert.ok(unconfiguredSender, 'sender configuration is visible before enabling a receiver');
     assert.deepEqual(unconfiguredSender.command.arguments, [group, 'initiator']);
@@ -365,7 +390,20 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     const agentId = service.getGroupAgentId(capabilityGroup.id);
     const { assertGroupModelReady } = require('../bridge/agent-capabilities');
     assert.throws(() => assertGroupModelReady(agentId, 'receiver', capabilityBinding.models!.find((ref: any) => ref.id === 'other-member')), /no current receiver structured-tool probe/);
-    await service.probeToolCalling(capabilityGroup.id, 'other-member', token, 'receiver');
+    const oldRetargetPicker = fakeVscode.window.showQuickPick;
+    try {
+      fakeVscode.window.showQuickPick = async (items: any[]) => items.find(item => item.modelRef?.id === 'other-member');
+      const alternate = await pickGroupReceiverModel(service, capabilityGroup);
+      assert.deepEqual(alternate.modelRef, capabilityBinding.models!.find((ref: any) => ref.id === 'other-member'), 'retarget selection preserves source, origin, and binding revision');
+      fakeVscode.window.showQuickPick = async (items: any[]) => items.find(item => item.description?.includes('配置默认'));
+      assert.deepEqual((await pickGroupReceiverModel(service, capabilityGroup, alternate.modelRef)).modelRef, capabilityBinding.receiverModel, 'choosing default explicitly replaces a non-default model');
+      fakeVscode.window.showQuickPick = async (items: any[]) => items.find(item => item.description === 'keep');
+      assert.deepEqual(await pickGroupReceiverModel(service, capabilityGroup, alternate.modelRef), {}, 'keep does not send an override');
+      fakeVscode.window.showQuickPick = async () => undefined;
+      assert.equal(await pickGroupReceiverModel(service, capabilityGroup), undefined);
+    } finally {
+      fakeVscode.window.showQuickPick = oldRetargetPicker;
+    }
     capabilityBinding = service.getAgentBinding(capabilityGroup.id)!;
     assert.equal(capabilityBinding.receiverModel?.id, 'remote-model', 'probing an alternate must not change the configured default');
     assertGroupModelReady(agentId, 'receiver', capabilityBinding.models!.find((ref: any) => ref.id === 'other-member'));
