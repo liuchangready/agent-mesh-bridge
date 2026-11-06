@@ -542,14 +542,17 @@ export class MergeCoordinator {
     const rows = gitOutput(repoPath, ['worktree', 'list', '--porcelain']).split(/\r?\n\r?\n/);
     const row = rows.map((value) => ({ value, branch: value.match(/^branch (.+)$/m)?.[1], worktree: value.match(/^worktree (.+)$/m)?.[1] }))
       .find((item) => item.branch === targetRef);
-    if (!row?.worktree) return { ok: true, error: '', commit: targetCommit };
-    if (!fs.existsSync(row.worktree)) return { ok: false, error: `Target branch ${targetRef} is registered at missing worktree ${row.worktree}; restore or remove that worktree registration, then retry merge.` };
-    const dirty = gitOutput(row.worktree, ['status', '--porcelain', '--untracked-files=all']);
     if (preflight) {
+      if (!row?.worktree) return { ok: true, error: '', commit: targetCommit };
+      if (!fs.existsSync(row.worktree)) return { ok: false, error: `Target branch ${targetRef} is registered at missing worktree ${row.worktree}; restore or remove that worktree registration, then retry merge.` };
+      const dirty = gitOutput(row.worktree, ['status', '--porcelain', '--untracked-files=all']);
       if (targetCommit !== previousCommit || currentHead(row.worktree) !== targetCommit || dirty) return { ok: false, path: row.worktree, error: `Target branch ${targetRef} changed or has uncommitted files in ${row.worktree}. Preserve or commit those changes, then retry merge; the bridge left them untouched.` };
       return { ok: true, error: '', path: row.worktree, commit: targetCommit };
     }
-    if (targetCommit !== commit && !this.isAncestor(repoPath, commit, targetCommit)) return { ok: false, path: row.worktree, error: `Target branch ${targetRef} moved to unrelated commit ${targetCommit}; the bridge left its checkout untouched.` };
+    if (targetCommit !== commit && !this.isAncestor(repoPath, commit, targetCommit)) return { ok: false, path: row?.worktree, error: `Target branch ${targetRef} moved to unrelated commit ${targetCommit}; the bridge did not report this task as delivered.` };
+    if (!row?.worktree) return { ok: true, error: '', commit: targetCommit };
+    if (!fs.existsSync(row.worktree)) return { ok: false, error: `Target branch ${targetRef} is registered at missing worktree ${row.worktree}; restore or remove that worktree registration, then retry merge.` };
+    const dirty = gitOutput(row.worktree, ['status', '--porcelain', '--untracked-files=all']);
     if (currentHead(row.worktree) === targetCommit && !dirty) return { ok: true, error: '', path: row.worktree, commit: targetCommit };
     const stagedTree = previousCommit && gitOutput(row.worktree, ['write-tree']);
     const indexIsPriorTarget = !!previousCommit && stagedTree === gitOutput(repoPath, ['rev-parse', `${previousCommit}^{tree}`]);

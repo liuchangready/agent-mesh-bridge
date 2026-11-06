@@ -221,6 +221,37 @@ test('delivery remains pinned after the user checks out a different branch', asy
   assert.equal(store.getTask('thread_pinned_target')!.worktree!.deliveryTarget!.checkoutPath, undefined);
 });
 
+test('an unchecked delivery target that is externally rewound after landing stays blocked', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-unchecked-target-rewind-'));
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const base = git(repository, 'rev-parse', 'HEAD');
+  git(repository, 'branch', 'master', base); git(repository, 'checkout', '-b', 'user-branch');
+  const target = resolveGitRepository(repository, storage, 'master');
+  const worktree = createTaskWorktree(target, 'thread_unchecked_target_rewind', storage);
+  fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task change\nmiddle\nbeta\n');
+  worktree.headCommit = commitTaskChanges(worktree, 'approved task change');
+  const store = new TaskStore(storage); store.upsertTask(thread('thread_unchecked_target_rewind', worktree));
+  t.after(() => { store.dispose(); removeTaskWorktree(worktree); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));
+  const sync = (coordinator as unknown as { syncCheckedOutTarget: (repo: string, ref: string, commit: string, preflight: boolean, previous?: string) => { ok: boolean; error: string; path?: string; commit?: string } }).syncCheckedOutTarget;
+  let rewound = false;
+  (coordinator as unknown as { syncCheckedOutTarget: typeof sync }).syncCheckedOutTarget = function (repo, ref, commit, preflight, previous) {
+    if (!preflight && !rewound) { git(repo, 'update-ref', ref, base, commit); rewound = true; }
+    return sync.call(this, repo, ref, commit, preflight, previous);
+  };
+
+  const result = await coordinator.mergeApproved('thread_unchecked_target_rewind');
+  assert.equal(rewound, true);
+  assert.equal(result.status, 'blocked');
+  assert.match(result.message, /unrelated commit/i);
+  assert.equal(git(repository, 'rev-parse', 'refs/heads/master'), base);
+  assert.equal(git(repository, 'show', 'refs/heads/master:shared.txt'), 'alpha\nmiddle\nbeta');
+  const saved = store.getTask('thread_unchecked_target_rewind')!;
+  assert.equal(saved.status, 'waiting_merge');
+  assert.equal(saved.worktree!.integration!.phase, 'blocked');
+  assert.notEqual(saved.status, 'completed');
+});
+
 test('legacy records without deliveryTarget keep their recorded targetRef semantics', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-legacy-target-'));
   const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
