@@ -68,6 +68,14 @@ async function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
   await new Promise<void>((resolve) => child.once('exit', () => resolve()));
 }
 
+async function waitForProcessExit(pid: number, attempts = 300): Promise<void> {
+  for (let n = 0; n < attempts; n++) {
+    try { process.kill(pid, 0); } catch { return; }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Timed out waiting for helper process ${pid} to exit`);
+}
+
 test('POSIX helper command passes its channel path and acknowledges child registration', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-perl-lock-smoke-'));
   const lockPath = path.join(root, 'merge.lock');
@@ -165,6 +173,10 @@ test('two tasks edit the same file in independent worktrees and integrate serial
   assert.equal(path.resolve(store.getTask('thread_merge_B')!.worktree!.integration!.targetPath!), path.resolve(repository));
   assert.equal(store.getTask('thread_merge_B')!.finalSummary?.gitDelivery?.targetBranch, 'feature/caller');
   assert.equal(store.getTask('thread_merge_B')!.finalSummary?.gitDelivery?.validationStatus, 'cleaned');
+  const validationCommit = store.getTask('thread_merge_B')!.worktree!.validation!.commit!;
+  assert.equal(validationCommit, resultB.commit);
+  assert.equal(git(repository, 'show', `${validationCommit}:shared.txt`), 'A\nmiddle\nB');
+  assert.equal(fs.existsSync(store.getTask('thread_merge_B')!.worktree!.validation!.path), false);
 });
 
 test('a dirty checked-out delivery target blocks safely and preserves user files', async (t) => {
@@ -433,9 +445,11 @@ test('pause cancels an approved merge while it is waiting for the global lock', 
   const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
   const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, 'thread_cancel_lock_wait', storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A waiting\nmiddle\nbeta\n'); worktree.headCommit = commitTaskChanges(worktree, 'approved');
-  const store = new TaskStore(storage); t.after(() => { store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
+  const store = new TaskStore(storage);
   store.upsertTask(thread('thread_cancel_lock_wait', worktree));
   const lockPath = path.join(root, 'merge.lock'); const lockOwner = new MeshFileLock(lockPath); const release = await lockOwner.acquire(); assert.ok(release);
+  const helperPid = (lockOwner as unknown as { activeLease: { helperPid: number } }).activeLease.helperPid;
+  t.after(async () => { store.dispose(); release(); await waitForProcessExit(helperPid); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(lockPath));
   const pending = coordinator.mergeApproved('thread_cancel_lock_wait');
   await new Promise((resolve) => setTimeout(resolve, 200));
@@ -444,6 +458,60 @@ test('pause cancels an approved merge while it is waiting for the global lock', 
   assert.equal(fs.existsSync(path.join(storage, 'merge-transactions', 'thread_cancel_lock_wait.json')), false);
   assert.equal(gitOutput(repository, ['rev-parse', target.targetRef]), target.baseCommit);
   release();
+});
+
+test('recovery syncs the actual latest checkout and reports validation cleanup truthfully', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-recovery-latest-'));
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const target = resolveGitRepository(repository, storage);
+  const source = createTaskWorktree(target, 'thread_recovery_latest', storage);
+  fs.writeFileSync(path.join(source.path, 'shared.txt'), 'task change\nmiddle\nbeta\n');
+  source.headCommit = commitTaskChanges(source, 'approved task change');
+  const validationPath = path.join(storage, 'merge-worktrees', 'thread_recovery_latest-crash');
+  fs.mkdirSync(path.dirname(validationPath), { recursive: true });
+  git(repository, 'worktree', 'add', '--detach', validationPath, target.baseCommit);
+  git(validationPath, 'merge', '--no-commit', '--no-ff', source.headCommit!);
+  const validationTree = git(validationPath, 'write-tree');
+  const candidate = git(repository, '-c', 'user.name=Agent Mesh Bridge', '-c', 'user.email=agent-mesh-bridge@localhost', 'commit-tree', validationTree, '-p', target.baseCommit, '-p', source.headCommit!, '-m', 'Merge recovery task');
+  git(repository, 'update-ref', target.targetRef, candidate, target.baseCommit);
+  git(repository, 'reset', '--hard', candidate);
+  fs.writeFileSync(path.join(repository, 'later.txt'), 'later external commit\n');
+  git(repository, 'add', 'later.txt'); git(repository, 'commit', '-m', 'later target change');
+  const latest = git(repository, 'rev-parse', 'HEAD');
+  git(repository, 'read-tree', '-u', '--reset', target.baseCommit);
+  assert.match(git(repository, 'status', '--porcelain'), /later\.txt/, 'fixture represents a ref update that outran its checkout/index sync');
+
+  const store = new TaskStore(storage); t.after(() => { store.dispose(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  store.upsertTask(thread('thread_recovery_latest', source));
+  const transactionRoot = path.join(storage, 'merge-transactions'); fs.mkdirSync(transactionRoot, { recursive: true });
+  fs.writeFileSync(path.join(transactionRoot, 'thread_recovery_latest.json'), JSON.stringify({
+    threadId: 'thread_recovery_latest', sourceCommit: source.headCommit, targetOldCommit: target.baseCommit,
+    phase: 'ref_updated', candidateCommit: candidate, validationPath, validationCommit: candidate, validationResult: 'passed',
+  }));
+  const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));
+  const removed = (coordinator as unknown as { removeValidationWorktree: (repo: string, validation: string) => boolean }).removeValidationWorktree;
+  const result = await coordinator.mergeApproved('thread_recovery_latest');
+  assert.equal(result.status, 'merged', result.message);
+  assert.equal(git(repository, 'rev-parse', target.targetRef), latest);
+  assert.equal(git(repository, 'rev-parse', 'HEAD'), latest);
+  assert.equal(fs.readFileSync(path.join(repository, 'later.txt'), 'utf8').replace(/\r\n/g, '\n'), 'later external commit\n');
+  assert.equal(fs.readFileSync(path.join(repository, 'shared.txt'), 'utf8').replace(/\r\n/g, '\n'), 'task change\nmiddle\nbeta\n');
+  assert.equal(git(repository, 'status', '--porcelain'), '');
+  const task = store.getTask('thread_recovery_latest')!;
+  assert.equal(task.worktree!.validation!.commit, candidate);
+  assert.equal(git(repository, 'show', `${task.worktree!.validation!.commit}:shared.txt`), 'task change\nmiddle\nbeta');
+  assert.equal(task.worktree!.validation!.status, 'cleaned');
+  assert.equal(fs.existsSync(validationPath), false);
+  assert.equal(git(repository, 'worktree', 'list', '--porcelain').includes(validationPath), false);
+
+  git(repository, 'worktree', 'add', '--detach', validationPath, target.baseCommit);
+  (coordinator as unknown as { removeValidationWorktree: (repo: string, validation: string) => boolean }).removeValidationWorktree = () => false;
+  (coordinator as unknown as { cleanupValidationWorktree: (repo: string, thread: string, validation: string) => void }).cleanupValidationWorktree(repository, 'thread_recovery_latest', validationPath);
+  assert.equal(store.getTask('thread_recovery_latest')!.worktree!.validation!.status, 'present');
+  assert.equal(fs.existsSync(validationPath), true);
+  assert.match(store.getTask('thread_recovery_latest')!.finalSummary?.gitDelivery?.validationStatus || '', /present/);
+  (coordinator as unknown as { removeValidationWorktree: typeof removed }).removeValidationWorktree = removed.bind(coordinator);
+  assert.equal((coordinator as unknown as { removeValidationWorktree: (repo: string, validation: string) => boolean }).removeValidationWorktree(repository, validationPath), true);
 });
 
 test('an approved task cannot integrate until its reviewer process releases the task role', async (t) => {
@@ -456,12 +524,19 @@ test('an approved task cannot integrate until its reviewer process releases the 
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A reviewed\nmiddle\nbeta\n', 'utf8');
   worktree.headCommit = commitTaskChanges(worktree, 'approved');
   const store = new TaskStore(storage);
-  t.after(() => { store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
+  let helperPid: number | undefined;
+  t.after(async () => { store.dispose(); if (helperPid) await waitForProcessExit(helperPid); fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); });
   store.upsertTask(thread('thread_reviewer_exit', worktree));
   const roles = new TaskRoleLock(storage);
   const lease = roles.tryAcquire('thread_reviewer_exit', 'reviewer');
   assert.ok(lease);
-  const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));
+  const lock = new MeshFileLock(path.join(root, 'merge.lock'));
+  const attachChildPid = lock.attachChildPid.bind(lock);
+  lock.attachChildPid = async (pid, cancelled) => {
+    helperPid = (lock as unknown as { activeLease: { helperPid: number } }).activeLease.helperPid;
+    return attachChildPid(pid, cancelled);
+  };
+  const coordinator = new MergeCoordinator(store, storage, lock);
   const pending = coordinator.mergeApproved('thread_reviewer_exit');
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.strictEqual(fs.existsSync(path.join(storage, 'merge-transactions', 'thread_reviewer_exit.json')), false);
@@ -516,6 +591,10 @@ test('dirty approved work and failed combined validation never update the target
   delete process.env.MESH_VALIDATION_FAIL;
   assert.strictEqual(failed.status, 'validation_failed');
   assert.strictEqual(gitOutput(repository, ['rev-parse', target.targetRef]), target.baseCommit);
+  const failedValidation = store.getTask('thread_validation_fail')!.worktree!.validation!;
+  assert.equal(failedValidation.result, 'failed');
+  assert.equal(failedValidation.commit, undefined, 'a failed validation must not claim the old HEAD as verified');
+  assert.equal(failedValidation.status === 'cleaned', !fs.existsSync(failedValidation.path));
 
   const dirtyWorktree = createTaskWorktree(target, 'thread_dirty_approval', storage);
   fs.writeFileSync(path.join(dirtyWorktree.path, 'shared.txt'), 'approved\nmiddle\nbeta\n', 'utf8');
@@ -618,6 +697,10 @@ test('pause stops combined validation and forced delete waits for it before clea
   const mergeA = coordinator.mergeApproved('thread_merge_A'); await waitFor(path.join(signals, 'thread_merge_A.entered'));
   control.pauseTask('thread_merge_A', 'stop validation', 'test');
   assert.equal((await mergeA).status, 'stale');
+  const cancelledValidation = store.getTask('thread_merge_A')!.worktree!.validation!;
+  assert.equal(cancelledValidation.result, 'cancelled');
+  assert.equal(cancelledValidation.commit, undefined, 'cancelled validation must not claim the old HEAD');
+  assert.equal(cancelledValidation.status === 'cleaned', !fs.existsSync(cancelledValidation.path));
   assert.equal(gitOutput(repository, ['rev-parse', target.targetRef]), target.baseCommit);
   assert.ok(fs.existsSync(a.path), 'pause retains the task worktree');
 

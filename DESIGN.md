@@ -176,7 +176,7 @@ interface ResponseAssessment {
 
 调度器独立扫描 ready 轮次。暂停、待检视、bootstrap pending 与返修任务只影响自身；明确启用的并发限额、角色锁和 bootstrap 才会阻止启动。所有新任务有独立 Git worktree，因此相同文件也能并发编辑；文件变化记录不用于排队或归属判定。
 
-同一来源仓库共享一个桥接管理的集成 ref。任务分支从该 ref 最新已提交 SHA 创建，未提交用户改动不复制。隔离元数据缺失的历史任务保持原行为，不自动迁移。
+旧任务（缺少 `deliveryTarget`）保留账本中记录的集成 ref 语义，不自动迁移。新任务固定真实本地交付分支，任务分支从派发时该目标的已提交 SHA 创建。
 
 New tasks pin the real local delivery branch selected at dispatch (`targetBranch` or the source checkout branch), rather than sharing an internal integration ref. Task branches start from that pinned target commit. Legacy ledger entries without `deliveryTarget` retain their historical `targetRef` behavior.
 ### 2.5 MR 收口（调用者）
