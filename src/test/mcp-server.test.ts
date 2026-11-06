@@ -159,6 +159,45 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'expectedFiles'));
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'allowNoScope'));
     assert.strictEqual(toolNames.length, 19);
+    assert.ok(dispatch.inputSchema.properties.modelRef, 'dispatch schema must expose the structured Group modelRef');
+  });
+
+  test('tools/call forwards structured modelRef into dispatcher validation', async () => {
+    const response = await mcpServer.handleRpcMessage({ jsonrpc: '2.0', id: 603, method: 'tools/call', params: {
+      name: 'dispatch_task', arguments: { targetAgent: 'codex', reviewFlow: 'legacy', title: 'Invalid structured route', prompt: 'run',
+        modelRef: { source: 'vscode-lm', vendor: 'vendor-test', id: 'model-test' } },
+    } });
+    assert.match(response.error.message, /structured Group Agent modelRef cannot be used for a CLI target/);
+    assert.equal(taskStore.getAllTasks().length, 0);
+  });
+
+  test('all public modelRef control schemas and calls retain the exact structured reference', async () => {
+    const listed = await mcpServer.handleRpcMessage({ jsonrpc: '2.0', id: 604, method: 'tools/list', params: {} });
+    for (const name of ['dispatch_task', 'request_rework', 'retry_task', 'resume_task', 'retarget_task']) {
+      const definition = listed.result.tools.find((tool: any) => tool.name === name);
+      assert.ok(definition?.inputSchema.properties.modelRef, `${name} must expose modelRef`);
+    }
+    const modelRef = { source: 'vscode-lm', vendor: 'vendor-matrix', id: 'model-matrix' };
+    let retargetArgs: any;
+    (reworkController as any).retargetTask = async (threadId: string, overrides: any, reason: string, by: string) => {
+      retargetArgs = { threadId, ...overrides, reason, by };
+      return { status: 'RETARGETED', threadId };
+    };
+    await mcpServer.handleRpcMessage({ jsonrpc: '2.0', id: 605, method: 'tools/call', params: {
+      name: 'retarget_task', arguments: { threadId: 'thread-modelref-matrix', targetAgent: 'copilot_group:11111111-2222-4333-8444-555555555555', modelRef, modelRequestedByUser: true, reason: 'explicit switch' },
+    } });
+    assert.deepEqual(retargetArgs.modelRef, modelRef);
+    assert.equal(retargetArgs.modelRequestedByUser, true);
+    let retryArgs: any;
+    (reworkController as any).retryFailedRound = async (threadId: string, overrides: any) => {
+      retryArgs = { threadId, ...overrides };
+      return { round: 1 };
+    };
+    await mcpServer.handleRpcMessage({ jsonrpc: '2.0', id: 606, method: 'tools/call', params: {
+      name: 'retry_task', arguments: { threadId: 'thread-modelref-matrix', targetAgent: 'copilot_group:11111111-2222-4333-8444-555555555555', modelRef, modelRequestedByUser: true },
+    } });
+    assert.deepEqual(retryArgs.modelRef, modelRef);
+    assert.equal(retryArgs.modelRequestedByUser, true);
   });
 
   test('list_agent_models reports the receiver and sender defaults separately', async () => {

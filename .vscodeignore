@@ -7,6 +7,14 @@ src/**
 tsconfig.json
 **/*.map
 out/test/**
+out/review-*.log
+
+# The build output is gitignored; whitelist runtime JavaScript without reviving test and log artifacts.
+!out/extension.js
+!out/bridge/**/*.js
+!out/config/**/*.js
+!out/copilot/**/*.js
+!out/ui/**/*.js
 
 # Development-only material: never needed at runtime, would only bloat the .vsix.
 AGENTS.md

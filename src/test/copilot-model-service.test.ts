@@ -4,6 +4,9 @@ import { AddressInfo } from 'node:net';
 const Module = require('module');
 const http = require('node:http');
 const net = require('node:net');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 test('registered commands and tree nodes preserve exact host identity; invoke settles on cancellation', async () => {
   let selected = 0;
@@ -145,7 +148,8 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     window: {
       showQuickPick: async (items: any[]) =>
         items.find((item) => item.ref?.vendor === 'vendor-b') ??
-        items.find((item) => item.source === 'openai-compatible'),
+        items.find((item) => item.source === 'openai-compatible') ??
+        items.find((item) => item.value === 'default'),
       showInputBox: async (options: any) => {
         if (options.prompt === 'Group display name') return 'Local API';
         if (options.prompt === 'OpenAI-compatible API base URL') return baseUrl;
@@ -171,12 +175,23 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
   };
   const server = http.createServer((request: any, response: any) => {
     apiAuthorization = request.headers.authorization;
-    response.end(JSON.stringify({ choices: [{ message: { content: 'integrated answer' } }] }));
+    const chunks: Buffer[] = [];
+    request.on('data', (chunk: Buffer) => chunks.push(chunk));
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      if (body.tools?.some((tool: any) => tool.function?.name === 'bridge_capability_probe')) {
+        const nonce = /nonce ([a-f0-9-]+)/i.exec(body.messages?.[0]?.content || '')?.[1];
+        response.end(JSON.stringify({ choices: [{ finish_reason: 'tool_calls', message: { content: null, tool_calls: [{ id: 'probe-call', type: 'function', function: { name: 'bridge_capability_probe', arguments: JSON.stringify({ nonce }) } }] } }] }));
+      } else response.end(JSON.stringify({ choices: [{ message: { content: 'integrated answer' } }] }));
+    });
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address() as AddressInfo;
   const baseUrl = `http://127.0.0.1:${address.port}/v1`;
   const originalLoad = Module._load;
+  const originalBridgeHome = process.env.AGENT_MESH_BRIDGE_HOME;
+  const bridgeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-settings-'));
+  process.env.AGENT_MESH_BRIDGE_HOME = bridgeHome;
   Module._load = function (request: string, parent: unknown, isMain: boolean) {
     return request === 'vscode' ? fakeVscode : originalLoad.call(this, request, parent, isMain);
   };
@@ -204,7 +219,7 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     await service.refreshHostModels();
     assert.equal(selected, 1);
     const group = await service.groups.save({
-      id: 'group',
+      id: '11111111-2222-4333-8444-555555555557',
       name: 'Host group',
       source: 'vscode-lm',
       models: [
@@ -269,6 +284,51 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     assert.match(shownResult, /remote-model/);
     assert.equal(shownResult.includes('integration-secret'), false);
 
+    await service.configureGroupAgent(apiGroup.id, { enabled: true, toolsAuthorized: true, receiverModel: 'remote-model' });
+    const pinnedReceiver = service.getAgentBinding(apiGroup.id)!.receiverModel;
+    await service.configureGroupAgent(apiGroup.id, { enabled: true, toolsAuthorized: true, initiatorModel: 'remote-model' });
+    let savedBinding = service.getAgentBinding(apiGroup.id)!;
+    assert.deepEqual(savedBinding.receiverModel, pinnedReceiver, 'saving sender settings must not rewrite a pinned receiver model');
+    assert.ok(savedBinding, fs.readFileSync(path.join(bridgeHome, 'group-agent-config.json'), 'utf8'));
+    assert.equal(savedBinding.receiverModel?.source, 'openai-compatible');
+    assert.equal(savedBinding.initiatorModel?.source, 'openai-compatible');
+    await service.configureGroupAgent(apiGroup.id, { enabled: true, toolsAuthorized: true, receiverModel: null });
+    savedBinding = service.getAgentBinding(apiGroup.id)!;
+    assert.equal(savedBinding.receiverModel, undefined);
+    assert.equal(savedBinding.initiatorModel?.id, 'remote-model');
+    await service.configureGroupAgent(apiGroup.id, { enabled: true, toolsAuthorized: true, receiverModel: 'remote-model' });
+    const pinnedSender = service.getAgentBinding(apiGroup.id)!.initiatorModel;
+    await service.configureGroupAgent(apiGroup.id, { enabled: false, toolsAuthorized: true });
+    assert.deepEqual(service.getAgentBinding(apiGroup.id)!.initiatorModel, pinnedSender, 'changing enabled state must preserve the other side model reference');
+    await service.configureGroupAgent(apiGroup.id, { enabled: true, toolsAuthorized: true });
+    await service.configureGroupAgent(apiGroup.id, { enabled: true, toolsAuthorized: true, initiatorModel: null });
+    savedBinding = service.getAgentBinding(apiGroup.id)!;
+    assert.equal(savedBinding.receiverModel?.id, 'remote-model');
+    assert.equal(savedBinding.initiatorModel, undefined);
+
+    const capabilityGroup = await service.groups.save({ ...apiGroup, name: 'Capability API', models: [
+      { id: 'remote-model', name: 'Default member' }, { id: 'other-member', name: 'Explicitly probed member' },
+    ] });
+    const host = { version: 1, hostInstanceId: 'test-host', generation: 17, pid: process.pid,
+      workspaceUri: `file://${bridgeHome}`, repositoryCommonDir: bridgeHome, trusted: true, localDesktop: true, updatedAt: Date.now() };
+    require('../bridge/group-agent-registry').writeGroupAgentHost(host, bridgeHome);
+    await service.probeToolCalling(capabilityGroup.id, 'remote-model', token, 'receiver');
+    await service.configureGroupAgent(capabilityGroup.id, { enabled: true, toolsAuthorized: true, receiverModel: 'remote-model' });
+    await service.markGroupAgentRoleReady(capabilityGroup.id, 'receiver');
+    let capabilityBinding = service.getAgentBinding(capabilityGroup.id)!;
+    const agentId = service.getGroupAgentId(capabilityGroup.id);
+    const { assertGroupModelReady } = require('../bridge/agent-capabilities');
+    assert.throws(() => assertGroupModelReady(agentId, 'receiver', capabilityBinding.models!.find((ref: any) => ref.id === 'other-member')), /no current receiver structured-tool probe/);
+    await service.probeToolCalling(capabilityGroup.id, 'other-member', token, 'receiver');
+    capabilityBinding = service.getAgentBinding(capabilityGroup.id)!;
+    assert.equal(capabilityBinding.receiverModel?.id, 'remote-model', 'probing an alternate must not change the configured default');
+    assertGroupModelReady(agentId, 'receiver', capabilityBinding.models!.find((ref: any) => ref.id === 'other-member'));
+    const changedEndpoint = await service.groups.save({ ...capabilityGroup, baseUrl: `${baseUrl}/different-backend` });
+    await service.refresh();
+    capabilityBinding = service.getAgentBinding(changedEndpoint.id)!;
+    assert.equal(capabilityBinding.receiverReady, false, 'changing the endpoint path invalidates old probe evidence even with the same origin');
+    assert.throws(() => assertGroupModelReady(agentId, 'receiver', capabilityBinding.models!.find((ref: any) => ref.id === 'other-member')), /no current receiver structured-tool probe/);
+
     const pendingToken = new CancellationTokenSource();
     const pendingCall = service.invoke(group, { id: 'opaque-1', vendor: 'vendor-a' }, 'pending-send', pendingToken.token as any);
     await sendStarted;
@@ -296,6 +356,29 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     );
     assert.equal(vendorACalls, callsBeforeCancelledInvoke, 'an already-cancelled token must not call a provider');
 
+    const taskStore = new (require('../bridge/task-store').TaskStore)(bridgeHome);
+    service.setTaskStore(taskStore);
+    const groupAgentId = service.getGroupAgentId(capabilityGroup.id);
+    taskStore.upsertTask({ threadId: 'thread_group_guard_active', title: 'active Group task', initiatorAgent: 'codex', targetAgent: groupAgentId,
+      status: 'running', currentRound: 1, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      receiverSessionId: 'session_group_history_1', workspacePath: bridgeHome, rounds: [],
+      summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 } } as any);
+    await assert.rejects(service.configureGroupAgent(capabilityGroup.id, { enabled: false, toolsAuthorized: true }), /active or has unmerged work/);
+    await assert.rejects(service.deleteGroup(capabilityGroup.id), /active or has unmerged work/);
+    taskStore.deleteTask('thread_group_guard_active');
+    taskStore.upsertTask({ threadId: 'thread_group_history', title: 'history', initiatorAgent: 'codex', targetAgent: groupAgentId,
+      status: 'completed', currentRound: 1, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      receiverSessionId: 'session_group_history_1', workspacePath: bridgeHome, rounds: [],
+      summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 } } as any);
+    const historyRuntime = new (require('../copilot/group-agent-runtime').GroupAgentRuntime)({ bridgeHome, request: async () => ({ text: 'owned history', finishReason: 'stop', toolCalls: [] }) });
+    await historyRuntime.run('session_group_history_1', bridgeHome, 'history prompt', undefined, 'developer', { agentId: groupAgentId, threadId: 'thread_group_history' });
+    assert.equal(service.listGroupAgentSessions(capabilityGroup.id).length, 1);
+    assert.equal(service.listGroupAgentSessions(capabilityGroup.id)[0].role, 'developer');
+    assert.equal(service.readGroupAgentSession('session_group_history_1', 0, 1).length, 1, 'session history is read in bounded pages');
+    await service.deleteGroup(capabilityGroup.id);
+    assert.equal(service.groups.getAll().some((item: any) => item.id === capabilityGroup.id), false);
+    taskStore.dispose();
+
     const disposeToken = new CancellationTokenSource();
     let disposeStarted!: () => void;
     const disposeStartedPromise = new Promise<void>((resolve) => (disposeStarted = resolve));
@@ -313,6 +396,9 @@ test('registered commands and tree nodes preserve exact host identity; invoke se
     for (const disposable of commandDisposables) disposable.dispose();
   } finally {
     Module._load = originalLoad;
+    if (originalBridgeHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME;
+    else process.env.AGENT_MESH_BRIDGE_HOME = originalBridgeHome;
+    fs.rmSync(bridgeHome, { recursive: true, force: true });
     await new Promise<void>((resolve, reject) =>
       server.close((error: Error | undefined) => (error ? reject(error) : resolve())),
     );

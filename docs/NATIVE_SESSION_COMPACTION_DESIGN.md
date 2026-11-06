@@ -1,7 +1,7 @@
 # 原生会话压缩
 
-> 版本：0.2 · 状态：实现进行中；自动维护默认关闭，未经本机路径/版本/provider 认证的适配保持 `needs_validation`。  
-> 设计基线：2026-11-06 用户批准的 0.1 快照。该快照是本任务输入；原始 `D:\agent_bridge\docs\NATIVE_SESSION_COMPACTION_DESIGN.md` 未从集成 ref 带入，本次不读取或覆盖用户 checkout。  
+> 版本：0.2 · 状态：实现进行中；自动维护默认关闭，未经本机路径/版本/provider 认证的适配保持 `needs_validation`。
+> 设计基线：2026-11-06 用户批准的 0.1 快照。该快照是本任务输入；原始 `D:\agent_bridge\docs\NATIVE_SESSION_COMPACTION_DESIGN.md` 未从集成 ref 带入，本次不读取或覆盖用户 checkout。
 > 前置设计：[账本上下文滞后压缩 v1](CONTEXT_COMPACTION_DESIGN.md)。本设计只增加原生会话层，不改变 v1 的账本规则。
 
 ## 1. 不变量

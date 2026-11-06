@@ -23,6 +23,7 @@ import {
 } from './types';
 import { aggregateThreadTokenUsage } from './token-usage-collector';
 import * as zlib from 'zlib';
+import { randomBytes } from 'crypto';
 import {
   bridgeHomeDir,
   bridgeLogsDir,
@@ -274,13 +275,26 @@ export function archiveCompletedTaskLogs(
   );
 
   for (const dir of archiveDirs) {
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-    } catch {}
+    fs.mkdirSync(dir, { recursive: true });
   }
 
   const entries: Array<{ name: string; content: Buffer | string; mtime?: Date }> = [];
   const foundFilenames = new Set<string>();
+
+  for (const [sessionId, ownerAgentId] of [
+    [thread.targetAgent.startsWith('copilot_group:') ? thread.receiverSessionId : undefined, thread.targetAgent],
+    [thread.reviewFlow === 'dedicated' && thread.initiatorAgent.startsWith('copilot_group:') ? (thread.reviewerSessionId || thread.callerSessionId) : undefined, thread.initiatorAgent],
+  ] as Array<[string | undefined, string]>) {
+    if (!sessionId || !/^[A-Za-z0-9_-]{8,128}$/.test(sessionId)) continue;
+    const sessionDir = path.join(bridgeHomeDir(root), 'group-agent-sessions');
+    const sessionPath = path.join(sessionDir, `${sessionId}.jsonl`);
+    const ownerPath = `${sessionPath}.owner.json`;
+    const owner = JSON.parse(fs.readFileSync(ownerPath, 'utf8'));
+    if (owner.version !== 1 || owner.transport !== 'bridge-agent' || owner.threadId !== thread.threadId || owner.ownerAgentId !== ownerAgentId)
+      throw new Error(`Group Agent session ${sessionId} is not owned by task ${thread.threadId}.`);
+    entries.push({ name: `group-agent_sessions/${sessionId}.jsonl`, content: fs.readFileSync(sessionPath) });
+    entries.push({ name: `group-agent_sessions/${sessionId}.jsonl.owner.json`, content: fs.readFileSync(ownerPath) });
+  }
 
   // 1. Gather worker logs
   const workerDirs = Array.from(
@@ -292,24 +306,16 @@ export function archiveCompletedTaskLogs(
   );
   for (const dir of workerDirs) {
     if (!fs.existsSync(dir)) continue;
-    try {
-      for (const name of fs.readdirSync(dir)) {
-        if (!name.startsWith(`${safe}_round_`)) continue;
-        if (!name.endsWith('.log') && !name.endsWith('.output.md') && !name.endsWith('.recovery.json')) continue;
-        if (foundFilenames.has(name)) continue;
-        const full = path.join(dir, name);
-        try {
-          const content = fs.readFileSync(full);
-          const stat = fs.statSync(full);
-          entries.push({
-            name: `worker_log/${name}`,
-            content,
-            mtime: stat.mtime,
-          });
-          foundFilenames.add(name);
-        } catch {}
-      }
-    } catch {}
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.startsWith(`${safe}_round_`)) continue;
+      if (!name.endsWith('.log') && !name.endsWith('.output.md') && !name.endsWith('.recovery.json')) continue;
+      if (foundFilenames.has(name)) continue;
+      const full = path.join(dir, name);
+      const content = fs.readFileSync(full);
+      const stat = fs.statSync(full);
+      entries.push({ name: `worker_log/${name}`, content, mtime: stat.mtime });
+      foundFilenames.add(name);
+    }
   }
 
   // 2. Gather reviewer logs
@@ -322,29 +328,16 @@ export function archiveCompletedTaskLogs(
   );
   for (const dir of reviewerDirs) {
     if (!fs.existsSync(dir)) continue;
-    try {
-      for (const name of fs.readdirSync(dir)) {
-        if (
-          !name.startsWith(`${safe}_round_`) &&
-          !name.startsWith(`${safe}_bootstrap.log`)
-        ) {
-          continue;
-        }
-        if (!name.endsWith('.reviewer.log') && !name.endsWith('_bootstrap.log') && !name.endsWith('.recovery.json')) continue;
-        if (foundFilenames.has(name)) continue;
-        const full = path.join(dir, name);
-        try {
-          const content = fs.readFileSync(full);
-          const stat = fs.statSync(full);
-          entries.push({
-            name: `reviewer_log/${name}`,
-            content,
-            mtime: stat.mtime,
-          });
-          foundFilenames.add(name);
-        } catch {}
-      }
-    } catch {}
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.startsWith(`${safe}_round_`) && !name.startsWith(`${safe}_bootstrap.log`)) continue;
+      if (!name.endsWith('.reviewer.log') && !name.endsWith('_bootstrap.log') && !name.endsWith('.recovery.json')) continue;
+      if (foundFilenames.has(name)) continue;
+      const full = path.join(dir, name);
+      const content = fs.readFileSync(full);
+      const stat = fs.statSync(full);
+      entries.push({ name: `reviewer_log/${name}`, content, mtime: stat.mtime });
+      foundFilenames.add(name);
+    }
   }
 
   // 3. Manifest / summary entry
@@ -376,18 +369,36 @@ export function archiveCompletedTaskLogs(
   const jsonPaths: string[] = [];
 
   for (const dir of archiveDirs) {
-    try {
-      const tarGzPath = path.join(dir, `${safe}_archive.tar.gz`);
-      fs.writeFileSync(tarGzPath, tarGzBuffer);
-      tarGzPaths.push(tarGzPath);
-
-      const jsonPath = path.join(dir, `${safe}_archive.json`);
-      fs.writeFileSync(jsonPath, summaryJsonStr, 'utf8');
-      jsonPaths.push(jsonPath);
-    } catch {}
+    const tarGzPath = path.join(dir, `${safe}_archive.tar.gz`);
+    const jsonPath = path.join(dir, `${safe}_archive.json`);
+    atomicWriteArchive(tarGzPath, tarGzBuffer);
+    atomicWriteArchive(jsonPath, Buffer.from(summaryJsonStr, 'utf8'));
+    tarGzPaths.push(tarGzPath);
+    jsonPaths.push(jsonPath);
   }
 
   return { tarGzPaths, jsonPaths };
+}
+
+function atomicWriteArchive(file: string, content: Buffer): void {
+  const temp = `${file}.tmp.${process.pid}.${randomBytes(8).toString('hex')}`;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(temp, 'wx', 0o600);
+    fs.writeFileSync(fd, content);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(temp, file);
+    if (process.platform !== 'win32') {
+      const dirFd = fs.openSync(path.dirname(file), 'r');
+      try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+    }
+  } catch (error) {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+    try { fs.unlinkSync(temp); } catch {}
+    throw error;
+  }
 }
 
 /**

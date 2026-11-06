@@ -14,6 +14,7 @@ import {
   getModelApprovalDir,
   listPendingModelApprovals,
   resolveDispatchModel,
+  resolveDispatchGroupModelRef,
   submitModelApprovalDecision,
   writeModelApprovalRequest,
 } from '../bridge/model-approval';
@@ -249,6 +250,35 @@ describe('resolveDispatchModel', () => {
     } finally {
       cleanup(dir);
     }
+  });
+});
+
+describe('resolveDispatchGroupModelRef', () => {
+  const defaultRef = { source: 'vscode-lm' as const, vendor: 'copilot', id: 'gpt-6-sol' };
+  const otherRef = { source: 'vscode-lm' as const, vendor: 'my-openai', id: 'gpt-6-sol' };
+
+  test('requires a user click and approval for a structured non-default model', async () => {
+    const dir = makeHome();
+    try {
+      const ignored = await resolveDispatchGroupModelRef({ targetAgent: 'copilot_group:group-1234', requestedModelRef: otherRef, defaultModelRef: defaultRef, dir });
+      assert.deepStrictEqual(ignored.modelRef, defaultRef);
+      assert.match(ignored.notice || '', /ignored/);
+      const approved = await resolveDispatchGroupModelRef({
+        targetAgent: 'copilot_group:group-1234', requestedModelRef: otherRef, defaultModelRef: defaultRef,
+        requestedByUser: true, dir, handler: decision('approved'),
+      });
+      assert.deepStrictEqual(approved.modelRef, otherRef);
+      assert.deepStrictEqual(approved.approval?.requestedModelRef, otherRef);
+    } finally { cleanup(dir); }
+  });
+
+  test('uses the configured binding on use-default and rejects denial', async () => {
+    const dir = makeHome();
+    try {
+      const kept = await resolveDispatchGroupModelRef({ targetAgent: 'copilot_group:group-1234', requestedModelRef: otherRef, defaultModelRef: defaultRef, requestedByUser: true, dir, handler: decision('use_default') });
+      assert.deepStrictEqual(kept.modelRef, defaultRef);
+      await assert.rejects(resolveDispatchGroupModelRef({ targetAgent: 'copilot_group:group-1234', requestedModelRef: otherRef, defaultModelRef: defaultRef, requestedByUser: true, dir, handler: decision('cancelled') }), { code: MODEL_APPROVAL_DENIED_CODE });
+    } finally { cleanup(dir); }
   });
 });
 

@@ -506,6 +506,8 @@ export class TaskSupervisor extends EventEmitter {
           taskThreadId: thread.threadId,
           taskRound: roundNumber,
           model: thread.targetModel,
+          modelRef: thread.targetModelRef,
+          role: 'developer',
           previousTokenUsage: readStoredRoundUsage(this.taskStore, thread.threadId, roundNumber),
           onChildPid: (pid) => {
             this.executionRegistry.attachChildPid(pid, registration);

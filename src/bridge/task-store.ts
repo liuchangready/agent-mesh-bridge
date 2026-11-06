@@ -21,7 +21,8 @@ import {
   isTerminalThreadStatus,
   removeTaskArtifacts,
 } from './task-summary';
-import { cleanupThreadNativeSessions } from './native-session-cleanup';
+import { cleanupGroupAgentTaskArtifacts } from './group-agent-mailbox';
+import { cleanupThreadNativeSessions, collectThreadSessionRefs } from './native-session-cleanup';
 import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
 
 export const MAX_STORED_TASKS = 1000;
@@ -900,22 +901,19 @@ export class TaskStore extends EventEmitter {
   /**
    * Archive one terminal task in place.
    *
-   * Keeps the task row, model/agent metadata, MR and the final digest; drops the
-   * rounds, session ids and per-round logs. Native CLI histories are left alone
-   * (that is `delete_task`'s job).
+   * Keeps the task row, model/agent metadata, MR and final digest; archives
+   * task-owned histories before dropping rounds and session ids.
    */
   public archiveTask(threadId: string): DelegationThread | undefined {
     this.ensureUpToDate();
-    const thread = this.tasks.get(threadId);
+    const source = this.tasks.get(threadId);
+    const thread = source && JSON.parse(JSON.stringify(source)) as DelegationThread;
     if (!thread || thread.archivedAt || !isTerminalThreadStatus(thread.status)) return undefined;
+    // Do not discard the source until a complete archive and archived ledger row are durable.
     const nativeLock = new NativeSessionLock(this.storageDir);
     const leases: NativeSessionLease[] = [];
-    const sessions = [
-      thread.receiverSessionCaptured ? [thread.targetAgent, thread.receiverSessionId] as const : undefined,
-      thread.reviewFlow === 'dedicated' && thread.reviewerSessionCaptured ? [thread.initiatorAgent, thread.reviewerSessionId] as const : undefined,
-    ].filter((entry): entry is readonly [DelegationThread['targetAgent'], string | undefined] => !!entry && !!entry[1]);
-    for (const [agent, sessionId] of sessions) {
-      const lease = nativeLock.acquire(agent, sessionId!);
+    for (const { agent, sessionId } of collectThreadSessionRefs(thread)) {
+      const lease = nativeLock.acquire(agent, sessionId);
       if (!lease) {
         for (const held of leases) nativeLock.release(held);
         return undefined;
@@ -923,18 +921,18 @@ export class TaskStore extends EventEmitter {
       leases.push(lease);
     }
     try {
-    // Read the session ids BEFORE they are stripped: archival is the "keep only
-    // the summary" boundary, so the native conversations and bridge logs are
-    // removed now. Best-effort: a missing conversation is not an error.
     try {
-      cleanupThreadNativeSessions(thread);
-    } catch {}
-    try {
-      archiveCompletedTaskLogs(thread, this.storageDir);
-    } catch {}
+      const archivedLogs = archiveCompletedTaskLogs(thread, this.storageDir);
+      if (!archivedLogs.tarGzPaths.length) return undefined;
+    } catch (error) {
+      console.warn(`[TaskStore] Could not archive ${threadId}; retaining task data:`, error);
+      return undefined;
+    }
     if (!archiveThreadData(thread)) return undefined;
-    this.tasks.set(threadId, thread);
     this.persistThread(thread);
+    this.tasks.set(threadId, thread);
+    try { cleanupThreadNativeSessions(source!); } catch {}
+    try { cleanupGroupAgentTaskArtifacts(source!, this.storageDir); } catch {}
     removeTaskArtifacts(threadId, this.storageDir, {
       keepArchive: true,
       targetAgent: thread.targetAgent,

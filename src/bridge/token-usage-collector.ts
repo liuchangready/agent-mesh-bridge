@@ -455,12 +455,13 @@ export function accumulateTokenUsage(
     attempts: (existing.attempts ?? 1) + (incoming.attempts ?? 1),
     available: existing.available || incoming.available,
     partial: existing.partial || incoming.partial ? true : undefined,
-    source:
-      existing.source === 'native_reported' && incoming.source === 'native_reported'
-        ? 'native_reported'
-        : existing.source === 'unavailable'
-          ? incoming.source
-          : existing.source === 'estimated'
+    source: incoming.source === 'unavailable'
+      ? existing.source
+      : existing.source === 'unavailable'
+        ? incoming.source
+        : existing.source === 'native_reported' && incoming.source === 'native_reported'
+          ? 'native_reported'
+          : existing.source === 'estimated' || incoming.source === 'estimated'
             ? 'estimated'
             : incoming.source,
   };
