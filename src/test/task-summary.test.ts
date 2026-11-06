@@ -247,6 +247,57 @@ test('Group Agent archive preserves owned Bridge session history in the archive 
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('Group archive failures retain the ledger, session, owner and logs until a complete retry succeeds', async () => {
+  const dir = makeTempDir('bridge-group-archive-retry-');
+  const store = new TaskStore(dir);
+  try {
+  const agent = 'copilot_group:11111111-2222-4333-8444-5555555555ab' as const;
+  const sessionId = 'session_archive_retry';
+  const thread = makeThread({ threadId: 'thread_group_archive_retry', targetAgent: agent, receiverSessionId: sessionId, status: 'completed' });
+  store.upsertTask(thread);
+  const originalRounds = JSON.parse(JSON.stringify(store.getTask(thread.threadId)!.rounds));
+  const { GroupAgentRuntime } = require('../copilot/group-agent-runtime');
+  const runtime = new GroupAgentRuntime({ bridgeHome: dir, request: async () => ({ text: 'retry archive history', finishReason: 'stop', toolCalls: [] }) });
+  await runtime.run(sessionId, dir, 'archive prompt', undefined, 'developer', { agentId: agent, threadId: thread.threadId });
+  const session = path.join(dir, 'group-agent-sessions', `${sessionId}.jsonl`);
+  const owner = `${session}.owner.json`;
+  const originalSession = fs.readFileSync(session);
+  const log = path.join(dir, 'logs', `${thread.threadId}_round_1.log`);
+  fs.mkdirSync(path.dirname(log), { recursive: true });
+  fs.writeFileSync(log, 'round log survives failed archival');
+  const archiveDir = path.join(dir, 'logs', 'Archive');
+  fs.mkdirSync(path.dirname(archiveDir), { recursive: true });
+  fs.writeFileSync(archiveDir, 'not a directory');
+
+  assert.equal(store.archiveTask(thread.threadId), undefined);
+  assert.deepEqual(store.getTask(thread.threadId)?.rounds, originalRounds);
+  assert.equal(store.getTask(thread.threadId)?.receiverSessionId, sessionId);
+  assert.equal(fs.readFileSync(session).toString(), originalSession.toString());
+  assert.equal(fs.existsSync(owner), true);
+  assert.equal(fs.readFileSync(log, 'utf8'), 'round log survives failed archival');
+  fs.unlinkSync(archiveDir);
+
+  fs.rmSync(session);
+  assert.equal(store.archiveTask(thread.threadId), undefined, 'a missing Group history file prevents archival');
+  assert.deepEqual(store.getTask(thread.threadId)?.rounds, originalRounds);
+  assert.equal(fs.existsSync(owner), true);
+  assert.equal(fs.readFileSync(log, 'utf8'), 'round log survives failed archival');
+  fs.writeFileSync(session, originalSession);
+
+  const archived = store.archiveTask(thread.threadId);
+  assert.ok(archived?.archivedAt);
+  assert.deepEqual(archived?.rounds, []);
+  assert.equal(fs.existsSync(session), false);
+  assert.equal(fs.existsSync(owner), false);
+  assert.equal(fs.existsSync(log), false);
+  const archive = path.join(dir, 'logs', 'Archive', `${thread.threadId}_archive.tar.gz`);
+  assert.match(require('zlib').gunzipSync(fs.readFileSync(archive)).toString('utf8'), /retry archive history/);
+  } finally {
+    store.dispose();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('TaskArchiveService archives terminal tasks beyond the retention window', () => {
   const dir = makeTempDir('bridge-archive-service-');
   const store = new TaskStore(dir);

@@ -218,15 +218,22 @@ export class GroupAgentRuntime {
           if (Buffer.byteLength(JSON.stringify(call.arguments)) > 32 * 1024)
             throw new Error('Group Agent tool arguments exceed 32 KB.');
           validateGroupToolCall(tools, call.name, call.arguments);
+          this.preflightToolCall(root, call.name, call.arguments);
           intents.add(call.id);
           this.sessions.append(sessionId, { role: 'intent', callId: call.id, name: call.name, arguments: call.arguments });
           const isControl = role === 'bootstrap' || (role === 'reviewer' && ['request_rework', 'approve_task'].includes(call.name));
           const controlInput = call.name === 'dispatch_task' && call.arguments.reviewBootstrap && typeof call.arguments.reviewBootstrap === 'object'
             ? call.arguments.reviewBootstrap as Record<string, unknown>
             : call.arguments;
-          const result = redactToolOutput(isControl
-            ? await this.options.controlTool?.(call.name, controlInput) ?? (() => { throw new Error('Group reviewer control service is unavailable.'); })()
-            : await this.executeTool(root, call.name, call.arguments, controller));
+          let result: string;
+          try {
+            result = redactToolOutput(isControl
+              ? await this.options.controlTool?.(call.name, controlInput) ?? (() => { throw new Error('Group reviewer control service is unavailable.'); })()
+              : await this.executeTool(root, call.name, call.arguments, controller));
+          } catch (error) {
+            if (!['list_files', 'read_file', 'search_files'].includes(call.name)) throw error;
+            result = redactToolOutput(`Tool failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
           this.sessions.append(sessionId, { role: 'tool', toolCallId: call.id, toolName: call.name, content: result });
           messages.push({ role: 'tool', toolCallId: call.id, toolName: call.name, content: result });
           completedCalls.add(call.id);
@@ -274,6 +281,22 @@ export class GroupAgentRuntime {
     return selected;
   }
 
+  private preflightToolCall(root: string, name: string, input: Record<string, unknown>): void {
+    if (name === 'list_files' && input.path !== undefined) {
+      const directory = this.resolvePath(root, this.stringArg(input.path, 'path'));
+      if (!fs.statSync(directory).isDirectory()) throw new Error('list_files path is not a directory.');
+    } else if (name === 'read_file') {
+      const file = this.resolvePath(root, this.stringArg(input.path, 'path'));
+      if (!fs.statSync(file).isFile()) throw new Error('read_file path is not a file.');
+    } else if (name === 'write_file') {
+      this.resolvePath(root, this.stringArg(input.path, 'path'));
+      if (Buffer.byteLength(this.stringArg(input.content, 'content')) > (this.options.maxToolOutputBytes ?? MAX_TOOL_OUTPUT))
+        throw new Error('write_file content exceeds the size limit.');
+    } else if (name === 'run_command' && (typeof input.command !== 'string' || !input.command.trim() || input.command.length > 16_000)) {
+      throw new Error('Invalid run_command input.');
+    }
+  }
+
   private async executeTool(root: string, name: string, input: Record<string, unknown>, controller: AbortController): Promise<string> {
     const maxOutput = this.options.maxToolOutputBytes ?? MAX_TOOL_OUTPUT;
     if (name === 'run_command') {
@@ -313,19 +336,17 @@ export class GroupAgentRuntime {
   }
 
   private resolvePath(root: string, value: string): string {
-    const candidate = path.resolve(root, value);
-    const relative = path.relative(root, candidate);
-    if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Tool path escapes the task worktree.');
-    let parent = path.dirname(candidate);
-    while (!fs.existsSync(parent) && parent !== root) parent = path.dirname(parent);
-    const realParent = fs.realpathSync(parent);
-    const realRelative = path.relative(root, realParent);
-    if (realRelative.startsWith('..') || path.isAbsolute(realRelative)) throw new Error('Tool path resolves outside the task worktree.');
-    if (fs.existsSync(candidate)) {
-      const realCandidate = fs.realpathSync(candidate);
-      const candidateRelative = path.relative(root, realCandidate);
-      if (candidateRelative.startsWith('..') || path.isAbsolute(candidateRelative)) throw new Error('Tool path resolves outside the task worktree.');
+    const worktree = fs.realpathSync(root);
+    const candidate = path.resolve(worktree, value);
+    const escapes = (relative: string) => relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+    if (escapes(path.relative(worktree, candidate))) throw new Error('Tool path escapes the task worktree.');
+    let existing = candidate;
+    while (!fs.existsSync(existing)) {
+      const parent = path.dirname(existing);
+      if (parent === existing) throw new Error('Tool path has no existing parent.');
+      existing = parent;
     }
+    if (escapes(path.relative(worktree, fs.realpathSync(existing)))) throw new Error('Tool path resolves outside the task worktree.');
     return candidate;
   }
 

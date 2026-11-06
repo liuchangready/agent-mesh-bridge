@@ -76,6 +76,64 @@ test('GroupAgentRuntime refuses to replay a tool call whose persisted intent has
     }
 });
 
+test('GroupAgentRuntime lists the worktree root and absolute root, and a failed read can resume in the same session', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-root-list-'));
+    const worktree = path.join(root, 'worktree');
+    fs.mkdirSync(worktree);
+    fs.writeFileSync(path.join(worktree, 'visible.txt'), 'visible');
+    let turn = 0;
+    let secondPrompt = '';
+    const runtime = new GroupAgentRuntime({ bridgeHome: path.join(root, 'bridge'), request: async (messages) => {
+      turn++;
+      if (turn === 1) return { text: '', finishReason: 'tool_calls', toolCalls: [{ id: 'root-dot', name: 'list_files', arguments: { path: '.' } }] };
+      if (turn === 2) return { text: '', finishReason: 'tool_calls', toolCalls: [{ id: 'root-absolute', name: 'list_files', arguments: { path: worktree } }] };
+      if (turn === 3) return { text: 'Listed both worktree roots.', finishReason: 'stop', toolCalls: [] };
+      if (messages.at(-1)?.role === 'user') secondPrompt = messages.at(-1)!.content;
+      return { text: 'Recovered in the same session.', finishReason: 'stop', toolCalls: [] };
+    } });
+    try {
+      const listed = await runtime.run('session_root_listing', worktree, 'List the worktree root.');
+      assert.match(listed.text, /both worktree roots/);
+      const outputs = runtime.sessions.read('session_root_listing').filter((event) => event.role === 'tool').map((event) => event.content);
+      assert.deepEqual(outputs, ['visible.txt', 'visible.txt']);
+
+      const failing = new GroupAgentRuntime({ bridgeHome: path.join(root, 'bridge'), request: async () => ({
+        text: '', finishReason: 'tool_calls', toolCalls: [{ id: 'missing-read', name: 'read_file', arguments: { path: 'missing.txt' } }],
+      }) });
+      await assert.rejects(failing.run('session_read_retry', worktree, 'Read missing file.'), /ENOENT|no such file/i);
+      assert.equal(failing.sessions.hasUnresolvedIntent('session_read_retry'), false);
+      const recovered = await runtime.run('session_read_retry', worktree, 'LATEST_REWORK');
+      assert.equal(recovered.text, 'Recovered in the same session.');
+      assert.equal(secondPrompt, 'LATEST_REWORK');
+      assert.equal(runtime.sessions.hasUnresolvedIntent('session_read_retry'), false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('GroupAgentRuntime rejects traversal and symlink escapes before recording an intent', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-path-guard-'));
+    const worktree = path.join(root, 'worktree');
+    const outside = path.join(root, 'outside');
+    fs.mkdirSync(worktree); fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, 'secret.txt'), 'outside');
+    let requestedPath = '../outside';
+    const runtime = new GroupAgentRuntime({ bridgeHome: path.join(root, 'bridge'), request: async () => ({
+      text: '', finishReason: 'tool_calls', toolCalls: [{ id: requestedPath === '../outside' ? 'traversal' : 'symlink', name: 'list_files', arguments: { path: requestedPath } }],
+    }) });
+    try {
+      await assert.rejects(runtime.run('session_path_traversal', worktree, 'Try traversal.'), /escapes the task worktree/);
+      assert.equal(runtime.sessions.hasUnresolvedIntent('session_path_traversal'), false);
+      const link = path.join(worktree, 'outside-link');
+      try {
+        fs.symlinkSync(outside, link, process.platform === 'win32' ? 'junction' : 'dir');
+        requestedPath = 'outside-link';
+        await assert.rejects(runtime.run('session_symlink_escape', worktree, 'Try symlink escape.', undefined, 'developer'), /resolves outside the task worktree/);
+        assert.equal(runtime.sessions.hasUnresolvedIntent('session_symlink_escape'), false);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EPERM') throw error;
+      }
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('GroupAgentRuntime waits for the real command child to close before reporting cancellation', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-group-cancel-'));
     const cwd = path.join(root, 'workspace');

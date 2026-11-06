@@ -472,6 +472,8 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
   const oldHome = process.env.AGENT_MESH_BRIDGE_HOME;
   const oldUserProfile = process.env.USERPROFILE;
   const oldHomeEnv = process.env.HOME;
+  const oldPath = process.env.PATH;
+  const oldCallerAgent = process.env.MESH_CALLER_AGENT;
   process.env.AGENT_MESH_BRIDGE_HOME = root;
   process.env.USERPROFILE = root;
   process.env.HOME = root;
@@ -514,9 +516,18 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
   fs.mkdirSync(fakeCliDir);
   const fakeClaude = process.platform === 'win32' ? path.join(fakeCliDir, 'claude.cmd') : path.join(fakeCliDir, 'claude');
   const fakeClaudeJs = path.join(fakeCliDir, 'fake-claude.js');
+  const fakeClaudeReviewer = process.platform === 'win32' ? path.join(fakeCliDir, 'claude-reviewer.cmd') : path.join(fakeCliDir, 'claude-reviewer');
+  const fakeClaudeReviewerJs = path.join(fakeCliDir, 'fake-claude-reviewer.js');
   fs.writeFileSync(fakeClaudeJs, `const fs=require('fs');const args=process.argv.slice(2);const resume=args.indexOf('--resume');const session=resume>=0?args[resume+1]:'fake-claude-session-001';const first=!fs.existsSync('result.md');fs.writeFileSync('result.md',first?'first pass\\n':'reworked\\n');fs.writeFileSync('command-check.md','passed');process.stdout.write(JSON.stringify({type:'system',subtype:'init',session_id:session})+'\\n');process.stdout.write(JSON.stringify({type:'assistant',message:{content:[{type:'text',text:'CLI implemented and tested the requested file.'}]}})+'\\n');process.stdout.write(JSON.stringify({type:'result',result:'CLI completed the task.',usage:{input_tokens:3,output_tokens:2}})+'\\n');`);
   if (process.platform === 'win32') fs.writeFileSync(fakeClaude, `@echo off\r\nnode "%~dp0fake-claude.js" %*\r\n`);
   else { fs.writeFileSync(fakeClaude, `#!/usr/bin/env node\nrequire(${JSON.stringify(fakeClaudeJs)});\n`); fs.chmodSync(fakeClaude, 0o755); }
+  const projectRoot = path.resolve(__dirname, '..');
+  const claudeReviewerSource = `const fs=require('fs'),path=require('path');const args=process.argv.slice(2);const resume=args.indexOf('--resume');const session=resume>=0?args[resume+1]:args[args.indexOf('--session-id')+1];const bootstrap=process.env.MESH_REVIEW_BOOTSTRAP==='1';let prompt='';(async()=>{const bridge=${JSON.stringify(projectRoot)};const home=process.env.AGENT_MESH_BRIDGE_HOME;const {TaskStore}=require(path.join(bridge,'bridge/task-store.js'));const {AgentDetector}=require(path.join(bridge,'bridge/agent-detector.js'));const {ActiveAgentResolver}=require(path.join(bridge,'bridge/active-agent-resolver.js'));const {AutonomousRunner}=require(path.join(bridge,'bridge/autonomous-runner.js'));const {CallbackManager}=require(path.join(bridge,'bridge/callback-manager.js'));const {AsyncDispatcher}=require(path.join(bridge,'bridge/async-dispatcher.js'));const {MCPServer}=require(path.join(bridge,'bridge/mcp-server.js'));const {ReworkController}=require(path.join(bridge,'bridge/rework-controller.js'));const {TaskExecutionRegistry}=require(path.join(bridge,'bridge/task-execution-registry.js'));const d=new AgentDetector(),s=new TaskStore(path.join(home,'.agent-mesh-bridge')),run=new AutonomousRunner(d,60000,undefined,s),cb=new CallbackManager(d);cb.setTaskStore(s);cb.setAutonomousRunner(run);const resolver=new ActiveAgentResolver(d),registry=new TaskExecutionRegistry(path.join(home,'.agent-mesh-bridge')),rw=new ReworkController(s,run,cb,d,registry),dispatcher=new AsyncDispatcher(s,resolver,run,cb,d,registry),mcp=new MCPServer(dispatcher,rw,s,d,resolver,run);try{if(bootstrap){const token=process.env.MESH_REVIEW_BOOTSTRAP_TOKEN;const thread=process.env.MESH_REVIEW_THREAD_ID;if(!token||!thread)throw Error('Bootstrap credential missing from environment');await mcp.handleToolCall('dispatch_task',{reviewBootstrap:{threadId:thread,token}});fs.writeFileSync(path.join(home,'fake-cli-session-id'),session);}else{const threadId=process.env.MESH_TASK_THREAD_ID||process.env.MESH_REVIEW_THREAD_ID;const task=s.getTask(threadId);if(!task?.worktree?.path)throw Error('Task worktree missing');const content=fs.readFileSync(path.join(task.worktree.path,'result.txt'),'utf8');const counter=path.join(home,'fake-cli-review-count');let count=0;try{count=Number(fs.readFileSync(counter,'utf8'))}catch{}count++;fs.writeFileSync(counter,String(count));if(content.includes('reworked'))await mcp.handleToolCall('approve_task',{threadId,remarks:'CLI reviewer approved',callerSessionId:session});else await mcp.handleToolCall('request_rework',{threadId,feedback:'Update result.txt to say reworked.',callerSessionId:session});}fs.appendFileSync(path.join(home,'fake-cli-review-sessions'),session+String.fromCharCode(10));process.stdout.write(JSON.stringify({type:'system',subtype:'init',session_id:session})+'\\n');process.stdout.write(JSON.stringify({type:'assistant',message:{content:[{type:'text',text:'CLI reviewer processed the task.'}]}})+'\\n');process.stdout.write(JSON.stringify({type:'result',result:'CLI reviewer processed the task.',usage:{input_tokens:2,output_tokens:1}})+'\\n');process.exit(0);}catch(e){process.stderr.write(e.stack||String(e));process.exitCode=1}finally{rw.dispose();cb.dispose?.();s.dispose()}})();`;
+  fs.writeFileSync(fakeClaudeReviewerJs, claudeReviewerSource);
+  if (process.platform === 'win32') fs.writeFileSync(fakeClaudeReviewer, `@echo off\r\nnode "%~dp0fake-claude-reviewer.js" %*\r\n`);
+  else { fs.writeFileSync(fakeClaudeReviewer, `#!/usr/bin/env node\nrequire(${JSON.stringify(fakeClaudeReviewerJs)});\n`); fs.chmodSync(fakeClaudeReviewer, 0o755); }
+  process.env.PATH = `${fakeCliDir}${path.delimiter}${oldPath || ''}`;
+  process.env.MESH_CALLER_AGENT = 'codex';
   detector.setCustomPath('claude_code', fakeClaude);
   const { AutonomousRunner } = require('../bridge/autonomous-runner');
   const { CallbackManager } = require('../bridge/callback-manager');
@@ -535,6 +546,7 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
   const rework = new ReworkController(store, runner, callback, detector, registry);
   let developerTurns = 0;
   let reviewerTurns = 0;
+  let callerReviewMode = false;
   const sessionsByRole: Record<string, string[]> = { developer: [], reviewer: [], bootstrap: [] };
   const fakeModels = {
     getAgentBinding: (groupId: string) => groupId === developerGroupUuid
@@ -543,7 +555,7 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
     async runGroupAgent(groupId: string, modelRef: any, sessionId: string, cwd: string, prompt: string,
       token: any, onPid: (pid?: number) => void, role: 'developer' | 'reviewer' | 'bootstrap', context: any) {
       sessionsByRole[role].push(sessionId);
-      const expectedModel = role === 'developer' ? groupId === developerGroupUuid ? secondGroupModel : approvedReceiverModel : initiatorModel;
+      const expectedModel = role === 'developer' ? groupId === developerGroupUuid ? secondGroupModel : callerReviewMode ? receiverModel : approvedReceiverModel : initiatorModel;
       assert.deepEqual(modelRef, expectedModel, 'the actual model request must use the explicitly approved/pinned role reference');
       const control = async (name: string, input: Record<string, unknown>) => {
         if (role === 'bootstrap') {
@@ -647,7 +659,7 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
       `const run=new AutonomousRunner(d,60000,undefined,s),c=new CallbackManager(d),g=new TaskExecutionRegistry(${JSON.stringify(storage)});` +
       `const x=new AsyncDispatcher(s,r,run,c,d,g),rw=new ReworkController(s,run,c,d,g);` +
       `x.setModelApprovalHandler(async request=>({id:request.id,status:'approved',at:new Date().toISOString(),by:'test-user'}));` +
-      `const m=new MCPServer(x,rw,s,d,r,run);m.handleToolCall('dispatch_task',{initiatorAgent:'codex',targetAgent:${JSON.stringify(targetAgent)},title:'Group full cycle',prompt:'Create and validate result.txt',workspacePath:${JSON.stringify(repo)},modelRef:${JSON.stringify(requestedModel)},modelRequestedByUser:${Boolean(requestedModel)}})` +
+      `const m=new MCPServer(x,rw,s,d,r,run);m.handleToolCall('dispatch_task',{initiatorAgent:${JSON.stringify(process.env.MESH_CALLER_AGENT || 'codex')},targetAgent:${JSON.stringify(targetAgent)},title:'Group full cycle',prompt:'Create and validate result.txt',workspacePath:${JSON.stringify(repo)},modelRef:${JSON.stringify(requestedModel)},modelRequestedByUser:${Boolean(requestedModel)}})` +
       `.then(v=>process.stdout.write(JSON.stringify(v))).catch(e=>{process.stderr.write(e.stack||e);process.exitCode=1}).finally(()=>s.dispose());`;
     const runIndependentDispatch = async (requestedModel?: typeof approvedReceiverModel, targetAgent = 'default') => {
     const child = childProcess.spawn(process.execPath, ['-e', buildDispatchScript(requestedModel, targetAgent)], { cwd: process.cwd(), env: { ...process.env,
@@ -701,7 +713,7 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
     assert.equal(sessionsByRole.developer.length, 4, 'both Group receivers retain one session each across their rework');
     assert.equal(sessionsByRole.reviewer.length, 4, 'the Group sender resumes each dedicated reviewer session');
 
-    reviewerTurns = 0;
+    developerTurns = 0; reviewerTurns = 0;
     const groupCliDispatch = await runIndependentDispatch(undefined, 'claude_code');
     const cliDeadline = Date.now() + 15_000;
     while (Date.now() < cliDeadline && store.getTask(groupCliDispatch.threadId)?.status !== 'completed') await new Promise((resolve) => setTimeout(resolve, 50));
@@ -713,6 +725,33 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
     assert.equal(groupCliFinished.rounds.some((round) => round.type === 'rework'), true);
     assert.equal(groupCliFinished.receiverSessionId, 'fake-claude-session-001', 'CLI rework resumes its original native session id');
     assert.equal(fs.readFileSync(path.join(groupCliFinished.worktree!.path, 'result.md'), 'utf8'), 'reworked\n');
+
+    // Caller mode uses a real CLI process for bootstrap and both review turns.
+    const callerConfig = require('../bridge/group-agent-registry').loadGroupAgentConfig(root);
+    require('../bridge/group-agent-registry').saveGroupAgentConfig({ ...callerConfig, defaultAgent: agent, defaultReviewer: 'caller', updatedAt: Date.now() }, root);
+    process.env.MESH_CALLER_AGENT = 'claude_code';
+    detector.setCustomPath('claude_code', fakeClaudeReviewer);
+    callerReviewMode = true;
+    const cliReviewDispatch = await runIndependentDispatch();
+    const cliReviewerDeadline = Date.now() + 20_000;
+    while (Date.now() < cliReviewerDeadline && store.getTask(cliReviewDispatch.threadId)?.status !== 'completed') {
+      if (store.getTask(cliReviewDispatch.threadId)?.status === 'waiting_merge') rework.resumePendingMerges();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const cliReviewFinished = store.getTask(cliReviewDispatch.threadId)!;
+    assert.equal(cliReviewFinished.requesterAgent, 'claude_code');
+    assert.equal(cliReviewFinished.initiatorAgent, 'claude_code', 'defaultReviewer=caller must keep the actual CLI reviewer');
+    assert.equal(cliReviewFinished.targetAgent, agent);
+    assert.equal(cliReviewFinished.status, 'completed', JSON.stringify({ status: cliReviewFinished.status, reviewBootstrap: cliReviewFinished.reviewBootstrap,
+      rounds: cliReviewFinished.rounds.map((round) => ({ round: round.round, type: round.type, status: round.status, error: round.error, assessment: round.assessment, interruption: round.interruption })) }));
+    assert.equal(cliReviewFinished.reviewBootstrap?.phase, 'confirmed');
+    const reviewerSessionIds = fs.readFileSync(path.join(root, 'fake-cli-review-sessions'), 'utf8').trim().split('\n');
+    assert.equal(cliReviewFinished.reviewerSessionId, reviewerSessionIds[0]);
+    assert.equal(new Set(reviewerSessionIds).size, 1, 'bootstrap, rework review and approval all reused one native CLI session');
+    assert.equal(cliReviewFinished.worktree?.integration?.phase, 'merged');
+    assert.equal(cliReviewFinished.rounds.some((round) => round.type === 'rework'), true);
+    assert.equal(fs.readFileSync(path.join(cliReviewFinished.worktree!.path, 'result.txt'), 'utf8'), 'reworked\n');
+    assert.equal(fs.readFileSync(path.join(root, 'fake-cli-review-count'), 'utf8'), '2', 'the CLI reviewer used its same captured session for rework and approval');
   } finally {
     bootstrap?.stop(); broker?.dispose(); supervisor.dispose(); rework.dispose(); callback.dispose?.(); store.dispose();
     if (heartbeat) clearInterval(heartbeat);
@@ -720,8 +759,20 @@ test('independent default dispatch completes Group bootstrap, tool work, same-se
     if (oldHome === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME; else process.env.AGENT_MESH_BRIDGE_HOME = oldHome;
     if (oldUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = oldUserProfile;
     if (oldHomeEnv === undefined) delete process.env.HOME; else process.env.HOME = oldHomeEnv;
+    if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+    if (oldCallerAgent === undefined) delete process.env.MESH_CALLER_AGENT; else process.env.MESH_CALLER_AGENT = oldCallerAgent;
+    try {
+      const worktrees = childProcess.execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd: repo, encoding: 'utf8' });
+      for (const line of worktrees.split(/\r?\n/)) {
+        if (!line.startsWith('worktree ')) continue;
+        const worktree = line.slice('worktree '.length);
+        const relative = path.relative(root, worktree);
+        if (relative.startsWith(`${path.join('.agent-mesh-bridge', 'worktrees')}${path.sep}`))
+          childProcess.execFileSync('git', ['worktree', 'remove', '--force', worktree], { cwd: repo, stdio: 'ignore' });
+      }
+    } catch {}
     for (let attempt = 0; ; attempt++) {
-      try { fs.rmSync(root, { recursive: true, force: true }); break; }
+      try { fs.rmSync(root, { recursive: true, force: true, maxRetries: 30, retryDelay: 100 }); break; }
       catch (error) {
         if (attempt >= 4 || !['ENOTEMPTY', 'EBUSY', 'EPERM'].includes((error as NodeJS.ErrnoException).code || '')) throw error;
         await new Promise((resolve) => setTimeout(resolve, 50));

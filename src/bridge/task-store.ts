@@ -20,7 +20,6 @@ import {
   isTerminalThreadStatus,
   removeTaskArtifacts,
 } from './task-summary';
-import { cleanupThreadNativeSessions } from './native-session-cleanup';
 import { cleanupGroupAgentTaskArtifacts } from './group-agent-mailbox';
 
 export const MAX_STORED_TASKS = 1000;
@@ -740,23 +739,21 @@ export class TaskStore extends EventEmitter {
    */
   public archiveTask(threadId: string): DelegationThread | undefined {
     this.ensureUpToDate();
-    const thread = this.tasks.get(threadId);
+    const source = this.tasks.get(threadId);
+    const thread = source && JSON.parse(JSON.stringify(source)) as DelegationThread;
     if (!thread || thread.archivedAt || !isTerminalThreadStatus(thread.status)) return undefined;
-    // Read the session ids BEFORE they are stripped: archival is the "keep only
-    // the summary" boundary, so the native conversations and bridge logs are
-    // removed now. Best-effort: a missing conversation is not an error.
+    // Do not discard the source until a complete archive and archived ledger row are durable.
     try {
-      cleanupThreadNativeSessions(thread);
-    } catch {}
-    try {
-      archiveCompletedTaskLogs(thread, this.storageDir);
-    } catch {}
-    try {
-      cleanupGroupAgentTaskArtifacts(thread, this.storageDir);
-    } catch {}
+      const archivedLogs = archiveCompletedTaskLogs(thread, this.storageDir);
+      if (!archivedLogs.tarGzPaths.length) return undefined;
+    } catch (error) {
+      console.warn(`[TaskStore] Could not archive ${threadId}; retaining task data:`, error);
+      return undefined;
+    }
     if (!archiveThreadData(thread)) return undefined;
-    this.tasks.set(threadId, thread);
     this.persistThread(thread);
+    this.tasks.set(threadId, thread);
+    try { cleanupGroupAgentTaskArtifacts(source!, this.storageDir); } catch {}
     removeTaskArtifacts(threadId, this.storageDir, {
       keepArchive: true,
       targetAgent: thread.targetAgent,
