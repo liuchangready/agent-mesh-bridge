@@ -114,7 +114,6 @@ export class ReworkController {
       threadId,
       targetAgent: overrides.targetAgent,
       model: overrides.model,
-      modelRef: overrides.modelRef,
       modelRequestedByUser: overrides.modelRequestedByUser,
       reason,
       by: 'caller',
@@ -163,7 +162,6 @@ export class ReworkController {
         threadId: params.threadId,
         targetAgent: params.targetAgent,
         model: params.model,
-        modelRef: params.modelRef,
         modelRequestedByUser: params.modelRequestedByUser,
         reason: 'request_rework: executor switch',
         by: 'caller',
@@ -943,7 +941,6 @@ export class ReworkController {
           taskThreadId: thread.threadId,
           taskRound: roundNumber,
           model: thread.targetModel,
-          modelRef: thread.targetModelRef,
           role: 'developer',
           previousTokenUsage: readStoredRoundUsage(this.taskStore, thread.threadId, roundNumber),
           onChildPid: (pid) => {

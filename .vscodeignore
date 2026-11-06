@@ -13,7 +13,6 @@ out/review-*.log
 !out/extension.js
 !out/bridge/**/*.js
 !out/config/**/*.js
-!out/copilot/**/*.js
 !out/ui/**/*.js
 
 # Development-only material: never needed at runtime, would only bloat the .vsix.

@@ -177,8 +177,6 @@ export class AgentDetector {
       case 'deepseek_harness':
         candidates = this.getDeepSeekHarnessCandidatePaths();
         break;
-      case 'vscode_chat':
-        return null;
     }
 
     // Only a path that can actually be launched here counts as installed: on
@@ -203,21 +201,7 @@ export class AgentDetector {
       claude_code: 'Anthropic Claude Code',
       codex: 'OpenAI Codex',
       deepseek_harness: 'DeepSeek Harness',
-      vscode_chat: 'GitHub Copilot · VS Code',
     };
-
-    if (agent === 'vscode_chat') {
-      const info: AgentInfo = {
-        id: 'vscode_chat',
-        name: names.vscode_chat,
-        status: 'offline',
-        available: false,
-        statusDetails: 'Requester only · Copilot sign-in and model status unknown',
-        lastChecked: new Date().toISOString(),
-      };
-      this.cache[agent] = { info, timestamp: Date.now() };
-      return info;
-    }
 
     const execPath = this.resolveExecutable(agent);
     const rateLimit = this.rateLimitTracker.getRateLimitInfo(agent);

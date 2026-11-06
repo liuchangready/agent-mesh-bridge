@@ -84,8 +84,6 @@ export function collectThreadSessionRefs(thread: DelegationThread): NativeSessio
   const seen = new Set<string>();
 
   const add = (agent: AgentId, sessionId?: string | null) => {
-    // No supported API lets the bridge identify or clean up a native Copilot chat.
-    if (agent === 'vscode_chat') return;
     const safe = toSafeSessionId(sessionId);
     if (!safe) return;
     const key = `${agent}:${safe.toLowerCase()}`;
@@ -95,16 +93,10 @@ export function collectThreadSessionRefs(thread: DelegationThread): NativeSessio
   };
 
   add(thread.targetAgent, thread.receiverSessionId);
-  // Dedicated review created its own reviewer conversation; it belongs to the
-  // task and is safe to delete. Only a CAPTURED reviewer session qualifies:
-  // before bootstrap confirms, `callerSessionId` still points at the requester's
-  // own chat, and deleting that would destroy the user's conversation. Never
-  // fall back to `callerSessionId`, and never delete a session that is still the
-  // requester's.
+  // Dedicated review created its own reviewer conversation; it belongs to the task.
   if (
     thread.reviewFlow === 'dedicated' &&
-    thread.reviewerSessionId &&
-    thread.reviewerSessionId !== thread.requesterSessionId
+    thread.reviewerSessionId
   ) {
     add(thread.initiatorAgent, thread.reviewerSessionId);
   }
@@ -179,7 +171,6 @@ function cleanupSession(
         cleanupDshSession(home, env, ref.sessionId, entry);
         break;
       default:
-        // The bridge has no supported Copilot session cleanup contract.
         break;
     }
   } catch (e: any) {

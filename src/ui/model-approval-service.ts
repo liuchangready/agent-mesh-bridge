@@ -27,7 +27,6 @@ const AGENT_LABELS: Record<string, string> = {
   codex: 'OpenAI Codex',
   claude_code: 'Anthropic Claude Code',
   deepseek_harness: 'DeepSeek Harness',
-  vscode_chat: 'VSCode Chat',
 };
 
 const APPROVE = '同意使用该模型';

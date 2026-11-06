@@ -4,7 +4,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { TaskStore } from './bridge/task-store';
 import { AgentDetector } from './bridge/agent-detector';
-import { ActiveAgentResolver } from './bridge/active-agent-resolver';
+import { ActiveAgentResolver, applyConfiguredAgentDefault } from './bridge/active-agent-resolver';
 import { AutonomousRunner } from './bridge/autonomous-runner';
 import { CallbackManager } from './bridge/callback-manager';
 import { ReviewWakeScheduler } from './bridge/review-wake-scheduler';
@@ -25,12 +25,6 @@ import { TaskControlService } from './bridge/task-control';
 import { TaskArchiveService } from './bridge/task-archive';
 import { ReviewerBootstrapService, confirmReviewerBootstrapTask } from './bridge/reviewer-bootstrap';
 import { TaskExecutionRegistry } from './bridge/task-execution-registry';
-import { registerCopilotMcpProvider } from './copilot/copilot-mcp-provider';
-import { isCopilotRequester } from './copilot/copilot-projection';
-import { claimCopilotTerminalNotification } from './copilot/copilot-notifications';
-import { CopilotModelService } from './copilot/model-service';
-import { GroupAgentHostBroker } from './copilot/group-agent-host-broker';
-import { registerCopilotModelCommands } from './copilot/model-commands';
 import { saveBridgePolicy, AgentLogDirectories } from './bridge/bridge-policy';
 import { probeCodexResumeSupport } from './bridge/codex-session';
 import { NativeSessionCompactor } from './bridge/native-session-compactor';
@@ -79,7 +73,6 @@ const MODEL_SETTING_KEYS: Record<AgentId, string> = {
   codex: 'models.codex',
   claude_code: 'models.claudeCode',
   deepseek_harness: 'models.deepseekHarness',
-  vscode_chat: 'models.vscodeChat',
 };
 
 /**
@@ -96,7 +89,6 @@ const INITIATOR_MODEL_SETTING_KEYS: Record<AgentId, string> = {
   codex: 'initiatorModels.codex',
   claude_code: 'initiatorModels.claudeCode',
   deepseek_harness: 'initiatorModels.deepseekHarness',
-  vscode_chat: 'initiatorModels.vscodeChat',
 };
 
 const LOG_DIR_SETTING_KEYS: Record<AgentId, string> = {
@@ -104,7 +96,6 @@ const LOG_DIR_SETTING_KEYS: Record<AgentId, string> = {
   codex: 'logDirectories.codex',
   claude_code: 'logDirectories.claudeCode',
   deepseek_harness: 'logDirectories.deepseekHarness',
-  vscode_chat: 'logDirectories.vscodeChat',
 };
 
 const readLogDirectorySettings = (): AgentLogDirectories => {
@@ -130,12 +121,10 @@ const AGENT_LABELS: Record<AgentId, string> = {
   codex: 'OpenAI Codex',
   claude_code: 'Anthropic Claude Code',
   deepseek_harness: 'DeepSeek Harness',
-  vscode_chat: 'VSCode Chat',
 };
 
 export function activate(context: vscode.ExtensionContext) {
   console.log('[Agent Mesh Bridge] Activating extension...');
-  const copilotHostInstanceId = registerCopilotMcpProvider(context);
 
   // Which build is actually rendering the UI?
   //
@@ -418,28 +407,7 @@ export function activate(context: vscode.ExtensionContext) {
   modelApprovalService.start();
   context.subscriptions.push(modelApprovalService);
   const timeoutMinutes = config.get<number>('taskTimeoutMinutes', 120);
-  const copilotModelService = new CopilotModelService(context);
-  copilotModelService.setTaskStore(taskStore);
   const runner = new AutonomousRunner(detector, timeoutMinutes * 60 * 1000, undefined, taskStore);
-  runner.setGroupAgentExecutor(async (options, signal) => {
-    if (!options.agent.startsWith('copilot_group:') || !options.cwd || !options.modelRef)
-      throw new Error('Group Agent run is missing its registered identity, model reference, or task worktree.');
-    const source = new vscode.CancellationTokenSource();
-    const abort = () => source.cancel();
-    signal.addEventListener('abort', abort, { once: true });
-    if (signal.aborted) abort();
-    try {
-      return await copilotModelService.runGroupAgent(
-        options.agent.slice('copilot_group:'.length), options.modelRef,
-        options.receiverSessionId, options.cwd, options.prompt, source.token, options.onChildPid,
-        options.role || 'developer',
-        { threadId: options.taskThreadId, extraEnv: options.extraEnv },
-      );
-    } finally {
-      signal.removeEventListener('abort', abort);
-      source.dispose();
-    }
-  });
   const callbackManager = new CallbackManager(detector);
   callbackManager.setAutonomousRunner(runner);
   // A deferred wake must re-read the thread when it is replayed.
@@ -515,47 +483,6 @@ export function activate(context: vscode.ExtensionContext) {
     true,
   );
   context.subscriptions.push({ dispose: () => reworkController.dispose() });
-  copilotModelService.setGroupAgentControlHandler(async (controlContext, name, input) => {
-    if (controlContext.role === 'bootstrap') {
-      const threadId = controlContext.extraEnv?.MESH_REVIEW_THREAD_ID;
-      const token = controlContext.extraEnv?.MESH_REVIEW_BOOTSTRAP_TOKEN;
-      if (!threadId || !token || input.threadId !== threadId || input.token !== token)
-        throw new Error('Group reviewer bootstrap credentials do not match this prepared task.');
-      const prepared = taskStore.getTask(threadId);
-      if (!prepared || prepared.initiatorAgent !== `copilot_group:${controlContext.groupId}`)
-        throw new Error('The prepared task belongs to a different registered Group Agent.');
-      const thread = confirmReviewerBootstrapTask(taskStore, threadId, { token });
-      return JSON.stringify({ threadId, status: 'DISPATCHED', nextAction: 'END_TURN_AND_WAIT_FOR_CALLBACK' });
-    }
-    const threadId = controlContext.threadId;
-    if (controlContext.role !== 'reviewer' || !threadId || input.threadId !== threadId)
-      throw new Error('Group reviewer controls are limited to the active task in this reviewer turn.');
-    taskStore.loadFromDisk();
-    const thread = taskStore.getTask(threadId);
-    const owner = new TaskRoleLock().getOwner(threadId);
-    if (!thread || thread.reviewFlow !== 'dedicated' || thread.initiatorAgent !== `copilot_group:${controlContext.groupId}` ||
-        thread.reviewerSessionId !== controlContext.sessionId || owner?.role !== 'reviewer' || owner.conversationId !== controlContext.sessionId)
-      throw new Error('Group reviewer session does not own the current task reviewer lease.');
-    if (name === 'request_rework') {
-      if (typeof input.feedback !== 'string' || !input.feedback.trim()) throw new Error('Review feedback is required.');
-      const result = await reworkController.requestRework({ threadId, feedback: input.feedback, callerSessionId: controlContext.sessionId });
-      return JSON.stringify(result);
-    }
-    if (name === 'approve_task') {
-      const result = reworkController.approveTask({ threadId, remarks: typeof input.remarks === 'string' ? input.remarks : undefined });
-      reworkController.resumePendingMerges();
-      return JSON.stringify(result);
-    }
-    throw new Error(`Unsupported Group reviewer control: ${name}`);
-  });
-  const groupAgentHostBroker = new GroupAgentHostBroker({
-    hostInstanceId: copilotHostInstanceId,
-    taskStore,
-    models: copilotModelService,
-    storageDir: path.dirname(taskStore.getStoragePath()),
-  });
-  groupAgentHostBroker.start();
-  context.subscriptions.push(groupAgentHostBroker);
   const taskControl = new TaskControlService(taskStore, runner);
   const configSync = new ConfigSyncService(undefined, dshProvider);
   configSync.setAgentMcpEnv(agentMcpEnvFor(dshProvider));
@@ -600,12 +527,25 @@ export function activate(context: vscode.ExtensionContext) {
     recentTreeProvider.refresh();
   });
 
-  // Explicit dynamic defaults are revalidated at selection time; an unavailable
-  // Group Agent produces an admission error instead of silently choosing a CLI.
   const applyAgentDefaults = () => {
-    const selected = vscode.workspace.getConfiguration('agentMeshBridge').get<string>('defaultAgent', 'auto');
-    resolver.setManualOverride(selected && selected !== 'auto' ? selected as AgentId : null);
-    void copilotModelService.refresh();
+    const agentConfig = vscode.workspace.getConfiguration('agentMeshBridge');
+    const selected = agentConfig.get<string>('defaultAgent', 'auto');
+    applyConfiguredAgentDefault(resolver, selected, (unsupported) => {
+      vscode.window.showWarningMessage(
+        `The saved default agent "${unsupported}" is no longer supported. It was reset to Auto. Use the Agent Bridge status bar to choose Antigravity, Codex, Claude Code, DeepSeek Harness, or Auto.`,
+      );
+      const inspected = agentConfig.inspect<string>('defaultAgent');
+      const target = inspected?.workspaceFolderValue !== undefined
+        ? vscode.ConfigurationTarget.WorkspaceFolder
+        : inspected?.workspaceValue !== undefined
+          ? vscode.ConfigurationTarget.Workspace
+          : vscode.ConfigurationTarget.Global;
+      try {
+        void agentConfig.update('defaultAgent', 'auto', target).then(undefined, () => {});
+      } catch {
+        // Keep activation healthy even when VS Code cannot persist the migration.
+      }
+    });
   };
   applyAgentDefaults();
 
@@ -614,7 +554,7 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(statusBar.getStatusBarItem());
 
   // 4. Tree Views
-  const agentNodesProvider = new AgentNodesProvider(detector, resolver, copilotModelService);
+  const agentNodesProvider = new AgentNodesProvider(detector, resolver);
   const activeTreeProvider = new TaskTreeProvider(taskStore, 'active');
   const recentTreeProvider = new TaskTreeProvider(taskStore, 'all');
 
@@ -632,18 +572,12 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   context.subscriptions.push(agentNodesTreeView, activeTreeView, recentTreeView);
-  context.subscriptions.push(...registerCopilotModelCommands(context, copilotModelService));
 
   // Track completed tasks to announce when a task transitions to completed
   const knownCompletedThreadIds = new Set<string>();
-  const knownCopilotTerminalStates = new Set<string>();
   for (const t of taskStore.getAllTasks()) {
     if (t.status === 'completed') {
       knownCompletedThreadIds.add(t.threadId);
-    }
-    if (t.requesterBinding?.hostInstanceId === copilotHostInstanceId &&
-        ['completed', 'failed', 'review_failed'].includes(t.status)) {
-      knownCopilotTerminalStates.add(`${t.threadId}:${t.status}`);
     }
   }
 
@@ -660,17 +594,6 @@ export function activate(context: vscode.ExtensionContext) {
 
     const taskList = Array.isArray(allTasks) ? allTasks : taskStore.getAllTasks();
     for (const t of taskList) {
-      if (isCopilotRequester(t)) {
-        if (claimCopilotTerminalNotification(t, copilotHostInstanceId, knownCopilotTerminalStates)) {
-          void vscode.window.showInformationMessage(
-            `[Agent Mesh Bridge] Copilot request “${t.title}” ${t.status}. Open the Bridge task details for the summary.`,
-            'View Details',
-          ).then((choice) => {
-            if (choice === 'View Details') TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, t.threadId);
-          }, (error: unknown) => console.warn('[Agent Mesh Bridge] Copilot task notification failed:', error));
-        }
-        continue;
-      }
       if (t.status === 'completed' && !knownCompletedThreadIds.has(t.threadId)) {
         knownCompletedThreadIds.add(t.threadId);
         const lastRound = t.rounds && t.rounds[t.rounds.length - 1];
@@ -1612,7 +1535,7 @@ export function activate(context: vscode.ExtensionContext) {
         const roleLabel = modelRole === 'initiator' ? '下发者默认模型' : '接收者默认模型';
 
         let agent = item?.info?.id;
-        if (!agent || agent === 'vscode_chat') {
+        if (!agent) {
           const pick = await vscode.window.showQuickPick(
             targets.map((a) => ({
               label: AGENT_LABELS[a],
@@ -1827,7 +1750,6 @@ export function activate(context: vscode.ExtensionContext) {
         !e.affectsConfiguration('agentMeshBridge.models') &&
         !e.affectsConfiguration('agentMeshBridge.initiatorModels') &&
         !e.affectsConfiguration('agentMeshBridge.defaultAgent') &&
-        !e.affectsConfiguration('agentMeshBridge.defaultReviewer') &&
         !e.affectsConfiguration('agentMeshBridge.logDirectories') &&
         !e.affectsConfiguration('agentMeshBridge.requireModelApproval') &&
         !e.affectsConfiguration('agentMeshBridge.contextCompaction') &&

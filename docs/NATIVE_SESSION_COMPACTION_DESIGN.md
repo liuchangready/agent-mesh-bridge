@@ -7,7 +7,7 @@
 ## 1. 不变量
 
 - 业务 thread、原生 session ID、任务 worktree、分支、审批 SHA 和本次合法模型路由保持不变。原生压缩只能通过接收 Agent 支持的控制面完成，禁止直接写 rollout、JSONL、SQLite、protobuf 或 zstd 文件，禁止把 `/compact` 当作后台 API，也不以模型摘要、截断返回值或新会话冒充压缩。
-- 只维护 Bridge 能证明由当前任务角色独占的 developer 或 dedicated reviewer 会话。legacy `callerSessionId`、requester 会话与 Copilot 原生会话永不自动维护。首轮 session 尚未捕获、bootstrap pending、活跃 turn、暂停未恢复、失败通知、终态、已归档或已删除任务不自动维护。
+- 只维护 Bridge 能证明由当前任务角色独占的 developer 或 dedicated reviewer 会话。legacy `callerSessionId` 永不自动维护。首轮 session 尚未捕获、bootstrap pending、活跃 turn、暂停未恢复、失败通知、终态、已归档或已删除任务不自动维护。
 - `contextCompaction` 胶囊仍只用于账本展示。恢复资料由可信账本、Git 元数据和本轮证据确定性生成，二者互不替代，也不改变审批结论。
 - 维护和业务轮使用不同结果判据。业务仍要求零退出码及有效最终文本；维护不要求 assistant 文本，但必须具备本次 thread 的压缩 item 完成、对应 completed turn、关闭后同 ID 恢复且压缩 item 在持久历史可见的证据。RPC ACK、metadata、旧 turn 或不相关 thread 事件均不算成功。
 
@@ -21,7 +21,6 @@
 | Claude Code | 沿用原生自动压缩。未验证手动后台控制接口前不接入 | 不主动维护 |
 | Antigravity | 当前只确认 `--conversation` 续聊 | `unsupported` |
 | DeepSeek Harness | 当前只确认已捕获 session 的接管语义 | `unsupported` |
-| Copilot Chat | 不属于 CLI 原生会话接入 | `unsupported` |
 
 Codex RPC 的空对象响应只是受理。当前 Codex 0.164.0-alpha.11.1 实测未产生旧式 `thread/compacted` 通知，而是产生完成的 `contextCompaction` item 及 completed turn；实现按这组与 thread/turn 关联的结构化证据判断，并在关闭后重新载入历史。若未来版本改变事件形状，必须重新验证，不能把 metadata 当替代物。
 
@@ -70,7 +69,7 @@ Codex RPC 的空对象响应只是受理。当前 Codex 0.164.0-alpha.11.1 实�
 
 ## 9. UI、配置和用户入口
 
-任务详情分别展示 developer/reviewer 的能力、最近 operation、原因、阶段、上下文占用（或未知）、warning 和日志页读入口；账本胶囊与原生会话压缩分开展示。VS Code 命令“压缩此任务原生会话”允许选择 developer 或 captured dedicated reviewer；异步完成后刷新 UI。运行 session 不得抢锁，手动维护不自动开始业务轮，并必须保持任务原有暂停/状态。legacy caller/requester 没有此命令入口。
+任务详情分别展示 developer/reviewer 的能力、最近 operation、原因、阶段、上下文占用（或未知）、warning 和日志页读入口；账本胶囊与原生会话压缩分开展示。VS Code 命令“压缩此任务原生会话”允许选择 developer 或 captured dedicated reviewer；异步完成后刷新 UI。运行 session 不得抢锁，手动维护不自动开始业务轮，并必须保持任务原有暂停/状态。legacy caller 没有此命令入口。
 
 本设计不新增 MCP 压缩工具、不新增守护进程、不改变 Agent 模型默认值、不选择摘要模型。模式设置、能力状态和单任务 UI 是 Bridge 控制面。
 

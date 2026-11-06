@@ -286,7 +286,6 @@ describe('native conversation cleanup on task deletion', () => {
         targetAgent: 'claude_code',
         receiverSessionId: SESSION_CLAUDE,
         reviewFlow: 'dedicated',
-        requesterSessionId: SESSION_CODEX,
         callerSessionId: SESSION_CODEX,
         // Bootstrap never confirmed, so reviewerSessionId is absent.
       }),
@@ -328,7 +327,6 @@ describe('native conversation cleanup on task deletion', () => {
         targetAgent: 'claude_code',
         receiverSessionId: SESSION_CLAUDE,
         reviewFlow: 'dedicated',
-        requesterSessionId: SESSION_CODEX,
         reviewerSessionId: SESSION_OTHER,
         callerSessionId: SESSION_OTHER,
       }),
@@ -396,12 +394,5 @@ describe('native conversation cleanup on task deletion', () => {
     assert.strictEqual(result.removedCount, 0);
   });
 
-  test('vscode_chat tasks have no native conversation store', () => {
-    const result = cleanup(
-      makeThread({ targetAgent: 'vscode_chat', receiverSessionId: SESSION_CLAUDE }),
-    );
 
-    assert.deepStrictEqual(result.entries, []);
-    assert.strictEqual(result.removedCount, 0);
-  });
 });
