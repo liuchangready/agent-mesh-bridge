@@ -9,8 +9,6 @@ import {
   DispatchResult,
   DispatchStatus,
   WorktreeInfo,
-  GroupModelRef,
-  GroupAgentBindingSnapshot,
   isIsolatedTaskWorktree,
   getModelRouting,
   findInFlightRound,
@@ -37,13 +35,8 @@ import { resolveConfiguredModel, resolveInitiatorModel } from './model-catalog';
 import { appendCompactionProtocol, compactRoundBestEffort } from './context-compactor';
 import { readStoredRoundUsage } from './token-usage-collector';
 import { concurrencyPolicy } from './bridge-policy';
-import {
-  ModelApprovalHandler,
-  resolveDispatchGroupModelRef,
-  resolveDispatchModel,
-} from './model-approval';
-import { assertCanExecute, assertGroupModelReady } from './agent-capabilities';
-import { isGroupAgentId, loadGroupAgentConfig } from './group-agent-registry';
+import { ModelApprovalHandler, resolveDispatchModel } from './model-approval';
+import { assertCanExecute } from './agent-capabilities';
 
 export class AsyncDispatcher {
   private taskStore: TaskStore;
@@ -111,12 +104,8 @@ export class AsyncDispatcher {
     let targetAgent: AgentId;
 
     if (!params.targetAgent || params.targetAgent === 'default') {
-      const configuredGroupReceiver = loadGroupAgentConfig()?.defaultAgent;
-      if (configuredGroupReceiver && configuredGroupReceiver !== 'auto') targetAgent = configuredGroupReceiver as AgentId;
-      else {
-        const resolved = await this.resolver.resolveActiveAgent();
-        targetAgent = resolved.agent;
-      }
+      const resolved = await this.resolver.resolveActiveAgent();
+      targetAgent = resolved.agent;
     } else {
       targetAgent = params.targetAgent;
     }
@@ -131,20 +120,9 @@ export class AsyncDispatcher {
     // Review topology is pinned per task. Dedicated needs a long-lived host to
     // launch the reviewer bootstrap, so a standalone MCP process falls back to
     // legacy instead of creating a task nobody could dispatch.
-    const reviewFlow = params.requesterContext
-      ? 'dedicated'
-      : resolveReviewFlow(params.reviewFlow, readBridgePolicy().reviewFlow);
-    if (params.requesterContext && !TaskSupervisor.isSupervisorActive()) {
-      throw new Error('Copilot submissions require the local VS Code reviewer host to be active.');
-    }
+    const reviewFlow = resolveReviewFlow(params.reviewFlow, readBridgePolicy().reviewFlow);
 
-    const requesterAgent: AgentId = knownInitiator || 'antigravity';
-    const defaultReviewer = loadGroupAgentConfig()?.defaultReviewer || 'caller';
-    const initiatorAgent: AgentId = reviewFlow === 'dedicated' && defaultReviewer !== 'caller'
-      ? defaultReviewer as AgentId
-      : requesterAgent;
-    if (reviewFlow !== 'dedicated' && defaultReviewer !== 'caller')
-      throw new Error('A non-caller default sender requires dedicated review. Select dedicated in agentMeshBridge.reviewFlow.');
+    const initiatorAgent: AgentId = knownInitiator || 'antigravity';
     if (reviewFlow === 'dedicated') assertCanExecute(initiatorAgent, 'review delegated tasks', 'initiator');
     if (reviewFlow !== 'dedicated' && knownInitiator && targetAgent === knownInitiator) {
       throw new Error(`Refusing to dispatch "${params.title}" to its own caller session: self-dispatch requires the dedicated reviewer flow.`);
@@ -159,13 +137,13 @@ export class AsyncDispatcher {
       params.callerSessionId && isValidSessionId(params.callerSessionId)
         ? params.callerSessionId
         : undefined;
-    if (!callerSessionId && this.detector && !params.requesterContext) {
-      callerSessionId = this.detector.detectActiveSession(requesterAgent, repositoryPath, [
+    if (!callerSessionId && this.detector) {
+      callerSessionId = this.detector.detectActiveSession(initiatorAgent, repositoryPath, [
         receiverSessionId,
       ]);
       if (callerSessionId) {
         console.log(
-          `[AsyncDispatcher] Auto-detected caller session for ${requesterAgent}: ${callerSessionId}`,
+          `[AsyncDispatcher] Auto-detected caller session for ${initiatorAgent}: ${callerSessionId}`,
         );
       }
     }
@@ -188,64 +166,22 @@ export class AsyncDispatcher {
     //
     // The configured default wins unless the caller declares an explicit user
     // request AND the user confirms the switch in VS Code (see model-approval).
-    const requesterModel = resolveInitiatorModel(requesterAgent, params.initiatorModel);
-    let initiatorModel = initiatorAgent === requesterAgent ? requesterModel : resolveInitiatorModel(initiatorAgent);
-    let initiatorModelRef: GroupModelRef | undefined;
-    if (isGroupAgentId(initiatorAgent)) {
-      const entry = loadGroupAgentConfig()?.agents.find((item) => item.id === initiatorAgent);
-      initiatorModelRef = entry?.initiatorModel;
-      if (initiatorModelRef) initiatorModel = { model: initiatorModelRef.id, source: 'sender-configured' };
-    }
-    let targetModelRef: GroupModelRef | undefined;
-    let modelResolution: Awaited<ReturnType<typeof resolveDispatchModel>>;
-    if (isGroupAgentId(targetAgent)) {
-      const entry = loadGroupAgentConfig()?.agents.find((item) => item.id === targetAgent);
-      if (!entry?.receiverModel || !entry.enabled || !entry.toolsAuthorized) throw new Error('The Group Agent has no enabled receiver model binding.');
-      if (params.model) throw new Error('Group Agent model selection requires a structured modelRef; CLI model strings remain supported for CLI agents.');
-      const sameRef = (left: GroupModelRef, right: GroupModelRef) => left.source === right.source && left.id === right.id &&
-        (left.source === 'vscode-lm' ? right.source === 'vscode-lm' && left.vendor === right.vendor : right.source === 'openai-compatible' && left.origin === right.origin && left.bindingRevision === right.bindingRevision);
-      if (params.modelRef && !sameRef(params.modelRef, entry.receiverModel) && !entry.models?.some((member) => sameRef(member, params.modelRef!)))
-        throw new Error('The selected structured Group Agent modelRef is not a current member of this group binding.');
-      if (entry.receiverModel.source === 'vscode-lm' && entry.source !== 'vscode-lm')
-        throw new Error('The selected model source does not match this Group Agent.');
-      if (entry.receiverModel.source === 'openai-compatible' && (entry.source !== 'openai-compatible' || entry.receiverModel.origin !== entry.baseUrl && entry.receiverModel.origin !== (entry.baseUrl ? new URL(entry.baseUrl).origin : '')))
-        throw new Error('The selected endpoint model does not match this Group Agent origin.');
-      const groupResolution = await resolveDispatchGroupModelRef({
-        targetAgent, requestedModelRef: params.modelRef, defaultModelRef: entry.receiverModel,
-        requestedByUser: params.modelRequestedByUser === true, initiatorAgent, title: params.title,
-        handler: this.modelApprovalHandler,
-      });
-      targetModelRef = groupResolution.modelRef;
-      modelResolution = { model: targetModelRef?.id, notice: groupResolution.notice, approval: groupResolution.approval };
-      if (!targetModelRef) throw new Error('The user selected the Group Agent default, but that binding is no longer configured.');
-      assertGroupModelReady(targetAgent, 'receiver', targetModelRef);
-    } else {
-      if (params.modelRef) throw new Error('A structured Group Agent modelRef cannot be used for a CLI target.');
-      modelResolution = await resolveDispatchModel({
-        targetAgent, requestedModel: params.model,
-        requestedByUser: params.modelRequestedByUser === true,
-        initiatorAgent, title: params.title, handler: this.modelApprovalHandler,
-      });
-    }
+    const initiatorModel = resolveInitiatorModel(initiatorAgent, params.initiatorModel);
+    const modelResolution = await resolveDispatchModel({
+      targetAgent, requestedModel: params.model,
+      requestedByUser: params.modelRequestedByUser === true,
+      initiatorAgent, title: params.title, handler: this.modelApprovalHandler,
+    });
     const targetModel = modelResolution.model;
     const modelNotice = modelResolution.notice;
 
     // Dedicated reviewer model: the sender-side default, pinned for the whole
     // task. It must never fall back to the receiver default, or a same-agent task
     // would trivially review itself with the execution model.
-    const reviewerModelRef = isGroupAgentId(initiatorAgent) ? initiatorModelRef : undefined;
-    if (reviewFlow === 'dedicated' && isGroupAgentId(initiatorAgent)) {
-      if (!reviewerModelRef) throw new Error(`Group reviewer ${initiatorAgent} has no configured sender-side model.`);
-      assertGroupModelReady(initiatorAgent, 'initiator', reviewerModelRef);
-    }
-    const reviewerModel = reviewerModelRef?.id ??
-      (reviewFlow === 'dedicated'
+    const reviewerModel = reviewFlow === 'dedicated'
         ? resolveConfiguredModel(initiatorAgent, undefined, 'initiator')
-        : undefined);
+        : undefined;
     if (reviewFlow === 'dedicated' && initiatorAgent === targetAgent) {
-      if (isGroupAgentId(initiatorAgent) && (!reviewerModelRef || !targetModelRef)) {
-        throw new Error('Same Group Agent dispatch requires explicit, role-specific sender and receiver model bindings.');
-      }
       if (!reviewerModel) {
         throw new Error(
           `Refusing same-agent task "${params.title}": configure a sender-side reviewer model for ` +
@@ -258,9 +194,7 @@ export class AsyncDispatcher {
             `${initiatorAgent} (agentMeshBridge.models.*) so the reviewer and the executor cannot be the same model.`,
         );
       }
-      const samePinnedModel = reviewerModelRef && targetModelRef
-        ? JSON.stringify(reviewerModelRef) === JSON.stringify(targetModelRef)
-        : reviewerModel === targetModel;
+      const samePinnedModel = reviewerModel === targetModel;
       if (samePinnedModel) {
         throw new Error(
           `Refusing same-agent task "${params.title}": reviewer and receiver both run ${reviewerModel}. ` +
@@ -275,14 +209,6 @@ export class AsyncDispatcher {
     }
     const worktree: WorktreeInfo = createTaskWorktree(resolveGitRepository(repositoryPath, this.storageDir), threadId, this.storageDir);
     const workspacePath = worktree.path;
-    const groupBindingSnapshot = (agent: AgentId, modelRef: GroupModelRef | undefined): GroupAgentBindingSnapshot | undefined => {
-      if (!isGroupAgentId(agent) || !modelRef) return undefined;
-      const binding = loadGroupAgentConfig()?.agents.find((entry) => entry.id === agent);
-      if (!binding || !binding.enabled || !binding.toolsAuthorized) throw new Error(`Group Agent ${agent} changed before task snapshot creation.`);
-      return { agentId: agent, revision: binding.revision, source: binding.source, ...(binding.baseUrl ? { baseUrl: binding.baseUrl } : {}), modelRef };
-    };
-    const targetGroupBindingSnapshot = groupBindingSnapshot(targetAgent, targetModelRef);
-    const initiatorGroupBindingSnapshot = groupBindingSnapshot(initiatorAgent, initiatorModelRef);
     const tempCandidate: DelegationThread = {
       threadId,
       title: params.title || 'Untitled Delegation Task',
@@ -296,17 +222,6 @@ export class AsyncDispatcher {
       ...(reviewFlow === 'dedicated'
         ? {
             reviewFlow,
-            requesterSessionId: callerSessionId,
-            requesterAgent: params.requesterContext?.agent || requesterAgent,
-            requesterModel: params.requesterContext ? undefined : requesterModel.model,
-            requesterModelSource: params.requesterContext ? 'none' : requesterModel.source,
-            ...(params.requesterContext
-              ? {
-                  requesterBinding: params.requesterContext.binding,
-                  requesterSubmissionId: params.requesterContext.submissionId,
-                  requesterSubmissionFingerprint: params.requesterContext.fingerprint,
-                }
-              : {}),
             reviewerModel,
             reviewerModelSource: reviewerModel ? ('sender-configured' as const) : ('none' as const),
             reviewBootstrap: { phase: 'pending' as const, attempts: 0 },
@@ -315,13 +230,8 @@ export class AsyncDispatcher {
       workspacePath,
       ...(worktree ? { worktree } : {}),
       initiatorModel: initiatorModel.model,
-      initiatorModelRef,
       initiatorModelSource: initiatorModel.source,
       targetModel,
-      targetModelRef,
-      reviewerModelRef,
-      ...(targetGroupBindingSnapshot ? { targetGroupBindingSnapshot } : {}),
-      ...(initiatorGroupBindingSnapshot ? { initiatorGroupBindingSnapshot } : {}),
       modelNotice,
       modelApproval: modelResolution.approval,
       summary: {
@@ -611,7 +521,6 @@ export class AsyncDispatcher {
           taskThreadId: thread.threadId,
           taskRound: roundNumber,
           model: thread.targetModel,
-          modelRef: thread.targetModelRef,
           role: 'developer',
           previousTokenUsage: readStoredRoundUsage(this.taskStore, thread.threadId, roundNumber),
           onChildPid: (pid) => {

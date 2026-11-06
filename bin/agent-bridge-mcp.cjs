@@ -10,7 +10,7 @@ const fs = require('fs');
 const profileIndex = process.argv.indexOf('--profile');
 if (profileIndex !== -1) {
   const profile = process.argv[profileIndex + 1];
-  if (!['mesh-agent', 'copilot-requester'].includes(profile)) {
+  if (profile !== 'mesh-agent') {
     console.error('[agent-bridge-mcp] Unknown server profile.');
     process.exit(2);
   }

@@ -15,7 +15,7 @@ export class ActiveAgentResolver {
   }
 
   public setManualOverride(agent: AgentId | null): void {
-    if (agent && !agent.startsWith('copilot_group:')) assertCanExecute(agent, 'be selected as the default receiver');
+    if (agent) assertCanExecute(agent, 'be selected as the default receiver');
     this.manualOverride = agent;
   }
 
@@ -193,5 +193,21 @@ export class ActiveAgentResolver {
     } catch {
       return 0;
     }
+  }
+}
+
+/** Apply a persisted setting without letting a removed agent abort extension startup. */
+export function applyConfiguredAgentDefault(
+  resolver: ActiveAgentResolver,
+  selected: string | undefined,
+  onUnsupported: (selected: string | undefined) => void,
+): boolean {
+  try {
+    resolver.setManualOverride(selected && selected !== 'auto' ? selected as AgentId : null);
+    return true;
+  } catch {
+    resolver.setManualOverride(null);
+    onUnsupported(selected);
+    return false;
   }
 }

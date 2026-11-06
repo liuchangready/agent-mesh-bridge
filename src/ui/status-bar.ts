@@ -31,7 +31,6 @@ export class StatusBarController {
       claude_code: 'Claude Code',
       codex: 'Codex',
       deepseek_harness: 'DeepSeek Harness',
-      vscode_chat: 'VSCode Chat',
     };
 
     let statusSymbol = '$(pass-filled)';

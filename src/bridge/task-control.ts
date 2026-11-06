@@ -9,7 +9,6 @@ import {
   describeNativeSessionCleanup,
 } from './native-session-cleanup';
 import { TaskStore } from './task-store';
-import { cleanupGroupAgentTaskArtifacts } from './group-agent-mailbox';
 import { removeTaskArtifacts } from './task-summary';
 import { removeTaskWorktree } from './git-worktree';
 import { changedFiles, currentHead } from './git-worktree';
@@ -257,7 +256,6 @@ export class TaskControlService {
     // already gone, so a cleanup failure can never resurrect the task.
     removeTaskArtifacts(threadId, this.storageDir);
     if (thread.worktree) removeTaskWorktree(thread.worktree);
-    cleanupGroupAgentTaskArtifacts(thread, this.storageDir);
 
     // Clean up the receiver's native conversation(s) only after the ledger entry
     // is gone: a cleanup failure must never leave a "deleted but still listed"

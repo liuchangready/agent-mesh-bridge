@@ -1,7 +1,7 @@
 {
   "name": "agent-mesh-bridge",
   "displayName": "Agent Mesh Bridge",
-  "description": "Agent Mesh Bridge for Antigravity, Codex, Claude Code and DeepSeek Harness, with GitHub Copilot requester-only support in VS Code",
+  "description": "Agent Mesh Bridge for Antigravity, Codex, Claude Code and DeepSeek Harness",
   "version": "1.2.18",
   "publisher": "agent-mesh",
   "author": "Antigravity Team",
@@ -27,7 +27,6 @@
     "deepseek",
     "dsh",
     "mcp",
-    "copilot",
     "multi-agent"
   ],
   "main": "./out/extension.js",
@@ -38,9 +37,6 @@
     "onStartupFinished"
   ],
   "contributes": {
-    "mcpServerDefinitionProviders": [
-      { "id": "agent-mesh-bridge.copilot", "label": "Agent Mesh Bridge · Copilot requester" }
-    ],
     "viewsContainers": {
       "activitybar": [
         {
@@ -67,34 +63,6 @@
       ]
     },
     "commands": [
-      {
-        "command": "agent-mesh-bridge.refreshCopilotModels",
-        "title": "Copilot: Refresh VS Code Model Catalog"
-      },
-      {
-        "command": "agent-mesh-bridge.addCopilotModelGroup",
-        "title": "Copilot: Add Model Group"
-      },
-      {
-        "command": "agent-mesh-bridge.importCopilotModelGroups",
-        "title": "Copilot: Import Group Names from JSONC"
-      },
-      {
-        "command": "agent-mesh-bridge.manageCopilotModelGroup",
-        "title": "Copilot: Manage Model Group"
-      },
-      {
-        "command": "agent-mesh-bridge.configureCopilotGroupAgent",
-        "title": "Copilot: 配置分组 Agent 下发者 / 接收者"
-      },
-      {
-        "command": "agent-mesh-bridge.configureCopilotHostModels",
-        "title": "Copilot: 使用已发现的宿主模型分组"
-      },
-      {
-        "command": "agent-mesh-bridge.callCopilotModel",
-        "title": "Copilot: Call Model"
-      },
       {
         "command": "agent-mesh-bridge.refreshAgentStatus",
         "title": "Refresh Agent Nodes Status",
@@ -182,16 +150,6 @@
     "menus": {
       "view/title": [
         {
-          "command": "agent-mesh-bridge.refreshCopilotModels",
-          "when": "view == agent-mesh-bridge.agent-nodes",
-          "group": "navigation"
-        },
-        {
-          "command": "agent-mesh-bridge.addCopilotModelGroup",
-          "when": "view == agent-mesh-bridge.agent-nodes",
-          "group": "navigation"
-        },
-        {
           "command": "agent-mesh-bridge.refreshAgentStatus",
           "when": "view == agent-mesh-bridge.agent-nodes",
           "group": "navigation"
@@ -215,12 +173,12 @@
       "view/item/context": [
         {
           "command": "agent-mesh-bridge.clearAgentExhaustion",
-          "when": "view == agent-mesh-bridge.agent-nodes && viewItem != agent_node_requester_only",
+          "when": "view == agent-mesh-bridge.agent-nodes",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.selectAgentModel",
-          "when": "view == agent-mesh-bridge.agent-nodes && viewItem != agent_node_requester_only",
+          "when": "view == agent-mesh-bridge.agent-nodes",
           "group": "1_actions"
         },
         {
@@ -286,12 +244,7 @@
         "agentMeshBridge.defaultAgent": {
           "type": "string",
           "default": "auto",
-          "markdownDescription": "Default receiver Agent for new tasks. Built-in CLI Agent IDs and explicitly enabled Copilot Group IDs are supported. A disabled, unavailable, or unauthorized explicit default fails admission instead of silently selecting another Agent."
-        },
-        "agentMeshBridge.defaultReviewer": {
-          "type": "string",
-          "default": "caller",
-          "markdownDescription": "Default sender/reviewer for new dedicated tasks. `caller` preserves the requesting Agent; an explicitly enabled Copilot Group ID can be selected from that group's menu. Legacy review remains caller-owned."
+          "markdownDescription": "Default receiver Agent for new tasks. Built-in CLI Agent IDs are supported. An unavailable explicit default fails admission instead of silently selecting another Agent."
         },
         "agentMeshBridge.models.antigravity": {
           "type": "string",
@@ -398,17 +351,6 @@
           ],
           "default": "dedicated",
           "markdownDescription": "How NEW tasks are reviewed. `dedicated` (default): the bridge starts a fresh reviewer conversation which dispatches the task and later reviews the developer report; this allows the same agent on both ends as long as the reviewer and executor models differ. `legacy`: resume the requester's own conversation for review (the old behaviour, kept as a rollback switch). Existing tasks never change topology."
-        },
-        "agentMeshBridge.copilot.enabled": {
-          "type": "boolean",
-          "default": false,
-          "markdownDescription": "Explicitly enable the requester-only GitHub Copilot MCP entry. Requires a trusted local desktop workspace and a configured CLI reviewer. The original Copilot chat is not resumed automatically."
-        },
-        "agentMeshBridge.copilot.reviewer": {
-          "type": "string",
-          "enum": ["", "codex", "claude_code", "antigravity", "deepseek_harness"],
-          "default": "",
-          "markdownDescription": "CLI agent used as the dedicated reviewer for Copilot-submitted tasks. No Copilot task entry is published until one is selected."
         },
         "agentMeshBridge.concurrency.enabled": {
           "type": "boolean",

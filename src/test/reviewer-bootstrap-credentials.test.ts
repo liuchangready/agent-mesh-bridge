@@ -78,7 +78,6 @@ describe('dedicated reviewer bootstrap identity', () => {
       receiverSessionId: `receiver-${threadId}`,
       workspacePath: tempDir,
       reviewFlow: 'dedicated',
-      requesterSessionId: `requester-${threadId}`,
       reviewerModel: 'gpt-6-pro',
       targetModel: 'flash',
       reviewBootstrap: { phase: 'pending', attempts: 0 },

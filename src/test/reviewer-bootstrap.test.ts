@@ -43,7 +43,6 @@ function makeDedicatedThread(threadId: string, overrides: Partial<DelegationThre
     receiverSessionId: 'receiver-session-1',
     workspacePath: makeTempDir('bridge-bootstrap-ws-'),
     reviewFlow: 'dedicated',
-    requesterSessionId: 'requester-session',
     reviewerModel: 'gpt-6-pro',
     targetModel: 'gpt-6-flash',
     reviewBootstrap: { phase: 'pending', attempts: 0 },
