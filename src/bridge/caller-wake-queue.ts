@@ -110,51 +110,19 @@ export class CallerWakeQueue {
     }
   }
 
-  /**
-   * Take the caller's wake slot.
-   *
-   * @returns true when this process may launch the wake now.
-   */
+  /** The native-session lease is the only writer admission; this remains a compatibility hook. */
   public tryAcquire(callerSessionId: string): boolean {
-    this.ensureDirs(callerSessionId);
-    const lockPath = this.lockPath(callerSessionId);
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const payload: WakeOwner = { pid: process.pid, at: Date.now() };
-      try {
-        fs.writeFileSync(lockPath, JSON.stringify(payload), { encoding: 'utf8', flag: 'wx' });
-        return true;
-      } catch (err: any) {
-        if (err?.code !== 'EEXIST') return false;
-        const owner = this.readOwner(callerSessionId);
-        if (!owner) {
-          // Fresh file that has not been written yet, or a corrupt one.
-          try {
-            if (Date.now() - fs.statSync(lockPath).mtimeMs < 5_000) return false;
-            fs.unlinkSync(lockPath);
-          } catch {}
-          continue;
-        }
-        if (this.isOwnerLive(owner)) return false;
-        try {
-          fs.unlinkSync(lockPath);
-        } catch {}
-      }
-    }
-    return false;
+    return !!callerSessionKey(callerSessionId);
   }
 
   /** Release the slot. Only the process that owns it may clear it. */
   public release(callerSessionId: string): void {
-    const owner = this.readOwner(callerSessionId);
-    if (owner && owner.pid !== process.pid) return;
-    try {
-      fs.unlinkSync(this.lockPath(callerSessionId));
-    } catch {}
+    void callerSessionId;
   }
 
   public isBusy(callerSessionId: string): boolean {
-    const owner = this.readOwner(callerSessionId);
-    return !!owner && this.isOwnerLive(owner);
+    void callerSessionId;
+    return false;
   }
 
   /** Queue a wake that could not start now. */

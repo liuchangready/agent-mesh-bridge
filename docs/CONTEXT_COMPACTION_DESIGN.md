@@ -256,3 +256,7 @@ sequenceDiagram
 - 最新日志按轮号数值选择、分页读写边界。
 
 `src/test/mcp-server.test.ts` 覆盖：默认视图截断/最新轮全量/日志不默认下发、`includeRawLogs` 全量、`get_round_raw_log` 分页与上限钳制。
+
+## 原生会话压缩 v2 的边界
+
+账本上下文滞后压缩 v1 只定义 `round.output` 的归档、卡片与有界读取，不管理 CLI 原生会话。原生层的完整约束、Codex 控制面、持久化证据、会话写租约、恢复资料、轮级 token components、UI 与文件生命周期见 [NATIVE_SESSION_COMPACTION_DESIGN.md](docs/NATIVE_SESSION_COMPACTION_DESIGN.md)。v1 的最新轮证据、胶囊不回填 prompt 与 best-effort 约束保持不变。

@@ -288,6 +288,42 @@ export function buildReviewerBootstrapPrompt(thread: DelegationThread, token?: s
   ].join('\n');
 }
 
+/** Consume the exact one-time reviewer credential and persist its handoff once. */
+export function confirmReviewerBootstrapTask(
+  taskStore: TaskStore,
+  threadId: string,
+  credential: { token?: string; hostPid?: number },
+  root?: string,
+): DelegationThread {
+  taskStore.loadFromDisk();
+  let thread = taskStore.getTask(threadId);
+  if (!thread) throw new Error(`Reviewer bootstrap thread not found: ${threadId}`);
+  if (thread.status !== 'queued' || thread.reviewFlow !== 'dedicated')
+    throw new Error(`Reviewer bootstrap for ${threadId} is no longer a queued dedicated task.`);
+  if (thread.reviewBootstrap?.phase === 'confirmed') throw new Error(`Thread ${threadId} was already dispatched by its reviewer.`);
+  if (thread.reviewBootstrap?.phase === 'failed') throw new Error(`Thread ${threadId} failed its reviewer bootstrap; it cannot be dispatched anymore.`);
+  const record = readReviewerBootstrapToken(threadId, root);
+  if (!record) throw new Error(`Reviewer bootstrap token for ${threadId} is missing or was already consumed.`);
+  if (credential.token && record.token !== credential.token)
+    throw new Error(`Reviewer bootstrap token mismatch for ${threadId}.`);
+  if (!credential.token && credential.hostPid && record.hostPid !== credential.hostPid)
+    throw new Error(`Reviewer bootstrap host process mismatch for ${threadId}.`);
+  if (!credential.token && !credential.hostPid)
+    throw new Error(`Reviewer bootstrap credential is missing for ${threadId}.`);
+  if (record.agent !== thread.initiatorAgent) throw new Error(`Reviewer bootstrap agent mismatch for ${threadId}.`);
+  taskStore.loadFromDisk();
+  const latest = taskStore.getTask(threadId);
+  if (!latest || latest.status !== 'queued' || latest.reviewFlow !== 'dedicated')
+    throw new Error(`Reviewer bootstrap for ${threadId} was stopped before confirmation; its token was not consumed.`);
+  thread = latest;
+  clearReviewerBootstrapToken(threadId, root);
+  thread.reviewBootstrap = { ...(thread.reviewBootstrap || { phase: 'pending', attempts: 0 }), phase: 'confirmed' };
+  thread.status = 'queued';
+  thread.summary.lastOutputSnippet = 'Reviewer dispatched the task; waiting for the bootstrap process to persist its native session.';
+  taskStore.upsertTask(thread);
+  return thread;
+}
+
 /**
  * Launches and supervises the one bootstrap turn per dedicated task.
  *
@@ -375,7 +411,7 @@ export class ReviewerBootstrapService {
 
   /** Launch the fresh reviewer conversation and wait for its bootstrap turn. */
   private async launch(thread: DelegationThread): Promise<void> {
-    assertCanExecute(thread.initiatorAgent, 'bootstrap as a reviewer');
+    assertCanExecute(thread.initiatorAgent, 'bootstrap as a reviewer', 'initiator');
     const store = this.deps.taskStore;
     const root = this.deps.storageDir || path.dirname(store.getStoragePath());
     store.loadFromDisk();
@@ -455,7 +491,10 @@ export class ReviewerBootstrapService {
         cwd: thread.workspacePath,
         taskThreadId: thread.threadId,
         taskRound: 0,
+        nativeSessionRole: 'reviewer',
         model: thread.reviewerModel,
+        modelRef: thread.reviewerModelRef,
+        role: 'bootstrap',
         markAsReceiver: false,
         timeoutMs: this.deps.timeoutMs ?? 3 * 60 * 1000,
         silenceTimeoutMs: 2 * 60 * 1000,

@@ -1,12 +1,16 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { execFileSync } from 'child_process';
 import { lookupInPath } from '../bridge/platform';
+import { getBridgeHome } from '../bridge/model-catalog';
+import { writeGroupAgentHost, GROUP_AGENT_HOST_FILENAME } from '../bridge/group-agent-registry';
 
 export const COPILOT_MCP_PROVIDER_ID = 'agent-mesh-bridge.copilot';
 
 export function registerCopilotMcpProvider(context: vscode.ExtensionContext): string {
   const hostInstanceId = require('crypto').randomUUID();
+  const hostGeneration = Date.now();
   const heartbeatFile = path.join(context.globalStorageUri.fsPath, `copilot-host-${hostInstanceId}.json`);
   let timer: NodeJS.Timeout | undefined;
 
@@ -33,6 +37,29 @@ export function registerCopilotMcpProvider(context: vscode.ExtensionContext): st
       const tmp = `${heartbeatFile}.${process.pid}.tmp`;
       fs.writeFileSync(tmp, JSON.stringify(payload), 'utf8');
       fs.renameSync(tmp, heartbeatFile);
+      const bridgeHome = getBridgeHome();
+      const groupHostFile = path.join(bridgeHome, GROUP_AGENT_HOST_FILENAME);
+      if (workspaceUri?.scheme === 'file' && vscode.workspace.isTrusted && vscode.env.uiKind !== vscode.UIKind.Web && !vscode.env.remoteName && vscode.workspace.workspaceFolders?.length === 1) {
+        try {
+          const commonDirRaw = execFileSync('git', ['-C', workspaceUri.fsPath, 'rev-parse', '--git-common-dir'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+          const commonDir = path.resolve(workspaceUri.fsPath, commonDirRaw);
+          if (commonDir && fs.existsSync(commonDir)) writeGroupAgentHost({
+            version: 1, hostInstanceId, generation: hostGeneration, pid: process.pid,
+            workspaceUri: workspaceUri.toString(), repositoryCommonDir: fs.realpathSync(commonDir),
+            trusted: true, localDesktop: true, updatedAt: Date.now(),
+          }, bridgeHome);
+        } catch {
+          try {
+            const existing = JSON.parse(fs.readFileSync(groupHostFile, 'utf8'));
+            if (existing.hostInstanceId === hostInstanceId) fs.unlinkSync(groupHostFile);
+          } catch {}
+        }
+      } else {
+        try {
+          const existing = JSON.parse(fs.readFileSync(groupHostFile, 'utf8'));
+          if (existing.hostInstanceId === hostInstanceId) fs.unlinkSync(groupHostFile);
+        } catch {}
+      }
     } catch (error) {
       console.warn('[Agent Mesh Bridge] Could not refresh Copilot MCP host binding:', error);
     }

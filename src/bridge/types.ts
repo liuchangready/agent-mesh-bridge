@@ -2,12 +2,16 @@
  * Data contracts and core types for Agent Mesh Bridge.
  */
 
-export type AgentId =
+export type CliAgentId =
   | 'antigravity'
   | 'claude_code'
   | 'codex'
   | 'deepseek_harness'
   | 'vscode_chat';
+
+/** A configured Copilot model group is executable only through the host registry. */
+export type GroupAgentId = `copilot_group:${string}`;
+export type AgentId = CliAgentId | GroupAgentId;
 
 export type TargetAgentSelection = 'default' | AgentId;
 
@@ -119,7 +123,8 @@ export type StreamGapPolicy = 'warn' | 'fail';
  */
 export const DEFAULT_STREAM_GAP_POLICY: StreamGapPolicy = 'warn';
 
-export interface ResponseAssessment {
+export interface CliResponseAssessment {
+  transport?: 'cli';
   /** exitCode === 0 AND actual output existed AND no unattributable stall. */
   success: boolean;
   /** Stable response status code, e.g. OK / NONZERO_EXIT / EMPTY_OUTPUT / STREAM_STALLED. */
@@ -130,6 +135,26 @@ export interface ResponseAssessment {
   /** Non-fatal findings (e.g. a long gap that was downgraded to a warning). */
   warnings?: AssessmentWarning[];
 }
+
+export interface BridgeAgentAssessment {
+  transport: 'bridge-agent';
+  success: boolean;
+  errorCode: string;
+  /** CLI stream metrics do not apply; zero chunks and no stdout are intentional. */
+  stream: StreamAssessment;
+  /** -1 means this transport has no operating-system CLI exit code. */
+  exitCode: -1;
+  runId: string;
+  sessionId: string;
+  finalEvent: boolean;
+  toolCallsCompleted: number;
+  startedAt: string;
+  completedAt: string;
+  warnings?: AssessmentWarning[];
+  reason?: string;
+}
+
+export type ResponseAssessment = CliResponseAssessment | BridgeAgentAssessment;
 
 /**
  * Merge-request handoff recorded by the caller/reviewer after a task (or a
@@ -280,6 +305,64 @@ export interface TokenUsageMetrics {
   notes?: string;
   /** ISO8601 collection timestamp. */
   collectedAt: string;
+  /** Per operation/attempt accounting; absent on historical ledger entries. */
+  components?: TokenUsageComponent[];
+}
+
+export interface TokenUsageComponent {
+  id: string;
+  kind: 'business' | 'native_compaction';
+  role: 'developer' | 'reviewer';
+  agent: AgentId;
+  model?: string;
+  uncachedInputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  outputTokens: number;
+  reasoningTokens?: number;
+  nativeTotalTokens?: number;
+  costUsd?: number;
+  costSource?: TokenCostSource;
+  source: TokenMetricSource;
+  available: boolean;
+  partial?: boolean;
+}
+
+export type NativeCompactionPhase =
+  | 'prepared' | 'running' | 'succeeded' | 'skipped' | 'failed' | 'interrupted' | 'unknown';
+
+export interface NativeSessionCompactionOperation {
+  id: string;
+  role: 'developer' | 'reviewer';
+  agent: AgentId;
+  sessionId: string;
+  model?: string;
+  reason: 'context_pressure' | 'turn_budget' | 'manual';
+  phase: NativeCompactionPhase;
+  revision: number;
+  startedAt: string;
+  finishedAt?: string;
+  nativeTurnId?: string;
+  errorCode?: string;
+  error?: string;
+  interruption?: TaskInterruption;
+  recoveryPath: string;
+  logPath: string;
+}
+
+export interface NativeSessionCompactionCursor {
+  revision?: number;
+  sessionId: string;
+  lastOperationId?: string;
+  turnsSinceCompaction: number;
+  recoveryVersion?: string;
+  recoveryDeliveredVersion?: string;
+  recoveryVerifiedOperationId?: string;
+  autoDisabledReason?: string;
+  autoSuppressedOperationId?: string;
+  turnCounterResetId?: string;
+  recentBusinessTurnIds?: string[];
+  recentNativeAutoCompactionEventIds?: string[];
 }
 
 /**
@@ -372,6 +455,7 @@ export interface DelegationRound {
    * `output`).
    */
   tokenUsage?: TokenUsageMetrics;
+  nativeSessionCompactions?: NativeSessionCompactionOperation[];
 }
 
 export interface ThreadSummary {
@@ -444,6 +528,9 @@ export interface TaskFinalSummary {
   totalTokens?: number;
   promptTokens?: number;
   outputTokens?: number;
+  tokenUsageByAgent?: Partial<Record<AgentId, number>>;
+  tokenUsageByModel?: Record<string, number>;
+  nativeCompactions?: { count: number; warnings: string[] };
 }
 
 /**
@@ -572,6 +659,13 @@ export interface DelegationThread {
   title: string; // Brief title, e.g. "Fix TCP cursor drift"
   initiatorAgent: AgentId; // Initiator (Caller A)
   targetAgent: AgentId; // Receiver (Target B)
+  /** Exact host/API model identity pinned for Bridge Group Agent tasks. */
+  targetModelRef?: GroupModelRef;
+  initiatorModelRef?: GroupModelRef;
+  reviewerModelRef?: GroupModelRef;
+  /** Non-secret Group endpoint/identity snapshot used by the host broker. */
+  targetGroupBindingSnapshot?: GroupAgentBindingSnapshot;
+  initiatorGroupBindingSnapshot?: GroupAgentBindingSnapshot;
   status: ThreadStatus; // Lifecycle status; each task has its own isolated Git worktree.
   currentRound: number; // Current round (1: initial, 2+: rework)
   createdAt: string; // ISO8601 creation timestamp
@@ -579,6 +673,7 @@ export interface DelegationThread {
 
   // Native session bindings for continuous rework resume
   receiverSessionId: string; // Native session ID for target agent
+  nativeSessionCompaction?: Partial<Record<'developer' | 'reviewer', NativeSessionCompactionCursor>>;
   /**
    * True once the receiver's real native session is known: either an agent
    * emitted its native id, or Claude's preassigned `--session-id` is the native
@@ -752,6 +847,7 @@ export interface DispatchTaskParams {
    * in VS Code. Otherwise the configured default is used.
    */
   model?: string;
+  modelRef?: GroupModelRef;
   /**
    * Caller declares the user themselves specified `model`. Defaults to false, so
    * a caller guessing a "better" model cannot silently switch away from the
@@ -796,6 +892,8 @@ export interface ModelApprovalRecord {
   requestedModel: string;
   /** The agent's configured default (what runs unless approved). */
   defaultModel?: string;
+  requestedModelRef?: GroupModelRef;
+  defaultModelRef?: GroupModelRef;
   at: string;
 }
 
@@ -803,6 +901,7 @@ export interface ModelApprovalRecord {
 export interface ExecutorOverride {
   targetAgent?: AgentId;
   model?: string;
+  modelRef?: GroupModelRef;
   /** The user named this model (see the model-approval rule). */
   modelRequestedByUser?: boolean;
 }
@@ -816,6 +915,8 @@ export interface TaskRetargetRecord {
   toAgent: AgentId;
   fromModel?: string;
   toModel?: string;
+  fromModelRef?: GroupModelRef;
+  toModelRef?: GroupModelRef;
   /** Native session dropped because a different agent cannot resume it. */
   previousReceiverSessionId?: string;
   sessionReset: boolean;
@@ -921,8 +1022,20 @@ export interface AgentInfo {
 export interface AgentMeshStatus {
   activeAgent: AgentId;
   resolvedMode: 'auto' | 'manual';
-  agents: Record<AgentId, AgentInfo>;
+  agents: Partial<Record<AgentId, AgentInfo>> & Record<CliAgentId, AgentInfo>;
   totalLedgerTasks: number;
+}
+
+export type GroupModelRef =
+  | { source: 'vscode-lm'; vendor: string; id: string }
+  | { source: 'openai-compatible'; id: string; origin: string; bindingRevision: number };
+
+export interface GroupAgentBindingSnapshot {
+  agentId: `copilot_group:${string}`;
+  revision: number;
+  source: 'vscode-lm' | 'openai-compatible';
+  baseUrl?: string;
+  modelRef: GroupModelRef;
 }
 
 /**

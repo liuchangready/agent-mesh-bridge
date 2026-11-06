@@ -257,6 +257,7 @@ describe('TaskControlService - pause/delete reasons', () => {
 
     const round = await reworkController.resumePausedTask('thread_control_1');
     assert.strictEqual(round.status, 'running');
+    assert.strictEqual(round.interruption, undefined, 'resumed round clears its pause marker');
 
     const deadline = Date.now() + 2_000;
     while (Date.now() < deadline) {
@@ -268,6 +269,7 @@ describe('TaskControlService - pause/delete reasons', () => {
     assert.strictEqual(executedPrompt, 'do the work');
     assert.strictEqual(thread.status, 'waiting_review');
     assert.strictEqual(thread.interruption, undefined, 'current interruption cleared');
+    assert.strictEqual(thread.rounds[0].interruption, undefined, 'persisted round clears its pause marker');
     assert.strictEqual(thread.interruptions?.[0]?.reason, 'pause for inspection', 'history kept');
   });
 

@@ -112,7 +112,24 @@
 
 详细架构设计见 [DESIGN.md](DESIGN.md)。
 
+### 版本边界：账本压缩 v1 与原生会话压缩 v2
+
+第 20 条“账本卫生、不碰原生会话”限定为 [账本上下文滞后压缩 v1](docs/CONTEXT_COMPACTION_DESIGN.md)：它只约束 `round.output` 归档、卡片、胶囊与读取边界。新增原生层见 [原生会话压缩设计](docs/NATIVE_SESSION_COMPACTION_DESIGN.md)，只允许调用已认证的原生控制面、保持原 session ID；严禁改写原生文件。v1 的最新轮保真、胶囊不回填 prompt、best-effort 归档等约束继续有效。
+
+原生维护属于现有 developer/reviewer 角色，沿用 thread、worktree、分支、SHA 与合法模型路由，并增加覆盖到真实子进程退出的 `agent + normalized session ID` 写租约。维护须最小权限、拒绝交互；有界私有 stdio RPC 是业务 `stdin` 关闭及权限旁路规则的例外，不使用 `danger-full-access`。业务响应的退出码与实际最终文本双条件不变；维护用同 thread、本次原生 turn 的结构化完成与持久恢复证据，不能用 ACK 或空输出放宽业务规则。
+
+`round.tokenUsage` 可含按 operation/attempt ID 去重的 business/native-compaction 组件；根级兼容数字与组件一致，线程及 Agent/模型汇总从组件派生，不能再计入原生累计 usage。维护日志、恢复资料与可选导出随任务归档/删除；不得触碰 legacy caller/requester 会话。未认证适配保持 `needs_validation`，自动维护默认关闭。详见 v2 设计及验收边界。
+
 ---
+
+### 23. Group Agent transport compatibility
+
+Copilot model groups are a separate Bridge-owned transport, registered only by stable `copilot_group:<groupUuid>` entries published from the trusted local extension host. `vscode_chat` remains requester-only. CLI executable discovery and the four CLI static IDs are unchanged; task admission resolves registered transport and role capability instead of treating every Agent as a CLI binary.
+
+- CLI native sessions, invocation flags, unattended permissions, and `exitCode + stdout` assessment keep their existing behavior. Bridge Group Agent sessions are append-only Bridge-owned native history; the UI must identify their owner and transport. The user’s native Copilot chat is never copied, resumed, or deleted.
+- A Group Agent must have a current host/workspace binding, explicit tool authorization, an exact role model binding, and a successful user-triggered structured-tool probe. Unknown capability is unavailable. A `bridge-agent` result uses final-event assessment and never fabricates CLI stdout or exit code zero; missing native usage remains unavailable/partial.
+- The extension host owns model access and SecretStorage. Model/tool execution stays in the registered task worktree; tool paths must be contained after realpath resolution, command output is bounded and redacted, and command children are cancellable and receiver-marked. An unresolved persisted side-effect intent is not replayed automatically.
+- Existing one-task/one-role, receiver no-forwarding, dedicated reviewer, model approval, pinned worktree/base SHA, merge gate, token, pause/resume/delete, archive and tombstone requirements apply to this transport. Reviewer control actions must reuse the existing business services and validate the actual reviewer session/role lease; a prompt or model output is never a credential.
 
 ## 2. 技术栈与运行环境
 

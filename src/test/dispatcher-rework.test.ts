@@ -37,6 +37,7 @@ import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { getBridgeHome, invalidateConfiguredModelCache, saveModelDefaults } from '../bridge/model-catalog';
 import { clearReviewerBootstrapToken } from '../bridge/reviewer-bootstrap';
 import { describeModelRouting } from '../bridge/types';
+import { saveGroupAgentConfig } from '../bridge/group-agent-registry';
 
 describe('AsyncDispatcher and ReworkController Tests', () => {
   let tempDir: string;
@@ -128,6 +129,36 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.strictEqual(stored.targetModel, undefined);
     assert.strictEqual(stored.initiatorModel, undefined);
     assert.strictEqual(stored.initiatorModelSource, 'none');
+  });
+
+  test('default auto in the host mirror keeps resolver and CLI defaults working', async () => {
+    const previous = process.env.AGENT_MESH_BRIDGE_HOME;
+    process.env.AGENT_MESH_BRIDGE_HOME = tempDir;
+    try {
+      saveGroupAgentConfig({ version: 1, updatedAt: Date.now(), defaultAgent: 'auto', agents: [] }, tempDir);
+      resolver.setManualOverride('codex');
+      const result = await dispatcher.dispatchTask({ targetAgent: 'default', title: 'Auto default', prompt: 'run' });
+      assert.equal(result.targetAgent, 'codex');
+      const explicitCli = await dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'Explicit CLI', prompt: 'run' });
+      assert.equal(explicitCli.targetAgent, 'claude_code');
+    } finally {
+      if (previous === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME;
+      else process.env.AGENT_MESH_BRIDGE_HOME = previous;
+    }
+  });
+
+  test('an explicit but stale Group default fails admission instead of falling back to CLI', async () => {
+    const previous = process.env.AGENT_MESH_BRIDGE_HOME;
+    process.env.AGENT_MESH_BRIDGE_HOME = tempDir;
+    try {
+      saveGroupAgentConfig({ version: 1, updatedAt: Date.now(), defaultAgent: 'copilot_group:11111111-2222-4333-8444-555555555551', agents: [] }, tempDir);
+      resolver.setManualOverride('codex');
+      await assert.rejects(dispatcher.dispatchTask({ targetAgent: 'default', title: 'Stale Group default', prompt: 'run' }), /not ready/i);
+      assert.equal(taskStore.getAllTasks().length, 0);
+    } finally {
+      if (previous === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME;
+      else process.env.AGENT_MESH_BRIDGE_HOME = previous;
+    }
   });
 
   test('refuses a same-agent dispatch while the legacy review flow is active', async () => {

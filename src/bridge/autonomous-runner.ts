@@ -9,10 +9,13 @@ import {
   MESH_TASK_ROUND_ENV,
   MESH_TASK_THREAD_ENV,
   ResponseAssessment,
+  BridgeAgentAssessment,
+  GroupModelRef,
   StreamAssessment,
   StreamGapPolicy,
   TaskInterruption,
   TokenUsageMetrics,
+  isValidSessionId,
 } from './types';
 import { AgentDetector } from './agent-detector';
 import { buildDshHeadlessCommand } from './deepseek-harness';
@@ -27,9 +30,45 @@ import {
 } from './cancellation-registry';
 import type { TaskStore } from './task-store';
 import { assertCanExecute } from './agent-capabilities';
+import { isGroupAgentId, loadGroupAgentConfig, loadGroupAgentHost } from './group-agent-registry';
+import { GroupAgentMailboxClient } from './group-agent-mailbox';
+import { NativeSessionCompactor } from './native-session-compactor';
+import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
+import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 
 /** Default silence watchdog: 10 minutes (long model reasoning is not a hang). */
 export const DEFAULT_SILENCE_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Antigravity asserts its own liveness when it parks the root agent:
+ *
+ *   root agent idle; waiting for 2 background task(s) to finish
+ *
+ * A build/emulator pipeline invoked through `run_command` then runs for tens of
+ * minutes with the agent deliberately emitting nothing. Treating that silence as
+ * a hang killed healthy rounds mid-build (and took the child pipeline process
+ * tree down with them), so the declaration is matched and given its own budget.
+ */
+const BACKGROUND_WAIT_LINE = /root agent idle;\s*waiting for \d+ background task/i;
+
+/**
+ * How long a declared background wait may last before silence counts as a hang
+ * again. Bounded so a wedged child process cannot park a round forever; the
+ * overall round timeout still applies on top.
+ */
+export const BACKGROUND_WAIT_BUDGET_MS = 45 * 60 * 1000;
+
+/**
+ * Per-agent silence thresholds, overriding the default.
+ *
+ * Single tool calls that legitimately print nothing for a long time:
+ * Antigravity drives headless emulator + IL2CPP builds, and DSH runs long shell
+ * pipelines. Both can exceed ten minutes with no intermediate bytes.
+ */
+const AGENT_SILENCE_TIMEOUT_MS: Partial<Record<string, number>> = {
+  antigravity: 25 * 60 * 1000,
+  deepseek_harness: 15 * 60 * 1000,
+};
 
 /**
  * Network/transport level failures that are worth one more attempt with the
@@ -275,12 +314,17 @@ export interface RunOptions {
   taskThreadId?: string;
   /** Round being executed (used for diagnostics and receiver guard). */
   taskRound?: number;
+  /** Role for native-session ownership; reviewer bootstrap is round zero. */
+  nativeSessionRole?: 'developer' | 'reviewer';
   /**
    * Model to run this round with. When omitted the bridge falls back to the
    * model configured for the agent (settings -> `model-config.json`), and only
    * then to whatever default the CLI itself ships with.
    */
   model?: string;
+  modelRef?: GroupModelRef;
+  role?: 'developer' | 'reviewer' | 'bootstrap';
+  signal?: AbortSignal;
   /**
    * Token usage already recorded for this round.
    *
@@ -314,6 +358,8 @@ export interface RunOptions {
    * agent still running) can be detected and killed before another round starts.
    */
   onChildPid?: (pid: number | undefined) => void;
+  /** Called as soon as a first native session id appears while its process is alive. */
+  onNativeSessionId?: (sessionId: string, childPid?: number) => void;
 }
 
 export interface RunResult {
@@ -332,6 +378,8 @@ export interface RunResult {
   tokenUsage?: TokenUsageMetrics;
   /** The model this attempt actually ran with. */
   model?: string;
+  /** CLI results keep exitCode/stdout; Bridge Agent results carry a final-event assessment. */
+  transport?: 'cli' | 'bridge-agent';
 }
 
 export class AutonomousRunner {
@@ -342,6 +390,8 @@ export class AutonomousRunner {
   private activeChildren: Map<string, child_process.ChildProcess> = new Map();
   private localCancellations: Map<string, CancellationRequest> = new Map();
   private executingThreads: Set<string> = new Set();
+  private groupAgentExecutor?: (options: RunOptions, signal: AbortSignal) => Promise<{ text: string; toolCallsCompleted: number; modelRequests?: number; tokenUsage?: TokenUsageMetrics }>;
+  private activeGroupCancels = new Map<string, () => void>();
   /** Where an unspecified model comes from; replaceable for tests. */
   private modelResolver: (agent: AgentId) => string | undefined = (agent) =>
     resolveConfiguredModel(agent);
@@ -379,6 +429,7 @@ export class AutonomousRunner {
       at: new Date().toISOString(),
       by,
     });
+    this.activeGroupCancels.get(threadId)?.();
     const child = this.activeChildren.get(threadId);
     if (child) {
       try {
@@ -726,26 +777,276 @@ export class AutonomousRunner {
    * would silently resurrect a process the user asked to kill.
    */
   public async execute(options: RunOptions): Promise<RunResult> {
-    assertCanExecute(options.agent, 'run as an executor or reviewer');
+    const reviewer = options.role === 'reviewer' || options.role === 'bootstrap';
+    assertCanExecute(options.agent, reviewer ? 'run as a reviewer' : 'run as an executor', reviewer ? 'initiator' : 'receiver');
+    if (isGroupAgentId(options.agent)) {
+      const groupAgentId = options.agent as `copilot_group:${string}`;
+      const binding = loadGroupAgentConfig()?.agents.find((entry) => entry.id === options.agent);
+      const modelRef = options.modelRef || (reviewer ? binding?.initiatorModel : binding?.receiverModel);
+      if (!binding?.enabled || !binding.toolsAuthorized || !modelRef)
+        throw new Error('The Group Agent is disabled, unauthorized, or has no model for this role.');
+      const host = loadGroupAgentHost();
+      const thread = options.taskThreadId ? this.taskStore?.getTask(options.taskThreadId) : undefined;
+      const snapshot = thread
+        ? (reviewer ? thread.initiatorGroupBindingSnapshot : thread.targetGroupBindingSnapshot)
+        : {
+            agentId: groupAgentId, revision: binding.revision, source: binding.source,
+            ...(binding.baseUrl ? { baseUrl: binding.baseUrl } : {}), modelRef,
+          };
+      if (!snapshot || snapshot.agentId !== options.agent || JSON.stringify(snapshot.modelRef) !== JSON.stringify(modelRef))
+        throw new Error('This task has no matching pinned Group Agent binding snapshot; explicitly retarget it to bind the current group.');
+      if (snapshot.source !== binding.source || snapshot.baseUrl !== binding.baseUrl)
+        throw new Error('The Group Agent source or endpoint changed; explicitly retarget this task to rebind it.');
+      const runId = require('crypto').randomUUID() as string;
+      const startedAt = new Date().toISOString();
+      const start = monotonicNowMs();
+      const suspension = new HostSuspensionGuard();
+      suspension.start();
+      const aborter = new AbortController();
+      const initialTaskExisted = options.taskThreadId && this.taskStore
+        ? Boolean(this.taskStore.getTask(options.taskThreadId)) : false;
+      let cancellation: CancellationRequest | undefined = options.taskThreadId
+        ? this.checkPendingCancellation(options.taskThreadId, initialTaskExisted) : undefined;
+      const externalAbort = () => aborter.abort(options.signal?.reason);
+      options.signal?.addEventListener('abort', externalAbort, { once: true });
+      if (options.signal?.aborted) externalAbort();
+      if (options.taskThreadId) this.activeGroupCancels.set(options.taskThreadId, () => aborter.abort());
+      const cancellationPoll = options.taskThreadId ? setInterval(() => {
+        cancellation ||= this.checkPendingCancellation(options.taskThreadId, initialTaskExisted);
+        if (cancellation) aborter.abort(new Error(cancellation.reason));
+      }, 100) : undefined;
+      let timeout: NodeJS.Timeout | undefined;
+      let timedOut = false;
+      const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
+      const checkTimeout = () => {
+        suspension.sync();
+        const now = monotonicNowMs();
+        const activeMs = now - start - suspension.suspendedWithin(start, now);
+        if (activeMs >= timeoutMs) {
+          timedOut = true;
+          aborter.abort(new Error('Group Agent task timed out.'));
+        } else {
+          timeout = setTimeout(checkTimeout, Math.min(1000, Math.max(50, timeoutMs - activeMs)));
+          timeout.unref?.();
+        }
+      };
+      timeout = setTimeout(checkTimeout, Math.min(1000, timeoutMs));
+      timeout.unref?.();
+      try {
+        if (!host) throw new Error('The trusted local VS Code Group Agent host is offline; resume this task in its original session when the host returns.');
+        if (options.taskThreadId && this.taskStore) {
+          const task = this.taskStore.getTask(options.taskThreadId);
+          if (!task) cancellation ||= { action: 'delete', reason: 'Task was deleted before Group Agent execution started', at: new Date().toISOString(), by: 'task_store' };
+          else if (options.role !== 'bootstrap' && options.taskRound !== undefined && task.currentRound !== options.taskRound)
+            throw new Error('The Group Agent round is no longer current.');
+        }
+        cancellation ||= options.taskThreadId ? this.checkPendingCancellation(options.taskThreadId, initialTaskExisted) : undefined;
+        if (cancellation) throw new Error(cancellation.reason);
+        if (aborter.signal.aborted) throw new Error('Group Agent execution was cancelled before it started.');
+        const runOptions = { ...options, modelRef, extraEnv: { ...options.extraEnv, MESH_GROUP_RUN_ID: runId } };
+        const output = this.groupAgentExecutor
+          ? await this.groupAgentExecutor(runOptions, aborter.signal)
+          : await (async () => {
+              if (!options.taskThreadId || !options.cwd) throw new Error('Group Agent mailbox requests require a task id and task worktree.');
+              return new GroupAgentMailboxClient().execute({
+              runId,
+              threadId: options.taskThreadId || '', round: options.taskRound ?? thread?.currentRound ?? 1,
+              role: options.role || 'developer', agent: groupAgentId, sessionId: options.receiverSessionId,
+              worktree: options.cwd || '', prompt: options.prompt, modelRef, bindingSnapshot: snapshot,
+              isRework: options.isRework, timeoutMs, previousTokenUsage: options.previousTokenUsage,
+              extraEnv: Object.fromEntries(Object.entries(options.extraEnv || {}).filter(([key, value]) => key.startsWith('MESH_REVIEW_') && typeof value === 'string')) as Record<string, string>,
+            }, host, aborter.signal, options.onChildPid);
+            })();
+        cancellation ||= options.taskThreadId ? this.checkPendingCancellation(options.taskThreadId, initialTaskExisted) : undefined;
+        if (options.taskThreadId && this.taskStore) {
+          const task = this.taskStore.getTask(options.taskThreadId);
+          if (!task) cancellation ||= { action: 'delete', reason: 'Task was deleted before the Group Agent result was accepted', at: new Date().toISOString(), by: 'task_store' };
+          else if (options.role !== 'bootstrap' && options.taskRound !== undefined && task.currentRound !== options.taskRound)
+            throw new Error('The Group Agent round changed before its result was accepted.');
+        }
+        if (cancellation) aborter.abort(new Error(cancellation.reason));
+        if (aborter.signal.aborted) throw new Error(timedOut ? 'Group Agent task timed out.' : cancellation?.reason || 'Group Agent task cancelled.');
+        const text = output.text;
+        const ended = new Date().toISOString();
+        const assessment: BridgeAgentAssessment = {
+          transport: 'bridge-agent', success: Boolean(text.trim()),
+          errorCode: text.trim() ? 'OK' : 'EMPTY_OUTPUT', runId,
+          stream: { chunkCount: 0, stdoutBytes: 0, stderrBytes: 0, maxGapMs: 0, gapThresholdMs: DEFAULT_SILENCE_TIMEOUT_MS, hasActualOutput: Boolean(text.trim()), continuous: true },
+          exitCode: -1,
+          sessionId: options.receiverSessionId, finalEvent: Boolean(text.trim()),
+          toolCallsCompleted: output.toolCallsCompleted, startedAt, completedAt: ended,
+        };
+        const tokenUsage = output.tokenUsage
+          ? accumulateTokenUsage(options.previousTokenUsage, output.tokenUsage)
+          : options.previousTokenUsage
+            ? { ...options.previousTokenUsage, partial: true, attempts: (options.previousTokenUsage.attempts ?? 1) + (output.modelRequests ?? 1), notes: [options.previousTokenUsage.notes, 'This execution returned no native usage metadata.'].filter(Boolean).join(' ') }
+            : {
+                uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+                promptTokens: 0, outputTokens: 0, totalTokens: 0, agent: options.agent,
+                model: options.model, source: 'unavailable' as const, available: false, partial: true,
+                attempts: output.modelRequests ?? 1, notes: 'The model did not provide native usage metadata.', collectedAt: ended,
+              };
+        return {
+          exitCode: -1, stdout: '', stderr: '', extractedOutput: text, actualSessionId: options.receiverSessionId,
+          durationMs: Math.max(0, monotonicNowMs() - start), model: options.model,
+          transport: 'bridge-agent', assessment, tokenUsage,
+        };
+      } catch (error) {
+        if (options.taskThreadId) cancellation = this.consumeCancellation(options.taskThreadId) || cancellation;
+        const ended = new Date().toISOString();
+        const executorInterruption = (error as { interruption?: TaskInterruption } | null)?.interruption;
+        const interrupted: TaskInterruption | undefined = executorInterruption || (timedOut
+          ? { kind: 'timeout', reason: 'Group Agent task timed out.', at: ended, by: 'runner' }
+          : /Group Agent host (?:is offline|generation changed)/i.test(error instanceof Error ? error.message : String(error))
+            ? { kind: 'paused', reason: error instanceof Error ? error.message : String(error), at: ended, by: 'group-agent-host' }
+          : cancellation
+            ? { kind: cancellation.action === 'pause' ? 'paused' : cancellation.action === 'delete' ? 'deleted' : 'stopped', reason: cancellation.reason, at: cancellation.at, by: cancellation.by }
+            : aborter.signal.aborted
+              ? { kind: 'stopped', reason: error instanceof Error ? error.message : String(error), at: ended, by: 'runner' }
+              : undefined);
+        const failedUsage = (error as { tokenUsage?: TokenUsageMetrics; modelRequests?: number } | null)?.tokenUsage;
+        const tokenUsage = failedUsage
+          ? accumulateTokenUsage(options.previousTokenUsage, failedUsage)
+          : options.previousTokenUsage
+            ? { ...options.previousTokenUsage, partial: true, attempts: (options.previousTokenUsage.attempts ?? 1) + ((error as { modelRequests?: number } | null)?.modelRequests ?? 1), notes: [options.previousTokenUsage.notes, 'The interrupted execution returned no complete usage summary.'].filter(Boolean).join(' ') }
+            : undefined;
+        return {
+          exitCode: -1, stdout: '', stderr: '', extractedOutput: '', actualSessionId: options.receiverSessionId,
+          durationMs: Math.max(0, monotonicNowMs() - start),
+          error: error instanceof Error ? error.message : String(error),
+          transport: 'bridge-agent',
+          ...(interrupted ? { interruption: interrupted } : {}),
+          ...(tokenUsage ? { tokenUsage } : {}),
+          assessment: {
+            transport: 'bridge-agent', success: false, errorCode: interrupted ? interrupted.kind.toUpperCase() : 'BRIDGE_AGENT_ERROR',
+            stream: { chunkCount: 0, stdoutBytes: 0, stderrBytes: 0, maxGapMs: 0, gapThresholdMs: DEFAULT_SILENCE_TIMEOUT_MS, hasActualOutput: false, continuous: false },
+            exitCode: -1,
+            runId, sessionId: options.receiverSessionId, finalEvent: false,
+            toolCallsCompleted: (error as { toolCallsCompleted?: number } | null)?.toolCallsCompleted || 0, startedAt, completedAt: ended,
+            reason: interrupted?.reason || (error instanceof Error ? error.message : String(error)),
+          },
+        };
+      } finally {
+        options.signal?.removeEventListener('abort', externalAbort);
+        if (timeout) clearTimeout(timeout);
+        if (cancellationPoll) clearInterval(cancellationPoll);
+        suspension.stop();
+        if (options.taskThreadId) this.activeGroupCancels.delete(options.taskThreadId);
+      }
+    }
     const maxRetries = options.maxRetries ?? 3;
     const baseBackoffMs = options.retryBackoffMs ?? 2000;
     const taskThreadId = options.taskThreadId;
+    const nativeRole = options.nativeSessionRole || 'developer';
     const initialTaskExisted =
       taskThreadId && this.taskStore ? Boolean(this.taskStore.getTask(taskThreadId)) : false;
+    const compactor = this.taskStore ? new NativeSessionCompactor(this.taskStore, this.detector) : undefined;
+    let nativeSessionId: string | undefined;
+    let nativeLease: NativeSessionLease | undefined;
+    let recoveryVersion: string | undefined;
+    let preparationExecution: { registry: TaskExecutionRegistry; registration: TaskExecutionRegistration; owned: boolean } | undefined;
+    let runId = `${taskThreadId || 'run'}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
     if (taskThreadId) {
       this.executingThreads.add(taskThreadId);
     }
 
     try {
-      let attemptOptions = options;
+      let runOptions = options;
+      if (taskThreadId && compactor && this.taskStore) {
+        let prepared;
+        for (;;) {
+          const pending = this.checkPendingCancellation(taskThreadId, initialTaskExisted);
+          if (pending) {
+            this.consumeCancellation(taskThreadId);
+            return this.buildInterruptedResult(pending);
+          }
+          try {
+            prepared = await compactor.prepareBeforeResume(taskThreadId, nativeRole, options.model, nativeRole === 'reviewer' && options.taskRound === 0);
+            break;
+          } catch (error: any) {
+            if (!String(error?.message || error).includes('already owned by another Bridge process')) throw error;
+            const cancelled = await this.cancellableSleep(250, taskThreadId, initialTaskExisted);
+            if (cancelled) {
+              this.consumeCancellation(taskThreadId);
+              return this.buildInterruptedResult(cancelled);
+            }
+          }
+        }
+        if (prepared.pauseReason) {
+          return this.buildInterruptedResult({
+            action: 'pause', reason: prepared.pauseReason, at: new Date().toISOString(), by: 'native_session_compaction',
+          });
+        }
+        nativeSessionId = prepared.sessionId;
+        nativeLease = prepared.lease;
+        preparationExecution = prepared.executionLease;
+        recoveryVersion = prepared.recoveryVersion;
+        if (prepared.warning) console.warn(`[AutonomousRunner] ${prepared.warning}`);
+        const sessionLock = new NativeSessionLock(path.dirname(this.taskStore.getStoragePath()));
+        const originalOnChildPid = options.onChildPid;
+        const originalOnNativeSessionId = options.onNativeSessionId;
+        const captureSession = (sessionId: string, childPid?: number) => {
+          if (!isValidSessionId(sessionId)) throw new Error('Agent emitted an invalid native session id.');
+          if (nativeSessionId && nativeSessionId !== sessionId) throw new Error('Native session id changed during one task execution.');
+          this.taskStore!.loadFromDisk();
+          const boundAgent = nativeRole === 'developer' ? options.agent : this.taskStore!.getTask(taskThreadId)?.initiatorAgent;
+          if (!boundAgent) throw new Error('Task disappeared before the first native session id could be bound.');
+          if (!nativeLease) {
+            nativeLease = sessionLock.acquire(boundAgent, sessionId, childPid);
+            if (!nativeLease) throw new Error(`Native session ${sessionId} is already owned by another Bridge process.`);
+            nativeSessionId = sessionId;
+            this.taskStore!.loadFromDisk();
+            const current = this.taskStore!.getTask(taskThreadId);
+            const cancel = this.checkPendingCancellation(taskThreadId, initialTaskExisted);
+            const currentAgent = current && (nativeRole === 'developer' ? current.targetAgent : current.initiatorAgent);
+            const currentModel = current && (nativeRole === 'developer' ? current.targetModel : current.reviewerModel);
+            const currentSession = current && (nativeRole === 'developer' ? current.receiverSessionId : current.reviewerSessionId);
+            const currentCaptured = current && (nativeRole === 'developer' ? current.receiverSessionCaptured : current.reviewerSessionCaptured);
+            const allowedStatus = current && (nativeRole === 'developer'
+              ? !['paused', 'completed', 'failed', 'archived'].includes(current.status)
+              : current.status === 'queued' || current.status === 'waiting_review' || current.status === 'reworking');
+            if (cancel || !current || current.archivedAt || currentAgent !== boundAgent ||
+                currentModel !== options.model || !allowedStatus || (currentCaptured && currentSession !== sessionId)) {
+              sessionLock.release(nativeLease);
+              nativeLease = undefined;
+              throw new Error('Task binding or state changed before the first native session id could be published.');
+            }
+            if (nativeRole === 'developer') {
+              current.receiverSessionId = sessionId;
+              current.receiverSessionCaptured = true;
+            } else {
+              current.reviewerSessionId = sessionId;
+              current.reviewerSessionCaptured = true;
+              current.callerSessionId = sessionId;
+            }
+            this.taskStore!.upsertTask(current);
+          } else if (nativeLease) {
+            sessionLock.attachChild(nativeLease, childPid);
+          }
+          originalOnNativeSessionId?.(sessionId, childPid);
+        };
+        runOptions = {
+          ...options,
+          prompt: prepared.recoveryPrefix
+            ? `<bridge_recovery_document version="${prepared.recoveryVersion}">\n${prepared.recoveryPrefix}\n</bridge_recovery_document>\n\n<CURRENT_INSTRUCTION>\n${options.prompt}\n</CURRENT_INSTRUCTION>`
+            : options.prompt,
+          onChildPid: (pid) => {
+            if (nativeLease) sessionLock.attachChild(nativeLease, pid);
+            if (preparationExecution) preparationExecution.registry.attachChildPid(pid, preparationExecution.registration);
+            originalOnChildPid?.(pid);
+          },
+          onNativeSessionId: captureSession,
+        };
+      }
+      let attemptOptions = runOptions;
       let attempt = 0;
       // Every attempt is billed, so the round's token usage is the SUM of all
       // attempts, not just the last one (transient-error replays cost real
       // money even when they fail). A retried or resumed round also carries
       // the spend of its previous execution, which the executor seeds here.
-      let accumulatedUsage: TokenUsageMetrics | undefined = options.previousTokenUsage
-        ? { ...options.previousTokenUsage }
+      let accumulatedUsage: TokenUsageMetrics | undefined = runOptions.previousTokenUsage
+        ? { ...runOptions.previousTokenUsage }
         : undefined;
       while (true) {
         attempt++;
@@ -760,11 +1061,31 @@ export class AutonomousRunner {
         }
 
         const result = await this.executeOnce(attemptOptions);
-        accumulatedUsage = accumulateTokenUsage(accumulatedUsage, result.tokenUsage);
+        const eventSessionId = result.actualSessionId || nativeSessionId;
+        if (taskThreadId && compactor && eventSessionId && !(nativeRole === 'reviewer' && options.taskRound === 0)) {
+          compactor.recordNativeAutoCompactionEvents(taskThreadId, nativeRole, eventSessionId, result.stdout || '');
+        }
+        accumulatedUsage = accumulateTokenUsage(
+          accumulatedUsage,
+          result.tokenUsage,
+          `${runId}:${attempt}`,
+          `legacy-business-round-${options.taskRound || 1}`,
+          nativeRole,
+        );
         const succeeded =
           result.exitCode === 0 && (!result.assessment || result.assessment.success);
         if (succeeded) {
           result.tokenUsage = accumulatedUsage;
+          const sessionId = result.actualSessionId || nativeSessionId;
+          if (taskThreadId && compactor && sessionId) {
+            if (!nativeLease && !nativeSessionId) {
+              // Some CLIs emit the session id only in their final chunk; bind it after process exit before publishing.
+              nativeLease = new NativeSessionLock(path.dirname(this.taskStore!.getStoragePath())).acquire(options.agent, sessionId);
+            }
+            if (!(nativeRole === 'reviewer' && options.taskRound === 0)) {
+              compactor.recordBusinessSuccess(taskThreadId, nativeRole, sessionId, `${runId}:${attempt}`, recoveryVersion);
+            }
+          }
           return result;
         }
 
@@ -890,10 +1211,29 @@ export class AutonomousRunner {
         return result;
       }
     } finally {
+      if (nativeLease && this.taskStore) {
+        const lock = new NativeSessionLock(path.dirname(this.taskStore.getStoragePath()));
+        let released = false;
+        for (let attempt = 0; attempt < 2 && !released; attempt++) {
+          try { released = lock.release(nativeLease); }
+          catch (error: any) {
+            console.error(`[AutonomousRunner] Native session lease release is pending for ${taskThreadId}: ${error?.message || error}`);
+          }
+        }
+        if (!released) console.error(`[AutonomousRunner] Native session lease remains safely held for ${taskThreadId}; retry after owner-gate contention clears.`);
+      }
+      if (preparationExecution) {
+        if (preparationExecution.owned) preparationExecution.registry.end(preparationExecution.registration);
+        preparationExecution.registry.dispose();
+      }
       if (taskThreadId) {
         this.executingThreads.delete(taskThreadId);
       }
     }
+  }
+
+  public setGroupAgentExecutor(executor: ((options: RunOptions, signal: AbortSignal) => Promise<{ text: string; toolCallsCompleted: number; modelRequests?: number; tokenUsage?: TokenUsageMetrics }>) | undefined): void {
+    this.groupAgentExecutor = executor;
   }
 
   /**
@@ -1193,7 +1533,10 @@ export class AutonomousRunner {
       const timeoutMs = options.timeoutMs || this.defaultTimeoutMs; // 2 hours default
       // Long model reasoning / silent tool waits can easily exceed 3 minutes.
       // Keep a 10-minute default; callers may still override per run.
-      const silenceTimeoutMs = options.silenceTimeoutMs || DEFAULT_SILENCE_TIMEOUT_MS;
+      const silenceTimeoutMs =
+        options.silenceTimeoutMs ||
+        AGENT_SILENCE_TIMEOUT_MS[String(options.agent).replace(/-/g, '_')] ||
+        DEFAULT_SILENCE_TIMEOUT_MS;
 
       const env: NodeJS.ProcessEnv = {
         ...process.env,
@@ -1235,7 +1578,11 @@ export class AutonomousRunner {
       let stdoutData = '';
       let stderrData = '';
       let isSettled = false;
+      let childBindingError: string | undefined;
+      let childCleanupError: string | undefined;
       let lastActivityMono = startMono;
+      /** When the agent last declared it is waiting on a background task. */
+      let backgroundWaitStartedMono: number | undefined;
       let watchdogTriggered = false;
       let maxTimerTriggered = false;
 
@@ -1317,19 +1664,6 @@ export class AutonomousRunner {
         } catch {}
       }
 
-      // Publish the real agent PID to the execution lease: it outlives a crashed
-      // host on Windows, and the next round must not start on top of it.
-      if (child.pid) {
-        try {
-          options.onChildPid?.(child.pid);
-        } catch {}
-        child.once('exit', () => {
-          try {
-            options.onChildPid?.(undefined);
-          } catch {}
-        });
-      }
-
       // Cross-process pause/delete: a control plane running elsewhere writes a
       // cancellation file; this runner owns the child and is the only one that
       // can actually kill it.
@@ -1397,11 +1731,36 @@ export class AutonomousRunner {
           0,
           nowMono - lastActivityMono - suspension.suspendedWithin(lastActivityMono, nowMono),
         );
-        if (silentDuration > silenceTimeoutMs) {
+        // A round parked on a declared background task is not hung: the agent
+        // said it is waiting and the child pipeline is the work being paid for.
+        // It gets its own bounded budget instead of the normal silence threshold
+        // (a wedged child still cannot park the round forever).
+        //
+        // The budget is measured on the park itself, NOT on the general silence
+        // duration, because a normal threshold may already have been exceeded
+        // before the agent announced the wait.
+        const parkedFor =
+          backgroundWaitStartedMono === undefined
+            ? undefined
+            : Math.max(
+                0,
+                nowMono -
+                  backgroundWaitStartedMono -
+                  suspension.suspendedWithin(backgroundWaitStartedMono, nowMono),
+              );
+        const exceeded =
+          parkedFor !== undefined
+            ? parkedFor > BACKGROUND_WAIT_BUDGET_MS
+            : silentDuration > silenceTimeoutMs;
+        if (exceeded) {
           clearInterval(silenceInterval);
           watchdogTriggered = true;
           console.warn(
-            `[AutonomousRunner] Watchdog triggered: Process ${options.agent} silent for ${Math.round(silentDuration / 1000)}s. Terminating.`,
+            parkedFor !== undefined
+              ? `[AutonomousRunner] Watchdog triggered: ${options.agent} parked on a background task for ` +
+                  `${Math.round(parkedFor / 1000)}s, beyond the ${Math.round(BACKGROUND_WAIT_BUDGET_MS / 1000)}s budget. Terminating.`
+              : `[AutonomousRunner] Watchdog triggered: Process ${options.agent} silent for ` +
+                  `${Math.round(silentDuration / 1000)}s (threshold ${Math.round(silenceTimeoutMs / 1000)}s). Terminating.`,
           );
           try {
             this.killProcess(child);
@@ -1444,6 +1803,9 @@ export class AutonomousRunner {
       // stderr stays free-text: that is where the CLI reports its own failures.
       let rateLimitSignal: string | undefined;
       let stdoutPartialLine = '';
+      let sessionPartialLine = '';
+      let observedSessionId: string | undefined;
+      let sessionCaptureError: string | undefined;
       let stderrPartialLine = '';
       const MAX_PARTIAL_LINE = 1 << 20; // 1 MiB guard against a newline-less stream
       const abortOnRateLimit = (hit: string) => {
@@ -1483,7 +1845,26 @@ export class AutonomousRunner {
         noteStreamChunk(data.length);
         const str = data.toString();
         stdoutData += str;
+        // A declared background wait is liveness, not a hang: record when the
+        // agent parked so the watchdog can grant it BACKGROUND_WAIT_BUDGET_MS.
+        if (BACKGROUND_WAIT_LINE.test(str)) {
+          backgroundWaitStartedMono = monotonicNowMs();
+        }
         stdoutPartialLine = scanLines(str, stdoutPartialLine, detectStructuredRateLimitSignal);
+        const sessionLines = (sessionPartialLine + str).split(/\r?\n/);
+        sessionPartialLine = sessionLines.pop() || '';
+        for (const line of sessionLines) {
+          if (childBindingError) break;
+          const sessionId = this.extractSessionId(line);
+          if (!sessionId || sessionId === observedSessionId) continue;
+          observedSessionId = sessionId;
+          try { options.onNativeSessionId?.(sessionId, child.pid); }
+          catch (error: any) {
+            sessionCaptureError = String(error?.message || error);
+            try { this.killProcess(child); } catch {}
+            break;
+          }
+        }
         if (options.onStdoutChunk) {
           options.onStdoutChunk(str);
         }
@@ -1503,6 +1884,11 @@ export class AutonomousRunner {
 
       child.on('error', (err) => {
         if (isSettled) return;
+        if (child.pid && child.exitCode === null) {
+          childBindingError ||= `Native child lifecycle failed: ${err.message}`;
+          try { this.killProcess(child); } catch {}
+          return;
+        }
         isSettled = true;
         clearInterval(silenceInterval);
         clearInterval(maxTimer);
@@ -1537,6 +1923,10 @@ export class AutonomousRunner {
       child.on('close', (code) => {
         if (isSettled) return;
         isSettled = true;
+        if (child.pid) {
+          try { options.onChildPid?.(undefined); }
+          catch (error: any) { childCleanupError = String(error?.message || error); }
+        }
         // Pick up a suspension window that ended right at exit time (e.g. the
         // machine was asleep when the child's last output arrived).
         suspension.sync();
@@ -1551,6 +1941,10 @@ export class AutonomousRunner {
         const durationMs = Date.now() - startTime;
         const extracted = this.extractCleanOutput(stdoutData);
         const actualSessionId = this.extractSessionId(stdoutData);
+        if (!childBindingError && actualSessionId && actualSessionId !== observedSessionId) {
+          try { options.onNativeSessionId?.(actualSessionId); }
+          catch (captureError: any) { sessionCaptureError = String(captureError?.message || captureError); }
+        }
         // A killed CLI never unregisters itself: clean its ownership record so
         // the next resume is not rejected as "already in use". Live processes
         // are never touched by the helper.
@@ -1598,8 +1992,16 @@ export class AutonomousRunner {
         } else if (code !== 0) {
           error = stderrData.trim() || `Process exited with non-zero code ${code ?? -1}`;
         }
+        if (sessionCaptureError) {
+          error = `Could not safely bind native session: ${sessionCaptureError}`;
+          interruption = { kind: 'stopped', reason: error, at: new Date().toISOString(), by: 'bridge' };
+        }
+        if (childBindingError || childCleanupError) {
+          error = `Could not safely maintain native child ownership: ${childBindingError || childCleanupError}`;
+          interruption = { kind: 'stopped', reason: error, at: new Date().toISOString(), by: 'bridge' };
+        }
 
-        const exitCode = cancellation ? -1 : (code ?? 0);
+        const exitCode = cancellation || childBindingError || childCleanupError ? -1 : (code ?? 0);
 
         let assessment = this.evaluateResponse({
           exitCode,
@@ -1682,6 +2084,16 @@ export class AutonomousRunner {
           model: effectiveModel,
         });
       });
+
+      // Install close/error handlers first. If durable PID binding fails, kill
+      // this child and let close record a failed round only after it has exited.
+      if (child.pid) {
+        try { options.onChildPid?.(child.pid); }
+        catch (error: any) {
+          childBindingError = String(error?.message || error);
+          try { this.killProcess(child); } catch {}
+        }
+      }
     });
   }
 

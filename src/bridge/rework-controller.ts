@@ -95,6 +95,10 @@ export class ReworkController {
     this.retargetService.setModelApprovalHandler(handler);
   }
 
+  public retargetTask(threadId: string, overrides: ExecutorOverride, reason: string, by = 'caller') {
+    return this.retargetService.retargetTask({ threadId, ...overrides, reason, by });
+  }
+
   /**
    * Apply a rework/retry/resume executor override, if the caller asked for one.
    * A model-only request against the same agent keeps the native session; a new
@@ -110,6 +114,7 @@ export class ReworkController {
       threadId,
       targetAgent: overrides.targetAgent,
       model: overrides.model,
+      modelRef: overrides.modelRef,
       modelRequestedByUser: overrides.modelRequestedByUser,
       reason,
       by: 'caller',
@@ -158,6 +163,7 @@ export class ReworkController {
         threadId: params.threadId,
         targetAgent: params.targetAgent,
         model: params.model,
+        modelRef: params.modelRef,
         modelRequestedByUser: params.modelRequestedByUser,
         reason: 'request_rework: executor switch',
         by: 'caller',
@@ -590,6 +596,11 @@ export class ReworkController {
     const nowIso = new Date().toISOString();
     pausedRound.status = 'running';
     pausedRound.error = undefined;
+    // The round carries its own interruption marker as well as the thread-level
+    // one. Leaving it behind made a resumed round look paused at a stale time,
+    // so the supervisor's "task is paused" probe cancelled the fresh run on the
+    // very next pass.
+    pausedRound.interruption = undefined;
     pausedRound.timestamp = nowIso;
     thread.currentRound = Math.max(thread.currentRound || 1, pausedRound.round);
     thread.status = isRework ? 'reworking' : 'running';
@@ -937,6 +948,8 @@ export class ReworkController {
           taskThreadId: thread.threadId,
           taskRound: roundNumber,
           model: thread.targetModel,
+          modelRef: thread.targetModelRef,
+          role: 'developer',
           previousTokenUsage: readStoredRoundUsage(this.taskStore, thread.threadId, roundNumber),
           onChildPid: (pid) => {
             if (registration) this.executionRegistry.attachChildPid(pid, registration);

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as http from 'node:http';
 import { AddressInfo } from 'node:net';
-import { completeCompatibleChat, fetchCompatibleModels } from '../copilot/compatible-model-client';
+import { completeCompatibleChat, completeCompatibleTools, fetchCompatibleModels } from '../copilot/compatible-model-client';
 
 async function withServer(
   handler: (request: http.IncomingMessage, response: http.ServerResponse) => void,
@@ -79,6 +79,26 @@ test('explicit model listing uses GET /models, deduplicates ids, and never follo
       );
     },
   );
+});
+
+test('structured tool requests preserve native usage with cached input normalized as a subset', async () => {
+  await withServer((_request, response) => {
+    response.end(JSON.stringify({
+      choices: [{ finish_reason: 'tool_calls', message: { content: null, tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"README.md"}' } }] } }],
+      usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14, prompt_tokens_details: { cached_tokens: 3 } },
+    }));
+  }, async (baseUrl) => {
+    const result = await completeCompatibleTools({
+      baseUrl, model: 'model-x', messages: [{ role: 'user', content: 'read' }],
+      tools: [{ name: 'read_file', description: 'Read a file', inputSchema: { type: 'object' } }],
+      apiKey: 'local-test-key', signal: new AbortController().signal,
+    });
+    assert.equal(result.toolCalls[0].arguments.path, 'README.md');
+    assert.deepEqual(result.usage, {
+      uncachedInputTokens: 7, cacheReadTokens: 3, cacheWriteTokens: 0,
+      promptTokens: 10, outputTokens: 4, totalTokens: 14, nativeTotalTokens: 14,
+    });
+  });
 });
 
 test('double slashes in a base path never become an authority for either API route', async () => {

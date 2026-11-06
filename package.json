@@ -133,6 +133,10 @@
         "icon": "$(debug-pause)"
       },
       {
+        "command": "agent-mesh-bridge.compactNativeSession",
+        "title": "Compress Native Task Session"
+      },
+      {
         "command": "agent-mesh-bridge.retargetTask",
         "title": "Change Executor (Agent + Model) / 切换执行者",
         "icon": "$(arrow-swap)"
@@ -273,15 +277,13 @@
       "properties": {
         "agentMeshBridge.defaultAgent": {
           "type": "string",
-          "enum": [
-            "auto",
-            "codex",
-            "claude_code",
-            "antigravity",
-            "deepseek_harness"
-          ],
           "default": "auto",
-          "description": "Default target agent for task delegation when not explicitly specified."
+          "markdownDescription": "Default receiver Agent for new tasks. Built-in CLI Agent IDs and explicitly enabled Copilot Group IDs are supported. A disabled, unavailable, or unauthorized explicit default fails admission instead of silently selecting another Agent."
+        },
+        "agentMeshBridge.defaultReviewer": {
+          "type": "string",
+          "default": "caller",
+          "markdownDescription": "Default sender/reviewer for new dedicated tasks. `caller` preserves the requesting Agent; an explicitly enabled Copilot Group ID can be selected from that group's menu. Legacy review remains caller-owned."
         },
         "agentMeshBridge.models.antigravity": {
           "type": "string",
@@ -373,6 +375,12 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Condense the previous round's bulky output once a later round has completed (lagged compaction). The current round always stays verbatim for review; the exact original is archived under `~/.agent-mesh-bridge/logs/` and remains readable with `get_round_raw_log`. Turn this off to keep every round verbatim in the ledger."
+        },
+        "agentMeshBridge.nativeSessionCompaction.mode": {
+          "type": "string",
+          "enum": ["off", "auto"],
+          "default": "off",
+          "markdownDescription": "Bridge-controlled compaction of a captured, bridge-owned native session before resume. `auto` is honored only by certified adapters; current unverified adapters stay disabled. This does not change an agent CLI's own automatic compaction."
         },
         "agentMeshBridge.reviewFlow": {
           "type": "string",

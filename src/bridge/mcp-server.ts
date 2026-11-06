@@ -10,7 +10,6 @@ import { ActiveAgentResolver } from './active-agent-resolver';
 import { AutonomousRunner } from './autonomous-runner';
 import { TaskSupervisor } from './task-supervisor';
 import { TaskControlService } from './task-control';
-import { TaskRetargetService } from './task-retarget';
 import { CallerPollGuard, progressSignature } from './caller-poll-guard';
 import { TaskRoleLock } from './task-role-lock';
 import {
@@ -21,12 +20,7 @@ import {
 } from './model-catalog';
 import { resolveDispatchModel } from './model-approval';
 import { buildFinalSummary, isTerminalThreadStatus } from './task-summary';
-import {
-  clearReviewerBootstrapToken,
-  findReviewerBootstrapByHostPid,
-  findSolePendingBootstrap,
-  readReviewerBootstrapToken,
-} from './reviewer-bootstrap';
+import { findReviewerBootstrapByHostPid, findSolePendingBootstrap, confirmReviewerBootstrapTask } from './reviewer-bootstrap';
 import {
   AgentId,
   DelegationRound,
@@ -39,6 +33,8 @@ import {
   MAX_RAW_LOG_BYTES,
   findExistingExecutionLog,
   findExistingOutputArchive,
+  getReviewerLogDir,
+  getWorkerLogDir,
   readTextFilePaged,
   resolveExistingArtifactPath,
   roundExecutionLogPath,
@@ -51,6 +47,7 @@ import {
 } from './reviewer-log';
 import { aggregateThreadTokenUsage } from './token-usage-collector';
 import { assertCanExecute } from './agent-capabilities';
+import { isGroupAgentId, loadGroupAgentConfig, loadGroupAgentHost } from './group-agent-registry';
 import { COPILOT_MAX_ROUNDS, projectCopilotRoundTokenUsage, projectCopilotTaskDetails, projectCopilotTaskSummary, projectCopilotTokenUsage } from '../copilot/copilot-projection';
 
 /** Older non-compacted rounds are excerpted to this many characters. */
@@ -80,6 +77,14 @@ const CONTROL_TOOLS = new Set([
   'record_merge_request',
 ]);
 
+const groupModelRefSchema = {
+  type: 'object',
+  oneOf: [
+    { properties: { source: { const: 'vscode-lm' }, vendor: { type: 'string', minLength: 1, maxLength: 128 }, id: { type: 'string', minLength: 1, maxLength: 256 } }, required: ['source', 'vendor', 'id'], additionalProperties: false },
+    { properties: { source: { const: 'openai-compatible' }, id: { type: 'string', minLength: 1, maxLength: 256 }, origin: { type: 'string', minLength: 1, maxLength: 512 }, bindingRevision: { type: 'integer', minimum: 0 } }, required: ['source', 'id', 'origin', 'bindingRevision'], additionalProperties: false },
+  ],
+};
+
 export class MCPServer {
   private dispatcher: AsyncDispatcher;
   private reworkController: ReworkController;
@@ -89,7 +94,6 @@ export class MCPServer {
   private runner: AutonomousRunner;
   private taskControl: TaskControlService;
   private modelCatalog: ModelCatalog;
-  private retargetService: TaskRetargetService;
   /** Starves polling loops on tasks this process dispatched itself. */
   private pollGuard = new CallerPollGuard();
   private readonly copilotProfile = process.env.MESH_MCP_PROFILE === 'copilot-requester';
@@ -110,7 +114,6 @@ export class MCPServer {
     this.runner = runner;
     this.taskControl = new TaskControlService(taskStore, runner);
     this.modelCatalog = new ModelCatalog(detector);
-    this.retargetService = new TaskRetargetService(taskStore);
   }
 
   /** Directory holding the mirrored ledger; archives/logs live beside it. */
@@ -187,12 +190,27 @@ export class MCPServer {
       );
     }
 
-    const source = args?.source === 'execution' ? 'execution' : 'output';
+    const source = args?.source === 'execution' ? 'execution' : args?.source === 'native_compaction' ? 'native_compaction' : 'output';
     const maxBytes = Math.min(
       Math.max(1, Number(args?.maxBytes) || DEFAULT_RAW_LOG_BYTES),
       MAX_RAW_LOG_BYTES,
     );
     const offsetBytes = Math.max(0, Number(args?.offsetBytes) || 0);
+
+    if (source === 'native_compaction') {
+      const operation = round.nativeSessionCompactions?.find((entry) => entry.id === args?.operationId);
+      if (!operation) throw new Error(`Native compaction operation not found on round ${roundNumber}.`);
+      const root = path.dirname(this.taskStore.getStoragePath());
+      const allowedDir = operation.role === 'reviewer'
+        ? getReviewerLogDir(operation.agent, root)
+        : getWorkerLogDir(operation.agent, root);
+      const file = path.resolve(operation.logPath);
+      if (path.dirname(file) !== path.resolve(allowedDir)) throw new Error('Native compaction log path is outside its agent log directory.');
+      const page = readTextFilePaged(file, { offsetBytes, maxBytes });
+      return { threadId, round: roundNumber, operationId: operation.id, source, available: true,
+        unit: 'bytes', ...page, returnedBytes: Buffer.byteLength(page.content, 'utf8'),
+        hint: page.truncated ? `Paged: continue with offsetBytes=${page.nextOffset}.` : 'End of file.' };
+    }
 
     if (source === 'execution') {
       const logPath = this.resolveRoundExecutionLog(threadId, roundNumber);
@@ -375,13 +393,11 @@ export class MCPServer {
           properties: {
             targetAgent: {
               type: 'string',
-              enum: ['default', 'codex', 'claude_code', 'antigravity', 'deepseek_harness'],
               description:
                 'Target agent to execute the task. Defaults to "default" (auto-detected). May be your own agent identity: same-agent dispatch runs under the dedicated reviewer flow and requires a reviewer model that differs from the executor model.',
             },
             initiatorAgent: {
               type: 'string',
-              enum: ['default', 'codex', 'claude_code', 'antigravity', 'deepseek_harness'],
               description:
                 'Your agent identity (codex, claude_code, antigravity, deepseek_harness). Defaults to auto-detected caller.',
             },
@@ -413,6 +429,7 @@ export class MCPServer {
               description:
                 'Set true only when the user themselves named the model in `model` (e.g. "use deepseek flash"). Defaults to false, in which case a non-default `model` is ignored and the configured default is used. With true, the bridge shows the user a confirmation dialog; approval switches the task, "keep default" falls back, and no answer within 3 minutes aborts the dispatch.',
             },
+            modelRef: { ...groupModelRefSchema, description: 'Exact Group Agent model reference. Non-default references require modelRequestedByUser: true and the standard user approval.' },
             initiatorModel: {
               type: 'string',
               description:
@@ -484,6 +501,7 @@ export class MCPServer {
               description:
                 'Set true only when the user named this model; the bridge then asks them to confirm the switch.',
             },
+            modelRef: groupModelRefSchema,
           },
           required: ['threadId', 'feedback'],
         },
@@ -552,6 +570,7 @@ export class MCPServer {
               description:
                 'Set true only when the user named this model; the bridge then asks them to confirm the switch.',
             },
+            modelRef: groupModelRefSchema,
           },
           required: ['threadId'],
         },
@@ -582,6 +601,7 @@ export class MCPServer {
               description:
                 'Set true only when the user named this model; the bridge then asks them to confirm the switch.',
             },
+            modelRef: groupModelRefSchema,
           },
           required: ['threadId'],
         },
@@ -599,7 +619,6 @@ export class MCPServer {
             },
             targetAgent: {
               type: 'string',
-              enum: ['antigravity', 'codex', 'claude_code', 'deepseek_harness'],
               description:
                 'New receiver agent. Omit to keep the current agent and change only the model. May be the task\'s initiator for a dedicated-review task, where a separate reviewer conversation inspects the result; the reviewer model must differ from this receiver model.',
             },
@@ -613,6 +632,7 @@ export class MCPServer {
               description:
                 'Set true only when the user themselves named the model; the bridge then asks them to confirm the switch in VS Code.',
             },
+            modelRef: groupModelRefSchema,
             reason: {
               type: 'string',
               description: 'Why the executor is being switched (recorded on the task).',
@@ -757,10 +777,11 @@ export class MCPServer {
             round: { type: 'number', description: 'Round number to read (1-based).' },
             source: {
               type: 'string',
-              enum: ['output', 'execution'],
+              enum: ['output', 'execution', 'native_compaction'],
               description:
-                'output = archived agent answer, execution = raw stdio log (default: output).',
+                'output = archived answer, execution = raw stdio log, native_compaction = one maintenance operation log (requires operationId).',
             },
+            operationId: { type: 'string', description: 'Operation id required with source native_compaction.' },
             offsetBytes: {
               type: 'number',
               description: 'Byte offset to start from (default 0).',
@@ -867,7 +888,6 @@ export class MCPServer {
           properties: {
             targetAgent: {
               type: 'string',
-              enum: ['default', 'codex', 'claude_code', 'antigravity', 'deepseek_harness'],
               description: 'Target agent to query.',
             },
             prompt: {
@@ -1037,82 +1057,7 @@ export class MCPServer {
     threadId: string,
     credential: { token?: string; hostPid?: number },
   ): any {
-    this.taskStore.loadFromDisk();
-    let thread = this.taskStore.getTask(threadId);
-    if (!thread) {
-      throw new Error(`Reviewer bootstrap thread not found: ${threadId}`);
-    }
-    if (thread.status !== 'queued') {
-      throw new Error(
-        `Reviewer bootstrap for ${threadId} cannot confirm while task status is "${thread.status}". ` +
-          `Only a queued task may be dispatched; resume it after a pause or retry after a failure.`,
-      );
-    }
-    if (thread.reviewFlow !== 'dedicated') {
-      throw new Error(
-        `Thread ${threadId} is not a dedicated reviewer task; refusing bootstrap dispatch.`,
-      );
-    }
-    const phase = thread.reviewBootstrap?.phase;
-    if (phase === 'confirmed') {
-      throw new Error(`Thread ${threadId} was already dispatched by its reviewer.`);
-    }
-    if (phase === 'failed') {
-      throw new Error(
-        `Thread ${threadId} failed its reviewer bootstrap; it cannot be dispatched anymore.`,
-      );
-    }
-    const record = readReviewerBootstrapToken(threadId);
-    if (!record) {
-      throw new Error(
-        `Reviewer bootstrap token for ${threadId} is missing or was already consumed; ` +
-          `the reviewer cannot dispatch this task again.`,
-      );
-    }
-    if (credential.token) {
-      if (record.token !== credential.token) {
-        throw new Error(
-          `Reviewer bootstrap token mismatch for ${threadId}: this process is not the task's reviewer.`,
-        );
-      }
-    } else if (credential.hostPid) {
-      if (record.hostPid !== credential.hostPid) {
-        throw new Error(
-          `Reviewer bootstrap process mismatch for ${threadId}: this process was not launched as that task's reviewer.`,
-        );
-      }
-    } else {
-      throw new Error(`Reviewer bootstrap credential missing for ${threadId}.`);
-    }
-    if (record.agent !== thread.initiatorAgent) {
-      throw new Error(
-        `Reviewer bootstrap agent mismatch for ${threadId}: expected ${thread.initiatorAgent}.`,
-      );
-    }
-
-    // Re-read immediately before consuming the credential. A pause/delete may
-    // have arrived from another bridge process while the launch record was
-    // being validated; in that case leave the one-shot token available for a
-    // later explicit resume.
-    this.taskStore.loadFromDisk();
-    const latest = this.taskStore.getTask(threadId);
-    if (!latest || latest.status !== 'queued') {
-      throw new Error(
-        `Reviewer bootstrap for ${threadId} was stopped before confirmation; ` +
-          `the task is ${latest?.status || 'deleted'} and its token was not consumed.`,
-      );
-    }
-    thread = latest;
-
-    clearReviewerBootstrapToken(threadId);
-    thread.reviewBootstrap = {
-      ...(thread.reviewBootstrap || { phase: 'pending', attempts: 0 }),
-      phase: 'confirmed',
-    };
-    thread.status = 'queued';
-    thread.summary.lastOutputSnippet =
-      'Reviewer dispatched the task; waiting for the bootstrap process to persist its native session.';
-    this.taskStore.upsertTask(thread);
+    const thread = confirmReviewerBootstrapTask(this.taskStore, threadId, credential);
 
     const stopInstruction =
       'STOP NOW — the task is dispatched. End your turn immediately; the bridge resumes THIS ' +
@@ -1139,7 +1084,7 @@ export class MCPServer {
    */
   private assertActiveReviewerRole(threadId: string): void {
     const thread = this.taskStore.getTask(threadId);
-    if (thread) assertCanExecute(thread.initiatorAgent, 'review or approve tasks');
+    if (thread) assertCanExecute(thread.initiatorAgent, 'review or approve tasks', 'initiator');
     const owner = new TaskRoleLock().getOwner(threadId);
     if (!owner || owner.role !== 'reviewer') {
       throw new Error(
@@ -1262,6 +1207,7 @@ export class MCPServer {
           callerSessionId: args.callerSessionId,
           workspacePath: args.workspacePath,
           model: args.model,
+          modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
           initiatorModel: args.initiatorModel,
         });
@@ -1300,6 +1246,7 @@ export class MCPServer {
           callerSessionId: args.callerSessionId,
           targetAgent: args.targetAgent,
           model: args.model,
+          modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
         });
         // Reviewer decision submitted: hand the task role over to the
@@ -1328,19 +1275,18 @@ export class MCPServer {
         return this.reworkController.resumePausedTask(args.threadId, {
           targetAgent: args.targetAgent,
           model: args.model,
+          modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
         });
       }
 
       case 'retarget_task': {
-        const result = await this.retargetService.retargetTask({
-          threadId: args.threadId,
+        const result = await this.reworkController.retargetTask(args.threadId, {
           targetAgent: args.targetAgent,
           model: args.model,
+          modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
-          reason: args.reason,
-          by: (process.env.MESH_CALLER_AGENT as string) || 'caller',
-        });
+        }, args.reason, (process.env.MESH_CALLER_AGENT as string) || 'caller');
         return result;
       }
 
@@ -1348,6 +1294,7 @@ export class MCPServer {
         const retried = await this.reworkController.retryFailedRound(args.threadId, {
           targetAgent: args.targetAgent,
           model: args.model,
+          modelRef: args.modelRef,
           modelRequestedByUser: args.modelRequestedByUser === true,
         });
         const thread = this.taskStore.getTask(args.threadId);
@@ -1654,6 +1601,31 @@ export class MCPServer {
 
         const agents: Record<string, any> = {};
         for (const agent of requested) {
+          if (isGroupAgentId(agent)) {
+            const entry = loadGroupAgentConfig()?.agents.find((item) => item.id === agent && item.enabled);
+            const host = loadGroupAgentHost();
+            if (!entry) continue;
+            const receiver = entry.receiverModel;
+            const initiator = entry.initiatorModel;
+            agents[agent] = {
+              configuredModel: receiver?.id || null,
+              configuredModelRef: receiver || null,
+              initiatorModel: initiator?.id || null,
+              initiatorModelRef: initiator || null,
+              models: (entry.models || [])
+                .map((modelRef: any) => ({ id: modelRef.id, modelRef, ...(modelRef.source === 'vscode-lm' ? { vendor: modelRef.vendor } : { origin: modelRef.origin }), ...(JSON.stringify(modelRef) === JSON.stringify(receiver) ? { hint: 'configured default' } : { capability: 'unknown until explicitly probed for this role' }) }))
+                .sort((left: any, right: any) => Number(right.hint === 'configured default') - Number(left.hint === 'configured default')),
+              source: entry.source,
+              capability: {
+                receiver: entry.receiverReady && !!host ? 'ready' : 'unknown',
+                initiator: entry.initiatorReady && !!host ? 'ready' : 'unknown',
+                host: host ? 'online' : 'offline',
+                toolsAuthorized: entry.toolsAuthorized,
+              },
+              updatedAt: new Date(loadGroupAgentConfig()?.updatedAt || Date.now()).toISOString(),
+            };
+            continue;
+          }
           const catalog = all[agent];
           if (!catalog) continue;
           const configuredModel = defaults[agent] || null;

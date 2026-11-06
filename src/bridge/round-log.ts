@@ -156,6 +156,12 @@ export function findExistingExecutionLog(
   const candidates: Array<string | undefined> = [
     roundExecutionLogPath(threadId, round, options.root, options.agent),
     roundExecutionLogPath(threadId, round, options.root),
+    // Rounds written before a log directory was configured live here.
+    path.join(
+      bridgeLogsDir(options.root),
+      WORKER_LOG_DIRNAME,
+      `${artifactBase(threadId, round)}.log`,
+    ),
     path.join(bridgeLogsDir(options.root), `${artifactBase(threadId, round)}.log`),
   ];
   return resolveExistingArtifactPath(candidates);
@@ -169,6 +175,12 @@ export function findExistingOutputArchive(
   const candidates: Array<string | undefined> = [
     roundOutputArchivePath(threadId, round, options.root, options.agent),
     roundOutputArchivePath(threadId, round, options.root),
+    // Rounds written before a log directory was configured live here.
+    path.join(
+      bridgeLogsDir(options.root),
+      WORKER_LOG_DIRNAME,
+      `${artifactBase(threadId, round)}${ROUND_OUTPUT_ARCHIVE_SUFFIX}`,
+    ),
     path.join(
       bridgeLogsDir(options.root),
       `${artifactBase(threadId, round)}${ROUND_OUTPUT_ARCHIVE_SUFFIX}`,
@@ -195,6 +207,9 @@ export function listRoundArtifacts(
   const dirs = new Set<string>();
   dirs.add(getWorkerLogDir(agent, root));
   dirs.add(getWorkerLogDir(undefined, root));
+  // Rounds written before a log directory was configured live in the legacy
+  // worker_log/ (or, older still, directly under logs/).
+  dirs.add(path.join(bridgeLogsDir(root), WORKER_LOG_DIRNAME));
   dirs.add(bridgeLogsDir(root));
 
   const prefix = `${safeThreadIdPart(threadId)}_round_`;

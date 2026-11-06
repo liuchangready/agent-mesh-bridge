@@ -22,6 +22,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import {
   PagedText,
+  REVIEWER_LOG_DIRNAME,
   bridgeLogsDir,
   formatBytes,
   getReviewerLogDir,
@@ -76,6 +77,12 @@ export function findExistingReviewerLog(
   const candidates: Array<string | undefined> = [
     reviewerLogPath(threadId, round, options.root, options.agent),
     reviewerLogPath(threadId, round, options.root),
+    // Reviews written before a log directory was configured live here.
+    path.join(
+      bridgeLogsDir(options.root),
+      REVIEWER_LOG_DIRNAME,
+      `${safeThreadIdPart(threadId)}_round_${safeRound}${REVIEWER_LOG_SUFFIX}`,
+    ),
     path.join(
       bridgeLogsDir(options.root),
       `${safeThreadIdPart(threadId)}_round_${safeRound}${REVIEWER_LOG_SUFFIX}`,
@@ -122,6 +129,9 @@ export function listReviewerLogRounds(
   const dirs = new Set<string>();
   dirs.add(getReviewerLogDir(agent, root));
   dirs.add(getReviewerLogDir(undefined, root));
+  // Reviews written before a log directory was configured live in the legacy
+  // reviewer_log/ (or, older still, directly under logs/).
+  dirs.add(path.join(bridgeLogsDir(root), REVIEWER_LOG_DIRNAME));
   dirs.add(bridgeLogsDir(root));
 
   const prefix = `${safeThreadIdPart(threadId)}_round_`;

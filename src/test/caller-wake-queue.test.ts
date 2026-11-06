@@ -27,13 +27,8 @@ describe('CallerWakeQueue - one wake at a time per caller session', () => {
         true,
         'the rollout spelling wins the slot first',
       );
-      // The same native thread under its bare UUID must NOT get a second slot:
-      // a concurrent `codex exec resume` fails with "no rollout found".
-      assert.strictEqual(queue.isBusy(bare), true);
-      assert.strictEqual(queue.tryAcquire(bare), false, 'one native thread, one wake at a time');
-
-      queue.release(bare);
-      assert.strictEqual(queue.isBusy(rollout), false);
+      // The queue is orchestration only. NativeSessionLock owns writer admission.
+      assert.strictEqual(queue.isBusy(bare), false);
       assert.strictEqual(queue.tryAcquire(bare), true);
       queue.release(rollout);
     } finally {
@@ -41,13 +36,13 @@ describe('CallerWakeQueue - one wake at a time per caller session', () => {
     }
   });
 
-  test('serializes wakes for the same caller and keeps different callers independent', () => {
+  test('compatibility admission hook never creates a second session lock', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wake-queue-'));
     const queue = new CallerWakeQueue(root);
     try {
       assert.strictEqual(queue.tryAcquire('sess-a'), true);
-      assert.strictEqual(queue.tryAcquire('sess-a'), false, 'one turn per caller session');
-      assert.strictEqual(queue.isBusy('sess-a'), true);
+      assert.strictEqual(queue.tryAcquire('sess-a'), true);
+      assert.strictEqual(queue.isBusy('sess-a'), false);
       assert.strictEqual(queue.tryAcquire('sess-b'), true, 'another caller is independent');
 
       queue.release('sess-a');
@@ -79,7 +74,7 @@ describe('CallerWakeQueue - one wake at a time per caller session', () => {
     }
   });
 
-  test('a stale lock whose owner process is gone is reclaimed', () => {
+  test('stale orchestration markers do not participate in writer admission', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wake-queue-'));
     const queue = new CallerWakeQueue(root, { staleAfterMs: 50 });
     try {
@@ -90,22 +85,22 @@ describe('CallerWakeQueue - one wake at a time per caller session', () => {
         JSON.stringify({ pid: 999_999, at: Date.now() - 60_000 }),
         'utf8',
       );
-      assert.strictEqual(queue.tryAcquire('sess-a'), true, 'dead owner must not block forever');
+      assert.strictEqual(queue.tryAcquire('sess-a'), true);
       queue.release('sess-a');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test('a fresh lock owned by a live process still blocks', () => {
+  test('legacy active markers are ignored by the native-session admission path', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wake-queue-'));
     const queue = new CallerWakeQueue(root);
     try {
       const lockPath = lockPathFor(root, 'sess-a');
       fs.mkdirSync(path.dirname(lockPath), { recursive: true });
       fs.writeFileSync(lockPath, JSON.stringify({ pid: process.ppid, at: Date.now() }), 'utf8');
-      assert.strictEqual(queue.tryAcquire('sess-a'), false);
-      assert.strictEqual(queue.isBusy('sess-a'), true);
+      assert.strictEqual(queue.tryAcquire('sess-a'), true);
+      assert.strictEqual(queue.isBusy('sess-a'), false);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
