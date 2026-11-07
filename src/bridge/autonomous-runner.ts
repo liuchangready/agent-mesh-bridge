@@ -98,6 +98,25 @@ const TRANSPORT_ERROR_PATTERNS: string[] = [
 ];
 
 /**
+ * Antigravity's `agy` CLI falls back to an interactive OAuth login when it
+ * cannot read its token from the keyring, then aborts after 60s because a
+ * print-mode run has no TTY to paste the authorization code into.
+ *
+ * Retry only explicit failure markers; printing a login URL alone is not a
+ * failed authentication attempt.
+ */
+const AUTH_TIMEOUT_SIGNALS: RegExp[] = [
+  /error:\s*authentication failed or timed out/i,
+  /authentication timed out\.?/i,
+];
+
+/** True when the run died in the non-interactive OAuth fallback. */
+export function detectsAuthTimeout(text: string): boolean {
+  if (!text) return false;
+  return AUTH_TIMEOUT_SIGNALS.some((pattern) => pattern.test(text));
+}
+
+/**
  * Structured "provider refused us" signals.
  *
  * The agent CLIs retry these internally (Claude Code: 10 attempts with 30–40s
@@ -306,6 +325,11 @@ export interface RunOptions {
   maxRetries?: number; // Max retries for transient startup/network errors, default 3
   /** Base delay for the exponential retry backoff; tests shorten it. */
   retryBackoffMs?: number;
+  /**
+   * Per-attempt delay before replaying an agent that died in the non-interactive
+   * OAuth fallback. Defaults to 5s; tests shorten it.
+   */
+  authBackoffMs?: number;
   /** Thread being executed, so the child can be marked as a task receiver. */
   taskThreadId?: string;
   /** Round being executed (used for diagnostics and receiver guard). */
@@ -773,6 +797,7 @@ export class AutonomousRunner {
     assertCanExecute(options.agent, reviewer ? 'run as a reviewer' : 'run as an executor', reviewer ? 'initiator' : 'receiver');
     const maxRetries = options.maxRetries ?? 3;
     const baseBackoffMs = options.retryBackoffMs ?? 2000;
+    const authBackoffMs = options.authBackoffMs ?? 5000;
     const taskThreadId = options.taskThreadId;
     const nativeRole = options.nativeSessionRole || 'developer';
     const initialTaskExisted =
@@ -1020,9 +1045,15 @@ export class AutonomousRunner {
         }
 
         if (attempt <= maxRetries && this.isRetryableFailure(result)) {
-          const backoffMs = Math.min(baseBackoffMs * Math.pow(2, attempt - 1), 10_000);
+          const combinedOutput = `${result.stdout}\n${result.stderr}\n${result.error || ''}`;
+          const authTimeout = detectsAuthTimeout(combinedOutput);
+          // Give the next process time to retry authentication within the existing retry budget.
+          const backoffMs = authTimeout
+            ? Math.min(authBackoffMs * attempt, 15_000)
+            : Math.min(baseBackoffMs * Math.pow(2, attempt - 1), 10_000);
+          const kind = authTimeout ? 'Authentication timeout' : 'Transient startup/network error';
           console.warn(
-            `[AutonomousRunner] Transient startup/network error on attempt ${attempt}/${maxRetries} for ${options.agent}: "${result.error || result.assessment?.reason || result.stderr.trim()}". Retrying in ${backoffMs / 1000}s...`,
+            `[AutonomousRunner] ${kind} on attempt ${attempt}/${maxRetries} for ${options.agent}: "${result.error || result.assessment?.reason || result.stderr.trim()}". Retrying in ${backoffMs / 1000}s...`,
           );
 
           // Check cancellation before sleeping
@@ -1126,7 +1157,9 @@ export class AutonomousRunner {
    */
   public isTransientError(result: RunResult): boolean {
     if (result.exitCode === 0) return false;
-    const combined = `${result.stdout}\n${result.stderr}\n${result.error || ''}`.toLowerCase();
+    const raw = `${result.stdout}\n${result.stderr}\n${result.error || ''}`;
+    if (detectsAuthTimeout(raw)) return true;
+    const combined = raw.toLowerCase();
     const transientPatterns = [
       ...TRANSPORT_ERROR_PATTERNS,
       'eligibility check failed',
