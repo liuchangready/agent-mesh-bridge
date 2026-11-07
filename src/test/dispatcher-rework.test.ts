@@ -33,10 +33,11 @@ import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
 import { AsyncDispatcher } from '../bridge/async-dispatcher';
 import { ReworkController } from '../bridge/rework-controller';
+import { TaskSupervisor } from '../bridge/task-supervisor';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { getBridgeHome, invalidateConfiguredModelCache, saveModelDefaults } from '../bridge/model-catalog';
 import { clearReviewerBootstrapToken } from '../bridge/reviewer-bootstrap';
-import { describeModelRouting } from '../bridge/types';
+import { DelegationThread, describeModelRouting, shouldResumeNativeSession } from '../bridge/types';
 
 describe('AsyncDispatcher and ReworkController Tests', () => {
   let tempDir: string;
@@ -102,6 +103,70 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       }`,
     );
   };
+
+  test('does not capture a Claude session after a silent first-launch failure', async () => {
+    runner.execute = async () => ({ exitCode: 1, stdout: '', stderr: 'startup failed', extractedOutput: '', durationMs: 1 });
+    const result = await dispatcher.dispatchTask({
+      targetAgent: 'claude_code', title: 'Missing Claude transcript', prompt: 'do the work', reviewFlow: 'legacy',
+    });
+    await waitForStatus(result.threadId, 'failed');
+    taskStore.loadFromDisk();
+    const thread = taskStore.getTask(result.threadId)!;
+    assert.ok(!thread.receiverSessionCaptured);
+    assert.strictEqual(shouldResumeNativeSession(thread, thread.rounds[0]), false);
+    assert.strictEqual(thread.receiverSessionId, result.receiverSessionId);
+  });
+
+  for (const entry of ['rework', 'supervisor'] as const) {
+    test(`${entry} does not capture a Claude session when its initial launch fails`, async () => {
+      const now = new Date().toISOString();
+      const thread: DelegationThread = {
+        threadId: `thread_missing_claude_${entry}`, title: 'Missing Claude transcript',
+        initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'running', currentRound: 1,
+        createdAt: now, updatedAt: now, receiverSessionId: '5c562220-839a-47d5-92c6-e61561e66f07',
+        workspacePath: process.cwd(), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
+        rounds: [{ round: 1, type: 'initial', prompt: 'do the work', status: 'running', durationMs: 0, timestamp: now }],
+      };
+      taskStore.upsertTask(thread);
+      runner.execute = async () => ({ exitCode: 1, stdout: '', stderr: 'startup failed', extractedOutput: '', durationMs: 1 });
+      if (entry === 'rework') {
+        await (reworkController as any).executeReworkBackground(thread, 1, 'do the work', false);
+      } else {
+        const supervisor = new TaskSupervisor(taskStore, runner, callbackManager, detector, new TaskExecutionRegistry(tempDir));
+        try { await supervisor.executeThreadRound(thread, thread.rounds[0]); }
+        finally { supervisor.dispose(); }
+      }
+      taskStore.loadFromDisk();
+      const stored = taskStore.getTask(thread.threadId)!;
+      assert.strictEqual(stored.status, 'failed');
+      assert.strictEqual(shouldResumeNativeSession(stored, stored.rounds[0]), false);
+      assert.strictEqual(stored.receiverSessionId, thread.receiverSessionId);
+    });
+  }
+
+  for (const agent of ['claude_code', 'codex'] as const) {
+    test(`preserves a captured ${agent} session when a later launch fails silently`, async () => {
+      runner.execute = async (options) => ({
+        exitCode: 0, stdout: 'done', stderr: '', extractedOutput: 'done',
+        actualSessionId: options.receiverSessionId, durationMs: 1,
+      });
+      const result = await dispatcher.dispatchTask({
+        targetAgent: agent, title: 'Existing session', prompt: 'do the work', reviewFlow: 'legacy',
+      });
+      await waitForStatus(result.threadId, 'waiting_review');
+      const thread = taskStore.getTask(result.threadId)!;
+      assert.strictEqual(thread.receiverSessionCaptured, true);
+      thread.status = 'running';
+      thread.rounds[0].status = 'running';
+      taskStore.upsertTask(thread);
+      runner.execute = async () => ({ exitCode: 1, stdout: '', stderr: 'startup failed', extractedOutput: '', durationMs: 1 });
+      await (dispatcher as any).executeBackgroundRound(thread, 1, thread.rounds[0].prompt, agent === 'claude_code');
+      taskStore.loadFromDisk();
+      assert.strictEqual(taskStore.getTask(result.threadId)!.status, 'failed');
+      assert.strictEqual(taskStore.getTask(result.threadId)!.receiverSessionCaptured, true);
+      assert.strictEqual(taskStore.getTask(result.threadId)!.receiverSessionId, result.receiverSessionId);
+    });
+  }
 
   test('should dispatch task asynchronously and create thread with round 1', async () => {
     const res = await dispatcher.dispatchTask({

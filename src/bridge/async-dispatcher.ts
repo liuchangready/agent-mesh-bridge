@@ -467,9 +467,6 @@ export class AsyncDispatcher {
       }
       current.status = isRework ? 'reworking' : 'running';
       current.summary.lastOutputSnippet = 'Executing in background...';
-      if (thread.targetAgent === 'claude_code' && !isRework) {
-        current.receiverSessionCaptured = true;
-      }
       this.taskStore.upsertTask(current);
       thread = current;
 
