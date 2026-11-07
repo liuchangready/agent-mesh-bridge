@@ -10,6 +10,7 @@ import {
   clearStaleClaudeSessionLocks,
   detectRateLimitSignal,
   detectStructuredRateLimitSignal,
+  detectsAuthTimeout,
   parseInUseSessionId,
 } from '../bridge/autonomous-runner';
 import { AgentDetector } from '../bridge/agent-detector';
@@ -939,6 +940,86 @@ describe('AutonomousRunner Tests', () => {
     };
     assert.strictEqual(runner.isTransportFailure(realFailure), false);
     assert.strictEqual(runner.isRetryableFailure(realFailure), false);
+  });
+
+  test('should treat an agy non-interactive auth timeout as transient and retryable', () => {
+    const authTimeout = {
+      exitCode: 1,
+      stdout:
+        'Authentication required. Please visit the URL to log in:\n' +
+        '  https://accounts.google.com/o/oauth2/auth?client_id=abc\n\n' +
+        'Waiting for authentication (timeout 60s)...\n' +
+        'Or, paste the authorization code here and press Enter:\n' +
+        'Error: authentication timed out.\n',
+      stderr: 'error: authentication failed or timed out',
+      extractedOutput: '',
+      durationMs: 60_500,
+      error: 'authentication failed or timed out',
+    };
+    assert.strictEqual(detectsAuthTimeout(authTimeout.stdout), true);
+    assert.strictEqual(runner.isTransientError(authTimeout), true);
+    assert.strictEqual(runner.isRetryableFailure(authTimeout), true);
+
+    // A run that printed the login URL but then authenticated on the keyring is
+    // not a timeout: replaying it would duplicate the round.
+    const recovered = {
+      exitCode: 0,
+      stdout:
+        'Authentication required. Please visit the URL to log in:\n  https://accounts.google.com/x\n' +
+        'Print mode: silent auth succeeded\n',
+      stderr: '',
+      extractedOutput: 'OK',
+      durationMs: 4200,
+    };
+    assert.strictEqual(detectsAuthTimeout(recovered.stdout), false);
+    assert.strictEqual(runner.isRetryableFailure(recovered), false);
+  });
+
+  test('should replay an agent that died in the auth fallback and succeed on the retry', async () => {
+    // First launch reproduces the real failure: agy cannot read the keyring in
+    // time, falls back to interactive OAuth and aborts after the prompt. The
+    // replay must recover instead of failing the whole round.
+    const marker = path.join(os.tmpdir(), `agy-auth-retry-${process.pid}-${Math.random().toString(16).slice(2)}`);
+    const authRunner = new AutonomousRunner(detector);
+    authRunner.buildCommand = () => ({
+      command: process.execPath,
+      args: [
+        '-e',
+        [
+          `const fs = require('fs'); const m = ${JSON.stringify(marker)};`,
+          'if (!fs.existsSync(m)) {',
+          "  fs.writeFileSync(m, '1');",
+          "  process.stdout.write('Waiting for authentication (timeout 60s)...\\n');",
+          "  process.stderr.write('error: authentication failed or timed out\\n');",
+          '  process.exit(1);',
+          '}',
+          "process.stdout.write('OK\\n');",
+        ].join(''),
+      ],
+      useShell: false,
+    });
+
+    try {
+      const result = await authRunner.execute({
+        agent: 'antigravity',
+        prompt: 'x',
+        isRework: false,
+        receiverSessionId: 'session-auth-retry',
+        timeoutMs: 60_000,
+        maxRetries: 3,
+        retryBackoffMs: 1,
+        authBackoffMs: 1,
+      });
+
+      assert.strictEqual(result.exitCode, 0, `retry should recover, got: ${result.stderr}`);
+      assert.match(result.stdout, /OK/);
+    } finally {
+      try {
+        fs.unlinkSync(marker);
+      } catch {
+        /* best effort */
+      }
+    }
   });
 
   test('should retry a dropped transport that still exited 0 with no final answer', () => {
