@@ -223,6 +223,91 @@ describe('AutonomousRunner Tests', () => {
     assert.deepStrictEqual(seen[1], { isRework: false, receiverSessionId: '' });
   });
 
+  test('replays a Claude round fresh when its reserved session has no transcript', async () => {
+    // Regression: claude_code reserves its session id with `--session-id` before
+    // the process starts, so `receiverSessionCaptured` is optimistic. A round
+    // that died before emitting anything leaves an id with no transcript on
+    // disk, and `--resume` then answers "No conversation found with session ID".
+    // Reserving the same id again is what creates it, so the round must retry as
+    // a fresh initial run instead of failing the task permanently.
+    const local = new AutonomousRunner(new AgentDetector({ claude_code: process.execPath }));
+    const seen: Array<{ isRework: boolean; receiverSessionId: string }> = [];
+    (local as any).executeOnce = async (opts: any) => {
+      seen.push({ isRework: opts.isRework, receiverSessionId: opts.receiverSessionId });
+      if (seen.length === 1) {
+        const message = `No conversation found with session ID: ${opts.receiverSessionId}`;
+        const stdout = JSON.stringify({
+          type: 'result',
+          subtype: 'error_during_execution',
+          is_error: true,
+          session_id: opts.receiverSessionId,
+          errors: [message],
+        });
+        return {
+          exitCode: 1,
+          stdout,
+          stderr: message,
+          error: message,
+          durationMs: 1,
+          actualSessionId: opts.receiverSessionId,
+          assessment: {
+            success: false,
+            errorCode: 'NONZERO_EXIT',
+            exitCode: 1,
+            stream: {
+              chunkCount: 1,
+              stdoutBytes: stdout.length,
+              stderrBytes: message.length,
+              maxGapMs: 1,
+              gapThresholdMs: 600_000,
+              hasActualOutput: false,
+              continuous: true,
+            },
+          },
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'ok' }),
+        stderr: '',
+        extractedOutput: 'ok',
+        durationMs: 1,
+        assessment: {
+          success: true,
+          errorCode: 'OK',
+          exitCode: 0,
+          stream: {
+            chunkCount: 1,
+            stdoutBytes: 40,
+            stderrBytes: 0,
+            maxGapMs: 1,
+            gapThresholdMs: 600_000,
+            hasActualOutput: true,
+            continuous: true,
+          },
+        },
+      };
+    };
+
+    const sessionId = '5c562220-839a-47d5-92c6-e61561e66f07';
+    const result = await local.execute({
+      agent: 'claude_code',
+      prompt: 'do it',
+      isRework: true,
+      receiverSessionId: sessionId,
+      retryBackoffMs: 1,
+      maxRetries: 3,
+    });
+
+    assert.strictEqual(result.exitCode, 0, 'the fresh run succeeds');
+    assert.strictEqual(seen.length, 2, 'exactly one replay as a fresh run');
+    assert.deepStrictEqual(
+      seen[1],
+      { isRework: false, receiverSessionId: sessionId },
+      'the replay reserves the same id with --session-id instead of resuming it',
+    );
+  });
+
   test('a transcript quoting RATE_LIMITED does not abort the run', async () => {
     const runner = new AutonomousRunner(detector);
     const transcript = [

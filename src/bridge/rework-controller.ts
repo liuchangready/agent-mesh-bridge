@@ -911,9 +911,6 @@ export class ReworkController {
       const current = thread;
       current.status = isRework ? 'reworking' : 'running';
       current.summary.lastOutputSnippet = 'Executing in background...';
-      if (current.targetAgent === 'claude_code' && !isRework) {
-        current.receiverSessionCaptured = true;
-      }
       this.taskStore.upsertTask(current);
       thread = current;
       console.log(
