@@ -1020,6 +1020,30 @@ export class AutonomousRunner {
           continue;
         }
 
+        // Claude Code refuses to resume a session with no transcript on disk:
+        // "No conversation found with session ID: <id>". The ledger can hold
+        // such an id because Claude's `receiverSessionCaptured` is optimistic —
+        // the id is reserved with `--session-id` before the process starts, so a
+        // round that died before emitting anything leaves a preassigned id with
+        // nothing behind it. Reserving that same id again is what creates the
+        // transcript, so replay the prompt as a fresh run instead of resuming.
+        const claudeSessionMissing =
+          options.agent === 'claude_code' &&
+          /no conversation found with session id/i.test(
+            `${result.stderr}\n${result.stdout}\n${result.error || ''}`,
+          );
+        if (attempt <= maxRetries && claudeSessionMissing && attemptOptions.isRework) {
+          console.warn(
+            `[AutonomousRunner] Claude session ${attemptOptions.receiverSessionId} has no transcript; ` +
+              `reserving that id with a fresh run of the same prompt.`,
+          );
+          attemptOptions = {
+            ...attemptOptions,
+            isRework: false,
+          };
+          continue;
+        }
+
         if (attempt <= maxRetries && this.isRetryableFailure(result)) {
           const combinedOutput = `${result.stdout}\n${result.stderr}\n${result.error || ''}`;
           const authTimeout = detectsAuthTimeout(combinedOutput);

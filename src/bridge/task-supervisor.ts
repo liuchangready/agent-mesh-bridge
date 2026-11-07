@@ -612,10 +612,7 @@ export class TaskSupervisor extends EventEmitter {
         );
         currentThread.receiverSessionId = result.actualSessionId;
       }
-      if (
-        result.actualSessionId ||
-        (thread.targetAgent === 'claude_code' && round.type === 'initial')
-      ) {
+      if (result.actualSessionId) {
         currentThread.receiverSessionCaptured = true;
       }
 
