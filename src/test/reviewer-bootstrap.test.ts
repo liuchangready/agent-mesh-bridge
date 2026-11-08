@@ -458,3 +458,109 @@ test('the last-resort finder answers only when one bootstrap can be meant', () =
   store.dispose();
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('a reviewer that never saw dispatch_task is relaunched instead of failed', async () => {
+  const dir = makeTempDir('bridge-bootstrap-no-tools-');
+  const store = new TaskStore(dir);
+  const thread = makeDedicatedThread('thread_bootstrap_no_tools');
+  store.upsertTask(thread);
+  writeReviewerBootstrapToken(
+    { threadId: thread.threadId, token: 'token-nt', agent: 'codex', createdAt: 'now' },
+    dir,
+  );
+
+  // The host raced its MCP registration: the turn ends "cleanly" but the tool
+  // was never in the list. A relaunch is the correct recovery, not a failure.
+  const runner = new AutonomousRunner(new AgentDetector(), 5_000);
+  const missingToolLine =
+    "TypeError: Cannot read properties of undefined (reading 'name')";
+  runner.execute = async (options: any) => {
+    options.onStdoutChunk?.(missingToolLine);
+    return {
+      exitCode: 0,
+      stdout: missingToolLine,
+      stderr: '',
+      extractedOutput: 'cannot read properties',
+      durationMs: 10,
+    };
+  };
+  const service = makeService(dir, store, runner);
+  await service.tick();
+  service.stop();
+
+  const stored = store.getTask(thread.threadId)!;
+  assert.strictEqual(stored.status, 'queued', 'a lost MCP race must not kill the task');
+  assert.strictEqual(stored.reviewBootstrap?.phase, 'pending');
+  assert.strictEqual(stored.reviewBootstrap?.attempts, 1);
+  assert.ok(stored.reviewBootstrap?.retryAfter, 'relaunch must wait out its cool-off');
+  // The developer still must not have started.
+  assert.strictEqual(stored.rounds[0].status, 'running');
+
+  store.dispose();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a reviewer that HAD dispatch_task and ignored it stays terminal', async () => {
+  const dir = makeTempDir('bridge-bootstrap-had-tool-');
+  const store = new TaskStore(dir);
+  const thread = makeDedicatedThread('thread_bootstrap_had_tool');
+  store.upsertTask(thread);
+  writeReviewerBootstrapToken(
+    { threadId: thread.threadId, token: 'token-ht', agent: 'codex', createdAt: 'now' },
+    dir,
+  );
+
+  // A recorded MCP call event proves the tools were present: nothing to retry.
+  const runner = new AutonomousRunner(new AgentDetector(), 5_000);
+  const dispatched =
+    '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"agent-mesh-bridge","tool":"dispatch_task"}}';
+  runner.execute = async (options: any) => {
+    options.onStdoutChunk?.(dispatched);
+    return {
+      exitCode: 0,
+      stdout: dispatched,
+      stderr: '',
+      extractedOutput: 'done',
+      durationMs: 10,
+    };
+  };
+  const service = makeService(dir, store, runner);
+  await service.tick();
+  service.stop();
+
+  const stored = store.getTask(thread.threadId)!;
+  assert.strictEqual(stored.status, 'failed');
+  assert.strictEqual(stored.reviewBootstrap?.phase, 'failed');
+  assert.match(stored.reviewBootstrap?.lastError || '', /without calling dispatch_task/i);
+
+  store.dispose();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('bootstrap attempts are capped so a permanently racy host still terminates', async () => {
+  const dir = makeTempDir('bridge-bootstrap-cap-');
+  const store = new TaskStore(dir);
+  const thread = makeDedicatedThread('thread_bootstrap_cap');
+  // Budget already spent: the next pass must fail instead of relaunching.
+  thread.reviewBootstrap = {
+    phase: 'pending',
+    attempts: 3,
+    lastError: 'reviewer bootstrap attempts exhausted',
+  };
+  store.upsertTask(thread);
+
+  const runner = new AutonomousRunner(new AgentDetector(), 5_000);
+  runner.execute = async () => {
+    throw new Error('must not launch once the budget is spent');
+  };
+  const service = makeService(dir, store, runner);
+  await service.tick();
+  service.stop();
+
+  const stored = store.getTask(thread.threadId)!;
+  assert.strictEqual(stored.status, 'failed');
+  assert.strictEqual(stored.reviewBootstrap?.phase, 'failed');
+
+  store.dispose();
+  fs.rmSync(dir, { recursive: true, force: true });
+});

@@ -476,6 +476,15 @@ export interface ReviewerBootstrapState {
   attempts: number;
   launchedAt?: string;
   lastError?: string;
+  /**
+   * Earliest time a relaunch is allowed.
+   *
+   * Set when a bootstrap turn ended without confirming because the host raced
+   * its MCP registration (the reviewer never saw `dispatch_task`). Retrying
+   * immediately tends to lose the same race, so the relaunch waits out a
+   * cool-off instead of being counted as a terminal failure straight away.
+   */
+  retryAfter?: string;
   /** Native reviewer conversation id captured from the bootstrap turn. */
   reviewerSessionId?: string;
 }

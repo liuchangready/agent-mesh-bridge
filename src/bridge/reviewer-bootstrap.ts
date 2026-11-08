@@ -63,6 +63,71 @@ export interface ReviewerBootstrapToken {
  */
 const BOOTSTRAP_HOST_TTL_MS = 30 * 60 * 1000;
 
+/** The one tool a bootstrap turn exists to call. */
+const REVIEWER_BOOTSTRAP_TOOL = 'dispatch_task';
+
+/** Bounded relaunch budget for a bootstrap that never confirmed. */
+const MAX_REVIEWER_BOOTSTRAP_ATTEMPTS = 3;
+
+/**
+ * Cool-off before relaunching a bootstrap that ended without confirming.
+ *
+ * The failure being retried is a launch race with the host's MCP registration,
+ * so an immediate relaunch tends to lose the same race. A short pause lets the
+ * previous reviewer process exit and its server release the stdio pipe.
+ */
+const REVIEWER_BOOTSTRAP_RETRY_DELAY_MS = 8 * 1000;
+
+/**
+ * Did the reviewer log show it never even saw the bridge tools?
+ *
+ * A dedicated reviewer launch can lose a race with the host's MCP registration:
+ * the host starts the model turn before the bridge server finished `initialize`,
+ * so `dispatch_task` is absent from the tool list and the model correctly
+ * reports "no such tool". A native MCP call always records the server/tool
+ * pair, so its absence plus an explicit missing-tool symptom identifies that
+ * race rather than a reviewer that simply ignored its instructions.
+ */
+function reviewerBootstrapLogShowsMissingTools(logFile: string): boolean {
+  let text = '';
+  try {
+    const stat = fs.statSync(logFile);
+    const limit = 256 * 1024;
+    if (stat.size <= limit) {
+      text = fs.readFileSync(logFile, 'utf8');
+    } else {
+      const half = Math.floor(limit / 2);
+      const head = Buffer.alloc(half);
+      const tail = Buffer.alloc(half);
+      const fd = fs.openSync(logFile, 'r');
+      try {
+        fs.readSync(fd, head, 0, head.length, 0);
+        fs.readSync(fd, tail, 0, tail.length, stat.size - tail.length);
+      } finally {
+        fs.closeSync(fd);
+      }
+      text = head.toString('utf8') + tail.toString('utf8');
+    }
+  } catch {
+    return false;
+  }
+  // A recorded MCP call proves the tools were present; nothing to retry for.
+  // The marker is the host's own `mcp_tool_call` event, NOT a bare mention of
+  // the tool name: a failed exec probe also prints `dispatch_task` in its source.
+  if (
+    text.includes(`"type":"mcp_tool_call"`) &&
+    text.includes(`"tool":"${REVIEWER_BOOTSTRAP_TOOL}"`)
+  ) {
+    return false;
+  }
+  if (text.includes(`mcp__agent_mesh_bridge__${REVIEWER_BOOTSTRAP_TOOL}`)) {
+    return false;
+  }
+  return /Cannot read properties of undefined|tool not available|unknown tool|no such tool|没有\s*`?dispatch_task|工具中没有/i.test(
+    text,
+  );
+}
+
 export function reviewerBootstrapTokenPath(threadId: string, root?: string): string {
   const safe = String(threadId || '').replace(/[^A-Za-z0-9_.-]/g, '_');
   return path.join(bootstrapDir(root), `${safe}.json`);
@@ -283,6 +348,11 @@ export function buildReviewerBootstrapPrompt(thread: DelegationThread, token?: s
     'title or prompt, do NOT explore the repository, do NOT modify files, and do NOT start any',
     'other task.',
     '',
+    'If `dispatch_task` is not in your tool list yet, the bridge MCP server is still starting: this is a',
+    'launch race, not a missing feature. In that case do NOT end the turn and do NOT report the tool as',
+    'unavailable. Wait a few seconds (for example by listing your tools again, or a short sleep) and retry',
+    '— up to ~60 seconds. Only if it is still absent after that may you say so.',
+    '',
     'After the tool returns, end your turn immediately. Do not poll for progress; the bridge will',
     'resume THIS conversation when the developer report is ready for review.',
   ].join('\n');
@@ -381,7 +451,10 @@ export class ReviewerBootstrapService {
         this.deps.executionRegistry.getOwner(candidate.threadId) ||
         new TaskRoleLock(root).getOwner(candidate.threadId)
       ) continue;
-      if ((candidate.reviewBootstrap?.attempts || 0) >= 3) {
+      // A relaunch after a lost MCP-registration race waits out its cool-off.
+      const retryAfter = Date.parse(candidate.reviewBootstrap?.retryAfter || '');
+      if (Number.isFinite(retryAfter) && Date.now() < retryAfter) continue;
+      if ((candidate.reviewBootstrap?.attempts || 0) >= MAX_REVIEWER_BOOTSTRAP_ATTEMPTS) {
         this.fail(
           candidate,
           candidate.reviewBootstrap?.lastError || 'reviewer bootstrap attempts exhausted',
@@ -469,8 +542,11 @@ export class ReviewerBootstrapService {
         return;
       }
       thread = beforeStart;
+      // The cool-off has done its job once the relaunch is admitted.
+      const { retryAfter: _retryAfter, ...previousBootstrap } =
+        thread.reviewBootstrap || { phase: 'pending' as const };
       thread.reviewBootstrap = {
-        ...(thread.reviewBootstrap || { phase: 'pending' }),
+        ...previousBootstrap,
         phase: 'launching',
         attempts: attempt,
         launchedAt: new Date().toISOString(),
@@ -557,10 +633,10 @@ export class ReviewerBootstrapService {
           if (!result) {
             fresh.reviewBootstrap = {
               ...(fresh.reviewBootstrap || { phase: 'pending', attempts: attempt }),
-              phase: attempt >= 3 ? 'failed' : 'pending',
+              phase: attempt >= MAX_REVIEWER_BOOTSTRAP_ATTEMPTS ? 'failed' : 'pending',
               lastError: `reviewer launch failed: ${runError?.message || runError}`,
             };
-            if (attempt >= 3) {
+            if (attempt >= MAX_REVIEWER_BOOTSTRAP_ATTEMPTS) {
               this.fail(fresh, `reviewer launch failed: ${runError?.message || runError}`);
             } else {
               store.upsertTask(fresh);
@@ -596,7 +672,24 @@ export class ReviewerBootstrapService {
               (result.exitCode === 0
                 ? `the reviewer turn ended without calling dispatch_task (reviewer log: ${logFile})`
                 : `reviewer process exited with code ${result.exitCode} (reviewer log: ${logFile})`);
-            this.fail(fresh, detail);
+            // A reviewer that never saw `dispatch_task` lost a race with the
+            // host's MCP registration rather than ignoring its instructions.
+            // Relaunching after a cool-off recovers those launches; a reviewer
+            // that HAD the tool and still did nothing stays terminal.
+            if (attempt < MAX_REVIEWER_BOOTSTRAP_ATTEMPTS && reviewerBootstrapLogShowsMissingTools(logFile)) {
+              fresh.reviewBootstrap = {
+                ...(fresh.reviewBootstrap || { phase: 'pending', attempts: attempt }),
+                phase: 'pending',
+                lastError: detail,
+                retryAfter: new Date(Date.now() + REVIEWER_BOOTSTRAP_RETRY_DELAY_MS).toISOString(),
+              };
+              fresh.summary.lastOutputSnippet =
+                `Reviewer bootstrap lost the MCP launch race (${REVIEWER_BOOTSTRAP_TOOL} was not ` +
+                `registered); relaunching (attempt ${attempt + 1}/${MAX_REVIEWER_BOOTSTRAP_ATTEMPTS}).`;
+              store.upsertTask(fresh);
+            } else {
+              this.fail(fresh, detail);
+            }
           }
         }
       } finally {
@@ -621,6 +714,7 @@ export class ReviewerBootstrapService {
       ...(fresh.reviewBootstrap || { phase: 'pending', attempts: 0 }),
       phase: 'failed',
       lastError: detail,
+      retryAfter: undefined,
     };
     fresh.status = 'failed';
     fresh.summary.lastOutputSnippet = `[Reviewer bootstrap failed] ${detail.slice(0, 140)}`;

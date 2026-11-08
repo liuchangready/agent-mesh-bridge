@@ -584,7 +584,12 @@ export class ReworkController {
         this.taskStore.upsertTask(thread);
         return pausedRound;
       }
-      thread.reviewBootstrap = { ...previousBootstrap, phase: 'pending', lastError: undefined };
+      thread.reviewBootstrap = {
+        ...previousBootstrap,
+        phase: 'pending',
+        lastError: undefined,
+        retryAfter: undefined,
+      };
       this.taskStore.upsertTask(thread);
       if (thread.status === 'queued') this.queueDrainer.schedule(100);
       return pausedRound;
