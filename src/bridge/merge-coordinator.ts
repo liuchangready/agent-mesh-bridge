@@ -9,6 +9,7 @@ import { DelegationThread } from './types';
 import { changedFiles, currentHead, gitOutput } from './git-worktree';
 import { TaskExecutionRegistry } from './task-execution-registry';
 import { killProcessTree } from './platform';
+import { taskValidationDir } from './round-log';
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const CHILD_ACK_TIMEOUT_MS = 10_000;
@@ -450,7 +451,9 @@ export class MergeCoordinator {
       if (prior?.validationPath) this.cleanupValidationWorktree(repoPath, threadId, prior.validationPath);
       const tx = { threadId, sourceCommit, targetOldCommit, phase: 'preparing', at: new Date().toISOString() } as any;
       this.writeTransaction(txPath, tx);
-      const scratchRoot = path.join(this.storageDir, 'merge-worktrees');
+      const scratchRoot = thread.artifactDir
+        ? taskValidationDir(thread.artifactDir)
+        : path.join(this.storageDir, 'merge-worktrees');
       const scratch = path.join(scratchRoot, `${threadId}-${crypto.randomUUID()}`);
       fs.mkdirSync(scratchRoot, { recursive: true });
       tx.validationPath = scratch; this.writeTransaction(txPath, tx);
@@ -577,9 +580,12 @@ export class MergeCoordinator {
   }
 
   private cleanupValidationWorktree(repoPath: string, threadId: string, validationPath: string): 'cleaned' | 'present' {
-    const root = path.resolve(this.storageDir, 'merge-worktrees');
     const candidate = path.resolve(validationPath);
-    if (!candidate.startsWith(`${root}${path.sep}`) || !path.basename(candidate).startsWith(`${threadId}-`)) return 'present';
+    const allowedRoots = [path.resolve(this.storageDir, 'merge-worktrees')];
+    const thread = this.store.getTask(threadId);
+    if (thread?.artifactDir) allowedRoots.push(path.resolve(taskValidationDir(thread.artifactDir)));
+    const allowed = allowedRoots.some((root) => candidate.startsWith(`${root}${path.sep}`));
+    if (!allowed || !path.basename(candidate).startsWith(`${threadId}-`)) return 'present';
     const status = this.removeValidationWorktree(repoPath, candidate) ? 'cleaned' : 'present';
     this.recordValidation(threadId, candidate, undefined, status);
     return status;

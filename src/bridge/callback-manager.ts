@@ -639,6 +639,7 @@ export class CallbackManager extends EventEmitter {
         kind: wakeKind,
         note: `${thread.title} | receiver=${thread.targetAgent} | roundType=${round.type} | senderModel=${senderModel || 'agent default'}`,
       },
+      { artifactDir: thread.artifactDir },
     );
     // The callback wakes the INITIATOR, which must retain full bridge tools
     // (review/rework/approve). Never inherit a receiver marker from whatever

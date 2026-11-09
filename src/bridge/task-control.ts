@@ -10,6 +10,7 @@ import {
 } from './native-session-cleanup';
 import { TaskStore } from './task-store';
 import { removeTaskArtifacts } from './task-summary';
+import { removeTaskDataDir } from './task-data-dir';
 import { removeTaskWorktree } from './git-worktree';
 import { changedFiles, currentHead } from './git-worktree';
 import { gitOutput } from './git-worktree';
@@ -254,8 +255,16 @@ export class TaskControlService {
     // Everything the bridge itself stored for this task: per-round logs, output
     // archives, reviewer logs and a pending bootstrap token. The ledger entry is
     // already gone, so a cleanup failure can never resurrect the task.
-    removeTaskArtifacts(threadId, this.storageDir);
+    removeTaskArtifacts(threadId, this.storageDir, {
+      keepArchive: false,
+      targetAgent: thread.targetAgent,
+      initiatorAgent: thread.initiatorAgent,
+      artifactDir: thread.artifactDir,
+    });
     if (thread.worktree) removeTaskWorktree(thread.worktree);
+    // The Git worktree is now unregistered; the unified task directory itself
+    // (worktree/, logs, Archive/, bootstrap credential) can go as a unit.
+    if (thread.artifactDir) removeTaskDataDir(thread.artifactDir, true);
 
     // Clean up the receiver's native conversation(s) only after the ledger entry
     // is gone: a cleanup failure must never leave a "deleted but still listed"

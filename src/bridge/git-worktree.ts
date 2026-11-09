@@ -98,9 +98,15 @@ function readTaskTarget(repositoryPath: string, storageDir: string): TaskTargetM
   }
 }
 
-export function createTaskWorktree(repo: GitRepository, threadId: string, storageDir: string): WorktreeInfo {
-  const pathRoot = path.join(storageDir, 'worktrees');
-  const worktreePath = path.join(pathRoot, threadId);
+export function createTaskWorktree(repo: GitRepository, threadId: string, storageDir: string, worktreeRoot?: string, artifactDir?: string): WorktreeInfo {
+  // Unified task directory: the worktree is a child of the task's own dir, so
+  // logs/Archive and the checkout can never drift to different roots.
+  const pathRoot = artifactDir
+    ? path.resolve(artifactDir)
+    : worktreeRoot
+      ? path.resolve(worktreeRoot)
+      : path.join(storageDir, 'worktrees');
+  const worktreePath = path.join(pathRoot, artifactDir ? 'worktree' : threadId);
   const taskBranch = `mesh/task/${threadId}`;
   fs.mkdirSync(pathRoot, { recursive: true });
   if (fs.existsSync(worktreePath)) throw new Error(`Task worktree already exists: ${worktreePath}`);

@@ -312,14 +312,22 @@ export class TaskDetailPanel {
     const thread = this.taskStore.getTask(this.currentThreadId);
     const round = thread?.rounds.find((entry) => entry.round === roundNumber);
     const root = path.dirname(this.taskStore.getStoragePath());
+    const artifactDir = thread?.artifactDir;
     const file = resolveExistingArtifactPath([
       round?.rawOutputFilePath,
-      findExistingOutputArchive(this.currentThreadId, roundNumber, { root, agent: thread?.targetAgent }),
-      findExistingExecutionLog(this.currentThreadId, roundNumber, { root, agent: thread?.targetAgent }),
-      roundOutputArchivePath(this.currentThreadId, roundNumber, root, thread?.targetAgent),
-      roundOutputArchivePath(this.currentThreadId, roundNumber),
-      roundExecutionLogPath(this.currentThreadId, roundNumber, root, thread?.targetAgent),
-      roundExecutionLogPath(this.currentThreadId, roundNumber),
+      findExistingOutputArchive(this.currentThreadId, roundNumber, { root, agent: thread?.targetAgent, artifactDir }),
+      findExistingExecutionLog(this.currentThreadId, roundNumber, { root, agent: thread?.targetAgent, artifactDir }),
+      ...(artifactDir
+        ? [
+            roundOutputArchivePath(this.currentThreadId, roundNumber, undefined, undefined, artifactDir),
+            roundExecutionLogPath(this.currentThreadId, roundNumber, undefined, undefined, artifactDir),
+          ]
+        : [
+            roundOutputArchivePath(this.currentThreadId, roundNumber, root, thread?.targetAgent),
+            roundOutputArchivePath(this.currentThreadId, roundNumber),
+            roundExecutionLogPath(this.currentThreadId, roundNumber, root, thread?.targetAgent),
+            roundExecutionLogPath(this.currentThreadId, roundNumber),
+          ]),
     ]);
     if (!file) {
       vscode.window.showWarningMessage(
@@ -344,10 +352,15 @@ export class TaskDetailPanel {
   private async handleOpenReviewerLog(roundNumber: number): Promise<void> {
     const thread = this.taskStore.getTask(this.currentThreadId);
     const root = path.dirname(this.taskStore.getStoragePath());
+    const artifactDir = thread?.artifactDir;
     const file = resolveExistingArtifactPath([
-      findExistingReviewerLog(this.currentThreadId, roundNumber, { root, agent: thread?.initiatorAgent }),
-      reviewerLogPath(this.currentThreadId, roundNumber, root, thread?.initiatorAgent),
-      reviewerLogPath(this.currentThreadId, roundNumber),
+      findExistingReviewerLog(this.currentThreadId, roundNumber, { root, agent: thread?.initiatorAgent, artifactDir }),
+      ...(artifactDir
+        ? [reviewerLogPath(this.currentThreadId, roundNumber, undefined, undefined, artifactDir)]
+        : [
+            reviewerLogPath(this.currentThreadId, roundNumber, root, thread?.initiatorAgent),
+            reviewerLogPath(this.currentThreadId, roundNumber),
+          ]),
     ]);
     if (!file) {
       vscode.window.showWarningMessage(
@@ -366,18 +379,20 @@ export class TaskDetailPanel {
   /** Reviewer log tail for one round, or undefined when the reviewer never ran. */
   private readReviewerOutput(roundNumber: number) {
     const root = path.dirname(this.taskStore.getStoragePath());
+    const artifactDir = this.taskStore.getTask(this.currentThreadId)?.artifactDir;
     return (
-      readReviewerLogTail(this.currentThreadId, roundNumber, { root }) ??
-      readReviewerLogTail(this.currentThreadId, roundNumber)
+      readReviewerLogTail(this.currentThreadId, roundNumber, { root, artifactDir }) ??
+      (artifactDir ? undefined : readReviewerLogTail(this.currentThreadId, roundNumber))
     );
   }
 
   /** Cheap existence probe for rounds whose bytes are not rendered inline. */
   private reviewerLogExists(roundNumber: number): boolean {
     const root = path.dirname(this.taskStore.getStoragePath());
+    const artifactDir = this.taskStore.getTask(this.currentThreadId)?.artifactDir;
     return (
-      statReviewerLog(this.currentThreadId, roundNumber, root).exists ||
-      statReviewerLog(this.currentThreadId, roundNumber).exists
+      statReviewerLog(this.currentThreadId, roundNumber, root, undefined, artifactDir).exists ||
+      (artifactDir ? false : statReviewerLog(this.currentThreadId, roundNumber).exists)
     );
   }
 
@@ -387,9 +402,10 @@ export class TaskDetailPanel {
    */
   private resolveReviewerLog(roundNumber: number): { round: number; fallback: boolean } | undefined {
     const root = path.dirname(this.taskStore.getStoragePath());
+    const artifactDir = this.taskStore.getTask(this.currentThreadId)?.artifactDir;
     return (
-      resolveReviewerLogRound(this.currentThreadId, roundNumber, root) ??
-      resolveReviewerLogRound(this.currentThreadId, roundNumber)
+      resolveReviewerLogRound(this.currentThreadId, roundNumber, root, undefined, artifactDir) ??
+      (artifactDir ? undefined : resolveReviewerLogRound(this.currentThreadId, roundNumber))
     );
   }
 
@@ -937,6 +953,14 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
         ${thread.status === 'paused' ? '<button class="secondary" style="margin-top:8px;" onclick="compactNativeSession()">Compress a captured task session…</button>' : ''}
       </div>
       ${thread.worktree ? renderWorktreeDetails(thread.worktree) : ''}
+      ${
+        thread.artifactDir
+          ? `<div class="meta-item">
+        <div class="meta-label">Task Data</div>
+        <div class="meta-val">${escapeHtml(thread.artifactDir)}<br/><span style="opacity:.75;">worktree/ · worker_log/ · reviewer_log/ · Archive/</span></div>
+      </div>`
+          : ''
+      }
       <div class="meta-item">
         <div class="meta-label">Created At</div>
         <div class="meta-val">${new Date(thread.createdAt).toLocaleString()}</div>

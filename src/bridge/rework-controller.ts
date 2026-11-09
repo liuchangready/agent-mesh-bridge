@@ -570,7 +570,7 @@ export class ReworkController {
       thread.summary.lastPromptSnippet = (pausedRound.prompt || '').slice(0, 100);
       thread.summary.lastOutputSnippet = 'Resuming the dedicated reviewer bootstrap...';
       const previousBootstrap = thread.reviewBootstrap || { phase: 'pending' as const, attempts: 0 };
-      const existingToken = readReviewerBootstrapToken(threadId, this.storageDir);
+      const existingToken = readReviewerBootstrapToken(threadId, this.storageDir, thread.artifactDir);
       if (!existingToken) {
         const reason = previousBootstrap.phase === 'confirmed' && !thread.reviewerSessionCaptured
           ? 'The one-time reviewer token is unavailable and its native session was never captured; the original reviewer session cannot be resumed safely.'
@@ -933,6 +933,7 @@ export class ReworkController {
         roundNumber,
         path.dirname(this.taskStore.getStoragePath()),
         thread.targetAgent,
+        thread.artifactDir,
       );
       try {
         fs.mkdirSync(path.dirname(roundLogPath), { recursive: true });

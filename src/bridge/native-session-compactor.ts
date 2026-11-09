@@ -8,7 +8,7 @@ import { CancellationRegistry } from './cancellation-registry';
 import { CodexNativeCompaction } from './codex-native-compaction';
 import { NativeSessionLock } from './native-session-lock';
 import { resolveConfiguredModel } from './model-catalog';
-import { getReviewerLogDir, getWorkerLogDir, safeThreadIdPart } from './round-log';
+import { getReviewerLogDir, getWorkerLogDir, safeThreadIdPart, taskReviewerLogDir, taskWorkerLogDir } from './round-log';
 import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 import { TaskRoleLock, TaskRole } from './task-role-lock';
 import { TaskStore } from './task-store';
@@ -144,6 +144,28 @@ function recoveryDocument(thread: DelegationThread, role: TaskRole, agent: Agent
   }
   if (Buffer.byteLength(text, 'utf8') > 12 * 1024) throw new Error('Required task constraints do not fit in the recovery document budget.');
   return text;
+}
+
+/**
+ * Bridge log directory for a role, preferring the task's recorded unified dir.
+ *
+ * Legacy tasks (no `artifactDir`) keep their per-agent logDirectories layout.
+ * New tasks never rescan agent-wide directories for their own files.
+ */
+function roleLogDir(
+  thread: DelegationThread,
+  role: TaskRole,
+  agent: AgentId,
+  root?: string,
+): string {
+  if (thread.artifactDir) {
+    return role === 'reviewer'
+      ? taskReviewerLogDir(thread.artifactDir)
+      : taskWorkerLogDir(thread.artifactDir);
+  }
+  return role === 'reviewer'
+    ? getReviewerLogDir(agent, root)
+    : getWorkerLogDir(agent, root);
 }
 
 function emptyMaintenanceUsage(id: string, role: TaskRole, agent: AgentId, model: string): TokenUsageComponent {
@@ -299,7 +321,7 @@ export class NativeSessionCompactor {
         cursor = { ...currentCursor, revision: (currentCursor.revision || 0) + 1 };
         thread.nativeSessionCompaction = { ...thread.nativeSessionCompaction, [role]: cursor };
         this.store.upsertTask(thread);
-        const expectedLogDir = role === 'reviewer' ? getReviewerLogDir(agent, root) : getWorkerLogDir(agent, root);
+        const expectedLogDir = roleLogDir(thread, role, agent, root);
         if (path.dirname(path.resolve(operation.logPath)) === path.resolve(expectedLogDir)) {
           try { fs.appendFileSync(operation.logPath, `${JSON.stringify({ at: operation.finishedAt, operationId: operation.id, phase: operation.phase, errorCode: operation.errorCode })}\n`, 'utf8'); } catch {}
         }
@@ -409,7 +431,7 @@ export class NativeSessionCompactor {
         thread.status = 'paused'; this.store.upsertTask(thread); new NativeSessionLock(root).release(lease);
         return { sessionId, pauseReason: reason };
       }
-      const logDir = role === 'reviewer' ? getReviewerLogDir(agent, root) : getWorkerLogDir(agent, root);
+      const logDir = roleLogDir(thread, role, agent, root);
       const recoveryPath = path.resolve(operation.recoveryPath);
       if (path.dirname(recoveryPath) !== path.resolve(logDir)) {
         releaseExecutionLease();
@@ -479,7 +501,7 @@ export class NativeSessionCompactor {
     const latest = [...(thread.rounds || [])].reverse().find((round) => round.type !== 'approval');
     if (!latest) return { warning: 'Automatic compaction skipped because no business round is available.' };
     const id = crypto.randomUUID();
-    const logDir = role === 'reviewer' ? getReviewerLogDir(agent, root) : getWorkerLogDir(agent, root);
+    const logDir = roleLogDir(thread, role, agent, root);
     const base = `${safeThreadIdPart(thread.threadId)}_round_${latest.round}.native_${id}`;
     const operation: NativeSessionCompactionOperation = {
       id, role: role as 'developer' | 'reviewer', agent, sessionId, model, reason: 'turn_budget',
@@ -729,7 +751,7 @@ export class NativeSessionCompactor {
       executions.dispose(); sessionLock.release(sessionLease); roleLock.release(roleLease); throw error;
     }
     const id = crypto.randomUUID();
-    const logDir = role === 'reviewer' ? getReviewerLogDir(agent, root) : getWorkerLogDir(agent, root);
+    const logDir = roleLogDir(thread, role, agent, root);
     const base = `${safeThreadIdPart(threadId)}_round_${round.round}.native_${id}`;
     const logPath = path.join(logDir, role === 'reviewer' ? `${base}.reviewer.log` : `${base}.log`);
     const recoveryPath = path.join(logDir, `${base}.recovery.json`);

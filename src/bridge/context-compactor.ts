@@ -33,7 +33,6 @@ import {
   isContextCompactionEnabled,
 } from './bridge-policy';
 import {
-  findExistingExecutionLog,
   formatBytes,
   resolveExistingArtifactPath,
   roundExecutionLogPath,
@@ -368,10 +367,19 @@ export class ContextCompactor {
         }
 
         const home = this.homeDir();
-        const archivePath = roundOutputArchivePath(input.threadId, target.round, home);
+        const artifactDir = thread.artifactDir;
+        const archivePath = roundOutputArchivePath(
+          input.threadId,
+          target.round,
+          home,
+          undefined,
+          artifactDir,
+        );
         const executionLogPath = resolveExistingArtifactPath([
-          roundExecutionLogPath(input.threadId, target.round, home),
-          roundExecutionLogPath(input.threadId, target.round),
+          roundExecutionLogPath(input.threadId, target.round, home, undefined, artifactDir),
+          ...(artifactDir
+            ? []
+            : [roundExecutionLogPath(input.threadId, target.round)]),
         ]);
 
         const capsule = extractCompactionCapsule(input.currentOutput || '');

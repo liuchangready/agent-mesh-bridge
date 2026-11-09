@@ -24,6 +24,41 @@ export const ROUND_EXECUTION_LOG_SUFFIX = '.log';
 export const WORKER_LOG_DIRNAME = 'worker_log';
 export const REVIEWER_LOG_DIRNAME = 'reviewer_log';
 export const ARCHIVE_DIRNAME = 'Archive';
+export const WORKTREE_DIRNAME = 'worktree';
+export const BOOTSTRAP_DIRNAME = 'bootstrap';
+export const VALIDATION_DIRNAME = 'validation';
+
+/**
+ * Paths owned by one task's unified data directory.
+ *
+ * A new task records the absolute base in `thread.artifactDir`; every later
+ * write goes through that recorded value instead of re-reading the (mutable)
+ * global `taskDataRoot` policy. Legacy tasks have no such base and keep using
+ * the per-agent log directories below.
+ */
+export function taskWorkerLogDir(artifactDir: string): string {
+  return path.join(artifactDir, WORKER_LOG_DIRNAME);
+}
+
+export function taskReviewerLogDir(artifactDir: string): string {
+  return path.join(artifactDir, REVIEWER_LOG_DIRNAME);
+}
+
+export function taskArchiveDir(artifactDir: string): string {
+  return path.join(artifactDir, ARCHIVE_DIRNAME);
+}
+
+export function taskWorktreeDir(artifactDir: string): string {
+  return path.join(artifactDir, WORKTREE_DIRNAME);
+}
+
+export function taskBootstrapDir(artifactDir: string): string {
+  return path.join(artifactDir, BOOTSTRAP_DIRNAME);
+}
+
+export function taskValidationDir(artifactDir: string): string {
+  return path.join(artifactDir, VALIDATION_DIRNAME);
+}
 
 function readPolicySnapshot(root?: string): any {
   try {
@@ -131,8 +166,10 @@ export function roundExecutionLogPath(
   round: number,
   root?: string,
   agent?: string,
+  artifactDir?: string,
 ): string {
-  return path.join(getWorkerLogDir(agent, root), `${artifactBase(threadId, round)}.log`);
+  const dir = artifactDir ? taskWorkerLogDir(artifactDir) : getWorkerLogDir(agent, root);
+  return path.join(dir, `${artifactBase(threadId, round)}.log`);
 }
 
 export function roundOutputArchivePath(
@@ -140,19 +177,23 @@ export function roundOutputArchivePath(
   round: number,
   root?: string,
   agent?: string,
+  artifactDir?: string,
 ): string {
-  return path.join(
-    getWorkerLogDir(agent, root),
-    `${artifactBase(threadId, round)}${ROUND_OUTPUT_ARCHIVE_SUFFIX}`,
-  );
+  const dir = artifactDir ? taskWorkerLogDir(artifactDir) : getWorkerLogDir(agent, root);
+  return path.join(dir, `${artifactBase(threadId, round)}${ROUND_OUTPUT_ARCHIVE_SUFFIX}`);
 }
 
 export function findExistingExecutionLog(
   threadId: string,
   round: number,
-  options: { root?: string; agent?: string } = {},
+  options: { root?: string; agent?: string; artifactDir?: string } = {},
 ): string | undefined {
-  const safeRound = Number.isFinite(round) ? Math.max(1, Math.floor(round)) : 1;
+  if (options.artifactDir) {
+    // A unified task directory is self-contained: one lifecycle file, one path.
+    return resolveExistingArtifactPath([
+      roundExecutionLogPath(threadId, round, undefined, undefined, options.artifactDir),
+    ]);
+  }
   const candidates: Array<string | undefined> = [
     roundExecutionLogPath(threadId, round, options.root, options.agent),
     roundExecutionLogPath(threadId, round, options.root),
@@ -170,8 +211,13 @@ export function findExistingExecutionLog(
 export function findExistingOutputArchive(
   threadId: string,
   round: number,
-  options: { root?: string; agent?: string } = {},
+  options: { root?: string; agent?: string; artifactDir?: string } = {},
 ): string | undefined {
+  if (options.artifactDir) {
+    return resolveExistingArtifactPath([
+      roundOutputArchivePath(threadId, round, undefined, undefined, options.artifactDir),
+    ]);
+  }
   const candidates: Array<string | undefined> = [
     roundOutputArchivePath(threadId, round, options.root, options.agent),
     roundOutputArchivePath(threadId, round, options.root),
@@ -203,14 +249,20 @@ export function listRoundArtifacts(
   threadId: string,
   root?: string,
   agent?: string,
+  artifactDir?: string,
 ): RoundArtifact[] {
   const dirs = new Set<string>();
-  dirs.add(getWorkerLogDir(agent, root));
-  dirs.add(getWorkerLogDir(undefined, root));
-  // Rounds written before a log directory was configured live in the legacy
-  // worker_log/ (or, older still, directly under logs/).
-  dirs.add(path.join(bridgeLogsDir(root), WORKER_LOG_DIRNAME));
-  dirs.add(bridgeLogsDir(root));
+  if (artifactDir) {
+    // Self-contained task directory: never rescan every agent's global logs.
+    dirs.add(taskWorkerLogDir(artifactDir));
+  } else {
+    dirs.add(getWorkerLogDir(agent, root));
+    dirs.add(getWorkerLogDir(undefined, root));
+    // Rounds written before a log directory was configured live in the legacy
+    // worker_log/ (or, older still, directly under logs/).
+    dirs.add(path.join(bridgeLogsDir(root), WORKER_LOG_DIRNAME));
+    dirs.add(bridgeLogsDir(root));
+  }
 
   const prefix = `${safeThreadIdPart(threadId)}_round_`;
   const map = new Map<string, RoundArtifact>();
@@ -252,8 +304,9 @@ export function findLatestExecutionLog(
   threadId: string,
   root?: string,
   agent?: string,
+  artifactDir?: string,
 ): RoundArtifact | undefined {
-  const logs = listRoundArtifacts(threadId, root, agent).filter((a) => a.kind === 'execution');
+  const logs = listRoundArtifacts(threadId, root, agent, artifactDir).filter((a) => a.kind === 'execution');
   if (logs.length === 0) return undefined;
   return logs.reduce((a, b) => (b.round > a.round ? b : a));
 }

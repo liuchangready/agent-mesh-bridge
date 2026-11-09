@@ -286,6 +286,18 @@
           "default": "",
           "markdownDescription": "**Sender-side** default model for DeepSeek Harness: the model its review/wake-up runs use after it dispatched a task (applied as a one-run profile overlay, like receiver rounds). Configured separately from the receiver-side model, so DSH can review as `pro` while the tasks it delegates to other agents run on their own models. Leave empty to keep the agent's own model; the task ledger then reports the receiver-side default for the sender badge when one is set."
         },
+        "agentMeshBridge.taskDataRoot": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Root directory for NEW tasks' unified data directories. Each task gets `<taskDataRoot>/<threadId>/` containing its Git worktree (`worktree/`), receiver logs (`worker_log/`), reviewer logs (`reviewer_log/`), terminal archives (`Archive/`), and one-shot bootstrap credential. When empty, defaults to `<bridge home>/tasks` (normally `~/.agent-mesh-bridge/tasks`). A relative path resolves against the bridge home. Only affects newly dispatched tasks; existing tasks keep the absolute directory recorded at creation, and legacy tasks keep their old worktree/log locations."
+        },
+        "agentMeshBridge.worktreeRoot": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Legacy base directory where per-task Git worktrees are created (`<root>/<threadId>`). New tasks put their worktree inside `agentMeshBridge.taskDataRoot/<threadId>/worktree`; this setting is kept for existing tasks and direct worktree creation. A relative path resolves against `~/.agent-mesh-bridge`."
+        },
         "agentMeshBridge.logDirectories.default": {
           "type": "string",
           "default": "",

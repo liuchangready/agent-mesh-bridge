@@ -62,6 +62,23 @@ export interface BridgePolicy {
   reviewFlow?: 'legacy' | 'dedicated';
   /** Per-agent base log storage directories. */
   logDirectories?: AgentLogDirectories;
+  /**
+   * Root directory for NEW tasks' unified data directories.
+   *
+   * Each task gets `<taskDataRoot>/<threadId>/` containing its worktree, logs,
+   * bootstrap credential, validation workspace and Archive. Empty keeps the
+   * default `<bridge home>/tasks`; a relative value resolves against the bridge
+   * home. Existing tasks keep the absolute `thread.artifactDir` recorded when
+   * they were created, so changing this never forks a running task's files.
+   */
+  taskDataRoot?: string;
+  /**
+   * Legacy per-task worktree root (pre-unified task directories).
+   *
+   * Kept for old ledger entries and for callers that create a worktree directly;
+   * new tasks use `taskDataRoot` and place the worktree inside their task dir.
+   */
+  worktreeRoot?: string;
   updatedAt?: string;
 }
 
@@ -139,6 +156,26 @@ export function saveBridgePolicy(patch: BridgePolicy, root?: string): BridgePoli
     }
     next.logDirectories = mergedDirs;
   }
+  if (patch.taskDataRoot !== undefined) {
+    if (typeof patch.taskDataRoot === 'string') {
+      const trimmed = patch.taskDataRoot.trim();
+      if (trimmed) {
+        next.taskDataRoot = trimmed;
+      } else {
+        delete next.taskDataRoot;
+      }
+    }
+  }
+  if (patch.worktreeRoot !== undefined) {
+    if (typeof patch.worktreeRoot === 'string') {
+      const trimmed = patch.worktreeRoot.trim();
+      if (trimmed) {
+        next.worktreeRoot = trimmed;
+      } else {
+        delete next.worktreeRoot;
+      }
+    }
+  }
   next.updatedAt = new Date().toISOString();
 
   try {
@@ -196,4 +233,24 @@ export function concurrencyPolicy(root?: string): ConcurrencyPolicy {
 /** Custom log directories configured per agent or globally. */
 export function getAgentLogDirectories(root?: string): AgentLogDirectories {
   return readBridgePolicy(root).logDirectories || {};
+}
+
+/**
+ * Root directory that holds every (legacy) task worktree.
+ *
+ * Falls back to `<storage>/worktrees`. New tasks ignore this switch and place
+ * their worktree inside the unified task directory; the setting is retained for
+ * old ledger entries and direct worktree creation callers.
+ */
+export function worktreeRoot(storageDir: string, root?: string): string {
+  // The mirrored policy lives next to the ledger, which is `storageDir` for every
+  // real caller. Reading only `root` would consult the real home directory and
+  // silently ignore a root recorded for a custom storage dir.
+  const policyRoot = root && root.trim() ? root : storageDir;
+  const configured = readBridgePolicy(policyRoot).worktreeRoot;
+  if (typeof configured === 'string' && configured.trim()) {
+    const value = configured.trim();
+    return path.isAbsolute(value) ? path.normalize(value) : path.resolve(policyRoot, value);
+  }
+  return path.join(storageDir, 'worktrees');
 }
