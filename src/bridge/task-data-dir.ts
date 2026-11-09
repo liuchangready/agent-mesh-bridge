@@ -10,6 +10,7 @@
  *     Archive/        terminal tar.gz + summary JSON
  *     bootstrap/      one-shot reviewer credential (removed when consumed)
  *     validation/     temporary combined-validation worktree
+ *     model-overlays/ bridge-generated one-run DSH model patch files
  *
  * The absolute path is persisted as `thread.artifactDir` / `taskDataDir` at
  * creation. Every later write must use that recorded path, never re-resolve the
@@ -26,6 +27,7 @@ import { readBridgePolicy } from './bridge-policy';
 import {
   ARCHIVE_DIRNAME,
   BOOTSTRAP_DIRNAME,
+  MODEL_OVERLAY_DIRNAME,
   REVIEWER_LOG_DIRNAME,
   VALIDATION_DIRNAME,
   WORKER_LOG_DIRNAME,
@@ -45,6 +47,7 @@ export interface TaskDataDirectories {
   archiveDir: string;
   bootstrapDir: string;
   validationDir: string;
+  modelOverlayDir: string;
 }
 
 /**
@@ -96,6 +99,7 @@ export function ensureTaskDataDir(
     archiveDir: path.join(artifactDir, ARCHIVE_DIRNAME),
     bootstrapDir: path.join(artifactDir, BOOTSTRAP_DIRNAME),
     validationDir: path.join(artifactDir, VALIDATION_DIRNAME),
+    modelOverlayDir: path.join(artifactDir, MODEL_OVERLAY_DIRNAME),
   };
   for (const dir of [
     artifactDir,
@@ -103,6 +107,7 @@ export function ensureTaskDataDir(
     dirs.reviewerLogDir,
     dirs.archiveDir,
     dirs.bootstrapDir,
+    dirs.modelOverlayDir,
   ]) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -138,6 +143,7 @@ export function removeTaskDataDir(
         ARCHIVE_DIRNAME,
         BOOTSTRAP_DIRNAME,
         VALIDATION_DIRNAME,
+        MODEL_OVERLAY_DIRNAME,
       ]) {
         fs.rmSync(path.join(resolved, name), { recursive: true, force: true });
       }

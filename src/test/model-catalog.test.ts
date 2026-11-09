@@ -24,6 +24,7 @@ import { DelegationThread, describeModelRouting, getModelRouting } from '../brid
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { AgentDetector } from '../bridge/agent-detector';
 import { buildDshProviderPatchBlock } from '../bridge/deepseek-harness';
+import { saveBridgePolicy } from '../bridge/bridge-policy';
 
 function makeTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -413,6 +414,62 @@ test('Model catalog - DSH runs get a per-run overlay patch', () => {
 
     // The user's own profile patch is never rewritten by a per-task override.
     assert.strictEqual(fs.readFileSync(profilePatch, 'utf8'), before);
+  });
+});
+
+test('Model catalog - task DSH overlay stays in the fixed task dir across root changes', () => {
+  const root = makeTempDir('mesh-dsh-task-overlay-');
+  const bridgeHome = path.join(root, 'bridge');
+  const dshHome = path.join(root, 'dsh');
+  const launcher = path.join(root, 'resources', 'runtime', 'cli', 'bin', 'dsh.cmd');
+  fs.mkdirSync(path.dirname(launcher), { recursive: true });
+  fs.writeFileSync(launcher, '@echo off\r\n', 'utf8');
+  const profileDir = path.join(dshHome, 'profiles', 'headless');
+  fs.mkdirSync(profileDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(profileDir, 'cordis.patch.yml'),
+    `${buildDshProviderPatchBlock({
+      provider: 'commandcode',
+      api: 'openai-completions',
+      baseUrl: 'https://api.commandcode.ai/provider/v1',
+      model: 'deepseek/deepseek-v4.1-flash',
+      apiKeyEnv: 'COMMANDCODE_API_KEY',
+    })}\n`,
+    'utf8',
+  );
+
+  withEnv({ AGENT_MESH_BRIDGE_HOME: bridgeHome, DSH_HOME: dshHome }, () => {
+    const runner = new AutonomousRunner(new AgentDetector({ deepseek_harness: launcher }));
+    const artifactDir = path.join(root, 'tasks', 'thread_overlay');
+    const model = 'deepseek/deepseek-v4.1-flash-fast';
+    const options = {
+      agent: 'deepseek_harness' as const,
+      prompt: 'ship it',
+      isRework: false,
+      receiverSessionId: 'session-1',
+      model,
+      artifactDir,
+    };
+
+    const first = runner.buildCommand(options);
+    const firstPatch = first.args[first.args.indexOf('--patch') + 1];
+    assert.strictEqual(firstPatch, path.join(artifactDir, 'model-overlays', 'deepseek_deepseek-v4.1-flash-fast.yml'));
+    assert.ok(fs.existsSync(firstPatch), firstPatch);
+
+    // A global root change must not move an existing task's overlay.
+    const newRoot = path.join(root, 'new-task-root');
+    saveBridgePolicy({ taskDataRoot: newRoot }, bridgeHome);
+    const second = runner.buildCommand(options);
+    const secondPatch = second.args[second.args.indexOf('--patch') + 1];
+    assert.strictEqual(secondPatch, firstPatch);
+    assert.ok(fs.existsSync(secondPatch), secondPatch);
+    assert.strictEqual(secondPatch.startsWith(newRoot), false);
+
+    // Calls without a task keep the historical global overlay location.
+    const legacy = runner.buildCommand({ ...options, artifactDir: undefined });
+    const legacyPatch = legacy.args[legacy.args.indexOf('--patch') + 1];
+    assert.strictEqual(legacyPatch, path.join(bridgeHome, 'model-overlays', 'deepseek_deepseek-v4.1-flash-fast.yml'));
+    assert.ok(fs.existsSync(legacyPatch), legacyPatch);
   });
 });
 

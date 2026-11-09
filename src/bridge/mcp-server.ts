@@ -990,7 +990,11 @@ export class MCPServer {
     // Channel 3: the pid of the reviewer CLI the bridge launched. Environment
     // independent, but only correct when this server really is a direct child
     // of that CLI.
-    const byHostPid = findReviewerBootstrapByHostPid(process.ppid);
+    const byHostPid = findReviewerBootstrapByHostPid(
+      process.ppid,
+      this.storeRoot(),
+      this.taskStore,
+    );
     if (byHostPid?.hostPid) {
       return { threadId: byHostPid.threadId, hostPid: byHostPid.hostPid };
     }

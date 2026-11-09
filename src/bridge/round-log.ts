@@ -27,6 +27,7 @@ export const ARCHIVE_DIRNAME = 'Archive';
 export const WORKTREE_DIRNAME = 'worktree';
 export const BOOTSTRAP_DIRNAME = 'bootstrap';
 export const VALIDATION_DIRNAME = 'validation';
+export const MODEL_OVERLAY_DIRNAME = 'model-overlays';
 
 /**
  * Paths owned by one task's unified data directory.
@@ -58,6 +59,11 @@ export function taskBootstrapDir(artifactDir: string): string {
 
 export function taskValidationDir(artifactDir: string): string {
   return path.join(artifactDir, VALIDATION_DIRNAME);
+}
+
+/** One-run DSH model overlay patches generated for this task. */
+export function taskModelOverlayDir(artifactDir: string): string {
+  return path.join(artifactDir, MODEL_OVERLAY_DIRNAME);
 }
 
 function readPolicySnapshot(root?: string): any {

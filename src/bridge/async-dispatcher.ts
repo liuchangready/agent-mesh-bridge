@@ -545,6 +545,7 @@ export class AsyncDispatcher {
           title: thread.title,
           cwd: thread.workspacePath,
           taskThreadId: thread.threadId,
+          artifactDir: thread.artifactDir,
           taskRound: roundNumber,
           model: thread.targetModel,
           role: 'developer',

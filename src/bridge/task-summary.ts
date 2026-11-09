@@ -32,6 +32,7 @@ import {
   getArchiveLogDir,
   taskArchiveDir,
   taskBootstrapDir,
+  taskModelOverlayDir,
   taskReviewerLogDir,
   taskWorkerLogDir,
 } from './round-log';
@@ -346,7 +347,24 @@ export function archiveCompletedTaskLogs(
     }
   }
 
-  // 3. Manifest / summary entry
+  // 3. Bridge-generated one-run model overlays (currently DSH patches).
+  if (artifactDir) {
+    const overlayDir = taskModelOverlayDir(artifactDir);
+    if (fs.existsSync(overlayDir)) {
+      for (const name of fs.readdirSync(overlayDir)) {
+        const full = path.join(overlayDir, name);
+        try {
+          if (!fs.statSync(full).isFile()) continue;
+          const entryName = `model-overlays/${name}`;
+          if (foundFilenames.has(entryName)) continue;
+          entries.push({ name: entryName, content: fs.readFileSync(full), mtime: fs.statSync(full).mtime });
+          foundFilenames.add(entryName);
+        } catch {}
+      }
+    }
+  }
+
+  // 4. Manifest / summary entry
   const manifest = {
     threadId: thread.threadId,
     title: thread.title,
@@ -462,6 +480,20 @@ export function removeTaskArtifacts(
       removed++;
     }
   } catch {}
+
+  // A per-task DSH overlay is a bridge-created run artifact: after its archive
+  // is durable (or on delete) it must not remain active in the task directory.
+  if (artifactDir) {
+    try {
+      const overlayDir = taskModelOverlayDir(artifactDir);
+      for (const name of fs.readdirSync(overlayDir)) {
+        try {
+          fs.unlinkSync(path.join(overlayDir, name));
+          removed++;
+        } catch {}
+      }
+    } catch {}
+  }
 
   if (!keepArchive) {
     const archiveDirs = artifactDir

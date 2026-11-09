@@ -524,6 +524,7 @@ export class TaskSupervisor extends EventEmitter {
           title: thread.title,
           cwd: thread.workspacePath,
           taskThreadId: thread.threadId,
+          artifactDir: thread.artifactDir,
           taskRound: roundNumber,
           model: thread.targetModel,
           role: 'developer',

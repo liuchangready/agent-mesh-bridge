@@ -900,7 +900,7 @@ export class CallbackManager extends EventEmitter {
           json: false,
           // DSH has no `--model`; the sender default travels as a one-run
           // overlay patch, exactly like a receiver round's model.
-          modelOverlayPath: senderModel ? writeDshModelOverlay(senderModel) : undefined,
+          modelOverlayPath: senderModel ? writeDshModelOverlay(senderModel, thread.artifactDir) : undefined,
         });
         if (!built) {
           reviewerLog.writeOutcome({ error: 'unbuildable DeepSeek Harness launch command' });

@@ -15,6 +15,7 @@ import { createTaskWorktree, resolveGitRepository } from '../bridge/git-worktree
 import {
   roundExecutionLogPath,
   taskArchiveDir,
+  taskModelOverlayDir,
   taskReviewerLogDir,
   taskWorkerLogDir,
   taskWorktreeDir,
@@ -99,6 +100,7 @@ test('a task directory is created with the standard layout and the worktree live
     dirs.reviewerLogDir,
     dirs.archiveDir,
     dirs.bootstrapDir,
+    dirs.modelOverlayDir,
   ]) {
     assert.strictEqual(fs.existsSync(dir), true, dir);
   }
@@ -139,6 +141,8 @@ test('archive and cleanup stay inside the task directory and never delete the ar
   fs.writeFileSync(path.join(dirs.reviewerLogDir, `${threadId}_bootstrap.log`), 'bootstrap bytes', 'utf8');
   fs.writeFileSync(path.join(dirs.bootstrapDir, `${threadId}.json`), '{"token":"secret"}', 'utf8');
   fs.writeFileSync(path.join(dirs.workerLogDir, `${threadId}_round_1.native_op.recovery.json`), '{"recovery":true}', 'utf8');
+  const overlayFile = path.join(dirs.modelOverlayDir, 'deepseek-task.yml');
+  fs.writeFileSync(overlayFile, 'model: task-overlay\n', 'utf8');
 
   const thread = {
     threadId,
@@ -164,6 +168,7 @@ test('archive and cleanup stay inside the task directory and never delete the ar
   assert.strictEqual(tarContains(archived.tarGzPaths[0], `worker_log/${threadId}_round_1.log`), true);
   assert.strictEqual(tarContains(archived.tarGzPaths[0], `reviewer_log/${threadId}_round_1.reviewer.log`), true);
   assert.strictEqual(tarContains(archived.tarGzPaths[0], `worker_log/${threadId}_round_1.native_op.recovery.json`), true);
+  assert.strictEqual(tarContains(archived.tarGzPaths[0], 'model-overlays/deepseek-task.yml'), true);
   assert.strictEqual(tarContains(archived.tarGzPaths[0], 'summary.json'), true);
 
   removeTaskArtifacts(threadId, storage, {
@@ -175,6 +180,7 @@ test('archive and cleanup stay inside the task directory and never delete the ar
   assert.strictEqual(fs.existsSync(path.join(dirs.workerLogDir, `${threadId}_round_1.log`)), false);
   assert.strictEqual(fs.existsSync(path.join(dirs.reviewerLogDir, `${threadId}_round_1.reviewer.log`)), false);
   assert.strictEqual(fs.existsSync(path.join(dirs.bootstrapDir, `${threadId}.json`)), false);
+  assert.strictEqual(fs.existsSync(overlayFile), false);
   assert.strictEqual(fs.existsSync(archived.tarGzPaths[0]), true);
   assert.strictEqual(fs.existsSync(archived.jsonPaths[0]), true);
 
@@ -236,6 +242,7 @@ test('delete_task removes the unified directory including its worktree', async (
   );
   fs.writeFileSync(path.join(worktree.path, 'readme.txt'), 'changed\n', 'utf8');
   fs.writeFileSync(path.join(dirs.workerLogDir, `${threadId}_round_1.log`), 'worker', 'utf8');
+  fs.writeFileSync(path.join(dirs.modelOverlayDir, 'deepseek-delete.yml'), 'model: delete-overlay\n', 'utf8');
 
   const now = new Date().toISOString();
   store.upsertTask({
@@ -267,6 +274,7 @@ test('delete_task removes the unified directory including its worktree', async (
   const result = await control.deleteTask(threadId, 'test cleanup', 'test', true);
   assert.strictEqual(result.status, 'DELETED');
   assert.strictEqual(fs.existsSync(dirs.artifactDir), false);
+  assert.strictEqual(fs.existsSync(dirs.modelOverlayDir), false);
   assert.strictEqual(fs.existsSync(worktree.path), false);
   assert.strictEqual(store.getTask(threadId), undefined);
 });

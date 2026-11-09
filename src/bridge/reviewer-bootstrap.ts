@@ -246,12 +246,13 @@ function bootstrapRecordFiles(root?: string, taskStore?: TaskStore): string[] {
 export function findReviewerBootstrapByHostPid(
   hostPid: number | undefined,
   root?: string,
+  taskStore?: TaskStore,
 ): ReviewerBootstrapToken | undefined {
   if (!hostPid || !Number.isFinite(hostPid)) return undefined;
 
   const now = Date.now();
   let found: ReviewerBootstrapToken | undefined;
-  for (const file of bootstrapRecordFiles(root)) {
+  for (const file of bootstrapRecordFiles(root, taskStore)) {
     let record: ReviewerBootstrapToken | undefined;
     try {
       record = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -596,6 +597,7 @@ export class ReviewerBootstrapService {
         title: `Reviewer bootstrap: ${thread.title}`,
         cwd: thread.workspacePath,
         taskThreadId: thread.threadId,
+        artifactDir: thread.artifactDir,
         taskRound: 0,
         nativeSessionRole: 'reviewer',
         model: thread.reviewerModel,

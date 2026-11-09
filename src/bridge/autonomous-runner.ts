@@ -332,6 +332,12 @@ export interface RunOptions {
   authBackoffMs?: number;
   /** Thread being executed, so the child can be marked as a task receiver. */
   taskThreadId?: string;
+  /**
+   * Absolute task data directory pinned at creation. Bridge-generated run
+   * artifacts (currently the DSH model overlay) go here, never to the current
+   * global root.
+   */
+  artifactDir?: string;
   /** Round being executed (used for diagnostics and receiver guard). */
   taskRound?: number;
   /** Role for native-session ownership; reviewer bootstrap is round zero. */
@@ -766,7 +772,7 @@ export class AutonomousRunner {
           sessionId: isRework ? receiverSessionId : undefined,
           json: true,
           // DSH has no `--model`; a per-run overlay patch switches the route.
-          modelOverlayPath: model ? writeDshModelOverlay(model) : undefined,
+          modelOverlayPath: model ? writeDshModelOverlay(model, options.artifactDir) : undefined,
         });
         if (built) {
           return built;
