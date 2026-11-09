@@ -291,6 +291,85 @@ test('legacy threads without artifactDir keep using per-agent log directories', 
   assert.strictEqual(fs.existsSync(taskArtifactDir(threadId, storage)), false);
 });
 
+test('TaskStore.archiveTask keeps overlays, rounds and sessions when an overlay read fails, then retries', (t) => {
+  const storage = isolatedDir('mesh-taskdata-archive-eio-');
+  const store = new TaskStore(storage);
+  const fsModule: any = require('fs');
+  const originalReadFileSync = fsModule.readFileSync;
+  t.after(() => {
+    fsModule.readFileSync = originalReadFileSync;
+    store.dispose();
+    removeTree(storage);
+  });
+
+  const threadId = 'thread_archive_overlay_eio';
+  const dirs = ensureTaskDataDir(threadId, storage);
+  const overlayFile = path.join(dirs.modelOverlayDir, 'model.yml');
+  fs.writeFileSync(overlayFile, 'model: overlay-eio\n', 'utf8');
+  fs.writeFileSync(path.join(dirs.workerLogDir, `${threadId}_round_1.log`), 'worker', 'utf8');
+  const now = new Date().toISOString();
+  store.upsertTask({
+    threadId,
+    title: 'Archive overlay EIO',
+    initiatorAgent: 'codex',
+    targetAgent: 'antigravity',
+    status: 'completed',
+    currentRound: 1,
+    createdAt: now,
+    updatedAt: now,
+    receiverSessionId: 'receiver-session-eio',
+    workspacePath: path.join(dirs.worktreeDir),
+    artifactDir: dirs.artifactDir,
+    taskDataDir: dirs.artifactDir,
+    rounds: [{
+      round: 1,
+      type: 'initial',
+      prompt: 'do the work',
+      output: 'done',
+      durationMs: 1,
+      status: 'completed',
+      timestamp: now,
+    }],
+    summary: { lastPromptSnippet: 'do the work', lastOutputSnippet: 'done', totalDurationMs: 1 },
+  });
+
+  let injectOverlayEio = true;
+  fsModule.readFileSync = function (file: any, ...args: any[]) {
+    if (injectOverlayEio && path.resolve(String(file)) === path.resolve(overlayFile)) {
+      const error: any = new Error('injected overlay EIO');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalReadFileSync.call(this, file, ...args);
+  };
+
+  const failed = store.archiveTask(threadId);
+  assert.strictEqual(failed, undefined, 'archive must fail instead of reporting success');
+  const afterFailure = store.getTask(threadId)!;
+  assert.strictEqual(afterFailure.archivedAt, undefined, 'failed archive must not mark the task archived');
+  assert.strictEqual(afterFailure.rounds.length, 1, 'failed archive must retain rounds');
+  assert.strictEqual(afterFailure.receiverSessionId, 'receiver-session-eio', 'failed archive must retain the session');
+  assert.strictEqual(fs.existsSync(overlayFile), true, 'failed archive must retain the unarchived overlay');
+  assert.strictEqual(fs.existsSync(path.join(dirs.archiveDir, `${threadId}_archive.tar.gz`)), false);
+
+  // Remove the fault and retry: the same task must archive completely.
+  injectOverlayEio = false;
+  const archived = store.archiveTask(threadId);
+  assert.ok(archived);
+  assert.ok(archived!.archivedAt);
+  const tarPath = path.join(dirs.archiveDir, `${threadId}_archive.tar.gz`);
+  const jsonPath = path.join(dirs.archiveDir, `${threadId}_archive.json`);
+  assert.strictEqual(fs.existsSync(tarPath), true);
+  assert.strictEqual(tarContains(tarPath, 'model-overlays/model.yml'), true);
+  const manifest = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+  assert.ok(
+    manifest.archivedLogFiles.includes('model-overlays/model.yml'),
+    'manifest must list the archived overlay',
+  );
+  assert.strictEqual(fs.existsSync(overlayFile), false, 'a successful archive may prune the active overlay');
+  assert.strictEqual(archived!.rounds.length, 0);
+});
+
 test('dispatch pins the absolute task directory and writes its round log there', async (t) => {
   const storage = isolatedDir('mesh-taskdata-dispatch-');
   const repo = path.join(storage, 'repo');

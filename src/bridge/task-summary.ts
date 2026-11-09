@@ -353,13 +353,15 @@ export function archiveCompletedTaskLogs(
     if (fs.existsSync(overlayDir)) {
       for (const name of fs.readdirSync(overlayDir)) {
         const full = path.join(overlayDir, name);
-        try {
-          if (!fs.statSync(full).isFile()) continue;
-          const entryName = `model-overlays/${name}`;
-          if (foundFilenames.has(entryName)) continue;
-          entries.push({ name: entryName, content: fs.readFileSync(full), mtime: fs.statSync(full).mtime });
-          foundFilenames.add(entryName);
-        } catch {}
+        const stat = fs.statSync(full);
+        if (!stat.isFile()) continue;
+        const entryName = `model-overlays/${name}`;
+        if (foundFilenames.has(entryName)) continue;
+        // I/O errors here must propagate: TaskStore.archiveTask only clears the
+        // source after a complete archive. Swallowing a read error and then
+        // deleting the overlay would silently lose a task product.
+        entries.push({ name: entryName, content: fs.readFileSync(full), mtime: stat.mtime });
+        foundFilenames.add(entryName);
       }
     }
   }
