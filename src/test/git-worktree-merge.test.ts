@@ -6,7 +6,7 @@ import * as path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import { createRequire } from 'module';
 import { resolveGitRepository, createTaskWorktree, commitTaskChanges, gitOutput, removeTaskWorktree } from '../bridge/git-worktree';
-import { buildPosixLockHelperCommand, MergeCoordinator, MeshFileLock } from '../bridge/merge-coordinator';
+import { buildPosixLockHelperCommand, MergeCoordinator, MeshFileLock, validationNodeDirs } from '../bridge/merge-coordinator';
 import { TaskRoleLock } from '../bridge/task-role-lock';
 import { TaskStore } from '../bridge/task-store';
 import { DelegationThread, WorktreeInfo } from '../bridge/types';
@@ -839,4 +839,52 @@ test('ref-updated transaction recovers durable ledger failure and ledger_written
   assert.equal(gitOutput(repository, ['rev-parse', target.targetRef]), landed, 'ledger_written plus stale disk copy must remain idempotent');
   assert.equal(staleStore.getTask('thread_ledger_crash')?.worktree?.integration?.phase, 'merged');
   staleStore.dispose();
+});
+
+test('combined validation resolves node even when the bridge environment has no node on PATH', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-node-path-'));
+  const repository = path.join(root, 'repo');
+  const storage = path.join(root, 'ledger');
+  initRepo(repository);
+  const repo = resolveGitRepository(repository, storage);
+  const worktree = createTaskWorktree(repo, 'thread_node_path', storage);
+
+  fs.writeFileSync(
+    path.join(worktree.path, 'package.json'),
+    JSON.stringify({ scripts: { compile: 'node validate.js', test: 'node validate.js' } }),
+    'utf8',
+  );
+  fs.writeFileSync(path.join(worktree.path, 'readme.txt'), 'changed\n', 'utf8');
+  worktree.headCommit = commitTaskChanges(worktree, 'approved change');
+
+  const store = new TaskStore(storage);
+  const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === 'path') || 'PATH';
+  const previousPath = process.env[pathKey];
+  const previousNode = process.env.DSH_BRIDGE_NODE;
+  t.after(() => {
+    if (previousPath === undefined) delete process.env[pathKey];
+    else process.env[pathKey] = previousPath;
+    if (previousNode === undefined) delete process.env.DSH_BRIDGE_NODE;
+    else process.env.DSH_BRIDGE_NODE = previousNode;
+    store.dispose();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+
+  // Pin the runtime, then drop every node directory from PATH: a bare `node`
+  // lookup in the validation child can only succeed if the merge gate exposes
+  // the resolved runtime itself.
+  process.env.DSH_BRIDGE_NODE = process.execPath;
+  const nodeDir = path.dirname(process.execPath);
+  process.env[pathKey] = (previousPath || '')
+    .split(path.delimiter)
+    .filter((entry) => !!entry && path.resolve(entry) !== path.resolve(nodeDir))
+    .join(path.delimiter);
+  assert.deepEqual(validationNodeDirs(), [nodeDir]);
+
+  store.upsertTask(thread('thread_node_path', worktree));
+  const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));
+  const result = await coordinator.mergeApproved('thread_node_path');
+
+  assert.equal(result.status, 'merged', result.message);
+  assert.equal(gitOutput(repository, ['show', `${worktree.targetRef!}:readme.txt`]).replace(/\r\n/g, '\n'), 'changed');
 });
