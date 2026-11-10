@@ -60,7 +60,7 @@ export interface BridgePolicy {
    * reviewer bootstrap).
    */
   reviewFlow?: 'legacy' | 'dedicated';
-  /** Per-agent base log storage directories. */
+  /** Legacy log roots read for tasks created before unified task directories. */
   logDirectories?: AgentLogDirectories;
   /**
    * Root directory for NEW tasks' unified data directories.
@@ -73,10 +73,9 @@ export interface BridgePolicy {
    */
   taskDataRoot?: string;
   /**
-   * Legacy per-task worktree root (pre-unified task directories).
+   * Legacy worktree root (pre-unified task directories), read for old callers.
    *
-   * Kept for old ledger entries and for callers that create a worktree directly;
-   * new tasks use `taskDataRoot` and place the worktree inside their task dir.
+   * Retained when loading old policy snapshots; new tasks use `taskDataRoot`.
    */
   worktreeRoot?: string;
   updatedAt?: string;
@@ -142,17 +141,12 @@ export function saveBridgePolicy(patch: BridgePolicy, root?: string): BridgePoli
     next.reviewFlow = patch.reviewFlow;
   }
   if (patch.logDirectories !== undefined) {
-    const currentDirs = next.logDirectories || {};
-    const mergedDirs: AgentLogDirectories = { ...currentDirs };
+    const mergedDirs: AgentLogDirectories = { ...(next.logDirectories || {}) };
     for (const [key, value] of Object.entries(patch.logDirectories)) {
-      if (typeof value === 'string') {
-        const trimmed = value.trim();
-        if (trimmed) {
-          mergedDirs[key as AgentId | 'default'] = trimmed;
-        } else {
-          delete mergedDirs[key as AgentId | 'default'];
-        }
-      }
+      if (typeof value !== 'string') continue;
+      const trimmed = value.trim();
+      if (trimmed) mergedDirs[key as AgentId | 'default'] = trimmed;
+      else delete mergedDirs[key as AgentId | 'default'];
     }
     next.logDirectories = mergedDirs;
   }
@@ -166,15 +160,10 @@ export function saveBridgePolicy(patch: BridgePolicy, root?: string): BridgePoli
       }
     }
   }
-  if (patch.worktreeRoot !== undefined) {
-    if (typeof patch.worktreeRoot === 'string') {
-      const trimmed = patch.worktreeRoot.trim();
-      if (trimmed) {
-        next.worktreeRoot = trimmed;
-      } else {
-        delete next.worktreeRoot;
-      }
-    }
+  if (patch.worktreeRoot !== undefined && typeof patch.worktreeRoot === 'string') {
+    const trimmed = patch.worktreeRoot.trim();
+    if (trimmed) next.worktreeRoot = trimmed;
+    else delete next.worktreeRoot;
   }
   next.updatedAt = new Date().toISOString();
 

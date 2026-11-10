@@ -290,43 +290,7 @@
           "type": "string",
           "default": "",
           "scope": "machine-overridable",
-          "markdownDescription": "Root directory for NEW tasks' unified data directories. Each task gets `<taskDataRoot>/<threadId>/` containing its Git worktree (`worktree/`), receiver logs (`worker_log/`), reviewer logs (`reviewer_log/`), terminal archives (`Archive/`), and one-shot bootstrap credential. When empty, defaults to `<bridge home>/tasks` (normally `~/.agent-mesh-bridge/tasks`). A relative path resolves against the bridge home. Only affects newly dispatched tasks; existing tasks keep the absolute directory recorded at creation, and legacy tasks keep their old worktree/log locations."
-        },
-        "agentMeshBridge.worktreeRoot": {
-          "type": "string",
-          "default": "",
-          "scope": "machine-overridable",
-          "markdownDescription": "Legacy base directory where per-task Git worktrees are created (`<root>/<threadId>`). New tasks put their worktree inside `agentMeshBridge.taskDataRoot/<threadId>/worktree`; this setting is kept for existing tasks and direct worktree creation. A relative path resolves against `~/.agent-mesh-bridge`."
-        },
-        "agentMeshBridge.logDirectories.default": {
-          "type": "string",
-          "default": "",
-          "scope": "machine-overridable",
-          "markdownDescription": "Default base directory for storing agent execution and review logs. When empty, defaults to `~/.agent-mesh-bridge/logs`. Contains `worker_log/`, `reviewer_log/`, and `Archive/` subdirectories."
-        },
-        "agentMeshBridge.logDirectories.antigravity": {
-          "type": "string",
-          "default": "",
-          "scope": "machine-overridable",
-          "markdownDescription": "Custom base log storage directory for **Google Antigravity**. Contains `worker_log/` (raw and compacted execution logs), `reviewer_log/` (review logs), and `Archive/` (compressed task archives)."
-        },
-        "agentMeshBridge.logDirectories.codex": {
-          "type": "string",
-          "default": "",
-          "scope": "machine-overridable",
-          "markdownDescription": "Custom base log storage directory for **OpenAI Codex**. Contains `worker_log/`, `reviewer_log/`, and `Archive/` subdirectories."
-        },
-        "agentMeshBridge.logDirectories.claudeCode": {
-          "type": "string",
-          "default": "",
-          "scope": "machine-overridable",
-          "markdownDescription": "Custom base log storage directory for **Anthropic Claude Code**. Contains `worker_log/`, `reviewer_log/`, and `Archive/` subdirectories."
-        },
-        "agentMeshBridge.logDirectories.deepseekHarness": {
-          "type": "string",
-          "default": "",
-          "scope": "machine-overridable",
-          "markdownDescription": "Custom base log storage directory for **DeepSeek Harness**. Contains `worker_log/`, `reviewer_log/`, and `Archive/` subdirectories."
+          "markdownDescription": "The single storage root for NEW tasks. Each task gets `<taskDataRoot>/<threadId>/` containing `worktree/`, `worker_log/`, `reviewer_log/`, `Archive/`, `bootstrap/`, `validation/`, and `model-overlays/`. When empty, defaults to `<bridge home>/tasks` (normally `~/.agent-mesh-bridge/tasks`). A relative path resolves against the bridge home. Only affects newly dispatched tasks; existing tasks keep their persisted artifact and worktree paths."
         },
         "agentMeshBridge.requireModelApproval": {
           "type": "boolean",

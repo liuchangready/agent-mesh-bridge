@@ -102,7 +102,7 @@
 
   23. **终态摘要、归档与删除（硬不变量）**：任务的对话内容必须有明确的保留边界。
       - `completed` / `failed` / `review_failed` 时由 `buildFinalSummary()` 生成**确定性只读摘要** `thread.finalSummary`（verdict、摘要正文、改动文件、错误、轮数、MR、token 汇总），在 `TaskStore.upsertTask()` 统一落账；不得调用模型生成摘要。`review_failed` 的 `verdict`/`error` 取 `thread.reviewFailure.reason`。`get_task_summary(threadId)` 是读取摘要的专用工具；运行中返回 `finalSummary: null`。
-      - **日志三目录分层与归档**：各 Agent 可独立指定基础日志存储目录（`agentMeshBridge.logDirectories.*`，支持 `default` / `antigravity` / `codex` / `claudeCode` / `deepseekHarness`，并在 `bridge-policy.json` 跨进程镜像；未指定时默认使用 `~/.agent-mesh-bridge/logs/`）。每个 Agent 的日志根目录下均自动维护三个子文件夹：
+      - **日志三目录分层与归档**：新任务统一使用 `agentMeshBridge.taskDataRoot/<threadId>/` 下的 `worker_log/`、`reviewer_log/` 与 `Archive/`；旧任务继续使用账本记录的路径，既有 `bridge-policy.json` 中的旧日志目录仅用于读取兼容。每个任务日志目录维护以下结构：
         1. `worker_log/`：存储执行者工作日志，包括原始 stdio 日志（`<threadId>_round_<n>.log`）与压缩前的输出归档（`<threadId>_round_<n>.output.md`）。
         2. `reviewer_log/`：存储检视者 review 日志，包括轮次审阅日志（`<threadId>_round_<n>.reviewer.log`）与独立 Reviewer Bootstrap 日志（`<threadId>_bootstrap.log`）。
         3. `Archive/`：任务完成或归档时将其日志压缩归档的目录，包含 `<threadId>_archive.tar.gz`（标准 POSIX ustar 压缩包，内含 worker_log、reviewer_log 完整日志文件及 summary.json）和 `<threadId>_archive.json`。
