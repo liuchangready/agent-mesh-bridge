@@ -140,6 +140,16 @@ export function saveBridgePolicy(patch: BridgePolicy, root?: string): BridgePoli
   if (patch.reviewFlow === 'legacy' || patch.reviewFlow === 'dedicated') {
     next.reviewFlow = patch.reviewFlow;
   }
+  if (patch.logDirectories !== undefined) {
+    const mergedDirs: AgentLogDirectories = { ...(next.logDirectories || {}) };
+    for (const [key, value] of Object.entries(patch.logDirectories)) {
+      if (typeof value !== 'string') continue;
+      const trimmed = value.trim();
+      if (trimmed) mergedDirs[key as AgentId | 'default'] = trimmed;
+      else delete mergedDirs[key as AgentId | 'default'];
+    }
+    next.logDirectories = mergedDirs;
+  }
   if (patch.taskDataRoot !== undefined) {
     if (typeof patch.taskDataRoot === 'string') {
       const trimmed = patch.taskDataRoot.trim();
@@ -149,6 +159,11 @@ export function saveBridgePolicy(patch: BridgePolicy, root?: string): BridgePoli
         delete next.taskDataRoot;
       }
     }
+  }
+  if (patch.worktreeRoot !== undefined && typeof patch.worktreeRoot === 'string') {
+    const trimmed = patch.worktreeRoot.trim();
+    if (trimmed) next.worktreeRoot = trimmed;
+    else delete next.worktreeRoot;
   }
   next.updatedAt = new Date().toISOString();
 
