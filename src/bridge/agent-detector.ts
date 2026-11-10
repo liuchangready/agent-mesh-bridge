@@ -361,7 +361,7 @@ export class AgentDetector {
         const command = wrap ? 'cmd.exe' : execPath;
         const args = wrap ? ['/c', execPath, '--version'] : ['--version'];
 
-        const proc = execFile(command, args, { timeout: 8000 }, (error, stdout) => {
+        const proc = execFile(command, args, { timeout: 8000, windowsHide: true }, (error, stdout) => {
           if (error) {
             resolve(undefined);
           } else {

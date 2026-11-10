@@ -675,7 +675,7 @@ export function queryDshVersion(launcherPath: string): Promise<string | undefine
     }
 
     try {
-      const proc = execFile(command, args, { timeout: 15000, env }, (error, stdout) => {
+      const proc = execFile(command, args, { timeout: 15000, env, windowsHide: true }, (error, stdout) => {
         finish(error ? undefined : stdout.trim().split('\n')[0] || undefined);
       });
       if (proc && proc.stdin) {
