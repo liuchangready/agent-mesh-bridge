@@ -25,7 +25,7 @@ import { TaskControlService } from './bridge/task-control';
 import { TaskArchiveService } from './bridge/task-archive';
 import { ReviewerBootstrapService, confirmReviewerBootstrapTask } from './bridge/reviewer-bootstrap';
 import { TaskExecutionRegistry } from './bridge/task-execution-registry';
-import { saveBridgePolicy, AgentLogDirectories } from './bridge/bridge-policy';
+import { saveBridgePolicy } from './bridge/bridge-policy';
 import { probeCodexResumeSupport } from './bridge/codex-session';
 import { NativeSessionCompactor } from './bridge/native-session-compactor';
 import {
@@ -89,26 +89,6 @@ const INITIATOR_MODEL_SETTING_KEYS: Record<AgentId, string> = {
   codex: 'initiatorModels.codex',
   claude_code: 'initiatorModels.claudeCode',
   deepseek_harness: 'initiatorModels.deepseekHarness',
-};
-
-const LOG_DIR_SETTING_KEYS: Record<AgentId, string> = {
-  antigravity: 'logDirectories.antigravity',
-  codex: 'logDirectories.codex',
-  claude_code: 'logDirectories.claudeCode',
-  deepseek_harness: 'logDirectories.deepseekHarness',
-};
-
-const readLogDirectorySettings = (): AgentLogDirectories => {
-  const cfg = vscode.workspace.getConfiguration('agentMeshBridge');
-  const dirs: AgentLogDirectories = {};
-  const defaultDir = cfg.get<string>('logDirectories.default');
-  if (defaultDir && defaultDir.trim()) dirs.default = defaultDir.trim();
-  for (const agent of ['antigravity', 'codex', 'claude_code', 'deepseek_harness'] as AgentId[]) {
-    const key = LOG_DIR_SETTING_KEYS[agent];
-    const val = cfg.get<string>(key);
-    if (val && val.trim()) dirs[agent] = val.trim();
-  }
-  return dirs;
 };
 
 /** Model setting key for a role; `undefined` for agents with no picker. */
@@ -390,12 +370,9 @@ export function activate(context: vscode.ExtensionContext) {
       // caller-resume flow and is the rollback switch; existing tasks stay on
       // whatever topology they were created with.
       reviewFlow: bridgeCfg.get<'dedicated' | 'legacy'>('reviewFlow', 'dedicated'),
-      logDirectories: readLogDirectorySettings(),
       // Unified task data directories for NEW tasks (worktree + logs + Archive).
       // Old tasks keep their recorded artifactDir/worktree path.
       taskDataRoot: bridgeCfg.get<string>('taskDataRoot', ''),
-      // Legacy worktree root, retained for old tasks and direct worktree callers.
-      worktreeRoot: bridgeCfg.get<string>('worktreeRoot', ''),
       concurrency: {
         enabled: bridgeCfg.get<boolean>('concurrency.enabled', false),
         maxConcurrentTasks: bridgeCfg.get<number>('concurrency.maxConcurrentTasks', 2),
@@ -1755,9 +1732,7 @@ export function activate(context: vscode.ExtensionContext) {
         !e.affectsConfiguration('agentMeshBridge.models') &&
         !e.affectsConfiguration('agentMeshBridge.initiatorModels') &&
         !e.affectsConfiguration('agentMeshBridge.defaultAgent') &&
-        !e.affectsConfiguration('agentMeshBridge.logDirectories') &&
         !e.affectsConfiguration('agentMeshBridge.taskDataRoot') &&
-        !e.affectsConfiguration('agentMeshBridge.worktreeRoot') &&
         !e.affectsConfiguration('agentMeshBridge.requireModelApproval') &&
         !e.affectsConfiguration('agentMeshBridge.contextCompaction') &&
         !e.affectsConfiguration('agentMeshBridge.nativeSessionCompaction') &&

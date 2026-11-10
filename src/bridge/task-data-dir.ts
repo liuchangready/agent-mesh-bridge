@@ -55,9 +55,8 @@ export interface TaskDataDirectories {
  *
  * Empty / absent uses `<storageDir>/tasks` (which is `~/.agent-mesh-bridge/tasks`
  * for the real bridge home). A relative configured value resolves against the
- * bridge home/storage directory, matching the existing `worktreeRoot` /
- * `logDirectories` convention. Legacy `worktreeRoot` is intentionally NOT
- * consulted here: it remains a compatibility setting for old tasks only.
+ * bridge home/storage directory. Legacy worktree and log locations are never
+ * consulted when creating a new task directory.
  */
 export function resolveTaskDataRoot(storageDir: string, root?: string): string {
   const policyRoot = root && root.trim() ? root : storageDir;
