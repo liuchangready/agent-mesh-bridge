@@ -378,6 +378,75 @@ try {
 
 export interface MergeResult { status: 'merged' | 'no_changes' | 'conflict' | 'validation_failed' | 'stale' | 'blocked'; message: string; commit?: string; }
 
+/** Where a repository declares its own combined-validation commands. */
+export const VALIDATION_MANIFEST = path.join('.agent-mesh-bridge', 'validate.json');
+
+export interface ValidationStep { command: string; args: string[]; label: string; needsShell: boolean; }
+
+export type ValidationStrategy =
+  | { ok: true; kind: 'package-scripts'; steps: ValidationStep[] }
+  | { ok: true; kind: 'manifest'; steps: ValidationStep[] }
+  | { ok: false; error: string };
+
+/**
+ * Resolve how to validate a merged tree.
+ *
+ * `package.json` scripts stay the primary contract because every Node project in
+ * this mesh already carries them. A repository without one (Unity, Gradle, MSBuild)
+ * declares its own commands in `.agent-mesh-bridge/validate.json` so the merge gate
+ * stops refusing the whole project: refusing an approved Unity task forever is a
+ * bridge capability gap, not a code defect. Everything else stays a hard refusal —
+ * a missing strategy must never be read as "validation passed".
+ */
+export function readValidationStrategy(cwd: string): ValidationStrategy {
+  const manifestPath = path.join(cwd, VALIDATION_MANIFEST);
+  let pkg: any;
+  try { pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8')); }
+  catch { pkg = undefined; }
+  if (pkg) {
+    const scripts = pkg.scripts || {};
+    if (!scripts.compile || !scripts.test) {
+      return { ok: false, error: 'Validation strategy must provide both package scripts "compile" and "test".' };
+    }
+    const steps: ValidationStep[] = [
+      { command: scripts.compile, args: [], label: 'npm run compile', needsShell: true },
+      { command: scripts.test, args: [], label: 'npm test', needsShell: true },
+    ];
+    return { ok: true, kind: 'package-scripts', steps };
+  }
+  if (!fs.existsSync(manifestPath)) {
+    return {
+      ok: false,
+      error:
+        'No supported validation strategy: package.json is missing or invalid and ' +
+        `${VALIDATION_MANIFEST.split(path.sep).join('/')} was not found.`,
+    };
+  }
+  let raw: any;
+  try { raw = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); }
+  catch (error: any) {
+    return { ok: false, error: `Validation manifest ${VALIDATION_MANIFEST} is not valid JSON: ${error?.message || error}` };
+  }
+  const declared = Array.isArray(raw?.commands) ? raw.commands : undefined;
+  if (!declared || declared.length === 0) {
+    return { ok: false, error: `Validation manifest ${VALIDATION_MANIFEST} must declare a non-empty "commands" array.` };
+  }
+  const steps: ValidationStep[] = [];
+  for (const [index, entry] of declared.entries()) {
+    if (typeof entry === 'string' && entry.trim()) {
+      steps.push({ command: entry.trim(), args: [], label: `command ${index + 1}`, needsShell: true });
+      continue;
+    }
+    if (!entry || typeof entry !== 'object' || typeof entry.command !== 'string' || !entry.command.trim()) {
+      return { ok: false, error: `Validation manifest ${VALIDATION_MANIFEST} command ${index + 1} needs a non-empty "command".` };
+    }
+    const args = Array.isArray(entry.args) ? entry.args.map((value: unknown) => String(value)) : [];
+    const label = typeof entry.label === 'string' && entry.label.trim() ? entry.label.trim() : `command ${index + 1}`;
+    steps.push({ command: entry.command.trim(), args, label, needsShell: entry.shell === true });
+  }
+  return { ok: true, kind: 'manifest', steps };
+}
+
 /**
  * Directories that must be visible when a validation step shells out to Node.
  *
@@ -650,34 +719,25 @@ export class MergeCoordinator {
   }
 
   private async validate(cwd: string, repositoryPath: string, threadId: string, sourceCommit: string): Promise<{ ok: boolean; error: string }> {
-    let pkg: any;
-    try { pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8')); }
-    catch { return { ok: false, error: 'No supported validation strategy: package.json is missing or invalid.' }; }
-    const scripts = pkg.scripts || {};
-    const commands: string[][] = [];
-    if (scripts.compile) commands.push(['run', 'compile']);
-    if (scripts.test) commands.push(['test']);
-    if (!scripts.compile || !scripts.test) return { ok: false, error: 'Validation strategy must provide both package scripts "compile" and "test".' };
+    const strategy = readValidationStrategy(cwd);
+    if (!strategy.ok) return { ok: false, error: strategy.error };
     const registration = this.executions.begin(threadId, this.store.getTask(threadId)?.currentRound || 0, 'merge-validation', cwd);
     const sourceModules = path.join(repositoryPath, 'node_modules');
     const scratchModules = path.join(cwd, 'node_modules');
     let linkedModules = false;
     try {
-    if (fs.existsSync(sourceModules) && !fs.existsSync(scratchModules)) {
+    if (strategy.kind === 'package-scripts' && fs.existsSync(sourceModules) && !fs.existsSync(scratchModules)) {
       try { fs.symlinkSync(sourceModules, scratchModules, process.platform === 'win32' ? 'junction' : 'dir'); linkedModules = true; }
       catch (error: any) { return { ok: false, error: `Could not expose the installed project dependencies to the temporary validation worktree: ${error?.message || error}` }; }
     }
-    for (const args of commands) {
-      const scriptName = args[0] === 'test' ? 'test' : args[1];
-      const packageFile = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8'));
-      const script = packageFile.scripts[scriptName];
+    for (const step of strategy.steps) {
       const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === 'path') || 'PATH';
       const binPath = path.join(repositoryPath, 'node_modules', '.bin');
       const searchPath = [binPath, ...validationNodeDirs(), process.env[pathKey] || '']
         .filter((entry) => !!entry)
         .join(path.delimiter);
       const env = { ...process.env, [pathKey]: searchPath };
-      const child = spawn(script, { cwd, env, windowsHide: true, shell: true });
+      const child = spawn(step.command, step.args, { cwd, env, windowsHide: true, shell: step.needsShell });
       this.executions.attachChildPid(child.pid, registration);
       let output = '';
       let trackingError: Error | undefined;
@@ -694,7 +754,7 @@ export class MergeCoordinator {
       try { await this.lock.attachChildPid(child.pid, () => !this.isMergeStillAllowed(threadId, sourceCommit)); }
       catch (error) { trackingError = error as Error; killProcessTree(child); }
       const result = await resultPromise;
-      if (result.code !== 0) return { ok: false, error: `npm ${args.join(' ')} failed (exit ${result.code}): ${result.output.slice(-5000)}` };
+      if (result.code !== 0) return { ok: false, error: `${step.label} failed (exit ${result.code}): ${result.output.slice(-5000)}` };
       if (!this.isMergeStillAllowed(threadId, sourceCommit)) return { ok: false, error: 'Task was paused or deleted during combined validation.' };
     }
     return { ok: true, error: '' };
