@@ -498,7 +498,13 @@ export class TaskSupervisor extends EventEmitter {
         });
       }, syncIntervalMs);
 
-      const logFilePath = roundExecutionLogPath(thread.threadId, roundNumber, undefined, thread.targetAgent);
+      const logFilePath = roundExecutionLogPath(
+        thread.threadId,
+        roundNumber,
+        undefined,
+        thread.targetAgent,
+        thread.artifactDir,
+      );
       try {
         fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
         fs.writeFileSync(logFilePath, '', 'utf8');
@@ -518,6 +524,7 @@ export class TaskSupervisor extends EventEmitter {
           title: thread.title,
           cwd: thread.workspacePath,
           taskThreadId: thread.threadId,
+          artifactDir: thread.artifactDir,
           taskRound: roundNumber,
           model: thread.targetModel,
           role: 'developer',
@@ -720,8 +727,11 @@ export class TaskSupervisor extends EventEmitter {
 
     // Compare round numbers numerically: a plain name sort puts round_9 after
     // round_10, which used to return the wrong round for long-lived tasks.
-    const latest = findLatestExecutionLog(threadId, path.dirname(this.taskStore.getStoragePath()))
-      || findLatestExecutionLog(threadId);
+    const artifactDir = this.taskStore.getTask(threadId)?.artifactDir;
+    const latest = artifactDir
+      ? findLatestExecutionLog(threadId, undefined, undefined, artifactDir)
+      : findLatestExecutionLog(threadId, path.dirname(this.taskStore.getStoragePath()))
+        || findLatestExecutionLog(threadId);
     if (latest) resolvedFilePath = latest.path;
 
     if ((!rawOutput || !rawOutput.trim()) && resolvedFilePath) {
@@ -777,11 +787,16 @@ export class TaskSupervisor extends EventEmitter {
     let resolvedFilePath: string | undefined = undefined;
 
     // The dispatcher/rework controller write under the store root, the
-    // supervisor under the default home; accept both, newest round wins.
-    const storeRoot = taskStore ? path.dirname(taskStore.getStoragePath()) : undefined;
-    const candidates = [storeRoot, undefined]
-      .map((root) => findLatestExecutionLog(threadId, root))
-      .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
+    // supervisor under the default home; a unified task directory is
+    // self-contained and takes precedence so no agent-wide scan is needed.
+    const store = taskStore || TaskStore.getInstance();
+    store.loadFromDisk();
+    const storeRoot = path.dirname(store.getStoragePath());
+    const artifactDir = store.getTask(threadId)?.artifactDir;
+    const candidates = (artifactDir
+      ? [findLatestExecutionLog(threadId, undefined, undefined, artifactDir)]
+      : [storeRoot, undefined].map((root) => findLatestExecutionLog(threadId, root))
+    ).filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
     if (candidates.length > 0) {
       const latest = candidates.reduce((a, b) => (b.round > a.round ? b : a));
       resolvedFilePath = latest.path;
@@ -789,8 +804,6 @@ export class TaskSupervisor extends EventEmitter {
     }
 
     if (!rawOutput) {
-      const store = taskStore || TaskStore.getInstance();
-      store.loadFromDisk();
       const task = store.getTask(threadId);
       if (task && task.rounds && task.rounds.length > 0) {
         const lastRound = task.rounds[task.rounds.length - 1];

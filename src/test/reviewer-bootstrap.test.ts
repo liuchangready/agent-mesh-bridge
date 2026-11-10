@@ -25,6 +25,7 @@ import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { NativeSessionLock } from '../bridge/native-session-lock';
 import { DelegationThread, isReviewerBootstrapPending } from '../bridge/types';
 import { saveBridgePolicy } from '../bridge/bridge-policy';
+import { ensureTaskDataDir } from '../bridge/task-data-dir';
 
 function makeTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -114,6 +115,65 @@ test('a bootstrap is identifiable by the launched reviewer pid, without any env'
   clearReviewerBootstrapToken('thread_pid', dir);
   assert.strictEqual(findReviewerBootstrapByHostPid(4242, dir), undefined);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('pid lookup follows the ledger artifactDir after taskDataRoot changes, and keeps legacy records', () => {
+  const dir = makeTempDir('bridge-bootstrap-pid-root-switch-');
+  const store = new TaskStore(dir);
+  try {
+    saveBridgePolicy({ taskDataRoot: 'old-root' }, dir);
+    const threadId = 'thread_pinned_bootstrap';
+    const dirs = ensureTaskDataDir(threadId, dir);
+    const thread = makeDedicatedThread(threadId, {
+      artifactDir: dirs.artifactDir,
+      taskDataDir: dirs.artifactDir,
+      reviewBootstrap: { phase: 'launching', attempts: 1 },
+    });
+    store.upsertTask(thread);
+    writeReviewerBootstrapToken(
+      {
+        threadId,
+        token: 'probe',
+        agent: 'codex',
+        createdAt: new Date().toISOString(),
+        hostPid: 4242,
+      },
+      dir,
+      dirs.artifactDir,
+    );
+
+    // Rebuild the reading side after the policy points at a different root.
+    saveBridgePolicy({ taskDataRoot: 'new-root' }, dir);
+    const reader = new TaskStore(dir);
+    try {
+      assert.strictEqual(
+        findReviewerBootstrapByHostPid(4242, dir, reader)?.threadId,
+        threadId,
+        'a policy change must not hide the credential stored under the pinned artifactDir',
+      );
+    } finally {
+      reader.dispose();
+    }
+
+    // Legacy/global records keep the pre-unified lookup path.
+    writeReviewerBootstrapToken(
+      {
+        threadId: 'thread_legacy_pid',
+        token: 'legacy-probe',
+        agent: 'codex',
+        createdAt: new Date().toISOString(),
+        hostPid: 4343,
+      },
+      dir,
+    );
+    assert.strictEqual(
+      findReviewerBootstrapByHostPid(4343, dir, store)?.threadId,
+      'thread_legacy_pid',
+    );
+  } finally {
+    store.dispose();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('a stale launch record cannot be claimed by a reused pid', () => {

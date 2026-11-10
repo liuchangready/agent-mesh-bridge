@@ -19,6 +19,7 @@ import {
 } from './types';
 import { readBridgePolicy } from './bridge-policy';
 import { roundExecutionLogPath } from './round-log';
+import { ensureTaskDataDir, removeTaskDataDir } from './task-data-dir';
 import { resolveReviewFlow, writeReviewerBootstrapToken } from './reviewer-bootstrap';
 import { TaskStore } from './task-store';
 import { AgentDetector } from './agent-detector';
@@ -26,7 +27,7 @@ import { ActiveAgentResolver } from './active-agent-resolver';
 import { AutonomousRunner, RunResult } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
 import { TaskSupervisor } from './task-supervisor';
-import { resolveGitRepository, createTaskWorktree, commitTaskChanges, changedFiles, currentHead } from './git-worktree';
+import { resolveGitRepository, createTaskWorktree, removeTaskWorktree, commitTaskChanges, changedFiles, currentHead } from './git-worktree';
 import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
 import { TaskExecutionOwner, TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 import { QueueDrainer, QueuedExecution } from './queue-drainer';
@@ -207,7 +208,24 @@ export class AsyncDispatcher {
     if (!this.taskStore.canAcceptTask()) {
       throw new Error('The task ledger is full and every stored task contains active, unmerged, or otherwise non-evictable work. Merge or explicitly delete retained tasks before dispatching another.');
     }
-    const worktree: WorktreeInfo = createTaskWorktree(resolveGitRepository(repositoryPath, this.storageDir, params.targetBranch), threadId, this.storageDir);
+    // One bridge-side directory owns every file this task will produce. Create
+    // it before the ledger row and worktree so a failed dispatch can be cleaned
+    // as a unit, and persist the absolute path immediately (never re-resolve the
+    // global policy for this task later).
+    const taskDirs = ensureTaskDataDir(threadId, this.storageDir);
+    let worktree: WorktreeInfo;
+    try {
+      worktree = createTaskWorktree(
+        resolveGitRepository(repositoryPath, this.storageDir, params.targetBranch),
+        threadId,
+        this.storageDir,
+        undefined,
+        taskDirs.artifactDir,
+      );
+    } catch (error) {
+      removeTaskDataDir(taskDirs.artifactDir, true);
+      throw error;
+    }
     const workspacePath = worktree.path;
     const tempCandidate: DelegationThread = {
       threadId,
@@ -228,6 +246,8 @@ export class AsyncDispatcher {
           }
         : { callerSessionId }),
       workspacePath,
+      artifactDir: taskDirs.artifactDir,
+      taskDataDir: taskDirs.artifactDir,
       ...(worktree ? { worktree } : {}),
       initiatorModel: initiatorModel.model,
       initiatorModelSource: initiatorModel.source,
@@ -272,7 +292,15 @@ export class AsyncDispatcher {
     const thread = tempCandidate;
 
     // Commit initial state to TaskStore
-    this.taskStore.upsertTask(thread);
+    try {
+      this.taskStore.upsertTask(thread);
+    } catch (error) {
+      // The ledger row is the durable entry point; without it the worktree and
+      // task directory are orphans, so clean both before surfacing the failure.
+      try { removeTaskWorktree(worktree); } catch {}
+      removeTaskDataDir(taskDirs.artifactDir, true);
+      throw error;
+    }
 
     // Dedicated review: the developer must NOT start yet. A fresh reviewer
     // conversation is launched by the extension-host bootstrap service; its
@@ -284,7 +312,7 @@ export class AsyncDispatcher {
         token,
         agent: initiatorAgent,
         createdAt: nowIso,
-      });
+      }, this.storageDir, taskDirs.artifactDir);
       if (!tokenWritten) {
         thread.status = 'failed';
         thread.reviewBootstrap = { phase: 'failed', attempts: 0, lastError: 'token write failed' };
@@ -496,6 +524,7 @@ export class AsyncDispatcher {
         roundNumber,
         undefined,
         thread.targetAgent,
+        thread.artifactDir,
       );
       try {
         fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
@@ -516,6 +545,7 @@ export class AsyncDispatcher {
           title: thread.title,
           cwd: thread.workspacePath,
           taskThreadId: thread.threadId,
+          artifactDir: thread.artifactDir,
           taskRound: roundNumber,
           model: thread.targetModel,
           role: 'developer',

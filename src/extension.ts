@@ -391,6 +391,11 @@ export function activate(context: vscode.ExtensionContext) {
       // whatever topology they were created with.
       reviewFlow: bridgeCfg.get<'dedicated' | 'legacy'>('reviewFlow', 'dedicated'),
       logDirectories: readLogDirectorySettings(),
+      // Unified task data directories for NEW tasks (worktree + logs + Archive).
+      // Old tasks keep their recorded artifactDir/worktree path.
+      taskDataRoot: bridgeCfg.get<string>('taskDataRoot', ''),
+      // Legacy worktree root, retained for old tasks and direct worktree callers.
+      worktreeRoot: bridgeCfg.get<string>('worktreeRoot', ''),
       concurrency: {
         enabled: bridgeCfg.get<boolean>('concurrency.enabled', false),
         maxConcurrentTasks: bridgeCfg.get<number>('concurrency.maxConcurrentTasks', 2),
@@ -1751,6 +1756,8 @@ export function activate(context: vscode.ExtensionContext) {
         !e.affectsConfiguration('agentMeshBridge.initiatorModels') &&
         !e.affectsConfiguration('agentMeshBridge.defaultAgent') &&
         !e.affectsConfiguration('agentMeshBridge.logDirectories') &&
+        !e.affectsConfiguration('agentMeshBridge.taskDataRoot') &&
+        !e.affectsConfiguration('agentMeshBridge.worktreeRoot') &&
         !e.affectsConfiguration('agentMeshBridge.requireModelApproval') &&
         !e.affectsConfiguration('agentMeshBridge.contextCompaction') &&
         !e.affectsConfiguration('agentMeshBridge.nativeSessionCompaction') &&

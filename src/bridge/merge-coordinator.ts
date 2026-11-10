@@ -9,6 +9,8 @@ import { DelegationThread } from './types';
 import { changedFiles, currentHead, gitOutput } from './git-worktree';
 import { TaskExecutionRegistry } from './task-execution-registry';
 import { killProcessTree } from './platform';
+import { taskValidationDir } from './round-log';
+import { resolveNodeCommand } from './deepseek-harness';
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const CHILD_ACK_TIMEOUT_MS = 10_000;
@@ -376,6 +378,27 @@ try {
 
 export interface MergeResult { status: 'merged' | 'no_changes' | 'conflict' | 'validation_failed' | 'stale' | 'blocked'; message: string; commit?: string; }
 
+/**
+ * Directories that must be visible when a validation step shells out to Node.
+ *
+ * An extension host or MCP server can be launched from an environment that has
+ * no `node` on PATH (a desktop app shipping its own runtime, a service manager,
+ * a shortcut with a trimmed environment). The validation child inherits that
+ * PATH, so `tsc` and `node --test` shims resolve `node` from the shell and fail
+ * with "'node' is not recognized" even though dependencies are installed.
+ *
+ * Resolving the executable here and exposing its directory keeps the merge gate
+ * independent of the environment the bridge process happened to inherit.
+ */
+export function validationNodeDirs(): string[] {
+  const dirs: string[] = [];
+  const resolved = resolveNodeCommand();
+  if (resolved && (resolved.includes('/') || resolved.includes('\\'))) {
+    dirs.push(path.dirname(resolved));
+  }
+  return dirs;
+}
+
 export class MergeCoordinator {
   private readonly executions: TaskExecutionRegistry;
 
@@ -450,7 +473,9 @@ export class MergeCoordinator {
       if (prior?.validationPath) this.cleanupValidationWorktree(repoPath, threadId, prior.validationPath);
       const tx = { threadId, sourceCommit, targetOldCommit, phase: 'preparing', at: new Date().toISOString() } as any;
       this.writeTransaction(txPath, tx);
-      const scratchRoot = path.join(this.storageDir, 'merge-worktrees');
+      const scratchRoot = thread.artifactDir
+        ? taskValidationDir(thread.artifactDir)
+        : path.join(this.storageDir, 'merge-worktrees');
       const scratch = path.join(scratchRoot, `${threadId}-${crypto.randomUUID()}`);
       fs.mkdirSync(scratchRoot, { recursive: true });
       tx.validationPath = scratch; this.writeTransaction(txPath, tx);
@@ -577,9 +602,12 @@ export class MergeCoordinator {
   }
 
   private cleanupValidationWorktree(repoPath: string, threadId: string, validationPath: string): 'cleaned' | 'present' {
-    const root = path.resolve(this.storageDir, 'merge-worktrees');
     const candidate = path.resolve(validationPath);
-    if (!candidate.startsWith(`${root}${path.sep}`) || !path.basename(candidate).startsWith(`${threadId}-`)) return 'present';
+    const allowedRoots = [path.resolve(this.storageDir, 'merge-worktrees')];
+    const thread = this.store.getTask(threadId);
+    if (thread?.artifactDir) allowedRoots.push(path.resolve(taskValidationDir(thread.artifactDir)));
+    const allowed = allowedRoots.some((root) => candidate.startsWith(`${root}${path.sep}`));
+    if (!allowed || !path.basename(candidate).startsWith(`${threadId}-`)) return 'present';
     const status = this.removeValidationWorktree(repoPath, candidate) ? 'cleaned' : 'present';
     this.recordValidation(threadId, candidate, undefined, status);
     return status;
@@ -645,7 +673,10 @@ export class MergeCoordinator {
       const script = packageFile.scripts[scriptName];
       const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === 'path') || 'PATH';
       const binPath = path.join(repositoryPath, 'node_modules', '.bin');
-      const env = { ...process.env, [pathKey]: `${binPath}${path.delimiter}${process.env[pathKey] || ''}` };
+      const searchPath = [binPath, ...validationNodeDirs(), process.env[pathKey] || '']
+        .filter((entry) => !!entry)
+        .join(path.delimiter);
+      const env = { ...process.env, [pathKey]: searchPath };
       const child = spawn(script, { cwd, env, windowsHide: true, shell: true });
       this.executions.attachChildPid(child.pid, registration);
       let output = '';

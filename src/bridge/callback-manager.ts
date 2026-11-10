@@ -639,6 +639,7 @@ export class CallbackManager extends EventEmitter {
         kind: wakeKind,
         note: `${thread.title} | receiver=${thread.targetAgent} | roundType=${round.type} | senderModel=${senderModel || 'agent default'}`,
       },
+      { artifactDir: thread.artifactDir },
     );
     // The callback wakes the INITIATOR, which must retain full bridge tools
     // (review/rework/approve). Never inherit a receiver marker from whatever
@@ -899,7 +900,7 @@ export class CallbackManager extends EventEmitter {
           json: false,
           // DSH has no `--model`; the sender default travels as a one-run
           // overlay patch, exactly like a receiver round's model.
-          modelOverlayPath: senderModel ? writeDshModelOverlay(senderModel) : undefined,
+          modelOverlayPath: senderModel ? writeDshModelOverlay(senderModel, thread.artifactDir) : undefined,
         });
         if (!built) {
           reviewerLog.writeOutcome({ error: 'unbuildable DeepSeek Harness launch command' });

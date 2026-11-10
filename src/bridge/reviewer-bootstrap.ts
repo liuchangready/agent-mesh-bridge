@@ -29,6 +29,8 @@ import { TaskRoleLock } from './task-role-lock';
 import { TaskStore } from './task-store';
 import { bootstrapDir } from './task-summary';
 import { reviewerBootstrapLogPath } from './reviewer-log';
+import { taskBootstrapDir, bridgeHomeDir } from './round-log';
+import { resolveTaskDataRoot } from './task-data-dir';
 import { assertCanExecute } from './agent-capabilities';
 import {
   DelegationThread,
@@ -128,18 +130,28 @@ function reviewerBootstrapLogShowsMissingTools(logFile: string): boolean {
   );
 }
 
-export function reviewerBootstrapTokenPath(threadId: string, root?: string): string {
+export function reviewerBootstrapTokenPath(
+  threadId: string,
+  root?: string,
+  artifactDir?: string,
+): string {
   const safe = String(threadId || '').replace(/[^A-Za-z0-9_.-]/g, '_');
+  // New tasks keep the one-shot credential inside their unified task dir so
+  // archiving/deleting the task also removes the credential. Legacy tasks keep
+  // the historical global bootstrap/ location.
+  if (artifactDir) return path.join(taskBootstrapDir(artifactDir), `${safe}.json`);
   return path.join(bootstrapDir(root), `${safe}.json`);
 }
 
 export function writeReviewerBootstrapToken(
   record: ReviewerBootstrapToken,
   root?: string,
+  artifactDir?: string,
 ): boolean {
   try {
-    fs.mkdirSync(bootstrapDir(root), { recursive: true });
-    fs.writeFileSync(reviewerBootstrapTokenPath(record.threadId, root), JSON.stringify(record), {
+    const file = reviewerBootstrapTokenPath(record.threadId, root, artifactDir);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(record), {
       encoding: 'utf8',
       mode: 0o600,
     });
@@ -153,10 +165,11 @@ export function writeReviewerBootstrapToken(
 export function readReviewerBootstrapToken(
   threadId: string,
   root?: string,
+  artifactDir?: string,
 ): ReviewerBootstrapToken | undefined {
   try {
     const parsed = JSON.parse(
-      fs.readFileSync(reviewerBootstrapTokenPath(threadId, root), 'utf8'),
+      fs.readFileSync(reviewerBootstrapTokenPath(threadId, root, artifactDir), 'utf8'),
     );
     return parsed && typeof parsed.token === 'string' ? (parsed as ReviewerBootstrapToken) : undefined;
   } catch {
@@ -164,9 +177,13 @@ export function readReviewerBootstrapToken(
   }
 }
 
-export function clearReviewerBootstrapToken(threadId: string, root?: string): void {
+export function clearReviewerBootstrapToken(
+  threadId: string,
+  root?: string,
+  artifactDir?: string,
+): void {
   try {
-    fs.unlinkSync(reviewerBootstrapTokenPath(threadId, root));
+    fs.unlinkSync(reviewerBootstrapTokenPath(threadId, root, artifactDir));
   } catch {}
 }
 
@@ -181,11 +198,38 @@ export function recordReviewerBootstrapHostPid(
   threadId: string,
   hostPid: number,
   root?: string,
+  artifactDir?: string,
 ): void {
   if (!hostPid || !Number.isFinite(hostPid)) return;
-  const record = readReviewerBootstrapToken(threadId, root);
+  const record = readReviewerBootstrapToken(threadId, root, artifactDir);
   if (!record) return;
-  writeReviewerBootstrapToken({ ...record, hostPid }, root);
+  writeReviewerBootstrapToken({ ...record, hostPid }, root, artifactDir);
+}
+
+function bootstrapRecordFiles(root?: string, taskStore?: TaskStore): string[] {
+  const files = new Set<string>();
+  const addDir = (dir: string) => {
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        if (name.endsWith('.json')) files.add(path.join(dir, name));
+      }
+    } catch {}
+  };
+  // Legacy tasks keep the global bootstrap/ location.
+  addDir(bootstrapDir(root));
+  // New tasks own `<artifactDir>/bootstrap/<threadId>.json`. Scan the current
+  // root for the pid fallback, and the ledger-recorded dirs when a store is
+  // available (a policy change must not hide a pending credential).
+  try {
+    const tasksRoot = resolveTaskDataRoot(bridgeHomeDir(root), root);
+    for (const entry of fs.readdirSync(tasksRoot, { withFileTypes: true })) {
+      if (entry.isDirectory()) addDir(path.join(tasksRoot, entry.name, 'bootstrap'));
+    }
+  } catch {}
+  for (const thread of taskStore?.getAllTasks() || []) {
+    if (thread.artifactDir) addDir(taskBootstrapDir(thread.artifactDir));
+  }
+  return [...files];
 }
 
 /**
@@ -202,22 +246,16 @@ export function recordReviewerBootstrapHostPid(
 export function findReviewerBootstrapByHostPid(
   hostPid: number | undefined,
   root?: string,
+  taskStore?: TaskStore,
 ): ReviewerBootstrapToken | undefined {
   if (!hostPid || !Number.isFinite(hostPid)) return undefined;
-  let names: string[];
-  try {
-    names = fs.readdirSync(bootstrapDir(root));
-  } catch {
-    return undefined;
-  }
 
   const now = Date.now();
   let found: ReviewerBootstrapToken | undefined;
-  for (const name of names) {
-    if (!name.endsWith('.json')) continue;
+  for (const file of bootstrapRecordFiles(root, taskStore)) {
     let record: ReviewerBootstrapToken | undefined;
     try {
-      record = JSON.parse(fs.readFileSync(path.join(bootstrapDir(root), name), 'utf8'));
+      record = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch {
       continue;
     }
@@ -276,20 +314,13 @@ export function findSolePendingBootstrap(
 ): ReviewerBootstrapToken | undefined {
   const agent = (query.agent || '').trim();
   if (!agent) return undefined;
-  let names: string[];
-  try {
-    names = fs.readdirSync(bootstrapDir(root));
-  } catch {
-    return undefined;
-  }
 
   const now = Date.now();
   const candidates: ReviewerBootstrapToken[] = [];
-  for (const name of names) {
-    if (!name.endsWith('.json')) continue;
+  for (const file of bootstrapRecordFiles(root, query.taskStore)) {
     let record: ReviewerBootstrapToken | undefined;
     try {
-      record = JSON.parse(fs.readFileSync(path.join(bootstrapDir(root), name), 'utf8'));
+      record = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch {
       continue;
     }
@@ -372,7 +403,7 @@ export function confirmReviewerBootstrapTask(
     throw new Error(`Reviewer bootstrap for ${threadId} is no longer a queued dedicated task.`);
   if (thread.reviewBootstrap?.phase === 'confirmed') throw new Error(`Thread ${threadId} was already dispatched by its reviewer.`);
   if (thread.reviewBootstrap?.phase === 'failed') throw new Error(`Thread ${threadId} failed its reviewer bootstrap; it cannot be dispatched anymore.`);
-  const record = readReviewerBootstrapToken(threadId, root);
+  const record = readReviewerBootstrapToken(threadId, root, thread.artifactDir);
   if (!record) throw new Error(`Reviewer bootstrap token for ${threadId} is missing or was already consumed.`);
   if (credential.token && record.token !== credential.token)
     throw new Error(`Reviewer bootstrap token mismatch for ${threadId}.`);
@@ -386,7 +417,7 @@ export function confirmReviewerBootstrapTask(
   if (!latest || latest.status !== 'queued' || latest.reviewFlow !== 'dedicated')
     throw new Error(`Reviewer bootstrap for ${threadId} was stopped before confirmation; its token was not consumed.`);
   thread = latest;
-  clearReviewerBootstrapToken(threadId, root);
+  clearReviewerBootstrapToken(threadId, root, thread.artifactDir);
   thread.reviewBootstrap = { ...(thread.reviewBootstrap || { phase: 'pending', attempts: 0 }), phase: 'confirmed' };
   thread.status = 'queued';
   thread.summary.lastOutputSnippet = 'Reviewer dispatched the task; waiting for the bootstrap process to persist its native session.';
@@ -497,7 +528,7 @@ export class ReviewerBootstrapService {
       return;
     }
     thread = current;
-    const tokenRecord = readReviewerBootstrapToken(thread.threadId, root);
+    const tokenRecord = readReviewerBootstrapToken(thread.threadId, root, thread.artifactDir);
     if (!tokenRecord) {
       this.fail(thread, 'Reviewer bootstrap token is missing (the task was created before the bootstrap service raced it?).');
       return;
@@ -526,7 +557,7 @@ export class ReviewerBootstrapService {
     }
 
     const attempt = (thread.reviewBootstrap?.attempts || 0) + 1;
-    const logFile = reviewerBootstrapLogPath(thread.threadId, root, thread.initiatorAgent);
+    const logFile = reviewerBootstrapLogPath(thread.threadId, root, thread.initiatorAgent, thread.artifactDir);
     let result;
     let runError: any;
     try {
@@ -566,6 +597,7 @@ export class ReviewerBootstrapService {
         title: `Reviewer bootstrap: ${thread.title}`,
         cwd: thread.workspacePath,
         taskThreadId: thread.threadId,
+        artifactDir: thread.artifactDir,
         taskRound: 0,
         nativeSessionRole: 'reviewer',
         model: thread.reviewerModel,
@@ -585,7 +617,7 @@ export class ReviewerBootstrapService {
           // Environment-independent half of the handshake: the bridge server
           // that this reviewer CLI spawns can identify itself by this pid even
           // when the host scrubs the inherited environment.
-          if (pid) recordReviewerBootstrapHostPid(thread.threadId, pid, root);
+          if (pid) recordReviewerBootstrapHostPid(thread.threadId, pid, root, thread.artifactDir);
         },
         onStdoutChunk: (chunk: string) => {
           try {
@@ -625,7 +657,7 @@ export class ReviewerBootstrapService {
                 ...fresh.reviewBootstrap,
                 reviewerSessionId: sessionId,
               };
-              clearReviewerBootstrapToken(fresh.threadId, root);
+              clearReviewerBootstrapToken(fresh.threadId, root, fresh.artifactDir);
             }
           }
           store.upsertTask(fresh);
@@ -663,7 +695,7 @@ export class ReviewerBootstrapService {
               fresh.status = 'queued';
               fresh.summary.lastOutputSnippet =
                 'Reviewer conversation dispatched the task; waiting for execution.';
-              clearReviewerBootstrapToken(fresh.threadId, root);
+              clearReviewerBootstrapToken(fresh.threadId, root, fresh.artifactDir);
               store.upsertTask(fresh);
             }
           } else {
@@ -731,7 +763,7 @@ export class ReviewerBootstrapService {
       at,
       by: 'bridge',
     });
-    clearReviewerBootstrapToken(fresh.threadId, this.deps.storageDir);
+    clearReviewerBootstrapToken(fresh.threadId, this.deps.storageDir, fresh.artifactDir);
     this.deps.taskStore.upsertTask(fresh);
   }
 }

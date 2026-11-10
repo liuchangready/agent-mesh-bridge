@@ -29,6 +29,7 @@ import { AgentId, ModelResolutionSource } from './types';
 import { AgentDetector } from './agent-detector';
 import { getDshHome, readDshConfiguredProvider } from './deepseek-harness';
 import { needsShellWrapper } from './platform';
+import { taskModelOverlayDir } from './round-log';
 
 /** Bridge storage root; overridable so tests never touch the real home directory. */
 export function getBridgeHome(): string {
@@ -369,9 +370,9 @@ export function extractJsonObject(raw: string): any | undefined {
   }
 }
 
-/** Directory the DSH overlay patches are written to. */
-export function getDshOverlayDir(): string {
-  return path.join(getBridgeHome(), 'model-overlays');
+/** Directory the DSH overlay patches are written to (legacy/global by default). */
+export function getDshOverlayDir(artifactDir?: string): string {
+  return artifactDir ? taskModelOverlayDir(artifactDir) : path.join(getBridgeHome(), 'model-overlays');
 }
 
 /**
@@ -381,11 +382,11 @@ export function getDshOverlayDir(): string {
  * replaces the whole `agent-default-model` config, so writing only a model would
  * silently drop the provider (verified with `dsh headless --dump-config`).
  */
-export function writeDshModelOverlay(model: string): string | undefined {
+export function writeDshModelOverlay(model: string, artifactDir?: string): string | undefined {
   const provider = readDshConfiguredProvider();
   if (!provider) return undefined;
 
-  const dir = getDshOverlayDir();
+  const dir = getDshOverlayDir(artifactDir);
   const safe = model.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
   const file = path.join(dir, `${safe}.yml`);
   const body = [

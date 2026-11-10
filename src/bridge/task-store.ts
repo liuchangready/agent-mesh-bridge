@@ -23,6 +23,7 @@ import {
 } from './task-summary';
 import { cleanupThreadNativeSessions, collectThreadSessionRefs } from './native-session-cleanup';
 import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
+import { removeTaskDataDir } from './task-data-dir';
 
 export const MAX_STORED_TASKS = 1000;
 
@@ -648,6 +649,12 @@ export class TaskStore extends EventEmitter {
         }
       }
       thread.rounds = merged.sort((a, b) => a.round - b.round);
+      // The unified task directory is immutable once assigned: a stale writer
+      // (or a policy reload) must not strip it and make this task fall back to
+      // agent-wide legacy log directories.
+      thread.artifactDir = thread.artifactDir || inMemory?.artifactDir || onDisk?.artifactDir;
+      thread.taskDataDir = thread.taskDataDir || inMemory?.taskDataDir || onDisk?.taskDataDir;
+      if (thread.artifactDir && !thread.taskDataDir) thread.taskDataDir = thread.artifactDir;
       const authoritative = [inMemory, onDisk].filter(Boolean) as DelegationThread[];
       for (const prior of authoritative) {
         if (!prior.worktree || !thread.worktree) continue;
@@ -943,6 +950,7 @@ export class TaskStore extends EventEmitter {
       keepArchive: true,
       targetAgent: thread.targetAgent,
       initiatorAgent: thread.initiatorAgent,
+      artifactDir: thread.artifactDir,
     });
     this.writeAggregate();
     this.emit('changed', Array.from(this.tasks.values()));
@@ -969,7 +977,12 @@ export class TaskStore extends EventEmitter {
         keepArchive: false,
         targetAgent: thread?.targetAgent,
         initiatorAgent: thread?.initiatorAgent,
+        artifactDir: thread?.artifactDir,
       });
+      // Remove every remaining task-owned subdirectory. The worktree is left
+      // for the caller (TaskControlService) to unregister with Git first; that
+      // caller removes the root afterwards.
+      if (thread?.artifactDir) removeTaskDataDir(thread.artifactDir, false);
       this.knownMtimes.delete(path.basename(this.threadFilePath(threadId)));
       this.writeAggregate();
       this.emit('changed', Array.from(this.tasks.values()));

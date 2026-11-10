@@ -34,6 +34,7 @@ import { MCPServer } from '../bridge/mcp-server';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { TaskRoleLock } from '../bridge/task-role-lock';
 import { roundOutputArchivePath } from '../bridge/round-log';
+import { reviewerLogPath } from '../bridge/reviewer-log';
 import {
   getBridgeHome,
   invalidateConfiguredModelCache,
@@ -275,10 +276,19 @@ describe('MCPServer Protocol Tests', () => {
     assert.match(missing.message, /No reviewer log/);
 
     // A captured reviewer stream must be served with the same paging contract.
-    const logsDir = path.join(tempDir, 'logs');
-    fs.mkdirSync(logsDir, { recursive: true });
+    // New tasks keep it inside their unified task directory; the helper falls
+    // back to the legacy logs/ location when no artifactDir is recorded.
+    const threadForLog = taskStore.getTask(dispatched.threadId)!;
+    const reviewerFile = reviewerLogPath(
+      dispatched.threadId,
+      1,
+      tempDir,
+      threadForLog.initiatorAgent,
+      threadForLog.artifactDir,
+    );
+    fs.mkdirSync(path.dirname(reviewerFile), { recursive: true });
     fs.writeFileSync(
-      path.join(logsDir, `${dispatched.threadId}_round_1.reviewer.log`),
+      reviewerFile,
       '--- wake ---\n[reviewer] EditMode 82/82\n[reviewer] verdict pending\n',
     );
 

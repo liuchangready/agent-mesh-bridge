@@ -101,6 +101,7 @@ flowchart TD
    - The lock covers the temporary three-way merge, real compile/test, target ref CAS update and ledger persistence. It does not cover development, individual tests, review, or remote push.
    - Persist source/target/candidate SHA and transaction phase for crash recovery. Conflicts and validation failures return to review; a dirty checked-out target is preserved and remains in blocked `waiting_merge` until an explicit retry.
    - `mergeRequest` 仅表示远端交付。未集成的成果不能自动归档、容量淘汰或普通删除；force 才可明确丢弃。旧任务不自动迁移。
+   - **统一任务数据目录**：新任务的所有 bridge 侧产物固定放在 `<taskDataRoot>/<threadId>/`，其中 `worktree/` 是 Git worktree，`worker_log/` / `reviewer_log/` 保存轮次日志与压缩归档，`Archive/` 保存终态 tar.gz + JSON，`bootstrap/` 保存一次性 reviewer 凭证，`validation/` 保存合并验证临时 worktree，`model-overlays/` 保存桥接生成的 DSH 单次运行模型 patch。绝对路径在创建时写入 `thread.artifactDir` / `taskDataDir`，后续轮次只读该值，不重新解析全局设置；`agentMeshBridge.taskDataRoot` 为空时默认 `<bridge home>/tasks`，相对路径相对 bridge home 解析。旧 ledger 条目无 `artifactDir`，继续使用原 `worktree.path` 与 `logDirectories` 布局，不迁移。
 ### 2.1 运行时三条硬准则
 
 1. **拆分任务不因权限停摆**：所有被派发的轮次必须携带各端 `skip-danger` 参数；Codex 的 `--ask-for-approval` 是全局参数，必须位于 `exec` 之前；DSH 注入 `DSH_PERMISSION_MODE=danger-full-access`，使其 `approval` 策略变为 `never`。

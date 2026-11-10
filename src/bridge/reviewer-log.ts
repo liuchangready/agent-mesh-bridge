@@ -29,6 +29,7 @@ import {
   readTextFilePaged,
   resolveExistingArtifactPath,
   safeThreadIdPart,
+  taskReviewerLogDir,
 } from './round-log';
 
 /** Suffix that distinguishes a reviewer log from the receiver's round log. */
@@ -49,10 +50,12 @@ export function reviewerLogPath(
   round: number,
   root?: string,
   agent?: string,
+  artifactDir?: string,
 ): string {
   const safeRound = Number.isFinite(round) ? Math.max(1, Math.floor(round)) : 1;
+  const dir = artifactDir ? taskReviewerLogDir(artifactDir) : getReviewerLogDir(agent, root);
   return path.join(
-    getReviewerLogDir(agent, root),
+    dir,
     `${safeThreadIdPart(threadId)}_round_${safeRound}${REVIEWER_LOG_SUFFIX}`,
   );
 }
@@ -61,9 +64,11 @@ export function reviewerBootstrapLogPath(
   threadId: string,
   root?: string,
   agent?: string,
+  artifactDir?: string,
 ): string {
+  const dir = artifactDir ? taskReviewerLogDir(artifactDir) : getReviewerLogDir(agent, root);
   return path.join(
-    getReviewerLogDir(agent, root),
+    dir,
     `${safeThreadIdPart(threadId)}_bootstrap.log`,
   );
 }
@@ -71,8 +76,13 @@ export function reviewerBootstrapLogPath(
 export function findExistingReviewerLog(
   threadId: string,
   round: number,
-  options: { root?: string; agent?: string } = {},
+  options: { root?: string; agent?: string; artifactDir?: string } = {},
 ): string | undefined {
+  if (options.artifactDir) {
+    return resolveExistingArtifactPath([
+      reviewerLogPath(threadId, round, undefined, undefined, options.artifactDir),
+    ]);
+  }
   const safeRound = Number.isFinite(round) ? Math.max(1, Math.floor(round)) : 1;
   const candidates: Array<string | undefined> = [
     reviewerLogPath(threadId, round, options.root, options.agent),
@@ -103,10 +113,11 @@ export function statReviewerLog(
   round: number,
   root?: string,
   agent?: string,
+  artifactDir?: string,
 ): ReviewerLogStat {
   const file =
-    findExistingReviewerLog(threadId, round, { root, agent }) ||
-    reviewerLogPath(threadId, round, root, agent);
+    findExistingReviewerLog(threadId, round, { root, agent, artifactDir }) ||
+    reviewerLogPath(threadId, round, root, agent, artifactDir);
   try {
     const stat = fs.statSync(file);
     if (!stat.isFile()) return { path: file, exists: false, sizeBytes: 0, mtimeMs: 0 };
@@ -125,14 +136,19 @@ export function listReviewerLogRounds(
   threadId: string,
   root?: string,
   agent?: string,
+  artifactDir?: string,
 ): number[] {
   const dirs = new Set<string>();
-  dirs.add(getReviewerLogDir(agent, root));
-  dirs.add(getReviewerLogDir(undefined, root));
-  // Reviews written before a log directory was configured live in the legacy
-  // reviewer_log/ (or, older still, directly under logs/).
-  dirs.add(path.join(bridgeLogsDir(root), REVIEWER_LOG_DIRNAME));
-  dirs.add(bridgeLogsDir(root));
+  if (artifactDir) {
+    dirs.add(taskReviewerLogDir(artifactDir));
+  } else {
+    dirs.add(getReviewerLogDir(agent, root));
+    dirs.add(getReviewerLogDir(undefined, root));
+    // Reviews written before a log directory was configured live in the legacy
+    // reviewer_log/ (or, older still, directly under logs/).
+    dirs.add(path.join(bridgeLogsDir(root), REVIEWER_LOG_DIRNAME));
+    dirs.add(bridgeLogsDir(root));
+  }
 
   const prefix = `${safeThreadIdPart(threadId)}_round_`;
   const rounds = new Set<number>();
@@ -165,11 +181,12 @@ export function resolveReviewerLogRound(
   requestedRound: number,
   root?: string,
   agent?: string,
+  artifactDir?: string,
 ): { round: number; fallback: boolean } | undefined {
-  if (statReviewerLog(threadId, requestedRound, root, agent).exists) {
+  if (statReviewerLog(threadId, requestedRound, root, agent, artifactDir).exists) {
     return { round: requestedRound, fallback: false };
   }
-  const latest = listReviewerLogRounds(threadId, root, agent)[0];
+  const latest = listReviewerLogRounds(threadId, root, agent, artifactDir)[0];
   if (latest === undefined) return undefined;
   return { round: latest, fallback: latest !== requestedRound };
 }
@@ -183,11 +200,11 @@ export function resolveReviewerLogRound(
 export function readReviewerLogTail(
   threadId: string,
   round: number,
-  options: { maxBytes?: number; root?: string; agent?: string } = {},
+  options: { maxBytes?: number; root?: string; agent?: string; artifactDir?: string } = {},
 ): PagedText | undefined {
   const file =
     findExistingReviewerLog(threadId, round, options) ||
-    reviewerLogPath(threadId, round, options.root, options.agent);
+    reviewerLogPath(threadId, round, options.root, options.agent, options.artifactDir);
   if (!fs.existsSync(file)) return undefined;
   const totalBytes = fs.statSync(file).size;
   const maxBytes = Math.max(1, options.maxBytes ?? REVIEWER_LOG_TAIL_BYTES);
@@ -223,10 +240,10 @@ export class ReviewerLogWriter {
     threadId: string,
     round: number,
     header: ReviewerLogHeader,
-    options: { root?: string; maxBytes?: number; agent?: string } = {},
+    options: { root?: string; maxBytes?: number; agent?: string; artifactDir?: string } = {},
   ) {
     const agent = options.agent || header.agent;
-    this.path = reviewerLogPath(threadId, round, options.root, agent);
+    this.path = reviewerLogPath(threadId, round, options.root, agent, options.artifactDir);
     this.maxBytes = Math.max(1024, options.maxBytes ?? REVIEWER_LOG_MAX_BYTES);
     try {
       fs.mkdirSync(path.dirname(this.path), { recursive: true });
@@ -313,7 +330,7 @@ export function createReviewerLogWriter(
   threadId: string,
   round: number,
   header: ReviewerLogHeader,
-  options: { root?: string; maxBytes?: number; agent?: string } = {},
+  options: { root?: string; maxBytes?: number; agent?: string; artifactDir?: string } = {},
 ): ReviewerLogWriter {
   return new ReviewerLogWriter(threadId, round, header, options);
 }

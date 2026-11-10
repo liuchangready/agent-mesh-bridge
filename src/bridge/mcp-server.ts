@@ -39,6 +39,8 @@ import {
   resolveExistingArtifactPath,
   roundExecutionLogPath,
   roundOutputArchivePath,
+  taskReviewerLogDir,
+  taskWorkerLogDir,
 } from './round-log';
 import {
   findExistingReviewerLog,
@@ -117,6 +119,13 @@ export class MCPServer {
 
   private resolveRoundOutputArchive(threadId: string, round: number): string | undefined {
     const thread = this.taskStore.getTask(threadId);
+    const artifactDir = thread?.artifactDir;
+    if (artifactDir) {
+      return resolveExistingArtifactPath([
+        findExistingOutputArchive(threadId, round, { artifactDir }),
+        roundOutputArchivePath(threadId, round, undefined, undefined, artifactDir),
+      ]);
+    }
     return resolveExistingArtifactPath([
       findExistingOutputArchive(threadId, round, { root: this.storeRoot(), agent: thread?.targetAgent }),
       roundOutputArchivePath(threadId, round, this.storeRoot(), thread?.targetAgent),
@@ -127,6 +136,13 @@ export class MCPServer {
 
   private resolveRoundExecutionLog(threadId: string, round: number): string | undefined {
     const thread = this.taskStore.getTask(threadId);
+    const artifactDir = thread?.artifactDir;
+    if (artifactDir) {
+      return resolveExistingArtifactPath([
+        findExistingExecutionLog(threadId, round, { artifactDir }),
+        roundExecutionLogPath(threadId, round, undefined, undefined, artifactDir),
+      ]);
+    }
     return resolveExistingArtifactPath([
       findExistingExecutionLog(threadId, round, { root: this.storeRoot(), agent: thread?.targetAgent }),
       roundExecutionLogPath(threadId, round, this.storeRoot(), thread?.targetAgent),
@@ -191,9 +207,13 @@ export class MCPServer {
       const operation = round.nativeSessionCompactions?.find((entry) => entry.id === args?.operationId);
       if (!operation) throw new Error(`Native compaction operation not found on round ${roundNumber}.`);
       const root = path.dirname(this.taskStore.getStoragePath());
-      const allowedDir = operation.role === 'reviewer'
-        ? getReviewerLogDir(operation.agent, root)
-        : getWorkerLogDir(operation.agent, root);
+      const allowedDir = task.artifactDir
+        ? operation.role === 'reviewer'
+          ? taskReviewerLogDir(task.artifactDir)
+          : taskWorkerLogDir(task.artifactDir)
+        : operation.role === 'reviewer'
+          ? getReviewerLogDir(operation.agent, root)
+          : getWorkerLogDir(operation.agent, root);
       const file = path.resolve(operation.logPath);
       if (path.dirname(file) !== path.resolve(allowedDir)) throw new Error('Native compaction log path is outside its agent log directory.');
       const page = readTextFilePaged(file, { offsetBytes, maxBytes });
@@ -289,10 +309,11 @@ export class MCPServer {
     const task = this.taskStore.getTask(threadId);
     if (!task) throw new Error(`Thread not found: ${threadId}`);
 
+    const artifactDir = task.artifactDir;
     const withLogs = [
       ...new Set([
-        ...listReviewerLogRounds(threadId, this.storeRoot()),
-        ...listReviewerLogRounds(threadId),
+        ...listReviewerLogRounds(threadId, this.storeRoot(), task.initiatorAgent, artifactDir),
+        ...(artifactDir ? [] : listReviewerLogRounds(threadId)),
       ]),
     ].sort((a, b) => b - a);
 
@@ -319,9 +340,13 @@ export class MCPServer {
 
     const thread = this.taskStore.getTask(threadId);
     const found = resolveExistingArtifactPath([
-      findExistingReviewerLog(threadId, round, { root: this.storeRoot(), agent: thread?.initiatorAgent }),
-      reviewerLogPath(threadId, round, this.storeRoot(), thread?.initiatorAgent),
-      reviewerLogPath(threadId, round),
+      findExistingReviewerLog(threadId, round, { root: this.storeRoot(), agent: task.initiatorAgent, artifactDir }),
+      ...(artifactDir
+        ? [reviewerLogPath(threadId, round, undefined, undefined, artifactDir)]
+        : [
+            reviewerLogPath(threadId, round, this.storeRoot(), task.initiatorAgent),
+            reviewerLogPath(threadId, round),
+          ]),
     ]);
 
     if (!found) {
@@ -965,7 +990,11 @@ export class MCPServer {
     // Channel 3: the pid of the reviewer CLI the bridge launched. Environment
     // independent, but only correct when this server really is a direct child
     // of that CLI.
-    const byHostPid = findReviewerBootstrapByHostPid(process.ppid);
+    const byHostPid = findReviewerBootstrapByHostPid(
+      process.ppid,
+      this.storeRoot(),
+      this.taskStore,
+    );
     if (byHostPid?.hostPid) {
       return { threadId: byHostPid.threadId, hostPid: byHostPid.hostPid };
     }

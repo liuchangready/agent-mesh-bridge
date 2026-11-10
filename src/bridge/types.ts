@@ -677,6 +677,18 @@ export interface DelegationThread {
   workspacePath: string; // Working directory
 
   /**
+   * Absolute root of this task's bridge-managed files (unified task directory).
+   *
+   * Written once at creation and never re-resolved from the global
+   * `agentMeshBridge.taskDataRoot` setting: a policy change must not make one
+   * task write into two roots. Absent on legacy ledger entries, which keep their
+   * recorded `worktree.path` and per-agent `logDirectories` layout.
+   */
+  artifactDir?: string;
+  /** Alias retained for callers/UI that name the same directory `taskDataDir`. */
+  taskDataDir?: string;
+
+  /**
    * Review topology pinned when the task was created (see `ReviewFlow`).
    * Absent on legacy ledger entries, which must keep the old caller-review path.
    */
