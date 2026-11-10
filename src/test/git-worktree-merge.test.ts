@@ -29,6 +29,18 @@ function git(cwd: string, ...args: string[]): string {
   return result.stdout.trim();
 }
 
+/**
+ * Compare two paths that are known to exist using their filesystem real path.
+ *
+ * Git returns the canonical on-disk case on Windows; path.resolve() does not
+ * canonicalize existing directory case, so a TEMP env like `C:\Windows\TEMP`
+ * would not compare equal to the real `C:\Windows\Temp`. realpathSync.native
+ * keeps POSIX comparisons case-sensitive while normalizing Windows casing.
+ */
+function assertSameExistingPath(actual: string, expected: string): void {
+  assert.equal(fs.realpathSync.native(actual), fs.realpathSync.native(expected));
+}
+
 function initRepo(root: string): void {
   fs.mkdirSync(root, { recursive: true });
   git(root, 'init', '-b', 'feature/caller');
@@ -170,7 +182,10 @@ test('two tasks edit the same file in independent worktrees and integrate serial
   assert.strictEqual(git(repository, 'rev-parse', 'feature/caller'), resultB.commit, 'the pinned real delivery branch advances');
   assert.strictEqual(fs.readFileSync(path.join(repository, 'shared.txt'), 'utf8').replace(/\r\n/g, '\n'), 'A\nmiddle\nB\n');
   assert.equal(git(repository, 'status', '--porcelain'), '', 'the checked-out target directory is synchronized and clean');
-  assert.equal(path.resolve(store.getTask('thread_merge_B')!.worktree!.integration!.targetPath!), path.resolve(repository));
+  assertSameExistingPath(
+    store.getTask('thread_merge_B')!.worktree!.integration!.targetPath!,
+    repository,
+  );
   assert.equal(store.getTask('thread_merge_B')!.finalSummary?.gitDelivery?.targetBranch, 'feature/caller');
   assert.equal(store.getTask('thread_merge_B')!.finalSummary?.gitDelivery?.validationStatus, 'cleaned');
   const validationCommit = store.getTask('thread_merge_B')!.worktree!.validation!.commit!;
