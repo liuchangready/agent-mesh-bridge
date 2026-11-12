@@ -483,6 +483,7 @@ export class AsyncDispatcher {
           roundNumber,
           current.targetAgent,
           current.workspacePath,
+          'developer',
         );
       } catch (error: any) {
         roleLock.release(roleLease);

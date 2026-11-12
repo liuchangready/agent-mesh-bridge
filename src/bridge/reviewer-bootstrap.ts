@@ -548,6 +548,7 @@ export class ReviewerBootstrapService {
         0,
         thread.initiatorAgent,
         thread.workspacePath,
+        'bootstrap',
       );
     } catch (error: any) {
       roleLock.release(roleLease);

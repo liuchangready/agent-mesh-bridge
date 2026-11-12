@@ -248,7 +248,13 @@ export class CallbackManager extends EventEmitter {
     let ownsExecutionRegistration = reviewerPreparation?.executionLease?.owned ?? false;
     try {
       if (!executionRegistration) {
-        executionRegistration = executionRegistry.begin(thread.threadId, reviewRound.round, thread.initiatorAgent, thread.workspacePath);
+        executionRegistration = executionRegistry.begin(
+          thread.threadId,
+          reviewRound.round,
+          thread.initiatorAgent,
+          thread.workspacePath,
+          'reviewer',
+        );
         ownsExecutionRegistration = true;
       }
     } catch (error: any) {
@@ -467,7 +473,13 @@ export class CallbackManager extends EventEmitter {
     const executionRegistry = new TaskExecutionRegistry(storageRoot);
     let executionRegistration: TaskExecutionRegistration;
     try {
-      executionRegistration = executionRegistry.begin(thread.threadId, roundNumber, thread.initiatorAgent, thread.workspacePath);
+      executionRegistration = executionRegistry.begin(
+        thread.threadId,
+        roundNumber,
+        thread.initiatorAgent,
+        thread.workspacePath,
+        'reviewer',
+      );
     } catch (error: any) {
       nativeLock.release(sessionLease); roleLock.release(roleLease); this.wakeQueue.release(callerSessionId); executionRegistry.dispose();
       console.warn(`[CallbackManager] Failure wake registration failed for ${thread.threadId}: ${error?.message || error}`);

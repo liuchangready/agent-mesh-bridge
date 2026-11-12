@@ -807,6 +807,119 @@ describe('MCPServer Protocol Tests', () => {
     }
   });
 
+  test('should detect a receiver by the pid of the launched task process when the host scrubs the environment', async () => {
+    // Codex hands its MCP servers ONLY the `env` table from config.toml, and
+    // DeepSeek Harness scrubs inherited variables, so MESH_TASK_RECEIVER never
+    // arrives. The bridge therefore also matches the pid of the CLI it launched.
+    // Before this channel existed a receiver could silently dispatch a nested
+    // task, which produced chains of tasks each delegating the same blocked brief.
+    const savedReceiver = process.env.MESH_TASK_RECEIVER;
+    const savedThread = process.env.MESH_TASK_THREAD_ID;
+    const savedRound = process.env.MESH_TASK_ROUND;
+    const registry = new TaskExecutionRegistry(tempDir);
+    const originalPpid = Object.getOwnPropertyDescriptor(process, 'ppid');
+    let registration: ReturnType<TaskExecutionRegistry['begin']> | undefined;
+    try {
+      delete process.env.MESH_TASK_RECEIVER;
+      delete process.env.MESH_TASK_THREAD_ID;
+      delete process.env.MESH_TASK_ROUND;
+
+      const threadId = 'thread_receiver_by_pid';
+      registration = registry.begin(threadId, 2, 'codex', tempDir, 'developer');
+      // The MCP server the agent spawns is a child of the CLI the bridge
+      // launched, so its ppid is the recorded child pid.
+      registry.attachChildPid(4321, registration);
+      Object.defineProperty(process, 'ppid', { value: 4321, configurable: true });
+
+      const toolNames = mcpServer.getToolDefinitions().map((tool: any) => tool.name);
+      assert.ok(!toolNames.includes('dispatch_task'), 'forwarding tools must stay hidden');
+      assert.ok(toolNames.includes('approve_task'));
+
+      const dispatchRes = await mcpServer.handleRpcMessage({
+        jsonrpc: '2.0',
+        id: 40,
+        method: 'tools/call',
+        params: {
+          name: 'dispatch_task',
+          arguments: { targetAgent: 'codex', title: 'nested', prompt: 'delegate again' },
+        },
+      });
+      assert.match(dispatchRes.error.message, /receiver/i);
+      assert.match(dispatchRes.error.message, /thread_receiver_by_pid/);
+
+      // The receiver must not drive its own task's review loop either.
+      const reworkRes = await mcpServer.handleRpcMessage({
+        jsonrpc: '2.0',
+        id: 41,
+        method: 'tools/call',
+        params: {
+          name: 'request_rework',
+          arguments: { threadId, feedback: 'again' },
+        },
+      });
+      assert.match(reworkRes.error.message, /receiver|not its initiator/i);
+    } finally {
+      if (originalPpid) Object.defineProperty(process, 'ppid', originalPpid);
+      if (registration) registry.end(registration);
+      registry.dispose();
+      if (savedReceiver === undefined) delete process.env.MESH_TASK_RECEIVER;
+      else process.env.MESH_TASK_RECEIVER = savedReceiver;
+      if (savedThread === undefined) delete process.env.MESH_TASK_THREAD_ID;
+      else process.env.MESH_TASK_THREAD_ID = savedThread;
+      if (savedRound === undefined) delete process.env.MESH_TASK_ROUND;
+      else process.env.MESH_TASK_ROUND = savedRound;
+    }
+  });
+
+  test('should not treat an unrelated process as a receiver when no execution record matches its pid', async () => {
+    const savedReceiver = process.env.MESH_TASK_RECEIVER;
+    const originalPpid = Object.getOwnPropertyDescriptor(process, 'ppid');
+    try {
+      delete process.env.MESH_TASK_RECEIVER;
+      Object.defineProperty(process, 'ppid', { value: 987654, configurable: true });
+
+      const toolNames = mcpServer.getToolDefinitions().map((tool: any) => tool.name);
+      assert.ok(toolNames.includes('dispatch_task'), 'a normal caller keeps the forwarding tools');
+    } finally {
+      if (originalPpid) Object.defineProperty(process, 'ppid', originalPpid);
+      if (savedReceiver === undefined) delete process.env.MESH_TASK_RECEIVER;
+      else process.env.MESH_TASK_RECEIVER = savedReceiver;
+    }
+  });
+
+  test('should never treat a reviewer or bootstrap round as a task receiver', async () => {
+    // A reviewer round is registered against the SAME thread and also binds the
+    // reviewer CLI pid. If the pid channel matched those records, the conversation
+    // whose job is to confirm the task would lose `dispatch_task`.
+    const savedReceiver = process.env.MESH_TASK_RECEIVER;
+    const registry = new TaskExecutionRegistry(tempDir);
+    const originalPpid = Object.getOwnPropertyDescriptor(process, 'ppid');
+    const registrations: Array<ReturnType<TaskExecutionRegistry['begin']>> = [];
+    try {
+      delete process.env.MESH_TASK_RECEIVER;
+      for (const [role, pid, threadId] of [
+        ['reviewer', 5101, 'thread_reviewer_role'],
+        ['bootstrap', 5102, 'thread_bootstrap_role'],
+        ['maintenance', 5103, 'thread_maintenance_role'],
+      ] as const) {
+        const registration = registry.begin(threadId, 1, 'codex', tempDir, role);
+        registry.attachChildPid(pid, registration);
+        registrations.push(registration);
+        Object.defineProperty(process, 'ppid', { value: pid, configurable: true });
+        assert.strictEqual(registry.findByChildPid(pid), undefined, `${role} must not resolve as a receiver`);
+      }
+      Object.defineProperty(process, 'ppid', { value: 5101, configurable: true });
+      const toolNames = mcpServer.getToolDefinitions().map((tool: any) => tool.name);
+      assert.ok(toolNames.includes('dispatch_task'), 'a reviewer keeps its forwarding tools');
+    } finally {
+      if (originalPpid) Object.defineProperty(process, 'ppid', originalPpid);
+      for (const registration of registrations) registry.end(registration);
+      registry.dispose();
+      if (savedReceiver === undefined) delete process.env.MESH_TASK_RECEIVER;
+      else process.env.MESH_TASK_RECEIVER = savedReceiver;
+    }
+  });
+
   test('should execute query_agent_mesh_status and return mesh info', async () => {
     const statusCall = {
       jsonrpc: '2.0',

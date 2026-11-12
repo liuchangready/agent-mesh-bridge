@@ -287,7 +287,13 @@ export class NativeSessionCompactor {
         const currentRound = [...(thread!.rounds || [])].reverse().find((entry) => entry.type !== 'approval');
         executionLease = {
           registry,
-          registration: registry.begin(threadId, currentRound?.round || thread!.currentRound || 1, agent, thread!.worktree?.path || thread!.workspacePath),
+          registration: registry.begin(
+            threadId,
+            currentRound?.round || thread!.currentRound || 1,
+            agent,
+            thread!.worktree?.path || thread!.workspacePath,
+            'maintenance',
+          ),
           owned: true,
         };
       }
@@ -746,7 +752,13 @@ export class NativeSessionCompactor {
       const freshRound = [...(thread.rounds || [])].reverse().find((entry) => entry.type !== 'approval');
       if (!freshRound) throw new Error('The task has no business round to attach the maintenance record to.');
       round = freshRound;
-      registration = executions.begin(threadId, freshRound.round, agent, thread.worktree?.path || thread.workspacePath);
+      registration = executions.begin(
+        threadId,
+        freshRound.round,
+        agent,
+        thread.worktree?.path || thread.workspacePath,
+        'maintenance',
+      );
     } catch (error) {
       executions.dispose(); sessionLock.release(sessionLease); roleLock.release(roleLease); throw error;
     }

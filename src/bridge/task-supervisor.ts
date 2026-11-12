@@ -426,6 +426,7 @@ export class TaskSupervisor extends EventEmitter {
         round.round,
         fresh.targetAgent,
         fresh.workspacePath,
+        'developer',
       );
     } catch (error: any) {
       roleLock.release(roleLease);

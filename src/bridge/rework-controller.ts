@@ -901,7 +901,13 @@ export class ReworkController {
       }
     }
     try {
-      registration = this.executionRegistry.begin(thread.threadId, roundNumber, thread.targetAgent, thread.workspacePath);
+      registration = this.executionRegistry.begin(
+        thread.threadId,
+        roundNumber,
+        thread.targetAgent,
+        thread.workspacePath,
+        'developer',
+      );
     } catch (error: any) {
       roleLock.release(roleLease);
       latest.status = 'failed';

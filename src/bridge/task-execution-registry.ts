@@ -15,12 +15,20 @@ export interface TaskExecutionOwner {
   childPid?: number;
   threadId: string;
   round: number;
+  /**
+   * Which side of the task this process runs. Only `developer` (the delegated
+   * task's own receiver) participates in receiver detection: a reviewer or
+   * bootstrap round is the caller and must keep its forwarding tools.
+   */
+  role?: TaskExecutionRole;
   acquiredAt: number;
   updatedAt: number;
   workspace?: string;
   agent?: string;
   recordPath: string;
 }
+
+export type TaskExecutionRole = 'developer' | 'reviewer' | 'bootstrap' | 'maintenance';
 
 export interface TaskExecutionRegistration {
   token: string;
@@ -77,6 +85,7 @@ export class TaskExecutionRegistry {
     round: number,
     agent?: string,
     workspace?: string,
+    role?: TaskExecutionRole,
   ): TaskExecutionRegistration {
     const recordPath = this.recordPath(threadId);
     const now = Date.now();
@@ -89,6 +98,7 @@ export class TaskExecutionRegistry {
       updatedAt: now,
       ...(workspace ? { workspace } : {}),
       ...(agent ? { agent } : {}),
+      ...(role ? { role } : {}),
       recordPath,
     };
     const registration: TaskExecutionRegistration = {
@@ -151,6 +161,49 @@ export class TaskExecutionRegistry {
     return this.readLegacyOwners().find(
       (legacy) => legacy.threadId === threadId && this.isOwnerLive(legacy),
     );
+  }
+
+  /**
+   * Find the live execution whose spawned CLI process is `hostPid`.
+   *
+   * Why this exists: `MESH_TASK_RECEIVER` is only visible to an MCP server that
+   * inherits its environment. Codex passes ONLY the `env` table from
+   * `config.toml` to the servers it spawns and DeepSeek Harness scrubs inherited
+   * variables, so the receiver marker never arrives and the forwarding guard
+   * silently disables itself. The bridge server is still a direct child of the
+   * CLI it launched, though, so matching that pid identifies the same process
+   * without any cooperation from the host.
+   *
+   * The record is only trusted while it is live: a stale execution file left by a
+   * crashed round must never mark an unrelated new process as a receiver.
+   *
+   * Only `developer` records qualify. A reviewer or bootstrap round is registered
+   * with the same thread and also binds its CLI pid, but that process is the
+   * caller: treating it as a receiver would strip `dispatch_task` from the very
+   * conversation whose job is to confirm the task.
+   */
+  public findByChildPid(hostPid: number | undefined): TaskExecutionOwner | undefined {
+    if (!hostPid || !Number.isFinite(hostPid)) return undefined;
+    const candidates: TaskExecutionOwner[] = [];
+    try {
+      for (const name of fs.readdirSync(this.dir)) {
+        if (!name.endsWith('.json')) continue;
+        const owner = this.readOwner(path.join(this.dir, name));
+        if (owner) candidates.push(owner);
+      }
+    } catch {}
+    candidates.push(...this.readLegacyOwners());
+
+    let found: TaskExecutionOwner | undefined;
+    for (const owner of candidates) {
+      if (owner.childPid !== hostPid) continue;
+      if (owner.role !== 'developer') continue;
+      if (!this.isOwnerLive(owner)) continue;
+      // A pid can be recycled; the newest live record wins, exactly like the
+      // reviewer bootstrap host-pid channel.
+      if (!found || owner.updatedAt > found.updatedAt) found = owner;
+    }
+    return found;
   }
 
   public listOwners(): TaskExecutionOwner[] {

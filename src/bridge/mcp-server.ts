@@ -12,6 +12,7 @@ import { TaskSupervisor } from './task-supervisor';
 import { TaskControlService } from './task-control';
 import { CallerPollGuard, progressSignature } from './caller-poll-guard';
 import { TaskRoleLock } from './task-role-lock';
+import { TaskExecutionRegistry } from './task-execution-registry';
 import {
   ModelCatalog,
   annotateConfiguredModel,
@@ -25,6 +26,7 @@ import {
   AgentId,
   DelegationRound,
   MESH_TASK_THREAD_ENV,
+  MESH_TASK_ROUND_ENV,
   getModelRouting,
   isTaskReceiverProcess,
 } from './types';
@@ -89,6 +91,8 @@ export class MCPServer {
   private modelCatalog: ModelCatalog;
   /** Starves polling loops on tasks this process dispatched itself. */
   private pollGuard = new CallerPollGuard();
+  /** Observes bridge-launched task processes so receiver detection works without env. */
+  private receiverProbe?: TaskExecutionRegistry;
 
   constructor(
     dispatcher: AsyncDispatcher,
@@ -940,7 +944,7 @@ export class MCPServer {
     // A receiver is executing one delegated task; hide new-work tools so the
     // model cannot even attempt recursive delegation. The runtime guard in
     // handleToolCall stays as the authoritative enforcement.
-    if (isTaskReceiverProcess()) {
+    if (this.resolveReceiverTask()) {
       return tools.filter((tool) => !FORWARDING_TOOLS.has(tool.name));
     }
     return tools;
@@ -1102,14 +1106,56 @@ export class MCPServer {
   }
 
   /**
+   * Identify the delegated task this process is executing, if any.
+   *
+   * Primary channel: `MESH_TASK_RECEIVER` plus `MESH_TASK_THREAD_ID` in the
+   * process environment. That is the deterministic path, but it only works for a
+   * host that inherits the environment.
+   *
+   * Fallback channel: the pid of the CLI process that launched this MCP server,
+   * matched against the bridge's own execution records. Codex passes ONLY the
+   * `env` table from `config.toml` to the MCP servers it spawns, and DeepSeek
+   * Harness scrubs inherited variables, so the markers never arrive there. This
+   * used to disable the forwarding guard entirely: receivers could call
+   * `dispatch_task` again, and a single blocked baseline silently turned into a
+   * nested chain of tasks that each delegated the same problem one level down.
+   *
+   * A bootstrap reviewer's pid is never a receiver record: reviewer rounds are
+   * registered under the thread's role lock as `reviewer`, and the execution
+   * record for the developer round is what carries the developer pid.
+   */
+  private resolveReceiverTask(): { threadId?: string; round?: number } | null {
+    if (isTaskReceiverProcess()) {
+      const threadId = process.env[MESH_TASK_THREAD_ENV];
+      const rawRound = process.env[MESH_TASK_ROUND_ENV];
+      const round = rawRound ? Number(rawRound) : undefined;
+      return {
+        threadId,
+        ...(Number.isFinite(round) ? { round } : {}),
+      };
+    }
+
+    const owner = this.executionRegistry().findByChildPid(process.ppid);
+    if (!owner) return null;
+    return { threadId: owner.threadId, round: owner.round };
+  }
+
+  /** Lazily create the registry that observes bridge-launched task processes. */
+  private executionRegistry(): TaskExecutionRegistry {
+    if (!this.receiverProbe) this.receiverProbe = new TaskExecutionRegistry(this.storeRoot() || undefined);
+    return this.receiverProbe;
+  }
+
+  /**
    * Enforce the receiver rule at call time (defense in depth: a client may have
    * cached the tool list from before the marker was applied, or call a tool
    * directly over JSON-RPC).
    */
   private assertReceiverMayCall(name: string, args: any): void {
-    if (!isTaskReceiverProcess()) return;
+    const receiver = this.resolveReceiverTask();
+    if (!receiver) return;
 
-    const currentThreadId = process.env[MESH_TASK_THREAD_ENV];
+    const currentThreadId = receiver.threadId;
     if (FORWARDING_TOOLS.has(name)) {
       const target = args?.targetAgent ? ` to ${args.targetAgent}` : '';
       throw new Error(
