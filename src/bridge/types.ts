@@ -839,6 +839,8 @@ export interface DispatchTaskParams {
   workspaceRoot?: string;
   workspaceSource?: TaskWorkspaceBinding['source'];
   workspaceOrigin?: TaskWorkspaceBinding['origin'];
+  /** MCP has resolved caller origin (including ambiguity); never infer it from the target. */
+  suppressWorkspaceOriginInference?: boolean;
   /** Local branch to deliver into; omitted means the source checkout's branch. */
   targetBranch?: string;
   /**

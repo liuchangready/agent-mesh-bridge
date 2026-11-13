@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
 import { WorktreeInfo } from './types';
+import { physicalDirectory } from './workspace';
 
 export interface GitRepository {
   commonDir: string;
@@ -39,7 +40,8 @@ export function resolveGitRepository(startPath: string, storageDir: string, requ
   let initialCommonDir: string;
   try { initialCommonDir = path.resolve(git(repositoryPath, ['rev-parse', '--path-format=absolute', '--git-common-dir'])); }
   catch (error) { throw new Error(`Workspace ${repositoryPath} is not a usable Git checkout. Open a Git repository with a committed HEAD before dispatching.`, { cause: error }); }
-  const inherited = readTaskTarget(repositoryPath, storageDir);
+  const sourceCheckout = git(repositoryPath, ['rev-parse', '--show-toplevel']);
+  const inherited = readTaskTarget(sourceCheckout, storageDir);
   if (inherited?.repositoryPath) repositoryPath = path.resolve(inherited.repositoryPath);
   const commonDir = path.resolve(git(repositoryPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
   if (safePath(initialCommonDir) !== safePath(commonDir)) throw new Error('Task worktree points to a different Git repository identity than its recorded source repository.');
@@ -66,6 +68,26 @@ export function resolveGitRepository(startPath: string, storageDir: string, requ
   const baseCommit = git(repositoryPath, ['rev-parse', '--verify', `${targetRef}^{commit}`]);
   if (deliveryTarget) deliveryTarget.baseCommit = baseCommit;
   return { commonDir, repositoryPath, targetRef, deliveryTarget, baseCommit };
+}
+
+/** Identify a linked checkout's main workspace without changing its delivery target. */
+export function resolveMainWorkspaceRoot(startPath: string, commonDir: string): string | undefined {
+  const checkout = physicalDirectory(git(startPath, ['rev-parse', '--show-toplevel']));
+  const records = git(startPath, ['worktree', 'list', '--porcelain', '-z']).split('\0\0');
+  const entries = records.map((record) => {
+    const fields = record.split('\0');
+    const row = fields.find((field) => field.startsWith('worktree '));
+    return row ? { path: row.slice('worktree '.length), bare: fields.includes('bare') } : undefined;
+  }).filter((entry): entry is { path: string; bare: boolean } => !!entry);
+  if (!entries.length || entries[0].bare) throw new Error('Cannot identify the main checkout of this Git worktree.');
+  const main = physicalDirectory(entries[0].path);
+  if (!entries.some((entry) => {
+    try { return physicalDirectory(entry.path) === checkout; } catch { return false; }
+  })) throw new Error('Source checkout is not registered in the Git worktree list.');
+  if (physicalDirectory(git(main, ['rev-parse', '--path-format=absolute', '--git-common-dir'])) !== physicalDirectory(commonDir)) {
+    throw new Error('Main checkout has a different Git common directory.');
+  }
+  return checkout === main ? undefined : main;
 }
 
 function readTaskTarget(repositoryPath: string, storageDir: string): TaskTargetMarker | undefined {

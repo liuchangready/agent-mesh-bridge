@@ -1209,16 +1209,16 @@ export class MCPServer {
   }
 
   private async resolveClientWorkspaceContext(allowHostRoot = true): Promise<typeof this.workspaceContext> {
-    if (this.workspaceContext || !this.clientRoots) return this.workspaceContext;
+    if (this.workspaceContext?.origin || !this.clientRoots) return this.workspaceContext;
     const roots = await Promise.race([this.clientRoots, new Promise<string[]>((resolve) => setTimeout(() => resolve([]), 1000))]);
     if (roots.length > 1) throw new Error('WORKSPACE_AMBIGUOUS: multiple client roots');
-    if (!roots.length) return undefined;
+    if (!roots.length) return this.workspaceContext;
     const storage = path.dirname(this.taskStore.getStoragePath());
     const matches = matchingWindows(storage, roots[0]);
     if (matches.length > 1) throw new Error('WORKSPACE_AMBIGUOUS: multiple windows have this root');
     const window = matches[0];
-    if (!window) return undefined;
-    if (!window.defaultWorkspaceId && !allowHostRoot) return undefined;
+    if (!window) return this.workspaceContext;
+    if (!window.defaultWorkspaceId && !allowHostRoot) return this.workspaceContext;
     const id = window.defaultWorkspaceId || new WorkspaceRegistry(storage).register(roots[0]).id;
     return { id, origin: { hostInstanceId: window.hostInstanceId, generation: window.generation },
       source: window.defaultWorkspaceId ? undefined : 'host-root' };
@@ -1245,8 +1245,12 @@ export class MCPServer {
             ? (args.initiatorAgent as AgentId)
             : callerFromEnv;
 
-        const resolvedContext = !args.workspaceRoot && !args.workspaceId
-          ? await this.resolveClientWorkspaceContext() : this.workspaceContext;
+        const explicitWorkspace = !!(args.workspaceRoot || args.workspaceId);
+        let resolvedContext = this.workspaceContext;
+        try { resolvedContext = await this.resolveClientWorkspaceContext(); }
+        catch (error: any) {
+          if (!explicitWorkspace || !String(error?.message).includes('WORKSPACE_AMBIGUOUS')) throw error;
+        }
         const windowContext = resolvedContext?.origin && readWindow(path.dirname(this.taskStore.getStoragePath()), resolvedContext.origin);
         const inheritedWorkspaceId = !args.workspaceRoot && !args.workspaceId
           ? windowContext?.defaultWorkspaceId || resolvedContext?.id : undefined;
@@ -1260,6 +1264,7 @@ export class MCPServer {
           workspaceSource: inheritedWorkspaceId && windowContext?.defaultWorkspaceId === inheritedWorkspaceId ? 'window-default' :
             inheritedWorkspaceId ? resolvedContext?.source || 'explicit' : 'explicit',
           workspaceOrigin: windowContext ? resolvedContext?.origin : undefined,
+          suppressWorkspaceOriginInference: true,
           targetBranch: args.targetBranch,
           model: args.model,
           modelRequestedByUser: args.modelRequestedByUser === true,
@@ -1730,7 +1735,7 @@ export class MCPServer {
 
       case 'invoke_antigravity': {
         const callerFromEnv = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
-        return await this.dispatcher.dispatchTask({
+        return await this.handleToolCall('dispatch_task', {
           targetAgent: 'antigravity',
           initiatorAgent: callerFromEnv || 'codex',
           title: args.title || 'Delegation to Antigravity',
@@ -1744,7 +1749,7 @@ export class MCPServer {
 
       case 'invoke_claude_code': {
         const callerFromEnv = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
-        return await this.dispatcher.dispatchTask({
+        return await this.handleToolCall('dispatch_task', {
           targetAgent: 'claude_code',
           initiatorAgent: callerFromEnv || 'codex',
           title: args.title || 'Delegation to Claude Code',
@@ -1758,7 +1763,7 @@ export class MCPServer {
 
       case 'invoke_codex': {
         const callerFromEnv = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
-        return await this.dispatcher.dispatchTask({
+        return await this.handleToolCall('dispatch_task', {
           targetAgent: 'codex',
           initiatorAgent: callerFromEnv || 'antigravity',
           title: args.title || 'Delegation to Codex',

@@ -151,6 +151,60 @@ describe('MCPServer Protocol Tests', () => {
     } finally { window.dispose(); }
   });
 
+  test('explicit cross-workspace dispatch keeps caller window on first and later calls', async () => {
+    const rootA = process.cwd();
+    const rootB = path.join(tempDir, 'repo-b'); fs.mkdirSync(rootB); initGitRepo(rootB);
+    const registry = new WorkspaceRegistry(tempDir);
+    const workspaceA = registry.register(rootA, 'user');
+    const workspaceB = registry.register(rootB, 'user');
+    const windowA = new WindowWorkspace(tempDir, [rootA]);
+    const windowB = new WindowWorkspace(tempDir, [rootB]);
+    windowA.setDefault(workspaceA.id);
+    const realDispatch = dispatcher.dispatchTask.bind(dispatcher);
+    dispatcher.dispatchTask = (params) => realDispatch({ ...params, reviewFlow: 'dedicated' });
+    try {
+      (mcpServer as any).clientRoots = Promise.resolve([physicalDirectory(rootA)]);
+      const send = (workspaceRoot?: string) => mcpServer.handleToolCall('dispatch_task', {
+        targetAgent: 'claude_code', initiatorAgent: 'codex', title: 'Window origin', prompt: 'run', ...(workspaceRoot ? { workspaceRoot } : {}),
+      });
+      const first = await send(rootB);
+      assert.equal(first.workspace.id, workspaceB.id);
+      assert.equal(first.workspace.origin.hostInstanceId, windowA.context.hostInstanceId);
+      assert.equal(windowB.adopt(first.workspace), false);
+      assert.equal(windowB.context.defaultWorkspaceId, undefined);
+      const next = await send();
+      assert.equal(next.workspace.id, workspaceA.id);
+      assert.equal(next.workspace.origin.hostInstanceId, windowA.context.hostInstanceId);
+      const again = await send(rootB);
+      assert.equal(again.workspace.origin.hostInstanceId, windowA.context.hostInstanceId);
+      assert.equal(windowB.adopt(again.workspace), false);
+      const byId = await mcpServer.handleToolCall('dispatch_task', { workspaceId: workspaceB.id,
+        targetAgent: 'claude_code', initiatorAgent: 'codex', title: 'Workspace by id', prompt: 'run' });
+      assert.equal(byId.workspace.id, workspaceB.id);
+      assert.equal(byId.workspace.origin.hostInstanceId, windowA.context.hostInstanceId);
+      assert.equal(windowB.adopt(byId.workspace), false);
+
+      (mcpServer as any).workspaceContext = undefined;
+      const invoked = await mcpServer.handleToolCall('invoke_antigravity', { workspaceRoot: rootB, prompt: 'run' });
+      assert.equal(invoked.workspace.id, workspaceB.id);
+      assert.equal(invoked.workspace.origin.hostInstanceId, windowA.context.hostInstanceId);
+      assert.equal(windowB.adopt(invoked.workspace), false);
+
+      (mcpServer as any).workspaceContext = { id: workspaceB.id };
+      const lateRoots = await send(rootB);
+      assert.equal(lateRoots.workspace.origin.hostInstanceId, windowA.context.hostInstanceId);
+      assert.equal(windowB.adopt(lateRoots.workspace), false);
+
+      const otherA = new WindowWorkspace(tempDir, [rootA]);
+      try {
+        (mcpServer as any).workspaceContext = undefined;
+        const ambiguous = await send(rootB);
+        assert.equal(ambiguous.workspace.origin, undefined);
+        assert.equal(windowB.adopt(ambiguous.workspace), false);
+      } finally { otherA.dispose(); }
+    } finally { windowA.dispose(); windowB.dispose(); }
+  });
+
   test('should handle tools/list and return all 18 specified tools', async () => {
     const listReq = {
       jsonrpc: '2.0',

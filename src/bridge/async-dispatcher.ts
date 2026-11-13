@@ -28,7 +28,7 @@ import { ActiveAgentResolver } from './active-agent-resolver';
 import { AutonomousRunner, RunResult } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
 import { TaskSupervisor } from './task-supervisor';
-import { resolveGitRepository, createTaskWorktree, removeTaskWorktree, commitTaskChanges, changedFiles, currentHead } from './git-worktree';
+import { resolveGitRepository, resolveMainWorkspaceRoot, createTaskWorktree, removeTaskWorktree, commitTaskChanges, changedFiles, currentHead } from './git-worktree';
 import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
 import { TaskExecutionOwner, TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 import { QueueDrainer, QueuedExecution } from './queue-drainer';
@@ -136,16 +136,20 @@ export class AsyncDispatcher {
     const receiverSessionId = crypto.randomUUID();
     const nowIso = now.toISOString();
     const registry = new WorkspaceRegistry(this.storageDir);
-    let selected = new WorkspaceResolver(registry).resolve(params.workspaceId, params.workspaceRoot);
-    const repositoryPath = physicalDirectory(selected.rootPath);
+    const resolver = new WorkspaceResolver(registry);
+    const requestedWorkspace = params.workspaceId ? resolver.resolve(params.workspaceId) : undefined;
+    if (!params.workspaceRoot && !requestedWorkspace) throw new Error('WORKSPACE_REQUIRED');
+    const repositoryPath = physicalDirectory(params.workspaceRoot || requestedWorkspace!.rootPath);
     const repository = resolveGitRepository(repositoryPath, this.storageDir, params.targetBranch);
-    if (fs.existsSync(path.join(repositoryPath, '.agent-mesh-task.json')) &&
-        physicalDirectory(repository.repositoryPath) !== repositoryPath) {
-      const main = registry.register(repository.repositoryPath);
-      if (params.workspaceId && params.workspaceId !== main.id) throw new Error('WORKSPACE_MISMATCH: task worktree belongs to its source workspace');
-      selected = main;
+    const mainRoot = resolveMainWorkspaceRoot(repositoryPath, repository.commonDir);
+    const selected = registry.register(mainRoot || repositoryPath);
+    if (requestedWorkspace && requestedWorkspace.id !== selected.id &&
+        physicalDirectory(requestedWorkspace.rootPath) !== repositoryPath) {
+      throw new Error('WORKSPACE_MISMATCH');
     }
-    const windowContext = (params.workspaceOrigin && readWindow(this.storageDir, params.workspaceOrigin)) || findUniqueWindow(this.storageDir, selected.rootPath);
+    const windowContext = params.workspaceOrigin
+      ? readWindow(this.storageDir, params.workspaceOrigin)
+      : params.suppressWorkspaceOriginInference ? undefined : findUniqueWindow(this.storageDir, selected.rootPath);
 
     let callerSessionId =
       params.callerSessionId && isValidSessionId(params.callerSessionId)

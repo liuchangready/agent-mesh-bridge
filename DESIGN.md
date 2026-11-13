@@ -2,6 +2,8 @@
 
 > 文件夹级 Bridge Workspace 的实现状态和上线条件见 [WORKSPACE_DESIGN.md](docs/WORKSPACE_DESIGN.md)。上线前必须处理所有未终态旧任务；新模型不兼容或迁移旧账本，代码任务继续要求有 HEAD 的 Git 仓库及隔离 worktree。
 
+> MCP 调用窗口来源与显式目标空间分别解析；来源不明确时不能由目标目录猜测窗口。Git linked worktree 经 worktree 列表和 common directory 验证后归入主 checkout 空间，交付分支仍固定为原 checkout 的分支或显式目标。
+
 > **版本**：1.0.0  
 > **状态**：已评审 (Approved)  
 > **适用范围**：VSCode 扩展、本地 Agent 协同网格 (Antigravity ⟷ OpenAI Codex ⟷ Anthropic Claude Code ⟷ DeepSeek Harness)
