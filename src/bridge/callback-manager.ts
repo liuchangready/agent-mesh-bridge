@@ -1,3 +1,4 @@
+import { getTaskExecutionPath } from './types';
 import * as child_process from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -252,7 +253,7 @@ export class CallbackManager extends EventEmitter {
           thread.threadId,
           reviewRound.round,
           thread.initiatorAgent,
-          thread.workspacePath,
+          getTaskExecutionPath(thread),
           'reviewer',
         );
         ownsExecutionRegistration = true;
@@ -477,7 +478,7 @@ export class CallbackManager extends EventEmitter {
         thread.threadId,
         roundNumber,
         thread.initiatorAgent,
-        thread.workspacePath,
+        getTaskExecutionPath(thread),
         'reviewer',
       );
     } catch (error: any) {
@@ -578,7 +579,7 @@ export class CallbackManager extends EventEmitter {
     }
 
     if ((!callerSessionId || !isValidSessionId(callerSessionId)) && this.detector) {
-      callerSessionId = this.detector.detectActiveSession(initiator, thread.worktree?.repositoryPath || thread.workspacePath, [
+      callerSessionId = this.detector.detectActiveSession(initiator, getTaskExecutionPath(thread), [
         thread.receiverSessionId,
       ]);
       if (callerSessionId) {
@@ -611,7 +612,7 @@ export class CallbackManager extends EventEmitter {
   ): boolean {
     assertCanExecute(thread.initiatorAgent, 'resume as a reviewer', 'initiator');
     const initiator = thread.initiatorAgent;
-    const cwd = thread.workspacePath || process.cwd();
+    const cwd = getTaskExecutionPath(thread);
     // Wake the caller on its SENDER-side default model, which is configured
     // separately from the receiver-side default: the same agent can dispatch a
     // task to itself and execute it with a different model. An empty sender

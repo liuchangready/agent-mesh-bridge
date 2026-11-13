@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -115,7 +116,7 @@ describe('CallbackManager records stalled reviewer wakes', () => {
       receiverSessionId: 'session-receiver-1',
       receiverSessionCaptured: true,
       callerSessionId: 'caller-session-1',
-      workspacePath: dirWorkspace(),
+      workspace: testWorkspace(dirWorkspace()),
       summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 1_000 },
       rounds: [round],
       ...overrides,
@@ -214,7 +215,7 @@ describe('CallbackManager records stalled reviewer wakes', () => {
         const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1';
         const tempWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'reviewer-child-workspace-'));
         const thread = makeThread({ threadId: `thread_reviewer_pid_${failure}`, initiatorAgent: 'antigravity',
-          reviewFlow: 'dedicated', reviewerSessionId: sessionId, reviewerSessionCaptured: true, workspacePath: tempWorkspace });
+          reviewFlow: 'dedicated', reviewerSessionId: sessionId, reviewerSessionCaptured: true, workspace: testWorkspace(tempWorkspace) });
         store.upsertTask(thread);
         let launchedPid: number | undefined;
         let actualClose = false;
@@ -471,7 +472,7 @@ describe('ReviewWakeScheduler', () => {
     receiverSessionId: 'session-receiver-1',
     receiverSessionCaptured: true,
     callerSessionId: 'caller-session-1',
-    workspacePath: os.tmpdir(),
+    workspace: testWorkspace(os.tmpdir()),
     summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 1_000 },
     rounds: [
       {
@@ -1017,7 +1018,7 @@ describe('review_failed lifecycle status', () => {
     updatedAt: '2026-10-23T11:00:00.000Z',
     receiverSessionId: 'session-receiver-1',
     callerSessionId: 'caller-session-1',
-    workspacePath: os.tmpdir(),
+    workspace: testWorkspace(os.tmpdir()),
     summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 1_000 },
     rounds: [],
   });

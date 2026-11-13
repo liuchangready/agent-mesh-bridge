@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -106,7 +107,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
 
   test('does not capture a Claude session after a silent first-launch failure', async () => {
     runner.execute = async () => ({ exitCode: 1, stdout: '', stderr: 'startup failed', extractedOutput: '', durationMs: 1 });
-    const result = await dispatcher.dispatchTask({
+    const result = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
       targetAgent: 'claude_code', title: 'Missing Claude transcript', prompt: 'do the work', reviewFlow: 'legacy',
     });
     await waitForStatus(result.threadId, 'failed');
@@ -124,7 +125,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
         threadId: `thread_missing_claude_${entry}`, title: 'Missing Claude transcript',
         initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'running', currentRound: 1,
         createdAt: now, updatedAt: now, receiverSessionId: '5c562220-839a-47d5-92c6-e61561e66f07',
-        workspacePath: process.cwd(), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
+        workspace: testWorkspace(process.cwd()), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
         rounds: [{ round: 1, type: 'initial', prompt: 'do the work', status: 'running', durationMs: 0, timestamp: now }],
       };
       taskStore.upsertTask(thread);
@@ -150,7 +151,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
         exitCode: 0, stdout: 'done', stderr: '', extractedOutput: 'done',
         actualSessionId: options.receiverSessionId, durationMs: 1,
       });
-      const result = await dispatcher.dispatchTask({
+      const result = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
         targetAgent: agent, title: 'Existing session', prompt: 'do the work', reviewFlow: 'legacy',
       });
       await waitForStatus(result.threadId, 'waiting_review');
@@ -169,7 +170,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
   }
 
   test('should dispatch task asynchronously and create thread with round 1', async () => {
-    const res = await dispatcher.dispatchTask({
+    const res = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
       targetAgent: 'codex',
       title: 'Optimize SQL Query',
       prompt: 'Add composite index on (tenant_id, created_at)',
@@ -200,9 +201,9 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     process.env.AGENT_MESH_BRIDGE_HOME = tempDir;
     try {
       resolver.setManualOverride('codex');
-      const result = await dispatcher.dispatchTask({ targetAgent: 'default', title: 'Auto default', prompt: 'run' });
+      const result = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(), targetAgent: 'default', title: 'Auto default', prompt: 'run' });
       assert.equal(result.targetAgent, 'codex');
-      const explicitCli = await dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'Explicit CLI', prompt: 'run' });
+      const explicitCli = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(), targetAgent: 'claude_code', title: 'Explicit CLI', prompt: 'run' });
       assert.equal(explicitCli.targetAgent, 'claude_code');
     } finally {
       if (previous === undefined) delete process.env.AGENT_MESH_BRIDGE_HOME;
@@ -213,7 +214,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
   test('refuses a same-agent dispatch while the legacy review flow is active', async () => {
     await assert.rejects(
       () =>
-        dispatcher.dispatchTask({
+        dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
           targetAgent: 'codex',
           initiatorAgent: 'codex',
           title: 'Self dispatch',
@@ -231,7 +232,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     try {
       await assert.rejects(
         () =>
-          dispatcher.dispatchTask({
+          dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
             targetAgent: 'deepseek_harness',
             title: 'Self dispatch via env',
             prompt: 'do the work',
@@ -263,7 +264,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       };
     };
     try {
-      const res = await dispatcher.dispatchTask({
+      const res = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
         targetAgent: 'codex',
         initiatorAgent: 'codex',
         title: 'Self review with two models',
@@ -298,7 +299,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     try {
       await assert.rejects(
         () =>
-          dispatcher.dispatchTask({
+          dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
             targetAgent: 'codex',
             initiatorAgent: 'codex',
             title: 'Same model self review',
@@ -322,7 +323,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     try {
       await assert.rejects(
         () =>
-          dispatcher.dispatchTask({
+          dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
             targetAgent: 'codex',
             initiatorAgent: 'codex',
             title: 'Unconfigured reviewer',
@@ -359,7 +360,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       by: 'user',
     }));
 
-    const res = await dispatcher.dispatchTask({
+    const res = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
       targetAgent: 'codex',
       title: 'Pin a specific model',
       prompt: 'Implement the parser',
@@ -393,7 +394,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     invalidateConfiguredModelCache();
 
     try {
-      const res = await dispatcher.dispatchTask({
+      const res = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
         targetAgent: 'codex',
         title: 'One dispatch, two model defaults',
         prompt: 'Implement the parser',
@@ -433,7 +434,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       throw new Error('a guessed model must never reach the user');
     });
 
-    const res = await dispatcher.dispatchTask({
+    const res = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
       targetAgent: 'codex',
       title: 'Do not guess a model',
       prompt: 'Implement the parser',
@@ -459,7 +460,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
 
     await assert.rejects(
       () =>
-        dispatcher.dispatchTask({
+        dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
           targetAgent: 'codex',
           title: 'Declined switch',
           prompt: 'Implement the parser',
@@ -500,7 +501,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       },
     });
 
-    const res = await dispatcher.dispatchTask({
+    const res = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
       targetAgent: 'antigravity',
       title: 'Empty output probe',
       prompt: 'return nothing',
@@ -515,7 +516,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
   });
 
   test('refuses a rework that would move a legacy task onto its own reviewer', async () => {
-    const dispatchRes = await dispatcher.dispatchTask({
+    const dispatchRes = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
       targetAgent: 'claude_code',
       title: 'Rework onto the reviewer',
       prompt: 'do the work',
@@ -541,7 +542,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
   });
 
   test('should request rework strictly reusing same receiverSessionId and incrementing round', async () => {
-    const dispatchRes = await dispatcher.dispatchTask({
+    const dispatchRes = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
       targetAgent: 'claude_code',
       title: 'Implement OAuth PKCE',
       prompt: 'Implement PKCE flow in auth.ts',
@@ -589,7 +590,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       };
     };
 
-    const dispatchRes = await dispatcher.dispatchTask({
+    const dispatchRes = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
       targetAgent: 'claude_code',
       title: 'Cross-agent rework',
       prompt: 'Implement the flow',
@@ -620,7 +621,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
   });
 
   test('should approve task and mark it completed', async () => {
-    const dispatchRes = await dispatcher.dispatchTask({
+    const dispatchRes = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
       targetAgent: 'antigravity',
       title: 'Format code according to styleguide',
       prompt: 'Run prettier and eslint',
@@ -643,7 +644,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
 
   test('should reject invalid callerSessionId (agent literals) and fallback properly', async () => {
     // 1. Dispatching with invalid callerSessionId "claude_code"
-    const dispatchRes = await dispatcher.dispatchTask({
+    const dispatchRes = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
       targetAgent: 'antigravity',
       title: 'Invalid callerSessionId test',
       prompt: 'Check caller session sanitization',
@@ -681,7 +682,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
   });
 
   test('should retry failed round preserving original round number and prompt', async () => {
-    const dispatchRes = await dispatcher.dispatchTask({
+    const dispatchRes = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
       targetAgent: 'codex',
       title: 'Fix edge case in parser',
       prompt: 'Handle trailing comma in JSON',

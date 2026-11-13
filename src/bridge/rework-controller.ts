@@ -1,3 +1,4 @@
+import { getTaskExecutionPath } from './types';
 import {
   DelegationThread,
   DelegationRound,
@@ -247,7 +248,7 @@ export class ReworkController {
     ) {
       const detected = this.detector.detectActiveSession(
         thread.initiatorAgent,
-        thread.worktree?.repositoryPath || thread.workspacePath,
+        getTaskExecutionPath(thread),
         [thread.receiverSessionId],
       );
       if (detected) {
@@ -271,7 +272,7 @@ export class ReworkController {
       console.log(
         `[ReworkController] Active TaskSupervisor detected. Delegating Round ${nextRound} execution to supervisor.`,
       );
-    } else if (this.isGloballyBusy(thread.threadId, thread.workspacePath)) {
+    } else if (this.isGloballyBusy(thread.threadId, getTaskExecutionPath(thread))) {
       this.markQueued(thread, this.workspaceOwner(thread));
       this.queueDrainer.schedule(1_500);
     } else {
@@ -398,7 +399,7 @@ export class ReworkController {
       console.log(
         `[ReworkController] Active TaskSupervisor detected. Delegating Round ${failedRound.round} retry to supervisor.`,
       );
-    } else if (this.isGloballyBusy(thread.threadId, thread.workspacePath)) {
+    } else if (this.isGloballyBusy(thread.threadId, getTaskExecutionPath(thread))) {
       this.markQueued(thread, this.workspaceOwner(thread));
       this.queueDrainer.schedule(1_500);
     } else {
@@ -618,7 +619,7 @@ export class ReworkController {
       console.log(
         `[ReworkController] Active TaskSupervisor detected. Delegating resumed Round ${pausedRound.round} to supervisor.`,
       );
-    } else if (this.isGloballyBusy(thread.threadId, thread.workspacePath)) {
+    } else if (this.isGloballyBusy(thread.threadId, getTaskExecutionPath(thread))) {
       this.markQueued(thread, this.workspaceOwner(thread));
       this.queueDrainer.schedule(1_500);
     } else {
@@ -905,7 +906,7 @@ export class ReworkController {
         thread.threadId,
         roundNumber,
         thread.targetAgent,
-        thread.workspacePath,
+        getTaskExecutionPath(thread),
         'developer',
       );
     } catch (error: any) {
@@ -930,7 +931,7 @@ export class ReworkController {
       );
 
       let result;
-      const workspaceBefore = captureWorkspaceSnapshot(thread.workspacePath);
+      const workspaceBefore = captureWorkspaceSnapshot(getTaskExecutionPath(thread));
       // Rework rounds used to run without a per-round stdio log, so the "raw
       // execution log" existed only for dispatch/supervisor rounds. Capture it
       // here too: `get_round_raw_log` must not silently return "not captured".
@@ -952,7 +953,7 @@ export class ReworkController {
           isRework,
           receiverSessionId: thread.receiverSessionId,
           title: thread.title,
-          cwd: thread.workspacePath,
+          cwd: getTaskExecutionPath(thread),
           taskThreadId: thread.threadId,
           artifactDir: thread.artifactDir,
           taskRound: roundNumber,
@@ -987,7 +988,7 @@ export class ReworkController {
 
       const touchedFiles = diffWorkspaceSnapshots(
         workspaceBefore,
-        captureWorkspaceSnapshot(thread.workspacePath),
+        captureWorkspaceSnapshot(getTaskExecutionPath(thread)),
       );
 
       this.taskStore.loadFromDisk();

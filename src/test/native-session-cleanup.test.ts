@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -34,7 +35,7 @@ function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread
     createdAt: now,
     updatedAt: now,
     receiverSessionId: SESSION_CLAUDE,
-    workspacePath: os.tmpdir(),
+    workspace: testWorkspace(os.tmpdir()),
     summary: { lastPromptSnippet: 'p', lastOutputSnippet: 'o', totalDurationMs: 0 },
     rounds: [],
     ...overrides,

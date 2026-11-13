@@ -1,6 +1,6 @@
 # 🌉 多 Agent 协同桥接 VSCode 插件设计与架构规范 (Agent Mesh Bridge)
 
-> 文件夹级 Bridge Workspace 的后续设计及其 2026-11-13 决策见 [WORKSPACE_DESIGN.md](docs/WORKSPACE_DESIGN.md)。该功能尚未实现：当前运行时代码仍使用 `workspacePath`。上线前必须清理所有未完成旧任务；新模型不兼容或迁移旧账本，代码任务继续要求有 HEAD 的 Git 仓库及隔离 worktree。
+> 文件夹级 Bridge Workspace 的实现状态和上线条件见 [WORKSPACE_DESIGN.md](docs/WORKSPACE_DESIGN.md)。上线前必须处理所有未终态旧任务；新模型不兼容或迁移旧账本，代码任务继续要求有 HEAD 的 Git 仓库及隔离 worktree。
 
 > **版本**：1.0.0  
 > **状态**：已评审 (Approved)  
@@ -319,7 +319,7 @@ export interface DelegationThread {
   receiverSessionId: string; // 目标 Agent 原生会话 ID
   receiverSessionCaptured?: boolean; // 是否已捕获真实原生会话（决定暂停恢复能否续聊）
   callerSessionId?: string; // 发起方会话 ID (用于回调定位)
-  workspacePath: string; // 执行工作区绝对路径
+  workspace: TaskWorkspaceBinding; // 空间身份、根目录、来源与 executionPath
 
   // 模型路由 (任务列表/详情/MCP 响应都展示两端)
   initiatorModel?: string; // 发送方模型 (显式 > 环境提示 > 下发者配置默认 > 接收者配置默认)
@@ -400,7 +400,7 @@ export interface DelegationRound {
   - `title` (string, 必填): 任务名称简述（10–30字）
   - `prompt` (string, 必填): 具体任务要求、目标与约束
   - `callerSessionId` (string, 可选): A 当前会话 ID（用于完成时唤醒）
-  - `workspacePath` (string, 可选): 工作区路径
+  - `workspaceRoot` / `workspaceId` (string, 可选): 本地绝对根目录或已注册空间 ID；未提供时仅使用已绑定连接上下文。
 - **返回值**：`{ threadId, status: "DISPATCHED", message: "Task started in background. Conclude your turn and await callback." }`
 
 ### 2. `request_rework`（要求在同一会话中返修）

@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -46,6 +47,7 @@ import {
   writeReviewerBootstrapToken,
 } from '../bridge/reviewer-bootstrap';
 import { DelegationRound } from '../bridge/types';
+import { WindowWorkspace, WorkspaceRegistry, physicalDirectory } from '../bridge/workspace';
 
 describe('MCPServer Protocol Tests', () => {
   let tempDir: string;
@@ -123,6 +125,32 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(res.result.capabilities.tools);
   });
 
+  test('client roots resolve only a unique live window and its manual default', async () => {
+    const window = new WindowWorkspace(tempDir, [process.cwd()]);
+    const registry = new WorkspaceRegistry(tempDir);
+    const selected = registry.register(process.cwd(), 'user');
+    window.setDefault(selected.id);
+    try {
+      (mcpServer as any).clientRoots = Promise.resolve([physicalDirectory(process.cwd())]);
+      const nonGit = path.join(tempDir, 'not-git'); fs.mkdirSync(nonGit);
+      const invalid = registry.register(nonGit, 'user'); window.setDefault(invalid.id);
+      await assert.rejects(mcpServer.handleToolCall('dispatch_task', { targetAgent: 'claude_code', title: 'failed', prompt: 'run' }), /Git|repository/);
+      assert.equal((mcpServer as any).workspaceContext, undefined);
+      assert.equal(window.context.defaultWorkspaceId, invalid.id);
+      window.setDefault(selected.id);
+      assert.deepEqual(await mcpServer.handleToolCall('list_recent_tasks', { scope: 'current' }), []);
+      const result = await mcpServer.handleToolCall('dispatch_task', { targetAgent: 'claude_code', title: 'root context', prompt: 'run' });
+      assert.equal(result.workspace.id, selected.id);
+      assert.equal(result.workspace.source, 'window-default');
+      assert.equal(result.workspace.origin.hostInstanceId, window.context.hostInstanceId);
+      const second = new WindowWorkspace(tempDir, [process.cwd()]);
+      try {
+        (mcpServer as any).workspaceContext = undefined;
+        await assert.rejects(mcpServer.handleToolCall('dispatch_task', { targetAgent: 'claude_code', title: 'ambiguous', prompt: 'run' }), /WORKSPACE_AMBIGUOUS/);
+      } finally { second.dispose(); }
+    } finally { window.dispose(); }
+  });
+
   test('should handle tools/list and return all 18 specified tools', async () => {
     const listReq = {
       jsonrpc: '2.0',
@@ -147,6 +175,7 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(toolNames.includes('delete_task'));
     assert.ok(toolNames.includes('record_merge_request'));
     assert.ok(toolNames.includes('list_recent_tasks'));
+    assert.ok(toolNames.includes('list_workspaces'));
     assert.ok(toolNames.includes('get_thread_details'));
     assert.ok(toolNames.includes('invoke_agent'));
     assert.ok(toolNames.includes('query_agent_mesh_status'));
@@ -158,9 +187,11 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(toolNames.includes('get_task_summary'));
     const dispatch = tools.find((t: any) => t.name === 'dispatch_task');
     assert.equal(dispatch.inputSchema.properties.targetBranch.type, 'string');
+    assert.equal(dispatch.inputSchema.properties.workspaceRoot.type, 'string');
+    assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'workspacePath'));
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'expectedFiles'));
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'allowNoScope'));
-    assert.strictEqual(toolNames.length, 19);
+    assert.strictEqual(toolNames.length, 20);
   });
 
   test('list_agent_models reports the receiver and sender defaults separately', async () => {
@@ -221,7 +252,7 @@ describe('MCPServer Protocol Tests', () => {
     const payload = (res: any) => JSON.parse(res.result.content[0].text);
 
     const dispatched = payload(
-      await call('dispatch_task', {
+      await call('dispatch_task', { workspaceRoot: process.cwd(),
         targetAgent: 'claude_code',
         title: 'Summarise me',
         prompt: 'do the work',
@@ -261,7 +292,7 @@ describe('MCPServer Protocol Tests', () => {
     const payload = (res: any) => JSON.parse(res.result.content[0].text);
 
     const dispatched = payload(
-      await call('dispatch_task', {
+      await call('dispatch_task', { workspaceRoot: process.cwd(),
         targetAgent: 'claude_code',
         title: 'Reviewer output',
         prompt: 'do the work',
@@ -324,7 +355,7 @@ describe('MCPServer Protocol Tests', () => {
     const payload = (res: any) => JSON.parse(res.result.content[0].text);
 
     const dispatched = payload(
-      await call('dispatch_task', {
+      await call('dispatch_task', { workspaceRoot: process.cwd(),
         targetAgent: 'codex',
         title: 'Stop polling',
         prompt: 'do the work',
@@ -404,7 +435,7 @@ describe('MCPServer Protocol Tests', () => {
       createdAt: now,
       updatedAt: now,
       receiverSessionId: 'session-abcdef12',
-      workspacePath: tempDir,
+      workspace: testWorkspace(tempDir),
       summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 3 },
       rounds: [
         round(1, 'initial', longOutput),
@@ -499,7 +530,7 @@ describe('MCPServer Protocol Tests', () => {
       createdAt: now,
       updatedAt: now,
       receiverSessionId: 'session-token-01',
-      workspacePath: tempDir,
+      workspace: testWorkspace(tempDir),
       summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 2 },
       rounds: [
         {
@@ -556,7 +587,7 @@ describe('MCPServer Protocol Tests', () => {
       method: 'tools/call',
       params: {
         name: 'dispatch_task',
-        arguments: {
+        arguments: { workspaceRoot: process.cwd(),
           targetAgent: 'codex',
           title: 'Refactor Cache Layer',
           prompt: 'Use LRU cache with 500 items max',
@@ -722,7 +753,7 @@ describe('MCPServer Protocol Tests', () => {
         method: 'tools/call',
         params: {
           name: 'dispatch_task',
-          arguments: { targetAgent: 'codex', title: 'nested', prompt: 'do more work' },
+          arguments: { workspaceRoot: process.cwd(), targetAgent: 'codex', title: 'nested', prompt: 'do more work' },
         },
       });
       assert.match(dispatchRes.error.message, /receiver/i);
@@ -841,7 +872,7 @@ describe('MCPServer Protocol Tests', () => {
         method: 'tools/call',
         params: {
           name: 'dispatch_task',
-          arguments: { targetAgent: 'codex', title: 'nested', prompt: 'delegate again' },
+          arguments: { workspaceRoot: process.cwd(), targetAgent: 'codex', title: 'nested', prompt: 'delegate again' },
         },
       });
       assert.match(dispatchRes.error.message, /receiver/i);
@@ -967,7 +998,7 @@ describe('MCPServer Protocol Tests', () => {
       method: 'tools/call',
       params: {
         name: 'dispatch_task',
-        arguments: {
+        arguments: { workspaceRoot: process.cwd(),
           targetAgent: 'codex',
           title: 'Retry in place',
           prompt: 'Implement the extension exactly as designed',
@@ -1007,7 +1038,7 @@ describe('MCPServer Protocol Tests', () => {
       method: 'tools/call',
       params: {
         name: 'dispatch_task',
-        arguments: {
+        arguments: { workspaceRoot: process.cwd(),
           targetAgent: 'codex',
           title: 'Repeat instruction',
           prompt,
@@ -1049,7 +1080,7 @@ describe('MCPServer Protocol Tests', () => {
     // A caller naming itself as the receiver used to create a task whose review
     // callback could never be delivered (the caller session is busy running the
     // round). It must be an error, and nothing may reach the ledger.
-    const rejected = await call('dispatch_task', {
+    const rejected = await call('dispatch_task', { workspaceRoot: process.cwd(),
       targetAgent: 'codex',
       initiatorAgent: 'codex',
       title: 'Self dispatch',
@@ -1089,7 +1120,7 @@ describe('MCPServer Protocol Tests', () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       receiverSessionId: 'receiver-bootstrap-1',
-      workspacePath: tempDir,
+      workspace: testWorkspace(tempDir),
       reviewFlow: 'dedicated',
       reviewerModel: 'gpt-6-pro',
       targetModel: 'sonnet',
@@ -1168,7 +1199,7 @@ describe('MCPServer Protocol Tests', () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       receiverSessionId: 'receiver-bootstrap-pid',
-      workspacePath: tempDir,
+      workspace: testWorkspace(tempDir),
       reviewFlow: 'dedicated',
       reviewerModel: 'gpt-6-pro',
       targetModel: 'sonnet',

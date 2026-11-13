@@ -654,6 +654,17 @@ export interface ReviewFailure {
   wake?: ReviewWakeState;
 }
 
+export type { TaskWorkspaceBinding } from './workspace';
+import type { TaskWorkspaceBinding } from './workspace';
+
+export function getTaskExecutionPath(thread: DelegationThread): string {
+  const executionPath = thread.workspace?.executionPath;
+  if (!executionPath || (thread.worktree && thread.worktree.path !== executionPath)) {
+    throw new Error(`Invalid execution path binding for ${thread.threadId}`);
+  }
+  return executionPath;
+}
+
 export interface DelegationThread {
   threadId: string; // e.g. "thread_20261016_163000_a7f9"
   title: string; // Brief title, e.g. "Fix TCP cursor drift"
@@ -674,7 +685,7 @@ export interface DelegationThread {
    */
   receiverSessionCaptured?: boolean;
   callerSessionId?: string; // Caller session ID for reactive wake-up callbacks
-  workspacePath: string; // Working directory
+  workspace: TaskWorkspaceBinding;
 
   /**
    * Absolute root of this task's bridge-managed files (unified task directory).
@@ -824,7 +835,10 @@ export interface DispatchTaskParams {
   prompt: string;
   callerSessionId?: string;
   initiatorAgent?: AgentId;
-  workspacePath?: string;
+  workspaceId?: string;
+  workspaceRoot?: string;
+  workspaceSource?: TaskWorkspaceBinding['source'];
+  workspaceOrigin?: TaskWorkspaceBinding['origin'];
   /** Local branch to deliver into; omitted means the source checkout's branch. */
   targetBranch?: string;
   /**
@@ -920,6 +934,7 @@ export interface DispatchResult {
   targetAgent: AgentId;
   status: DispatchStatus;
   message: string;
+  workspace: TaskWorkspaceBinding;
   /** Sender -> receiver model routing recorded on the task. */
   modelRouting?: ModelRoutingSummary;
   /** Set when the requested model was replaced or confirmed by the user. */

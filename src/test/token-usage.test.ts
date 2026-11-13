@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -59,7 +60,7 @@ function makeThread(rounds: DelegationRound[]): DelegationThread {
     createdAt: now,
     updatedAt: now,
     receiverSessionId: 'session-12345678',
-    workspacePath: process.cwd(),
+    workspace: testWorkspace(process.cwd()),
     summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
     rounds,
   };
@@ -863,6 +864,7 @@ describe('token usage - durability', () => {
     saveBridgePolicy({ nativeSessionCompaction: { mode: 'auto' } }, dir);
     const detector = { resolveExecutable: () => process.execPath } as any;
     const compactor = new NativeSessionCompactor(store, detector, () => 'certified');
+    (compactor as any).capabilityIdentity = () => ({ agent: 'codex', executablePath: process.execPath, executableVersion: 'test', providerRoute: 'subscription-default', providerId: 'openai', model: 'gpt-6-luna' });
     let calls = 0;
     (compactor as any).codex = { compact: async (request: any) => {
       calls++;
