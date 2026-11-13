@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -46,6 +47,7 @@ import {
   writeReviewerBootstrapToken,
 } from '../bridge/reviewer-bootstrap';
 import { DelegationRound } from '../bridge/types';
+import { WindowWorkspace, WorkspaceRegistry, physicalDirectory } from '../bridge/workspace';
 
 describe('MCPServer Protocol Tests', () => {
   let tempDir: string;
@@ -123,6 +125,86 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(res.result.capabilities.tools);
   });
 
+  test('client roots resolve only a unique live window and its manual default', async () => {
+    const window = new WindowWorkspace(tempDir, [process.cwd()]);
+    const registry = new WorkspaceRegistry(tempDir);
+    const selected = registry.register(process.cwd(), 'user');
+    window.setDefault(selected.id);
+    try {
+      (mcpServer as any).clientRoots = Promise.resolve([physicalDirectory(process.cwd())]);
+      const nonGit = path.join(tempDir, 'not-git'); fs.mkdirSync(nonGit);
+      const invalid = registry.register(nonGit, 'user'); window.setDefault(invalid.id);
+      await assert.rejects(mcpServer.handleToolCall('dispatch_task', { targetAgent: 'claude_code', title: 'failed', prompt: 'run' }), /Git|repository/);
+      assert.equal((mcpServer as any).workspaceContext, undefined);
+      assert.equal(window.context.defaultWorkspaceId, invalid.id);
+      window.setDefault(selected.id);
+      assert.deepEqual(await mcpServer.handleToolCall('list_recent_tasks', { scope: 'current' }), []);
+      const result = await mcpServer.handleToolCall('dispatch_task', { targetAgent: 'claude_code', title: 'root context', prompt: 'run' });
+      assert.equal(result.workspace.id, selected.id);
+      assert.equal(result.workspace.source, 'window-default');
+      assert.equal(result.workspace.origin.hostInstanceId, window.context.hostInstanceId);
+      const second = new WindowWorkspace(tempDir, [process.cwd()]);
+      try {
+        (mcpServer as any).workspaceContext = undefined;
+        await assert.rejects(mcpServer.handleToolCall('dispatch_task', { targetAgent: 'claude_code', title: 'ambiguous', prompt: 'run' }), /WORKSPACE_AMBIGUOUS/);
+      } finally { second.dispose(); }
+    } finally { window.dispose(); }
+  });
+
+  test('explicit cross-workspace dispatch keeps caller window on first and later calls', async () => {
+    const rootA = process.cwd();
+    const rootB = path.join(tempDir, 'repo-b'); fs.mkdirSync(rootB); initGitRepo(rootB);
+    const registry = new WorkspaceRegistry(tempDir);
+    const workspaceA = registry.register(rootA, 'user');
+    const workspaceB = registry.register(rootB, 'user');
+    const windowA = new WindowWorkspace(tempDir, [rootA]);
+    const windowB = new WindowWorkspace(tempDir, [rootB]);
+    windowA.setDefault(workspaceA.id);
+    const realDispatch = dispatcher.dispatchTask.bind(dispatcher);
+    dispatcher.dispatchTask = (params) => realDispatch({ ...params, reviewFlow: 'dedicated' });
+    try {
+      (mcpServer as any).clientRoots = Promise.resolve([physicalDirectory(rootA)]);
+      const send = (workspaceRoot?: string) => mcpServer.handleToolCall('dispatch_task', {
+        targetAgent: 'claude_code', initiatorAgent: 'codex', title: 'Window origin', prompt: 'run', ...(workspaceRoot ? { workspaceRoot } : {}),
+      });
+      const first = await send(rootB);
+      assert.equal(first.workspace.id, workspaceB.id);
+      assert.equal(first.workspace.origin.hostInstanceId, windowA.context.hostInstanceId);
+      assert.equal(windowB.adopt(first.workspace), false);
+      assert.equal(windowB.context.defaultWorkspaceId, undefined);
+      const next = await send();
+      assert.equal(next.workspace.id, workspaceA.id);
+      assert.equal(next.workspace.origin.hostInstanceId, windowA.context.hostInstanceId);
+      const again = await send(rootB);
+      assert.equal(again.workspace.origin.hostInstanceId, windowA.context.hostInstanceId);
+      assert.equal(windowB.adopt(again.workspace), false);
+      const byId = await mcpServer.handleToolCall('dispatch_task', { workspaceId: workspaceB.id,
+        targetAgent: 'claude_code', initiatorAgent: 'codex', title: 'Workspace by id', prompt: 'run' });
+      assert.equal(byId.workspace.id, workspaceB.id);
+      assert.equal(byId.workspace.origin.hostInstanceId, windowA.context.hostInstanceId);
+      assert.equal(windowB.adopt(byId.workspace), false);
+
+      (mcpServer as any).workspaceContext = undefined;
+      const invoked = await mcpServer.handleToolCall('invoke_antigravity', { workspaceRoot: rootB, prompt: 'run' });
+      assert.equal(invoked.workspace.id, workspaceB.id);
+      assert.equal(invoked.workspace.origin.hostInstanceId, windowA.context.hostInstanceId);
+      assert.equal(windowB.adopt(invoked.workspace), false);
+
+      (mcpServer as any).workspaceContext = { id: workspaceB.id };
+      const lateRoots = await send(rootB);
+      assert.equal(lateRoots.workspace.origin.hostInstanceId, windowA.context.hostInstanceId);
+      assert.equal(windowB.adopt(lateRoots.workspace), false);
+
+      const otherA = new WindowWorkspace(tempDir, [rootA]);
+      try {
+        (mcpServer as any).workspaceContext = undefined;
+        const ambiguous = await send(rootB);
+        assert.equal(ambiguous.workspace.origin, undefined);
+        assert.equal(windowB.adopt(ambiguous.workspace), false);
+      } finally { otherA.dispose(); }
+    } finally { windowA.dispose(); windowB.dispose(); }
+  });
+
   test('should handle tools/list and return all 18 specified tools', async () => {
     const listReq = {
       jsonrpc: '2.0',
@@ -147,6 +229,7 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(toolNames.includes('delete_task'));
     assert.ok(toolNames.includes('record_merge_request'));
     assert.ok(toolNames.includes('list_recent_tasks'));
+    assert.ok(toolNames.includes('list_workspaces'));
     assert.ok(toolNames.includes('get_thread_details'));
     assert.ok(toolNames.includes('invoke_agent'));
     assert.ok(toolNames.includes('query_agent_mesh_status'));
@@ -158,9 +241,11 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(toolNames.includes('get_task_summary'));
     const dispatch = tools.find((t: any) => t.name === 'dispatch_task');
     assert.equal(dispatch.inputSchema.properties.targetBranch.type, 'string');
+    assert.equal(dispatch.inputSchema.properties.workspaceRoot.type, 'string');
+    assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'workspacePath'));
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'expectedFiles'));
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'allowNoScope'));
-    assert.strictEqual(toolNames.length, 19);
+    assert.strictEqual(toolNames.length, 20);
   });
 
   test('list_agent_models reports the receiver and sender defaults separately', async () => {
@@ -221,7 +306,7 @@ describe('MCPServer Protocol Tests', () => {
     const payload = (res: any) => JSON.parse(res.result.content[0].text);
 
     const dispatched = payload(
-      await call('dispatch_task', {
+      await call('dispatch_task', { workspaceRoot: process.cwd(),
         targetAgent: 'claude_code',
         title: 'Summarise me',
         prompt: 'do the work',
@@ -261,7 +346,7 @@ describe('MCPServer Protocol Tests', () => {
     const payload = (res: any) => JSON.parse(res.result.content[0].text);
 
     const dispatched = payload(
-      await call('dispatch_task', {
+      await call('dispatch_task', { workspaceRoot: process.cwd(),
         targetAgent: 'claude_code',
         title: 'Reviewer output',
         prompt: 'do the work',
@@ -324,7 +409,7 @@ describe('MCPServer Protocol Tests', () => {
     const payload = (res: any) => JSON.parse(res.result.content[0].text);
 
     const dispatched = payload(
-      await call('dispatch_task', {
+      await call('dispatch_task', { workspaceRoot: process.cwd(),
         targetAgent: 'codex',
         title: 'Stop polling',
         prompt: 'do the work',
@@ -404,7 +489,7 @@ describe('MCPServer Protocol Tests', () => {
       createdAt: now,
       updatedAt: now,
       receiverSessionId: 'session-abcdef12',
-      workspacePath: tempDir,
+      workspace: testWorkspace(tempDir),
       summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 3 },
       rounds: [
         round(1, 'initial', longOutput),
@@ -499,7 +584,7 @@ describe('MCPServer Protocol Tests', () => {
       createdAt: now,
       updatedAt: now,
       receiverSessionId: 'session-token-01',
-      workspacePath: tempDir,
+      workspace: testWorkspace(tempDir),
       summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 2 },
       rounds: [
         {
@@ -556,7 +641,7 @@ describe('MCPServer Protocol Tests', () => {
       method: 'tools/call',
       params: {
         name: 'dispatch_task',
-        arguments: {
+        arguments: { workspaceRoot: process.cwd(),
           targetAgent: 'codex',
           title: 'Refactor Cache Layer',
           prompt: 'Use LRU cache with 500 items max',
@@ -722,7 +807,7 @@ describe('MCPServer Protocol Tests', () => {
         method: 'tools/call',
         params: {
           name: 'dispatch_task',
-          arguments: { targetAgent: 'codex', title: 'nested', prompt: 'do more work' },
+          arguments: { workspaceRoot: process.cwd(), targetAgent: 'codex', title: 'nested', prompt: 'do more work' },
         },
       });
       assert.match(dispatchRes.error.message, /receiver/i);
@@ -807,6 +892,119 @@ describe('MCPServer Protocol Tests', () => {
     }
   });
 
+  test('should detect a receiver by the pid of the launched task process when the host scrubs the environment', async () => {
+    // Codex hands its MCP servers ONLY the `env` table from config.toml, and
+    // DeepSeek Harness scrubs inherited variables, so MESH_TASK_RECEIVER never
+    // arrives. The bridge therefore also matches the pid of the CLI it launched.
+    // Before this channel existed a receiver could silently dispatch a nested
+    // task, which produced chains of tasks each delegating the same blocked brief.
+    const savedReceiver = process.env.MESH_TASK_RECEIVER;
+    const savedThread = process.env.MESH_TASK_THREAD_ID;
+    const savedRound = process.env.MESH_TASK_ROUND;
+    const registry = new TaskExecutionRegistry(tempDir);
+    const originalPpid = Object.getOwnPropertyDescriptor(process, 'ppid');
+    let registration: ReturnType<TaskExecutionRegistry['begin']> | undefined;
+    try {
+      delete process.env.MESH_TASK_RECEIVER;
+      delete process.env.MESH_TASK_THREAD_ID;
+      delete process.env.MESH_TASK_ROUND;
+
+      const threadId = 'thread_receiver_by_pid';
+      registration = registry.begin(threadId, 2, 'codex', tempDir, 'developer');
+      // The MCP server the agent spawns is a child of the CLI the bridge
+      // launched, so its ppid is the recorded child pid.
+      registry.attachChildPid(4321, registration);
+      Object.defineProperty(process, 'ppid', { value: 4321, configurable: true });
+
+      const toolNames = mcpServer.getToolDefinitions().map((tool: any) => tool.name);
+      assert.ok(!toolNames.includes('dispatch_task'), 'forwarding tools must stay hidden');
+      assert.ok(toolNames.includes('approve_task'));
+
+      const dispatchRes = await mcpServer.handleRpcMessage({
+        jsonrpc: '2.0',
+        id: 40,
+        method: 'tools/call',
+        params: {
+          name: 'dispatch_task',
+          arguments: { workspaceRoot: process.cwd(), targetAgent: 'codex', title: 'nested', prompt: 'delegate again' },
+        },
+      });
+      assert.match(dispatchRes.error.message, /receiver/i);
+      assert.match(dispatchRes.error.message, /thread_receiver_by_pid/);
+
+      // The receiver must not drive its own task's review loop either.
+      const reworkRes = await mcpServer.handleRpcMessage({
+        jsonrpc: '2.0',
+        id: 41,
+        method: 'tools/call',
+        params: {
+          name: 'request_rework',
+          arguments: { threadId, feedback: 'again' },
+        },
+      });
+      assert.match(reworkRes.error.message, /receiver|not its initiator/i);
+    } finally {
+      if (originalPpid) Object.defineProperty(process, 'ppid', originalPpid);
+      if (registration) registry.end(registration);
+      registry.dispose();
+      if (savedReceiver === undefined) delete process.env.MESH_TASK_RECEIVER;
+      else process.env.MESH_TASK_RECEIVER = savedReceiver;
+      if (savedThread === undefined) delete process.env.MESH_TASK_THREAD_ID;
+      else process.env.MESH_TASK_THREAD_ID = savedThread;
+      if (savedRound === undefined) delete process.env.MESH_TASK_ROUND;
+      else process.env.MESH_TASK_ROUND = savedRound;
+    }
+  });
+
+  test('should not treat an unrelated process as a receiver when no execution record matches its pid', async () => {
+    const savedReceiver = process.env.MESH_TASK_RECEIVER;
+    const originalPpid = Object.getOwnPropertyDescriptor(process, 'ppid');
+    try {
+      delete process.env.MESH_TASK_RECEIVER;
+      Object.defineProperty(process, 'ppid', { value: 987654, configurable: true });
+
+      const toolNames = mcpServer.getToolDefinitions().map((tool: any) => tool.name);
+      assert.ok(toolNames.includes('dispatch_task'), 'a normal caller keeps the forwarding tools');
+    } finally {
+      if (originalPpid) Object.defineProperty(process, 'ppid', originalPpid);
+      if (savedReceiver === undefined) delete process.env.MESH_TASK_RECEIVER;
+      else process.env.MESH_TASK_RECEIVER = savedReceiver;
+    }
+  });
+
+  test('should never treat a reviewer or bootstrap round as a task receiver', async () => {
+    // A reviewer round is registered against the SAME thread and also binds the
+    // reviewer CLI pid. If the pid channel matched those records, the conversation
+    // whose job is to confirm the task would lose `dispatch_task`.
+    const savedReceiver = process.env.MESH_TASK_RECEIVER;
+    const registry = new TaskExecutionRegistry(tempDir);
+    const originalPpid = Object.getOwnPropertyDescriptor(process, 'ppid');
+    const registrations: Array<ReturnType<TaskExecutionRegistry['begin']>> = [];
+    try {
+      delete process.env.MESH_TASK_RECEIVER;
+      for (const [role, pid, threadId] of [
+        ['reviewer', 5101, 'thread_reviewer_role'],
+        ['bootstrap', 5102, 'thread_bootstrap_role'],
+        ['maintenance', 5103, 'thread_maintenance_role'],
+      ] as const) {
+        const registration = registry.begin(threadId, 1, 'codex', tempDir, role);
+        registry.attachChildPid(pid, registration);
+        registrations.push(registration);
+        Object.defineProperty(process, 'ppid', { value: pid, configurable: true });
+        assert.strictEqual(registry.findByChildPid(pid), undefined, `${role} must not resolve as a receiver`);
+      }
+      Object.defineProperty(process, 'ppid', { value: 5101, configurable: true });
+      const toolNames = mcpServer.getToolDefinitions().map((tool: any) => tool.name);
+      assert.ok(toolNames.includes('dispatch_task'), 'a reviewer keeps its forwarding tools');
+    } finally {
+      if (originalPpid) Object.defineProperty(process, 'ppid', originalPpid);
+      for (const registration of registrations) registry.end(registration);
+      registry.dispose();
+      if (savedReceiver === undefined) delete process.env.MESH_TASK_RECEIVER;
+      else process.env.MESH_TASK_RECEIVER = savedReceiver;
+    }
+  });
+
   test('should execute query_agent_mesh_status and return mesh info', async () => {
     const statusCall = {
       jsonrpc: '2.0',
@@ -854,7 +1052,7 @@ describe('MCPServer Protocol Tests', () => {
       method: 'tools/call',
       params: {
         name: 'dispatch_task',
-        arguments: {
+        arguments: { workspaceRoot: process.cwd(),
           targetAgent: 'codex',
           title: 'Retry in place',
           prompt: 'Implement the extension exactly as designed',
@@ -894,7 +1092,7 @@ describe('MCPServer Protocol Tests', () => {
       method: 'tools/call',
       params: {
         name: 'dispatch_task',
-        arguments: {
+        arguments: { workspaceRoot: process.cwd(),
           targetAgent: 'codex',
           title: 'Repeat instruction',
           prompt,
@@ -936,7 +1134,7 @@ describe('MCPServer Protocol Tests', () => {
     // A caller naming itself as the receiver used to create a task whose review
     // callback could never be delivered (the caller session is busy running the
     // round). It must be an error, and nothing may reach the ledger.
-    const rejected = await call('dispatch_task', {
+    const rejected = await call('dispatch_task', { workspaceRoot: process.cwd(),
       targetAgent: 'codex',
       initiatorAgent: 'codex',
       title: 'Self dispatch',
@@ -976,7 +1174,7 @@ describe('MCPServer Protocol Tests', () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       receiverSessionId: 'receiver-bootstrap-1',
-      workspacePath: tempDir,
+      workspace: testWorkspace(tempDir),
       reviewFlow: 'dedicated',
       reviewerModel: 'gpt-6-pro',
       targetModel: 'sonnet',
@@ -1055,7 +1253,7 @@ describe('MCPServer Protocol Tests', () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       receiverSessionId: 'receiver-bootstrap-pid',
-      workspacePath: tempDir,
+      workspace: testWorkspace(tempDir),
       reviewFlow: 'dedicated',
       reviewerModel: 'gpt-6-pro',
       targetModel: 'sonnet',

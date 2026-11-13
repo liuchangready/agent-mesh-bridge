@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { TaskStore } from '../bridge/task-store';
 import { DelegationThread, describeModelRouting, getModelRouting } from '../bridge/types';
 import { aggregateThreadTokenUsage, formatTokenCount } from '../bridge/token-usage-collector';
+import { groupWorkspaceTasks } from '../bridge/workspace';
 
 export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
   private _onDidChangeTreeData: vscode.EventEmitter<TaskTreeItem | undefined | void> =
@@ -11,10 +12,12 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
 
   private taskStore: TaskStore;
   private mode: 'active' | 'all';
+  private readonly selectedWorkspace: () => string | undefined;
 
-  constructor(taskStore: TaskStore, mode: 'active' | 'all') {
+  constructor(taskStore: TaskStore, mode: 'active' | 'all', selectedWorkspace: () => string | undefined = () => undefined) {
     this.taskStore = taskStore;
     this.mode = mode;
+    this.selectedWorkspace = selectedWorkspace;
 
     this.taskStore.on('changed', () => {
       this.refresh();
@@ -35,13 +38,16 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
       return Promise.resolve(element.subItems || []);
     }
 
-    const tasks = this.taskStore.listTasks(1000, this.mode === 'active' ? 'active' : 'all');
+    const tasks = this.taskStore.listTasks(1000, this.mode === 'active' ? 'active' : 'all', this.selectedWorkspace());
 
-    const items = tasks.map((thread) => {
-      return this.createTaskTreeItem(thread);
-    });
-
-    return Promise.resolve(items);
+    return Promise.resolve(groupWorkspaceTasks(tasks).map((threads) => {
+      const group = new TaskTreeItem(threads[0].workspace.nameAtDispatch, vscode.TreeItemCollapsibleState.Expanded);
+      group.tooltip = threads[0].workspace.rootPath;
+      group.iconPath = new vscode.ThemeIcon('folder');
+      group.contextValue = 'workspace_group';
+      group.subItems = threads.map((thread) => this.createTaskTreeItem(thread));
+      return group;
+    }));
   }
 
   private createTaskTreeItem(thread: DelegationThread): TaskTreeItem {

@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -93,7 +94,7 @@ describe('caller session resolution', () => {
       createdAt: new Date(0).toISOString(),
       updatedAt: new Date(0).toISOString(),
       receiverSessionId: 'receiver-session-123',
-      workspacePath: process.cwd(),
+      workspace: testWorkspace(process.cwd()),
       summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
       rounds: [],
       ...overrides,

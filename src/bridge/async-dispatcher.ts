@@ -1,3 +1,4 @@
+import { getTaskExecutionPath } from './types';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -27,7 +28,7 @@ import { ActiveAgentResolver } from './active-agent-resolver';
 import { AutonomousRunner, RunResult } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
 import { TaskSupervisor } from './task-supervisor';
-import { resolveGitRepository, createTaskWorktree, removeTaskWorktree, commitTaskChanges, changedFiles, currentHead } from './git-worktree';
+import { resolveGitRepository, resolveMainWorkspaceRoot, createTaskWorktree, removeTaskWorktree, commitTaskChanges, changedFiles, currentHead } from './git-worktree';
 import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
 import { TaskExecutionOwner, TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 import { QueueDrainer, QueuedExecution } from './queue-drainer';
@@ -38,6 +39,7 @@ import { readStoredRoundUsage } from './token-usage-collector';
 import { concurrencyPolicy } from './bridge-policy';
 import { ModelApprovalHandler, resolveDispatchModel } from './model-approval';
 import { assertCanExecute } from './agent-capabilities';
+import { WorkspaceRegistry, WorkspaceResolver, physicalDirectory, findUniqueWindow, readWindow } from './workspace';
 
 export class AsyncDispatcher {
   private taskStore: TaskStore;
@@ -99,6 +101,7 @@ export class AsyncDispatcher {
    * Dispatches a new task asynchronously and non-blockingly.
    */
   public async dispatchTask(params: DispatchTaskParams): Promise<DispatchResult> {
+    if (Object.prototype.hasOwnProperty.call(params, 'workspacePath')) throw new Error('workspacePath is not supported; use workspaceRoot or workspaceId');
     if (!params.title?.trim() || !params.prompt?.trim()) {
       throw new Error('A task title and prompt are required for a normal dispatch.');
     }
@@ -132,7 +135,21 @@ export class AsyncDispatcher {
     const threadId = this.generateThreadId(now);
     const receiverSessionId = crypto.randomUUID();
     const nowIso = now.toISOString();
-    const repositoryPath = path.resolve(params.workspacePath || process.cwd());
+    const registry = new WorkspaceRegistry(this.storageDir);
+    const resolver = new WorkspaceResolver(registry);
+    const requestedWorkspace = params.workspaceId ? resolver.resolve(params.workspaceId) : undefined;
+    if (!params.workspaceRoot && !requestedWorkspace) throw new Error('WORKSPACE_REQUIRED');
+    const repositoryPath = physicalDirectory(params.workspaceRoot || requestedWorkspace!.rootPath);
+    const repository = resolveGitRepository(repositoryPath, this.storageDir, params.targetBranch);
+    const mainRoot = resolveMainWorkspaceRoot(repositoryPath, repository.commonDir);
+    const selected = registry.register(mainRoot || repositoryPath);
+    if (requestedWorkspace && requestedWorkspace.id !== selected.id &&
+        physicalDirectory(requestedWorkspace.rootPath) !== repositoryPath) {
+      throw new Error('WORKSPACE_MISMATCH');
+    }
+    const windowContext = params.workspaceOrigin
+      ? readWindow(this.storageDir, params.workspaceOrigin)
+      : params.suppressWorkspaceOriginInference ? undefined : findUniqueWindow(this.storageDir, selected.rootPath);
 
     let callerSessionId =
       params.callerSessionId && isValidSessionId(params.callerSessionId)
@@ -216,7 +233,7 @@ export class AsyncDispatcher {
     let worktree: WorktreeInfo;
     try {
       worktree = createTaskWorktree(
-        resolveGitRepository(repositoryPath, this.storageDir, params.targetBranch),
+        repository,
         threadId,
         this.storageDir,
         undefined,
@@ -226,7 +243,6 @@ export class AsyncDispatcher {
       removeTaskDataDir(taskDirs.artifactDir, true);
       throw error;
     }
-    const workspacePath = worktree.path;
     const tempCandidate: DelegationThread = {
       threadId,
       title: params.title || 'Untitled Delegation Task',
@@ -245,7 +261,10 @@ export class AsyncDispatcher {
             reviewBootstrap: { phase: 'pending' as const, attempts: 0 },
           }
         : { callerSessionId }),
-      workspacePath,
+      workspace: { id: selected.id, environmentId: selected.environmentId, rootPath: selected.rootPath,
+        canonicalRootKey: selected.canonicalRootKey, nameAtDispatch: selected.name,
+        source: params.workspaceSource || 'explicit', executionPath: worktree.path,
+        ...(windowContext ? { origin: { hostInstanceId: windowContext.hostInstanceId, generation: windowContext.generation } } : {}) },
       artifactDir: taskDirs.artifactDir,
       taskDataDir: taskDirs.artifactDir,
       ...(worktree ? { worktree } : {}),
@@ -322,6 +341,8 @@ export class AsyncDispatcher {
           `Could not start the dedicated reviewer for ${threadId}: the bootstrap token could not be written.`,
         );
       }
+      thread.workspace.dispatchAccepted = true;
+      this.taskStore.upsertTask(thread);
       const routing = getModelRouting(thread);
       const reviewerLine =
         `Dedicated reviewer ${initiatorAgent}` +
@@ -342,11 +363,14 @@ export class AsyncDispatcher {
         modelRouting: routing,
         modelNotice,
         modelApproval: modelResolution.approval,
+        workspace: thread.workspace,
         nextAction: 'END_TURN_AND_WAIT_FOR_CALLBACK',
         stopInstruction,
       };
     }
 
+    thread.workspace.dispatchAccepted = true;
+    this.taskStore.upsertTask(thread);
     // If TaskSupervisor is actively running (e.g. in VS Code extension host),
     // let it supervise execution persistently to prevent child processes from being killed when ephemeral MCP CLI exits.
     if (TaskSupervisor.isSupervisorActive()) {
@@ -394,6 +418,7 @@ export class AsyncDispatcher {
       modelRouting: routing,
       modelNotice,
       modelApproval: modelResolution.approval,
+      workspace: thread.workspace,
       nextAction: 'END_TURN_AND_WAIT_FOR_CALLBACK',
       stopInstruction,
     };
@@ -482,7 +507,8 @@ export class AsyncDispatcher {
           current.threadId,
           roundNumber,
           current.targetAgent,
-          current.workspacePath,
+          getTaskExecutionPath(current),
+          'developer',
         );
       } catch (error: any) {
         roleLock.release(roleLease);
@@ -535,7 +561,7 @@ export class AsyncDispatcher {
       // Baseline right before the agent starts: the diff afterwards tells us
       // exactly which files this round changed, even if the caller declared
       // nothing or the agent edited files unrelated to its task.
-      const workspaceBefore = captureWorkspaceSnapshot(thread.workspacePath);
+      const workspaceBefore = captureWorkspaceSnapshot(getTaskExecutionPath(thread));
       try {
         result = await this.runner.execute({
           agent: thread.targetAgent,
@@ -543,7 +569,7 @@ export class AsyncDispatcher {
           isRework,
           receiverSessionId: thread.receiverSessionId,
           title: thread.title,
-          cwd: thread.workspacePath,
+          cwd: getTaskExecutionPath(thread),
           taskThreadId: thread.threadId,
           artifactDir: thread.artifactDir,
           taskRound: roundNumber,
@@ -587,7 +613,7 @@ export class AsyncDispatcher {
       // fresh (a pause between here and the finalize below must not lose it).
       const touchedFiles = diffWorkspaceSnapshots(
         workspaceBefore,
-        captureWorkspaceSnapshot(thread.workspacePath),
+        captureWorkspaceSnapshot(getTaskExecutionPath(thread)),
       );
 
       this.taskStore.loadFromDisk();

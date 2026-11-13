@@ -2,6 +2,7 @@ import * as readline from 'readline';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
 import { AsyncDispatcher } from './async-dispatcher';
 import { ReworkController } from './rework-controller';
 import { TaskStore } from './task-store';
@@ -12,6 +13,7 @@ import { TaskSupervisor } from './task-supervisor';
 import { TaskControlService } from './task-control';
 import { CallerPollGuard, progressSignature } from './caller-poll-guard';
 import { TaskRoleLock } from './task-role-lock';
+import { TaskExecutionRegistry } from './task-execution-registry';
 import {
   ModelCatalog,
   annotateConfiguredModel,
@@ -25,6 +27,7 @@ import {
   AgentId,
   DelegationRound,
   MESH_TASK_THREAD_ENV,
+  MESH_TASK_ROUND_ENV,
   getModelRouting,
   isTaskReceiverProcess,
 } from './types';
@@ -49,6 +52,7 @@ import {
 } from './reviewer-log';
 import { aggregateThreadTokenUsage } from './token-usage-collector';
 import { assertCanExecute } from './agent-capabilities';
+import { WorkspaceRegistry, readWindow, matchingWindows, physicalDirectory } from './workspace';
 
 /** Older non-compacted rounds are excerpted to this many characters. */
 const DETAIL_HISTORY_OUTPUT_MAX_CHARS = 4_000;
@@ -89,6 +93,12 @@ export class MCPServer {
   private modelCatalog: ModelCatalog;
   /** Starves polling loops on tasks this process dispatched itself. */
   private pollGuard = new CallerPollGuard();
+  private workspaceContext?: { id: string; origin?: { hostInstanceId: string; generation: string }; source?: 'host-root' };
+  private clientSupportsRoots = false;
+  private clientRoots?: Promise<string[]>;
+  private resolveClientRoots?: (roots: string[]) => void;
+  /** Observes bridge-launched task processes so receiver detection works without env. */
+  private receiverProbe?: TaskExecutionRegistry;
 
   constructor(
     dispatcher: AsyncDispatcher,
@@ -430,10 +440,11 @@ export class MCPServer {
               description:
                 'Your native session UUID so the bridge can proactively wake you up upon completion. Do NOT pass agent names (e.g. "claude_code"). If omitted, the bridge automatically auto-detects your active session.',
             },
-            workspacePath: {
+            workspaceRoot: {
               type: 'string',
-              description: 'Workspace root path (defaults to current working directory).',
+              description: 'Absolute local workspace root directory.',
             },
+            workspaceId: { type: 'string', description: 'Registered Bridge workspace ID.' },
             targetBranch: {
               type: 'string',
               description: 'Existing local branch to merge the approved task into. Defaults to the source checkout branch and is pinned for this task.',
@@ -710,11 +721,18 @@ export class MCPServer {
         },
       },
       {
+        name: 'list_workspaces',
+        description: 'List registered Bridge workspaces.',
+        inputSchema: { type: 'object', properties: {} },
+      },
+      {
         name: 'list_recent_tasks',
         description: 'Query recent delegation tasks from the 1,000 tasks persistent ledger.',
         inputSchema: {
           type: 'object',
           properties: {
+            workspaceId: { type: 'string', description: 'Only tasks belonging to this workspace.' },
+            scope: { type: 'string', enum: ['all', 'current'], description: 'Use the bound window’s current default, or query all workspaces.' },
             limit: {
               type: 'number',
               description: 'Number of recent tasks to return (default: 20, max: 1000).',
@@ -940,7 +958,7 @@ export class MCPServer {
     // A receiver is executing one delegated task; hide new-work tools so the
     // model cannot even attempt recursive delegation. The runtime guard in
     // handleToolCall stays as the authoritative enforcement.
-    if (isTaskReceiverProcess()) {
+    if (this.resolveReceiverTask()) {
       return tools.filter((tool) => !FORWARDING_TOOLS.has(tool.name));
     }
     return tools;
@@ -1102,14 +1120,56 @@ export class MCPServer {
   }
 
   /**
+   * Identify the delegated task this process is executing, if any.
+   *
+   * Primary channel: `MESH_TASK_RECEIVER` plus `MESH_TASK_THREAD_ID` in the
+   * process environment. That is the deterministic path, but it only works for a
+   * host that inherits the environment.
+   *
+   * Fallback channel: the pid of the CLI process that launched this MCP server,
+   * matched against the bridge's own execution records. Codex passes ONLY the
+   * `env` table from `config.toml` to the MCP servers it spawns, and DeepSeek
+   * Harness scrubs inherited variables, so the markers never arrive there. This
+   * used to disable the forwarding guard entirely: receivers could call
+   * `dispatch_task` again, and a single blocked baseline silently turned into a
+   * nested chain of tasks that each delegated the same problem one level down.
+   *
+   * A bootstrap reviewer's pid is never a receiver record: reviewer rounds are
+   * registered under the thread's role lock as `reviewer`, and the execution
+   * record for the developer round is what carries the developer pid.
+   */
+  private resolveReceiverTask(): { threadId?: string; round?: number } | null {
+    if (isTaskReceiverProcess()) {
+      const threadId = process.env[MESH_TASK_THREAD_ENV];
+      const rawRound = process.env[MESH_TASK_ROUND_ENV];
+      const round = rawRound ? Number(rawRound) : undefined;
+      return {
+        threadId,
+        ...(Number.isFinite(round) ? { round } : {}),
+      };
+    }
+
+    const owner = this.executionRegistry().findByChildPid(process.ppid);
+    if (!owner) return null;
+    return { threadId: owner.threadId, round: owner.round };
+  }
+
+  /** Lazily create the registry that observes bridge-launched task processes. */
+  private executionRegistry(): TaskExecutionRegistry {
+    if (!this.receiverProbe) this.receiverProbe = new TaskExecutionRegistry(this.storeRoot() || undefined);
+    return this.receiverProbe;
+  }
+
+  /**
    * Enforce the receiver rule at call time (defense in depth: a client may have
    * cached the tool list from before the marker was applied, or call a tool
    * directly over JSON-RPC).
    */
   private assertReceiverMayCall(name: string, args: any): void {
-    if (!isTaskReceiverProcess()) return;
+    const receiver = this.resolveReceiverTask();
+    if (!receiver) return;
 
-    const currentThreadId = process.env[MESH_TASK_THREAD_ENV];
+    const currentThreadId = receiver.threadId;
     if (FORWARDING_TOOLS.has(name)) {
       const target = args?.targetAgent ? ` to ${args.targetAgent}` : '';
       throw new Error(
@@ -1148,9 +1208,23 @@ export class MCPServer {
     }
   }
 
-  /**
-   * Execute a tool call and return result object.
-   */
+  private async resolveClientWorkspaceContext(allowHostRoot = true): Promise<typeof this.workspaceContext> {
+    if (this.workspaceContext?.origin || !this.clientRoots) return this.workspaceContext;
+    const roots = await Promise.race([this.clientRoots, new Promise<string[]>((resolve) => setTimeout(() => resolve([]), 1000))]);
+    if (roots.length > 1) throw new Error('WORKSPACE_AMBIGUOUS: multiple client roots');
+    if (!roots.length) return this.workspaceContext;
+    const storage = path.dirname(this.taskStore.getStoragePath());
+    const matches = matchingWindows(storage, roots[0]);
+    if (matches.length > 1) throw new Error('WORKSPACE_AMBIGUOUS: multiple windows have this root');
+    const window = matches[0];
+    if (!window) return this.workspaceContext;
+    if (!window.defaultWorkspaceId && !allowHostRoot) return this.workspaceContext;
+    const id = window.defaultWorkspaceId || new WorkspaceRegistry(storage).register(roots[0]).id;
+    return { id, origin: { hostInstanceId: window.hostInstanceId, generation: window.generation },
+      source: window.defaultWorkspaceId ? undefined : 'host-root' };
+  }
+
+  /** Execute a tool call and return result object. */
   public async handleToolCall(name: string, args: any): Promise<any> {
     this.assertReceiverMayCall(name, args);
     switch (name) {
@@ -1163,6 +1237,7 @@ export class MCPServer {
         if (bootstrap) {
           return this.confirmReviewerBootstrap(bootstrap.threadId, bootstrap);
         }
+        if (Object.prototype.hasOwnProperty.call(args, 'workspacePath')) throw new Error('workspacePath is not supported; use workspaceRoot or workspaceId');
 
         const callerFromEnv = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
         const initiatorAgent =
@@ -1170,18 +1245,32 @@ export class MCPServer {
             ? (args.initiatorAgent as AgentId)
             : callerFromEnv;
 
+        const explicitWorkspace = !!(args.workspaceRoot || args.workspaceId);
+        let resolvedContext = this.workspaceContext;
+        try { resolvedContext = await this.resolveClientWorkspaceContext(); }
+        catch (error: any) {
+          if (!explicitWorkspace || !String(error?.message).includes('WORKSPACE_AMBIGUOUS')) throw error;
+        }
+        const windowContext = resolvedContext?.origin && readWindow(path.dirname(this.taskStore.getStoragePath()), resolvedContext.origin);
+        const inheritedWorkspaceId = !args.workspaceRoot && !args.workspaceId
+          ? windowContext?.defaultWorkspaceId || resolvedContext?.id : undefined;
         const dispatched = await this.dispatcher.dispatchTask({
           targetAgent: args.targetAgent,
           initiatorAgent,
           title: args.title,
           prompt: args.prompt,
           callerSessionId: args.callerSessionId,
-          workspacePath: args.workspacePath,
+          workspaceRoot: args.workspaceRoot, workspaceId: args.workspaceId || inheritedWorkspaceId,
+          workspaceSource: inheritedWorkspaceId && windowContext?.defaultWorkspaceId === inheritedWorkspaceId ? 'window-default' :
+            inheritedWorkspaceId ? resolvedContext?.source || 'explicit' : 'explicit',
+          workspaceOrigin: windowContext ? resolvedContext?.origin : undefined,
+          suppressWorkspaceOriginInference: true,
           targetBranch: args.targetBranch,
           model: args.model,
           modelRequestedByUser: args.modelRequestedByUser === true,
           initiatorModel: args.initiatorModel,
         });
+        this.workspaceContext = { id: dispatched.workspace.id, origin: dispatched.workspace.origin };
 
         // Guard the task this process just created: repeated status reads at the
         // same progress return a status-only payload instead of feeding a poll
@@ -1321,10 +1410,21 @@ export class MCPServer {
         };
       }
 
+      case 'list_workspaces': {
+        const registry = new WorkspaceRegistry(path.dirname(this.taskStore.getStoragePath()));
+        const tasks = this.taskStore.listTasks(1000);
+        return registry.list().slice(0, 1000).map((workspace) => ({ ...workspace,
+          available: fs.existsSync(workspace.rootPath),
+          taskCount: tasks.filter((task) => task.workspace.id === workspace.id).length }));
+      }
       case 'list_recent_tasks': {
         const limit = typeof args.limit === 'number' ? args.limit : 20;
         const statusFilter = args.statusFilter;
-        const tasks = this.taskStore.listTasks(limit, statusFilter);
+        const queryContext = args.scope === 'current' ? await this.resolveClientWorkspaceContext(false) : this.workspaceContext;
+        const windowContext = queryContext?.origin && readWindow(path.dirname(this.taskStore.getStoragePath()), queryContext.origin);
+        const workspaceId = args.workspaceId || (args.scope === 'current' ? windowContext?.defaultWorkspaceId : undefined);
+        if (args.scope === 'current' && !workspaceId) throw new Error('WORKSPACE_REQUIRED: no current window default');
+        const tasks = this.taskStore.listTasks(limit, statusFilter, workspaceId);
         // Every task carries both ends of its model routing so a caller can see
         // which model it dispatched from and which model the receiver runs, plus
         // the derived token rollup so a list can be compared by cost.
@@ -1635,12 +1735,12 @@ export class MCPServer {
 
       case 'invoke_antigravity': {
         const callerFromEnv = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
-        return await this.dispatcher.dispatchTask({
+        return await this.handleToolCall('dispatch_task', {
           targetAgent: 'antigravity',
           initiatorAgent: callerFromEnv || 'codex',
           title: args.title || 'Delegation to Antigravity',
           prompt: args.prompt,
-          workspacePath: args.workspacePath,
+          workspaceRoot: args.workspaceRoot, workspaceId: args.workspaceId,
           model: args.model,
           modelRequestedByUser: args.modelRequestedByUser === true,
           initiatorModel: args.initiatorModel,
@@ -1649,12 +1749,12 @@ export class MCPServer {
 
       case 'invoke_claude_code': {
         const callerFromEnv = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
-        return await this.dispatcher.dispatchTask({
+        return await this.handleToolCall('dispatch_task', {
           targetAgent: 'claude_code',
           initiatorAgent: callerFromEnv || 'codex',
           title: args.title || 'Delegation to Claude Code',
           prompt: args.prompt,
-          workspacePath: args.workspacePath,
+          workspaceRoot: args.workspaceRoot, workspaceId: args.workspaceId,
           model: args.model,
           modelRequestedByUser: args.modelRequestedByUser === true,
           initiatorModel: args.initiatorModel,
@@ -1663,12 +1763,12 @@ export class MCPServer {
 
       case 'invoke_codex': {
         const callerFromEnv = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
-        return await this.dispatcher.dispatchTask({
+        return await this.handleToolCall('dispatch_task', {
           targetAgent: 'codex',
           initiatorAgent: callerFromEnv || 'antigravity',
           title: args.title || 'Delegation to Codex',
           prompt: args.prompt,
-          workspacePath: args.workspacePath,
+          workspaceRoot: args.workspaceRoot, workspaceId: args.workspaceId,
           model: args.model,
           modelRequestedByUser: args.modelRequestedByUser === true,
           initiatorModel: args.initiatorModel,
@@ -1690,6 +1790,7 @@ export class MCPServer {
 
     try {
       if (method === 'initialize') {
+        this.clientSupportsRoots = !!params?.capabilities?.roots;
         return {
           jsonrpc: '2.0',
           id,
@@ -1785,6 +1886,23 @@ export class MCPServer {
       if (!trimmed) return;
       try {
         const req = JSON.parse(trimmed);
+        if (req?.method === 'notifications/initialized' && this.clientSupportsRoots) {
+          this.clientRoots = new Promise((resolve) => { this.resolveClientRoots = resolve; });
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: 'mesh-roots', method: 'roots/list', params: {} }) + '\n');
+        }
+        if (req?.id === 'mesh-roots' && !req.method) {
+          const roots: string[] = [];
+          let invalidRoot = false;
+          for (const entry of Array.isArray(req.result?.roots) ? req.result.roots : []) {
+            try {
+              if (typeof entry.uri !== 'string' || !entry.uri.startsWith('file:')) { invalidRoot = true; continue; }
+              roots.push(physicalDirectory(fileURLToPath(entry.uri)));
+            } catch { invalidRoot = true; }
+          }
+          this.resolveClientRoots?.(invalidRoot ? [] : [...new Set(roots)]);
+          this.resolveClientRoots = undefined;
+          return;
+        }
         const resp = await this.handleRpcMessage(req);
         if (resp) {
           process.stdout.write(JSON.stringify(resp) + '\n');

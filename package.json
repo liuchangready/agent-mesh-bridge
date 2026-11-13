@@ -63,6 +63,9 @@
       ]
     },
     "commands": [
+      { "command": "agent-mesh-bridge.selectWorkspace", "title": "Agent Bridge: Select Default Workspace" },
+      { "command": "agent-mesh-bridge.clearWorkspace", "title": "Agent Bridge: Clear Default Workspace" },
+      { "command": "agent-mesh-bridge.filterWorkspaces", "title": "Agent Bridge: Filter Tasks by Workspace" },
       {
         "command": "agent-mesh-bridge.refreshAgentStatus",
         "title": "Refresh Agent Nodes Status",
@@ -241,6 +244,13 @@
     "configuration": {
       "title": "Agent Mesh Bridge",
       "properties": {
+        "agentMeshBridge.workspace.taskViewScope": {
+          "type": "string",
+          "enum": ["all", "current"],
+          "default": "all",
+          "scope": "window",
+          "description": "Initial task tree filter for this window. The filter command can select a specific workspace."
+        },
         "agentMeshBridge.defaultAgent": {
           "type": "string",
           "default": "auto",

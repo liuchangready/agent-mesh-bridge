@@ -1,3 +1,4 @@
+import { getTaskExecutionPath } from './types';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -425,7 +426,8 @@ export class TaskSupervisor extends EventEmitter {
         fresh.threadId,
         round.round,
         fresh.targetAgent,
-        fresh.workspacePath,
+        getTaskExecutionPath(fresh),
+        'developer',
       );
     } catch (error: any) {
       roleLock.release(roleLease);
@@ -514,7 +516,7 @@ export class TaskSupervisor extends EventEmitter {
       let result: RunResult;
       // Baseline before the agent starts: the diff afterwards attributes exactly
       // which files this round changed.
-      const workspaceBefore = captureWorkspaceSnapshot(thread.workspacePath);
+      const workspaceBefore = captureWorkspaceSnapshot(getTaskExecutionPath(thread));
       try {
         result = await this.runner.execute({
           agent: thread.targetAgent,
@@ -522,7 +524,7 @@ export class TaskSupervisor extends EventEmitter {
           isRework,
           receiverSessionId: thread.receiverSessionId,
           title: thread.title,
-          cwd: thread.workspacePath,
+          cwd: getTaskExecutionPath(thread),
           taskThreadId: thread.threadId,
           artifactDir: thread.artifactDir,
           taskRound: roundNumber,
@@ -568,7 +570,7 @@ export class TaskSupervisor extends EventEmitter {
 
       const touchedFiles = diffWorkspaceSnapshots(
         workspaceBefore,
-        captureWorkspaceSnapshot(thread.workspacePath),
+        captureWorkspaceSnapshot(getTaskExecutionPath(thread)),
       );
 
       // Re-read latest task from disk to avoid overwriting newer state

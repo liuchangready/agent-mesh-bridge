@@ -13,7 +13,7 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
   private detector: AgentDetector;
   private resolver: ActiveAgentResolver;
   private cachedAgents: Record<AgentId, AgentInfo> | null = null;
-  constructor(detector: AgentDetector, resolver: ActiveAgentResolver) {
+  constructor(detector: AgentDetector, resolver: ActiveAgentResolver, private readonly workspaceLabel: () => string = () => 'Not selected') {
     this.detector = detector;
     this.resolver = resolver;
   }
@@ -42,6 +42,11 @@ export class AgentNodesProvider implements vscode.TreeDataProvider<AgentNodeItem
     const agentsList: AgentId[] = ['antigravity', 'codex', 'claude_code', 'deepseek_harness'];
 
     const items: AgentNodeItem[] = [];
+    const workspace = new AgentNodeItem('Workspace', vscode.TreeItemCollapsibleState.None);
+    workspace.description = this.workspaceLabel();
+    workspace.iconPath = new vscode.ThemeIcon('folder');
+    workspace.command = { command: 'agent-mesh-bridge.selectWorkspace', title: 'Select Workspace' };
+    items.push(workspace);
     for (const agentId of agentsList) {
       const info = this.cachedAgents[agentId] || (await this.detector.probeAgent(agentId));
       const isActive = activeResolution.agent === agentId;

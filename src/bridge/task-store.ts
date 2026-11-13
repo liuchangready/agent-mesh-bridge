@@ -268,7 +268,7 @@ export const THREADS_DIR_NAME = 'threads';
 export class TaskStore extends EventEmitter {
   private static instance: TaskStore | null = null;
   private storageDir: string;
-  /** Aggregate snapshot, kept only as a derived read model / legacy fallback. */
+  /** Aggregate snapshot, kept only as a derived read model. */
   private storageFile: string;
   /** Per-thread authoritative files: parallel writers touch different files. */
   private threadsDir: string;
@@ -277,7 +277,6 @@ export class TaskStore extends EventEmitter {
   private knownMtimes: Map<string, number> = new Map();
   private isWatching: boolean = false;
   private watchDebounceTimer: NodeJS.Timeout | null = null;
-  private lastAggMtimeMs: number = 0;
   private lastDirMtimeMs: number = 0;
 
   constructor(customStorageDir?: string) {
@@ -334,38 +333,13 @@ export class TaskStore extends EventEmitter {
    *
    * Per-thread files are authoritative: two processes updating two different
    * tasks write two different files, so neither can overwrite the other's
-   * rounds. A legacy single-file ledger is migrated in place on first load.
+   * rounds. The aggregate snapshot is never an input or migration source.
    */
   public loadFromDisk(): void {
     this.tasks.clear();
     this.knownMtimes.clear();
 
-    if (fs.existsSync(this.threadsDir)) {
-      this.syncFromThreads(true);
-      this.lastAggMtimeMs = this.fileMtimeMs(this.storageFile);
-      return;
-    }
-
-    if (!fs.existsSync(this.storageFile)) {
-      this.lastAggMtimeMs = 0;
-      return;
-    }
-
-    try {
-      const data = fs.readFileSync(this.storageFile, 'utf8');
-      const rawList: DelegationThread[] = data.trim() ? JSON.parse(data) : [];
-      if (Array.isArray(rawList)) {
-        this.ensureThreadsDir();
-        for (const thread of rawList) {
-          if (!thread || !thread.threadId) continue;
-          this.tasks.set(thread.threadId, thread);
-          this.persistThread(thread);
-        }
-      }
-      this.lastAggMtimeMs = this.fileMtimeMs(this.storageFile);
-    } catch (err) {
-      console.error(`[TaskStore] Failed to parse ${this.storageFile}:`, err);
-    }
+    this.syncFromThreads(true);
   }
 
   /** Re-parse only the thread files whose mtime changed, and drop vanished ones. */
@@ -384,8 +358,12 @@ export class TaskStore extends EventEmitter {
       if (!force && this.knownMtimes.get(name) === mtime) continue;
       try {
         const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-        if (parsed && parsed.threadId) {
+        if (parsed && parsed.threadId && parsed.workspace?.id && parsed.workspace?.executionPath &&
+            (!parsed.worktree || parsed.worktree.path === parsed.workspace.executionPath)) {
           this.tasks.set(parsed.threadId, parsed as DelegationThread);
+          this.knownMtimes.set(name, mtime);
+        } else {
+          this.tasks.delete(name.slice(0, -'.json'.length));
           this.knownMtimes.set(name, mtime);
         }
       } catch {
@@ -402,42 +380,12 @@ export class TaskStore extends EventEmitter {
   }
 
   /**
-   * Fold writes made by a not-yet-upgraded process that only knows the
-   * aggregate file, so a rolling upgrade does not lose in-flight rounds.
-   */
-  private mergeFromAggregate(): void {
-    try {
-      const data = fs.readFileSync(this.storageFile, 'utf8');
-      if (!data.trim()) return;
-      const list = JSON.parse(data);
-      if (!Array.isArray(list)) return;
-      for (const thread of list as DelegationThread[]) {
-        if (!thread || !thread.threadId) continue;
-        const current = this.tasks.get(thread.threadId);
-        const incomingAt = new Date(thread.updatedAt || thread.createdAt || 0).getTime();
-        const currentAt = current
-          ? new Date(current.updatedAt || current.createdAt || 0).getTime()
-          : -1;
-        if (incomingAt > currentAt) {
-          this.tasks.set(thread.threadId, thread);
-          this.persistThread(thread);
-        }
-      }
-    } catch {}
-  }
-
-  /**
    * Ensures in-memory cache reflects any external file modifications on disk.
    */
   public ensureUpToDate(): void {
     const dirMtime = this.fileMtimeMs(this.threadsDir);
-    const aggMtime = this.fileMtimeMs(this.storageFile);
-    if (dirMtime <= this.lastDirMtimeMs && aggMtime <= this.lastAggMtimeMs) return;
+    if (dirMtime <= this.lastDirMtimeMs) return;
     this.syncFromThreads(false);
-    if (aggMtime > this.lastAggMtimeMs) {
-      this.mergeFromAggregate();
-      this.lastAggMtimeMs = aggMtime;
-    }
   }
 
   /** Atomic single-thread write: `rename` is the only step readers can observe. */
@@ -515,7 +463,6 @@ export class TaskStore extends EventEmitter {
     try {
       fs.writeFileSync(tempFile, JSON.stringify(truncated, null, 2), 'utf8');
       fs.renameSync(tempFile, this.storageFile);
-      this.lastAggMtimeMs = this.fileMtimeMs(this.storageFile);
     } catch (err) {
       console.error(`[TaskStore] Failed to write aggregate ${this.storageFile}:`, err);
       try {
@@ -552,12 +499,6 @@ export class TaskStore extends EventEmitter {
           this.emit('changed', Array.from(this.tasks.values()));
         }, 300);
       };
-      // The aggregate is kept for compatibility, but the per-thread directory is
-      // the real source of truth: another process can write a thread file and
-      // die before refreshing the aggregate, so both must be watched.
-      fs.watchFile(this.storageFile, { interval: 1000 }, (curr, prev) => {
-        if (curr.mtimeMs !== prev.mtimeMs) onChange();
-      });
       this.ensureThreadsDir();
       fs.watchFile(this.threadsDir, { interval: 1000 }, (curr, prev) => {
         if (curr.mtimeMs !== prev.mtimeMs) onChange();
@@ -571,7 +512,6 @@ export class TaskStore extends EventEmitter {
   public dispose(): void {
     if (this.isWatching) {
       try {
-        fs.unwatchFile(this.storageFile);
         fs.unwatchFile(this.threadsDir);
       } catch {}
       this.isWatching = false;
@@ -594,6 +534,10 @@ export class TaskStore extends EventEmitter {
    * Upsert a task thread.
    */
   public upsertTask(thread: DelegationThread): void {
+    if (!thread.workspace?.id || !thread.workspace.executionPath ||
+        (thread.worktree && thread.workspace.executionPath !== thread.worktree.path)) {
+      throw new Error('Task requires a valid workspace binding matching its worktree');
+    }
     this.ensureUpToDate();
     const priorMemory = this.tasks.get(thread.threadId);
     const rollbackSnapshot = priorMemory ? structuredClone(priorMemory) : undefined;
@@ -614,6 +558,23 @@ export class TaskStore extends EventEmitter {
     const inMemory = this.tasks.get(thread.threadId);
     if ((onDisk || inMemory) && onDisk !== thread) {
       const authority = [inMemory, onDisk].filter(Boolean) as DelegationThread[];
+      for (const prior of authority) {
+        if (!thread.workspace || !prior.workspace || thread.workspace.id !== prior.workspace.id ||
+            thread.workspace.rootPath !== prior.workspace.rootPath ||
+            thread.workspace.environmentId !== prior.workspace.environmentId ||
+            thread.workspace.canonicalRootKey !== prior.workspace.canonicalRootKey ||
+            thread.workspace.nameAtDispatch !== prior.workspace.nameAtDispatch ||
+            thread.workspace.source !== prior.workspace.source ||
+            JSON.stringify(thread.workspace.origin) !== JSON.stringify(prior.workspace.origin)) {
+          throw new Error('Task workspace binding cannot be changed');
+        }
+        if (prior.workspace.dispatchAccepted) thread.workspace.dispatchAccepted = true;
+        if (thread.workspace.executionPath !== prior.workspace.executionPath &&
+            (!thread.worktree || thread.workspace.executionPath !== thread.worktree.path ||
+             !prior.worktree || fs.existsSync(prior.worktree.path) || !fs.existsSync(thread.worktree.path))) {
+          throw new Error('Task execution path cannot be changed');
+        }
+      }
       for (const prior of authority) preferBinding(thread, prior);
       thread.nativeSessionCompaction = mergeNativeCursors(
         mergeNativeCursors(inMemory?.nativeSessionCompaction, onDisk?.nativeSessionCompaction, {
@@ -840,7 +801,7 @@ export class TaskStore extends EventEmitter {
   /**
    * List tasks with pagination and optional filter.
    */
-  public listTasks(limit: number = 20, statusFilter?: string): DelegationThread[] {
+  public listTasks(limit: number = 20, statusFilter?: string, workspaceId?: string): DelegationThread[] {
     this.ensureUpToDate();
     const safeLimit = Math.min(Math.max(1, limit), MAX_STORED_TASKS);
     let all = Array.from(this.tasks.values()).sort((a, b) => {
@@ -849,6 +810,7 @@ export class TaskStore extends EventEmitter {
       return timeB - timeA;
     });
 
+    if (workspaceId) all = all.filter((task) => task.workspace.id === workspaceId);
     if (statusFilter && statusFilter !== 'all') {
       if (statusFilter === 'active') {
         all = all.filter(
@@ -857,6 +819,7 @@ export class TaskStore extends EventEmitter {
             t.status === 'waiting_review' ||
             t.status === 'reworking' ||
             t.status === 'queued' ||
+            t.status === 'waiting_merge' ||
             t.status === 'paused',
         );
       } else {

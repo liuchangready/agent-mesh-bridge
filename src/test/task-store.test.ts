@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -38,7 +39,7 @@ describe('TaskStore Tests', () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       receiverSessionId: 'uuid-1234',
-      workspacePath: tempDir,
+      workspace: testWorkspace(tempDir),
       summary: {
         lastPromptSnippet: 'Fix the bug',
         lastOutputSnippet: 'Running...',
@@ -84,7 +85,7 @@ describe('TaskStore Tests', () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       receiverSessionId: 'sess-abc',
-      workspacePath: tempDir,
+      workspace: testWorkspace(tempDir),
       summary: {
         lastPromptSnippet: 'Original prompt',
         lastOutputSnippet: 'Running',
@@ -135,7 +136,7 @@ describe('TaskStore Tests', () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       receiverSessionId: 'sess-mr',
-      workspacePath: tempDir,
+      workspace: testWorkspace(tempDir),
       summary: {
         lastPromptSnippet: 'do work',
         lastOutputSnippet: 'approved',
@@ -170,7 +171,7 @@ describe('TaskStore Tests', () => {
     const now = new Date(Date.now() - 10_000).toISOString();
     const thread: DelegationThread = {
       threadId: 'thread_merge_failure', title: 'merge failure', initiatorAgent: 'codex', targetAgent: 'claude_code',
-      status: 'waiting_merge', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session', workspacePath: tempDir,
+      status: 'waiting_merge', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session', workspace: testWorkspace(tempDir),
       summary: { lastPromptSnippet: 'review', lastOutputSnippet: 'approved', totalDurationMs: 1 }, rounds: [],
       worktree: { path: tempDir, mainPath: tempDir, repositoryPath: tempDir, commonDir: tempDir, targetRef: 'refs/mesh/batch', taskBranch: 'mesh/task/x', baseCommit: 'base', headCommit: 'approved', approvedCommit: 'approved', integration: { phase: 'waiting', updatedAt: now } },
     };
@@ -204,7 +205,7 @@ describe('TaskStore Tests', () => {
         createdAt: timeIso,
         updatedAt: timeIso,
         receiverSessionId: `sess_${i}`,
-        workspacePath: tempDir,
+        workspace: testWorkspace(tempDir),
         summary: {
           lastPromptSnippet: `Prompt ${i}`,
           lastOutputSnippet: `Output ${i}`,

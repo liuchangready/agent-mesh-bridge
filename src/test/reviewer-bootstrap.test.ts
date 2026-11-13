@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'node:fs';
@@ -42,7 +43,7 @@ function makeDedicatedThread(threadId: string, overrides: Partial<DelegationThre
     createdAt: '2026-11-01T00:00:00.000Z',
     updatedAt: '2026-11-01T00:00:00.000Z',
     receiverSessionId: 'receiver-session-1',
-    workspacePath: makeTempDir('bridge-bootstrap-ws-'),
+    workspace: testWorkspace(makeTempDir('bridge-bootstrap-ws-')),
     reviewFlow: 'dedicated',
     reviewerModel: 'gpt-6-pro',
     targetModel: 'gpt-6-flash',
@@ -358,7 +359,7 @@ test('paused and waiting-review tasks do not serialize independent reviewer boot
   const workspace = makeTempDir('bridge-bootstrap-shared-ws-');
   const parked = makeDedicatedThread('thread_waiting_review', {
     status: 'waiting_review',
-    workspacePath: workspace,
+    workspace: testWorkspace(workspace),
   });
   parked.reviewFlow = 'legacy';
   parked.reviewBootstrap = undefined;
@@ -366,7 +367,7 @@ test('paused and waiting-review tasks do not serialize independent reviewer boot
 
   const targets = ['thread_bootstrap_a', 'thread_bootstrap_b'].map((threadId, index) => {
     const target = makeDedicatedThread(threadId, {
-      workspacePath: workspace,
+      workspace: testWorkspace(workspace),
       createdAt: `2026-11-01T00:00:0${index}.000Z`,
     });
     store.upsertTask(target);
@@ -426,7 +427,7 @@ test('concurrency: a running task in another workspace does not block a pending 
   const older = makeDedicatedThread('thread_other_ws', {
     status: 'reworking',
     createdAt: '2026-10-31T23:00:00.000Z',
-    workspacePath: otherWorkspace,
+    workspace: testWorkspace(otherWorkspace),
   });
   older.reviewFlow = 'legacy';
   older.reviewBootstrap = undefined;
@@ -490,7 +491,7 @@ test('the last-resort finder answers only when one bootstrap can be meant', () =
   assert.strictEqual(findSolePendingBootstrap({ agent: 'codex', taskStore: store }, dir)?.threadId, first.threadId);
   assert.strictEqual(
     findSolePendingBootstrap(
-      { agent: 'codex', workspacePath: first.workspacePath, taskStore: store },
+      { agent: 'codex', workspacePath: first.workspace.executionPath, taskStore: store },
       dir,
     )?.threadId,
     first.threadId,
@@ -509,7 +510,7 @@ test('the last-resort finder answers only when one bootstrap can be meant', () =
   // An exact workspace match still identifies the right one.
   assert.strictEqual(
     findSolePendingBootstrap(
-      { agent: 'codex', workspacePath: second.workspacePath, taskStore: store },
+      { agent: 'codex', workspacePath: second.workspace.executionPath, taskStore: store },
       dir,
     )?.threadId,
     second.threadId,

@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -23,7 +24,7 @@ describe('AutonomousRunner Tests', () => {
   // exercises the execution pipeline must not depend on a real Claude install.
   // `process.execPath` exists and is executable everywhere; the tests that care
   // about the spawned program override `buildCommand` anyway.
-  const detector = new AgentDetector({ claude_code: process.execPath });
+  const detector = new AgentDetector({ claude_code: process.execPath, antigravity: process.execPath });
   const runner = new AutonomousRunner(detector);
 
   test('should use a 10-minute silence watchdog by default', () => {
@@ -1382,7 +1383,7 @@ describe('AutonomousRunner Tests', () => {
         createdAt: now,
         updatedAt: now,
         receiverSessionId: '',
-        workspacePath: process.cwd(),
+        workspace: testWorkspace(process.cwd()),
         summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
         rounds: [
           {

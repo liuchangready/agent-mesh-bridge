@@ -1,3 +1,4 @@
+import { getTaskExecutionPath } from './types';
 import * as child_process from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -248,7 +249,13 @@ export class CallbackManager extends EventEmitter {
     let ownsExecutionRegistration = reviewerPreparation?.executionLease?.owned ?? false;
     try {
       if (!executionRegistration) {
-        executionRegistration = executionRegistry.begin(thread.threadId, reviewRound.round, thread.initiatorAgent, thread.workspacePath);
+        executionRegistration = executionRegistry.begin(
+          thread.threadId,
+          reviewRound.round,
+          thread.initiatorAgent,
+          getTaskExecutionPath(thread),
+          'reviewer',
+        );
         ownsExecutionRegistration = true;
       }
     } catch (error: any) {
@@ -467,7 +474,13 @@ export class CallbackManager extends EventEmitter {
     const executionRegistry = new TaskExecutionRegistry(storageRoot);
     let executionRegistration: TaskExecutionRegistration;
     try {
-      executionRegistration = executionRegistry.begin(thread.threadId, roundNumber, thread.initiatorAgent, thread.workspacePath);
+      executionRegistration = executionRegistry.begin(
+        thread.threadId,
+        roundNumber,
+        thread.initiatorAgent,
+        getTaskExecutionPath(thread),
+        'reviewer',
+      );
     } catch (error: any) {
       nativeLock.release(sessionLease); roleLock.release(roleLease); this.wakeQueue.release(callerSessionId); executionRegistry.dispose();
       console.warn(`[CallbackManager] Failure wake registration failed for ${thread.threadId}: ${error?.message || error}`);
@@ -566,7 +579,7 @@ export class CallbackManager extends EventEmitter {
     }
 
     if ((!callerSessionId || !isValidSessionId(callerSessionId)) && this.detector) {
-      callerSessionId = this.detector.detectActiveSession(initiator, thread.worktree?.repositoryPath || thread.workspacePath, [
+      callerSessionId = this.detector.detectActiveSession(initiator, getTaskExecutionPath(thread), [
         thread.receiverSessionId,
       ]);
       if (callerSessionId) {
@@ -599,7 +612,7 @@ export class CallbackManager extends EventEmitter {
   ): boolean {
     assertCanExecute(thread.initiatorAgent, 'resume as a reviewer', 'initiator');
     const initiator = thread.initiatorAgent;
-    const cwd = thread.workspacePath || process.cwd();
+    const cwd = getTaskExecutionPath(thread);
     // Wake the caller on its SENDER-side default model, which is configured
     // separately from the receiver-side default: the same agent can dispatch a
     // task to itself and execute it with a different model. An empty sender

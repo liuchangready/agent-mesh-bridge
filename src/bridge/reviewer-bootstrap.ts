@@ -1,3 +1,4 @@
+import { getTaskExecutionPath } from './types';
 /**
  * Dedicated reviewer bootstrap (plan B).
  *
@@ -338,7 +339,7 @@ export function findSolePendingBootstrap(
   const inWorkspace = query.workspacePath
     ? candidates.filter((record) => {
         const thread = query.taskStore.getTask(record.threadId);
-        return !!thread && sameWorkspace(thread.workspacePath, query.workspacePath as string);
+        return !!thread && sameWorkspace(getTaskExecutionPath(thread), query.workspacePath as string);
       })
     : [];
   if (inWorkspace.length === 1) return inWorkspace[0];
@@ -547,7 +548,8 @@ export class ReviewerBootstrapService {
         thread.threadId,
         0,
         thread.initiatorAgent,
-        thread.workspacePath,
+        getTaskExecutionPath(thread),
+        'bootstrap',
       );
     } catch (error: any) {
       roleLock.release(roleLease);
@@ -595,7 +597,7 @@ export class ReviewerBootstrapService {
         isRework: resumeReviewerSession,
         receiverSessionId: preassigned,
         title: `Reviewer bootstrap: ${thread.title}`,
-        cwd: thread.workspacePath,
+        cwd: getTaskExecutionPath(thread),
         taskThreadId: thread.threadId,
         artifactDir: thread.artifactDir,
         taskRound: 0,
