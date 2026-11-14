@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 ﻿import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as fs from 'fs';
@@ -49,7 +50,7 @@ function thread(threadId: string, worktree: WorktreeInfo): DelegationThread {
     createdAt: now,
     updatedAt: now,
     receiverSessionId: `session-${threadId}`,
-    workspacePath: worktree.path,
+    workspace: testWorkspace(worktree.path),
     summary: { lastPromptSnippet: 'review', lastOutputSnippet: 'approved', totalDurationMs: 1 },
     rounds: [
       {

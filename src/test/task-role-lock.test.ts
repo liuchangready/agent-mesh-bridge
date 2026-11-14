@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -29,7 +30,7 @@ function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread
     updatedAt: new Date().toISOString(),
     receiverSessionId: 'session-role-0001',
     callerSessionId: 'rollout-role-0001',
-    workspacePath: os.tmpdir(),
+    workspace: testWorkspace(os.tmpdir()),
     summary: {
       lastPromptSnippet: 'do the work',
       lastOutputSnippet: 'Executing...',

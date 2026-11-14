@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -52,7 +53,7 @@ function task(overrides: Partial<DelegationThread> = {}): DelegationThread {
     reviewerSessionCaptured: true,
     reviewFlow: 'dedicated',
     reviewBootstrap: { phase: 'confirmed', attempts: 1 },
-    workspacePath: os.tmpdir(),
+    workspace: testWorkspace(os.tmpdir()),
     summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
     rounds: [round(1, 'completed', 'initial'), round(2, 'failed')],
     ...overrides,

@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, after } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as fs from 'fs';
@@ -45,7 +46,7 @@ function makeThread(threadId: string, worktree: ReturnType<typeof createTaskWork
   const now = new Date().toISOString();
   return {
     threadId, title: threadId, initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'waiting_review', currentRound: 1,
-    createdAt: now, updatedAt: now, receiverSessionId: `session-${threadId}`, workspacePath: worktree.path,
+    createdAt: now, updatedAt: now, receiverSessionId: `session-${threadId}`, workspace: testWorkspace(worktree.path),
     summary: { lastPromptSnippet: 'review', lastOutputSnippet: 'done', totalDurationMs: 1 },
     rounds: [{ round: 1, type: 'initial', prompt: 'change', output: 'changed file', durationMs: 1, status: 'completed', timestamp: now }],
     worktree: { ...worktree, headCommit: worktree.headCommit, integration: { phase: 'ready', updatedAt: now } },

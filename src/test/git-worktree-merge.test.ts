@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as fs from 'fs';
@@ -60,7 +61,7 @@ function thread(threadId: string, worktree: WorktreeInfo): DelegationThread {
   return {
     threadId, title: threadId, initiatorAgent: 'codex', targetAgent: 'claude_code',
     status: 'waiting_merge', currentRound: 1, createdAt: now, updatedAt: now,
-    receiverSessionId: `session-${threadId}`, workspacePath: worktree.path,
+    receiverSessionId: `session-${threadId}`, workspace: testWorkspace(worktree.path),
     summary: { lastPromptSnippet: 'review', lastOutputSnippet: 'approved', totalDurationMs: 1 },
     rounds: [{ round: 1, type: 'initial', prompt: 'change one line', output: 'done', durationMs: 1, status: 'completed', timestamp: now }],
     worktree: { ...worktree, approvedCommit: worktree.headCommit, integration: { phase: 'waiting', sourceCommit: worktree.headCommit, updatedAt: now } },
@@ -153,7 +154,7 @@ test('two tasks edit the same file in independent worktrees and integrate serial
   const callback = new CallbackManager(detector, storage); const registry = new TaskExecutionRegistry(storage);
   const dispatcher = new AsyncDispatcher(store, new ActiveAgentResolver(detector), runner, callback, detector, registry);
   const dispatchResult = await Promise.race([
-    dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'dispatch during validation', prompt: 'independent task', workspacePath: repository }),
+    dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'dispatch during validation', prompt: 'independent task', workspaceRoot: repository }),
     new Promise<never>((_, reject) => { const timer = setTimeout(() => reject(new Error('new dispatch waited on final integration lock')), 3_000); timer.unref(); }),
   ]);
   const admitted = store.getTask(dispatchResult.threadId)!;
@@ -599,7 +600,7 @@ test('a dead reviewer launcher does not permit merge while its native child live
   const worktree = createTaskWorktree(target, 'thread_reviewer_child_live', storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A approved\nmiddle\nbeta\n');
   worktree.headCommit = commitTaskChanges(worktree, 'approved');
-  const store = new TaskStore(storage); t.after(() => { store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
+  const store = new TaskStore(storage); t.after(() => { store.dispose(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); });
   store.upsertTask(thread('thread_reviewer_child_live', worktree));
   const roles = new TaskRoleLock(storage); const lease = roles.tryAcquire('thread_reviewer_child_live', 'reviewer'); assert.ok(lease);
   const liveReviewer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });

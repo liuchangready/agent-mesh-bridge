@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'node:fs';
@@ -28,7 +29,7 @@ function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread
     updatedAt: '2026-11-01T00:10:00.000Z',
     receiverSessionId: 'receiver-session-1',
     callerSessionId: 'caller-session-1',
-    workspacePath: path.join(os.tmpdir(), 'bridge-workspace-summary'),
+    workspace: testWorkspace(path.join(os.tmpdir(), 'bridge-workspace-summary')),
     summary: { lastPromptSnippet: 'p', lastOutputSnippet: 'o', totalDurationMs: 10 },
     rounds: [
       {

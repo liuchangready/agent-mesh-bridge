@@ -494,8 +494,9 @@ export class MergeCoordinator {
           .map((value) => ({ value, branch: value.match(/^branch (.+)$/m)?.[1], worktree: value.match(/^worktree (.+)$/m)?.[1] }))
           .find((item) => item.branch === `refs/heads/${worktree.taskBranch}` && item.worktree && fs.existsSync(item.worktree));
         if (moved?.worktree) {
-          const updated = structuredClone(thread); updated.worktree!.path = moved.worktree; updated.workspacePath = moved.worktree; this.store.upsertTask(updated);
+          const updated = structuredClone(thread); updated.worktree!.path = moved.worktree; updated.workspace.executionPath = moved.worktree; this.store.upsertTask(updated);
           worktree.path = moved.worktree;
+          thread.workspace.executionPath = moved.worktree;
         } else {
           const reason = `Task worktree ${worktree.path} is missing and no registered worktree for ${worktree.taskBranch} was found.`;
           this.finishBlocked(threadId, reason, '', worktree.approvedCommit!); return { status: 'blocked', message: reason };

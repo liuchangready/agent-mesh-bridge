@@ -1,3 +1,4 @@
+import { getTaskExecutionPath } from '../bridge/types';
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { TaskStore } from '../bridge/task-store';
@@ -945,7 +946,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
       }
       <div class="meta-item">
         <div class="meta-label">Workspace</div>
-        <div class="meta-val">${escapeHtml(thread.workspacePath)}</div>
+        <div class="meta-val">${escapeHtml(getTaskExecutionPath(thread))}</div>
       </div>
       <div class="meta-item" style="grid-column:1/-1;">
         <div class="meta-label">Native Session Compaction / 原生会话压缩</div>

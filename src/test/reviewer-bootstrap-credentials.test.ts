@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe, beforeEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -76,7 +77,7 @@ describe('dedicated reviewer bootstrap identity', () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       receiverSessionId: `receiver-${threadId}`,
-      workspacePath: tempDir,
+      workspace: testWorkspace(tempDir),
       reviewFlow: 'dedicated',
       reviewerModel: 'gpt-6-pro',
       targetModel: 'flash',
@@ -176,7 +177,7 @@ describe('dedicated reviewer bootstrap identity', () => {
       const noGitWorkspace = path.join(isolatedHome, 'no-git-workspace');
       fs.mkdirSync(noGitWorkspace, { recursive: true });
       fs.writeFileSync(path.join(noGitWorkspace, '.git'), 'invalid git directory marker');
-      const res = await callDispatch({ targetAgent: 'claude_code', title: 'No Git repository', prompt: 'must fail', workspacePath: noGitWorkspace });
+      const res = await callDispatch({ targetAgent: 'claude_code', title: 'No Git repository', prompt: 'must fail', workspaceRoot: noGitWorkspace });
       assert.ok(res.error, JSON.stringify(res));
       assert.match(String(res.error.message), /Git|repository|HEAD/i);
     } finally {

@@ -1,3 +1,4 @@
+import { getTaskExecutionPath } from './types';
 import * as crypto from 'crypto';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
@@ -291,7 +292,7 @@ export class NativeSessionCompactor {
             threadId,
             currentRound?.round || thread!.currentRound || 1,
             agent,
-            thread!.worktree?.path || thread!.workspacePath,
+            getTaskExecutionPath(thread!),
             'maintenance',
           ),
           owned: true,
@@ -354,7 +355,7 @@ export class NativeSessionCompactor {
         try {
           const executable = agent === 'codex' ? this.detector.resolveExecutable('codex') : undefined;
           recovered = !!executable && !!latestOperation.model && await this.codex.probeResume({
-            executable, sessionId: sessionId!, cwd: thread.worktree?.path || thread.workspacePath,
+            executable, sessionId: sessionId!, cwd: getTaskExecutionPath(thread),
             model: latestOperation.model || model || '', operationId: latestOperation.id,
             role, cancelled: () => !!new CancellationRegistry(root).peek(threadId),
             onChildPid: (pid) => {
@@ -541,7 +542,7 @@ export class NativeSessionCompactor {
     this.store.upsertTask(thread);
     try {
       const result = await this.codex.compact({
-        executable, sessionId, cwd: thread.worktree?.path || thread.workspacePath, model, operationId: id, role: role as 'developer' | 'reviewer',
+        executable, sessionId, cwd: getTaskExecutionPath(thread), model, operationId: id, role: role as 'developer' | 'reviewer',
         expectedProviderId: identity.providerId,
         cancelled: () => !!cancellation.peek(thread.threadId),
         onUsage: (usage) => this.recordMaintenanceUsage(thread.threadId, latest.round, id, role, agent, model, usage),
@@ -593,7 +594,7 @@ export class NativeSessionCompactor {
       try { fs.appendFileSync(operation.logPath, `${JSON.stringify({ at: operation.finishedAt, operationId: id, phase: operation.phase, errorCode: operation.errorCode, error: operation.error })}\n`); } catch {}
       if (operation.phase === 'interrupted') return { pauseReason: 'Automatic compaction was cancelled; the task must remain paused.' };
       try {
-        const healthy = await this.codex.probeResume({ executable, sessionId, cwd: thread.worktree?.path || thread.workspacePath, model, operationId: id, role: role as 'developer' | 'reviewer', cancelled: () => !!cancellation.peek(thread.threadId), onChildPid: bindChild });
+        const healthy = await this.codex.probeResume({ executable, sessionId, cwd: getTaskExecutionPath(thread), model, operationId: id, role: role as 'developer' | 'reviewer', cancelled: () => !!cancellation.peek(thread.threadId), onChildPid: bindChild });
         if (healthy) return { warning: 'Automatic compaction outcome is unknown; same-ID read-only recovery succeeded and the recovery document remains pending.' };
       } catch {}
       const reason = `Native session ${sessionId} could not be proven healthy after automatic operation ${id}; compression was not replayed.`;
@@ -756,7 +757,7 @@ export class NativeSessionCompactor {
         threadId,
         freshRound.round,
         agent,
-        thread.worktree?.path || thread.workspacePath,
+        getTaskExecutionPath(thread),
         'maintenance',
       );
     } catch (error) {
@@ -788,7 +789,7 @@ export class NativeSessionCompactor {
       operation.revision++;
       this.store.upsertTask(thread);
       const result = await this.codex.compact({
-        executable, sessionId: nativeSessionId, cwd: thread.worktree?.path || thread.workspacePath, model, operationId: id, role: role as 'developer' | 'reviewer',
+        executable, sessionId: nativeSessionId, cwd: getTaskExecutionPath(thread), model, operationId: id, role: role as 'developer' | 'reviewer',
         expectedProviderId: identity.providerId,
         cancelled: isNewCancellation,
         onUsage: (usage) => this.recordMaintenanceUsage(threadId, round!.round, id, role, agent, model!, usage),

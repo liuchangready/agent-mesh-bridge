@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -31,7 +32,7 @@ function makeDedicatedTask(
     createdAt: now,
     updatedAt: now,
     receiverSessionId: 'receiver-session-original',
-    workspacePath: os.tmpdir(),
+    workspace: testWorkspace(os.tmpdir()),
     reviewFlow: 'dedicated',
     reviewBootstrap: { phase, attempts: 1, launchedAt: now },
     summary: {
@@ -115,7 +116,7 @@ describe('dedicated reviewer bootstrap pause/resume lifecycle', () => {
       const id = 'thread_bootstrap_pending_resume';
       const token = 'one-shot-token-kept-across-pause';
       store.upsertTask(makeDedicatedTask(id, 'launching', {
-        workspacePath: path.join(dir, 'workspace'),
+        workspace: testWorkspace(path.join(dir, 'workspace')),
       }));
       assert.equal(writeReviewerBootstrapToken({
         threadId: id,
@@ -150,7 +151,7 @@ describe('dedicated reviewer bootstrap pause/resume lifecycle', () => {
     await withFixture(async ({ dir, store, controller, runner }) => {
       const id = 'thread_bootstrap_missing_session';
       store.upsertTask(makeDedicatedTask(id, 'confirmed', {
-        workspacePath: path.join(dir, 'workspace'),
+        workspace: testWorkspace(path.join(dir, 'workspace')),
         reviewerSessionCaptured: false,
       }));
       // No token file models the one-shot confirmation token already being consumed.
@@ -194,7 +195,7 @@ describe('dedicated reviewer bootstrap pause/resume lifecycle', () => {
         reviewerSessionCaptured: true,
         reviewerSessionId: 'reviewer-session-captured',
         callerSessionId: 'reviewer-session-captured',
-        workspacePath: path.join(dir, 'workspace'),
+        workspace: testWorkspace(path.join(dir, 'workspace')),
       }));
 
       const taskControl = new TaskControlService(

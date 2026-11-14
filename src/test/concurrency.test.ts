@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -56,7 +57,7 @@ function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread
     createdAt: now,
     updatedAt: now,
     receiverSessionId: 'receiver-session-0001',
-    workspacePath: os.tmpdir(),
+    workspace: testWorkspace(os.tmpdir()),
     summary: { lastPromptSnippet: 'work', lastOutputSnippet: 'done', totalDurationMs: 1 },
     rounds: [{ round: 1, type: 'initial', prompt: 'work', output: 'done', status: 'completed', durationMs: 1, timestamp: now }],
     ...overrides,
@@ -160,15 +161,15 @@ describe('AsyncDispatcher - independent task admission', () => {
 
   test('same-file tasks in one repository run concurrently in isolated worktrees', async () => {
     saveBridgePolicy({ concurrency: { enabled: false } });
-    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'A', prompt: 'edit a', workspacePath: workspace });
+    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'A', prompt: 'edit a', workspaceRoot: workspace });
     assert.strictEqual(first.status, 'DISPATCHED');
     await waitFor(() => started.length === 1);
 
-    const conflict = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'B same file', prompt: 'edit a too', workspacePath: workspace });
+    const conflict = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'B same file', prompt: 'edit a too', workspaceRoot: workspace });
     assert.strictEqual(conflict.status, 'DISPATCHED');
     await waitFor(() => started.length === 2);
 
-    const disjoint = await dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'C disjoint', prompt: 'edit c', workspacePath: workspace });
+    const disjoint = await dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'C disjoint', prompt: 'edit c', workspaceRoot: workspace });
     assert.strictEqual(disjoint.status, 'DISPATCHED', disjoint.message);
     await waitFor(() => started.length === 3);
     assert.strictEqual(maxActive, 3, 'the runner promises overlap in wall time, not merely in dispatcher return statuses');
@@ -187,7 +188,7 @@ describe('AsyncDispatcher - independent task admission', () => {
       await held;
       return { exitCode: 0, stdout: 'Streaming chunk 1\nStreaming chunk 2\nTask completed', stderr: '', extractedOutput: 'Task completed successfully', durationMs: 150 };
     };
-    const task = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Streaming', prompt: 'stream output', workspacePath: workspace });
+    const task = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Streaming', prompt: 'stream output', workspaceRoot: workspace });
     try {
       await waitFor(() => chunkSeen);
       await waitFor(() => !!taskStore.getTask(task.threadId)?.rounds[0].output?.includes('Streaming chunk'));
@@ -214,7 +215,7 @@ describe('AsyncDispatcher - independent task admission', () => {
       await held;
       return { exitCode: 0, stdout: rawLogText, stderr: '', extractedOutput: rawLogText, durationMs: 50 };
     };
-    const task = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'High volume log', prompt: 'emit 1500 lines', workspacePath: workspace });
+    const task = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'High volume log', prompt: 'emit 1500 lines', workspaceRoot: workspace });
     supervisor.checkPendingTasks();
     try {
       await waitFor(() => logChunkSeen);
@@ -240,7 +241,7 @@ describe('AsyncDispatcher - independent task admission', () => {
     const legacy = { token: 'legacy', pid: process.pid, threadId: 'old-thread', round: 1, acquiredAt: Date.now(), updatedAt: Date.now() };
     fs.writeFileSync(path.join(tempDir, 'execution.lock'), JSON.stringify(legacy));
     saveBridgePolicy({ concurrency: { enabled: false } });
-    const task = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Independent', prompt: 'edit', workspacePath: workspace });
+    const task = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Independent', prompt: 'edit', workspaceRoot: workspace });
     assert.strictEqual(task.status, 'DISPATCHED');
     await waitFor(() => started.length === 1);
     assert.strictEqual(taskStore.getTask(task.threadId)?.status, 'running');
@@ -249,25 +250,25 @@ describe('AsyncDispatcher - independent task admission', () => {
 
   test('enabled limits queue only after observed registrations reach the cap', async () => {
     saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 1, maxConcurrentPerAgent: 2 } });
-    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Limited A', prompt: 'a', workspacePath: workspace });
+    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Limited A', prompt: 'a', workspaceRoot: workspace });
     assert.strictEqual(first.status, 'DISPATCHED');
     await waitFor(() => started.length === 1);
-    const second = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Limited B', prompt: 'b', workspacePath: workspace });
+    const second = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Limited B', prompt: 'b', workspaceRoot: workspace });
     assert.strictEqual(second.status, 'QUEUED');
     assert.match(second.message, /limit reached/i);
   });
 
   test('a per-agent cap skips only that agent and still starts a different agent candidate', async () => {
     saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 3, maxConcurrentPerAgent: 1 } });
-    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Codex active', prompt: 'a', workspacePath: workspace });
+    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Codex active', prompt: 'a', workspaceRoot: workspace });
     assert.strictEqual(first.status, 'DISPATCHED');
     await waitFor(() => started.length === 1);
 
-    const sameAgent = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Codex queued', prompt: 'b', workspacePath: workspace });
+    const sameAgent = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Codex queued', prompt: 'b', workspaceRoot: workspace });
     assert.strictEqual(sameAgent.status, 'QUEUED');
     assert.match(sameAgent.message, /agent codex/i);
 
-    const otherAgent = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Other agent', prompt: 'c', workspacePath: workspace });
+    const otherAgent = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Other agent', prompt: 'c', workspaceRoot: workspace });
     assert.strictEqual(otherAgent.status, 'DISPATCHED', otherAgent.message);
     await waitFor(() => started.length === 2);
     assert.deepStrictEqual(started.slice().sort(), ['Codex active', 'Other agent']);
@@ -312,7 +313,7 @@ describe('AsyncDispatcher - independent task admission', () => {
 
 function makePendingThread(threadId: string, workspacePath: string, createdAt: string): DelegationThread {
   return makeThread({
-    threadId, title: threadId, status: 'running', workspacePath, createdAt, updatedAt: createdAt,
+    threadId, title: threadId, status: 'running', workspace: testWorkspace(workspacePath), createdAt, updatedAt: createdAt,
     currentRound: 1,
     rounds: [{ round: 1, type: 'initial', prompt: 'work ' + threadId, status: 'running', durationMs: 0, timestamp: createdAt }],
   });
@@ -338,7 +339,7 @@ describe('QueueDrainer - scan every runnable candidate', () => {
     const started: string[] = [];
     const drainer = new QueueDrainer(store, registry, () => false, async (target) => {
       started.push(target.thread.threadId);
-      registry.begin(target.thread.threadId, target.round.round, target.thread.targetAgent, target.thread.workspacePath);
+      registry.begin(target.thread.threadId, target.round.round, target.thread.targetAgent, target.thread.workspace.executionPath);
     });
     await drainer.drain();
     assert.deepStrictEqual(started, ['ready']);

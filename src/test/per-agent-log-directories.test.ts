@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -203,7 +204,7 @@ describe('Per-agent log directories with worker_log, reviewer_log, Archive', () 
         targetAgent: 'codex',
         initiatorAgent: 'antigravity',
         receiverSessionId: 'sess_rec_123',
-        workspacePath: root,
+        workspace: testWorkspace(root),
         targetModel: 'gpt-5-pro',
         reviewerModel: 'gemini-2.5-pro',
         createdAt: new Date().toISOString(),
@@ -378,7 +379,7 @@ describe('Per-agent log directories with worker_log, reviewer_log, Archive', () 
         targetAgent: 'codex',
         initiatorAgent: 'antigravity',
         receiverSessionId: 'sess_rec_456',
-        workspacePath: root,
+        workspace: testWorkspace(root),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         currentRound: 1,

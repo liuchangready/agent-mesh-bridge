@@ -14,7 +14,7 @@ describe('RateLimitTracker & Agent Status Tests', () => {
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-rate-limit-test-'));
     tracker = new RateLimitTracker(tempDir);
-    detector = new AgentDetector(undefined, tracker);
+    detector = new AgentDetector({ antigravity: process.execPath }, tracker);
   });
 
   afterEach(() => {

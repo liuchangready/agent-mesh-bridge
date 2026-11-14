@@ -1,8 +1,10 @@
+import { getTaskExecutionPath } from './bridge/types';
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { TaskStore } from './bridge/task-store';
+import { WorkspaceRegistry, WindowWorkspace, physicalDirectory } from './bridge/workspace';
 import { AgentDetector } from './bridge/agent-detector';
 import { ActiveAgentResolver, applyConfiguredAgentDefault } from './bridge/active-agent-resolver';
 import { AutonomousRunner } from './bridge/autonomous-runner';
@@ -275,6 +277,22 @@ export function activate(context: vscode.ExtensionContext) {
 
   // 2. Initialize Core Services
   const taskStore = TaskStore.getInstance();
+  const workspaceStorage = path.dirname(taskStore.getStoragePath());
+  const workspaceRegistry = new WorkspaceRegistry(workspaceStorage);
+  const currentWindowRoots = (): string[] => (vscode.workspace.workspaceFolders || []).flatMap((folder) => {
+    if (folder.uri.scheme !== 'file') return [];
+    try { return [physicalDirectory(folder.uri.fsPath)]; } catch { return []; }
+  });
+  const windowWorkspace = new WindowWorkspace(workspaceStorage, currentWindowRoots());
+  const knownWorkspaceTasks = new Set(taskStore.getAllTasks().map((task) => task.threadId));
+  const windowHeartbeat = setInterval(() => {
+    try { windowWorkspace.publish(); } catch (error) { console.warn('[Agent Mesh Bridge] Workspace heartbeat failed:', error); }
+  }, 10000);
+  context.subscriptions.push({ dispose: () => { clearInterval(windowHeartbeat); windowWorkspace.dispose(); } });
+  context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => {
+    windowWorkspace.context.folderRoots = currentWindowRoots();
+    windowWorkspace.publish();
+  }));
   const detector = new AgentDetector(customPaths);
   const nativeSessionCompactor = new NativeSessionCompactor(taskStore, detector);
   // Ledger retention: keep the newest N tasks hot, archive older terminal ones.
@@ -536,9 +554,23 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(statusBar.getStatusBarItem());
 
   // 4. Tree Views
-  const agentNodesProvider = new AgentNodesProvider(detector, resolver);
-  const activeTreeProvider = new TaskTreeProvider(taskStore, 'active');
-  const recentTreeProvider = new TaskTreeProvider(taskStore, 'all');
+  const agentNodesProvider = new AgentNodesProvider(detector, resolver, () => {
+    const id = windowWorkspace.context.defaultWorkspaceId;
+    return (id && workspaceRegistry.get(id)?.rootPath) || 'Not selected';
+  });
+  let workspaceView: 'all' | 'current' | string = config.get<string>('workspace.taskViewScope') === 'current' ? 'current' : 'all';
+  const selectedWorkspace = () => workspaceView === 'all' ? undefined :
+    workspaceView === 'current' ? (windowWorkspace.context.defaultWorkspaceId || '__no_current_workspace__') : workspaceView;
+  const activeTreeProvider = new TaskTreeProvider(taskStore, 'active', selectedWorkspace);
+  const recentTreeProvider = new TaskTreeProvider(taskStore, 'all', selectedWorkspace);
+  taskStore.on('changed', () => {
+    const candidates = taskStore.getAllTasks().filter((task) => !knownWorkspaceTasks.has(task.threadId) && task.workspace?.dispatchAccepted)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.threadId.localeCompare(b.threadId));
+    for (const task of candidates) {
+      knownWorkspaceTasks.add(task.threadId);
+      if (windowWorkspace.adopt(task.workspace)) { activeTreeProvider.refresh(); recentTreeProvider.refresh(); void agentNodesProvider.refresh(false); }
+    }
+  });
 
   const agentNodesTreeView = vscode.window.createTreeView('agent-mesh-bridge.agent-nodes', {
     treeDataProvider: agentNodesProvider,
@@ -824,6 +856,32 @@ export function activate(context: vscode.ExtensionContext) {
       recentTreeProvider.refresh();
       statusBar.update();
       vscode.window.showInformationMessage('Agent Mesh Bridge: Tasks refreshed.');
+    }),
+
+    vscode.commands.registerCommand('agent-mesh-bridge.selectWorkspace', async () => {
+      const entries = workspaceRegistry.list().map((workspace) => ({ label: workspace.name, description: workspace.rootPath, id: workspace.id }));
+      const choice = await vscode.window.showQuickPick([...entries, { label: 'Browse for folder...', description: '', id: '' }], { placeHolder: 'Select this window’s default Bridge workspace' });
+      if (!choice) return;
+      let id = choice.id;
+      if (!id) {
+        const folders = await vscode.window.showOpenDialog({ canSelectFolders: true, canSelectFiles: false, canSelectMany: false });
+        if (!folders?.length || folders[0].scheme !== 'file') return;
+        id = workspaceRegistry.register(folders[0].fsPath, 'user').id;
+      }
+      windowWorkspace.setDefault(id);
+      activeTreeProvider.refresh(); recentTreeProvider.refresh(); void agentNodesProvider.refresh(false);
+    }),
+    vscode.commands.registerCommand('agent-mesh-bridge.clearWorkspace', () => {
+      windowWorkspace.setDefault(undefined);
+      activeTreeProvider.refresh(); recentTreeProvider.refresh(); void agentNodesProvider.refresh(false);
+    }),
+    vscode.commands.registerCommand('agent-mesh-bridge.filterWorkspaces', async () => {
+      const options = [{ label: 'All workspaces', id: 'all' }, { label: 'Current workspace', id: 'current' },
+        ...workspaceRegistry.list().map((workspace) => ({ label: workspace.name, description: workspace.rootPath, id: workspace.id }))];
+      const choice = await vscode.window.showQuickPick(options, { placeHolder: 'Filter task views' });
+      if (!choice) return;
+      workspaceView = choice.id;
+      activeTreeProvider.refresh(); recentTreeProvider.refresh();
     }),
 
     vscode.commands.registerCommand('agent-mesh-bridge.selectActiveAgent', async () => {
@@ -1424,7 +1482,7 @@ export function activate(context: vscode.ExtensionContext) {
         if (!thread.callerSessionId) {
           const detected = detector.detectActiveSession(
             thread.initiatorAgent,
-            thread.workspacePath,
+            getTaskExecutionPath(thread),
             [thread.receiverSessionId],
           );
           const input = await vscode.window.showInputBox({

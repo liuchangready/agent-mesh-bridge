@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -52,7 +53,7 @@ function makeThread(rounds: DelegationRound[], currentRound: number): Delegation
     createdAt: '2026-10-19T00:00:00.000Z',
     updatedAt: '2026-10-19T00:00:00.000Z',
     receiverSessionId: 'receiver-session-0001',
-    workspacePath: os.tmpdir(),
+    workspace: testWorkspace(os.tmpdir()),
     summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
     rounds,
   };

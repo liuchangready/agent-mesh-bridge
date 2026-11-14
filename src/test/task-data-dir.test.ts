@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as fs from 'fs';
@@ -154,7 +155,7 @@ test('archive and cleanup stay inside the task directory and never delete the ar
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     receiverSessionId: '',
-    workspacePath: path.join(dirs.worktreeDir),
+    workspace: testWorkspace(path.join(dirs.worktreeDir)),
     artifactDir: dirs.artifactDir,
     taskDataDir: dirs.artifactDir,
     rounds: [],
@@ -213,7 +214,7 @@ test('TaskStore.deleteTask removes a task directory and its bootstrap credential
     createdAt: now,
     updatedAt: now,
     receiverSessionId: '',
-    workspacePath: path.join(storage, 'workspace'),
+    workspace: testWorkspace(path.join(storage, 'workspace')),
     artifactDir: dirs.artifactDir,
     taskDataDir: dirs.artifactDir,
     rounds: [],
@@ -255,7 +256,7 @@ test('delete_task removes the unified directory including its worktree', async (
     createdAt: now,
     updatedAt: now,
     receiverSessionId: '',
-    workspacePath: worktree.path,
+    workspace: testWorkspace(worktree.path),
     artifactDir: dirs.artifactDir,
     taskDataDir: dirs.artifactDir,
     worktree: { ...worktree, headCommit: worktree.baseCommit },
@@ -318,7 +319,7 @@ test('TaskStore.archiveTask keeps overlays, rounds and sessions when an overlay 
     createdAt: now,
     updatedAt: now,
     receiverSessionId: 'receiver-session-eio',
-    workspacePath: path.join(dirs.worktreeDir),
+    workspace: testWorkspace(path.join(dirs.worktreeDir)),
     artifactDir: dirs.artifactDir,
     taskDataDir: dirs.artifactDir,
     rounds: [{
@@ -406,7 +407,7 @@ test('dispatch pins the absolute task directory and writes its round log there',
     removeTree(storage);
   });
 
-  const result = await dispatcher.dispatchTask({
+  const result = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
     targetAgent: 'codex',
     initiatorAgent: 'antigravity',
     title: 'Unified dispatch layout',

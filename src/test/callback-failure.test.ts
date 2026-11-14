@@ -1,3 +1,4 @@
+import { testWorkspace } from './workspace-fixture';
 import { test, describe } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -51,7 +52,7 @@ describe('CallbackManager failure wake-ups', () => {
     receiverSessionId: 'session-8b5dc091-3d68-43d9-bd08-05b383c4b972',
     receiverSessionCaptured: true,
     callerSessionId: 'caller-codex-session-1',
-    workspacePath: process.cwd(),
+    workspace: testWorkspace(process.cwd()),
     summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 857_740 },
     rounds: [
       { ...failedRound(), round: 1, type: 'initial' },
