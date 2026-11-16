@@ -240,7 +240,7 @@ export class ReworkController {
     const resumesNativeSession = shouldResumeNativeSession(thread, reworkRound);
 
     thread.currentRound = nextRound;
-    thread.status = resumesNativeSession ? 'reworking' : 'running';
+    thread.status = 'running';
     thread.interruption = undefined;
     thread.updatedAt = nowIso;
     if (thread.reviewFlow === 'dedicated') {
@@ -394,7 +394,7 @@ export class ReworkController {
     // Never rewind the thread's notion of "latest round"; retrying an older
     // round must not make a newer one look current again.
     thread.currentRound = Math.max(thread.currentRound || 1, failedRound.round);
-    thread.status = isRework ? 'reworking' : 'running';
+    thread.status = 'running';
     thread.interruption = undefined;
     thread.updatedAt = nowIso;
     thread.summary.lastPromptSnippet = (failedRound.prompt || '').slice(0, 100);
@@ -655,7 +655,7 @@ export class ReworkController {
     pausedRound.interruption = undefined;
     pausedRound.timestamp = nowIso;
     thread.currentRound = Math.max(thread.currentRound || 1, pausedRound.round);
-    thread.status = isRework ? 'reworking' : 'running';
+    thread.status = 'running';
     thread.interruption = undefined;
     thread.updatedAt = nowIso;
     thread.summary.lastPromptSnippet = (pausedRound.prompt || '').slice(0, 100);
@@ -1111,7 +1111,7 @@ export class ReworkController {
 
     try {
       const current = thread;
-      current.status = isRework ? 'reworking' : 'running';
+      current.status = 'running';
       current.summary.lastOutputSnippet = 'Executing in background...';
       this.taskStore.upsertTask(current);
       thread = current;
@@ -1337,7 +1337,7 @@ export class ReworkController {
     const freshRound = fresh ? findInFlightRound(fresh) : undefined;
     if (
       !fresh ||
-      (fresh.status !== 'queued' && fresh.status !== 'running' && fresh.status !== 'reworking') ||
+      (fresh.status !== 'queued' && fresh.status !== 'running') ||
       fresh.targetAgent !== thread.targetAgent ||
       fresh.reviewBlocked ||
       isReviewerBootstrapPending(fresh) ||

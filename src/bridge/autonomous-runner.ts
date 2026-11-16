@@ -873,7 +873,7 @@ export class AutonomousRunner {
             const currentCaptured = current && (nativeRole === 'developer' ? current.receiverSessionCaptured : current.reviewerSessionCaptured);
             const allowedStatus = current && (nativeRole === 'developer'
               ? !['paused', 'completed', 'failed', 'archived'].includes(current.status)
-              : current.status === 'queued' || current.status === 'waiting_review' || current.status === 'reworking');
+              : current.status === 'queued' || current.status === 'waiting_review');
             if (cancel || !current || current.archivedAt || currentAgent !== boundAgent ||
                 currentModel !== options.model || !allowedStatus || (currentCaptured && currentSession !== sessionId)) {
               sessionLock.release(nativeLease);

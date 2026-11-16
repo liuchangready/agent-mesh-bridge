@@ -264,7 +264,7 @@ export class TaskSupervisor extends EventEmitter {
         if (!thread || !thread.threadId || this.activeTasks.has(thread.threadId)) return false;
         if (thread.status === 'paused' || thread.status === 'waiting_review') return false;
         if (thread.reviewBlocked || isReviewerBootstrapPending(thread)) return false;
-        return thread.status === 'running' || thread.status === 'reworking' || thread.status === 'queued';
+        return thread.status === 'running' || thread.status === 'queued';
       })
       .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 
@@ -323,7 +323,7 @@ export class TaskSupervisor extends EventEmitter {
     const freshRound = fresh ? findInFlightRound(fresh) : undefined;
     if (
       !fresh ||
-      (fresh.status !== 'queued' && fresh.status !== 'running' && fresh.status !== 'reworking') ||
+      (fresh.status !== 'queued' && fresh.status !== 'running') ||
       fresh.targetAgent !== thread.targetAgent ||
       fresh.reviewBlocked ||
       isReviewerBootstrapPending(fresh) ||
@@ -357,7 +357,7 @@ export class TaskSupervisor extends EventEmitter {
       assertCanExecute(stored.targetAgent, 'run a scheduled task round');
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      if (stored.status === 'queued' || stored.status === 'running' || stored.status === 'reworking') {
+      if (stored.status === 'queued' || stored.status === 'running') {
         const pendingRound = findInFlightRound(stored);
         if (pendingRound) {
           pendingRound.status = 'failed';
@@ -441,7 +441,7 @@ export class TaskSupervisor extends EventEmitter {
     }
 
     try {
-      latest.status = round.type === 'rework' ? 'reworking' : 'running';
+      latest.status = 'running';
       latest.summary.lastOutputSnippet = 'Executing in background...';
       this.taskStore.upsertTask(latest);
     } catch (error) {

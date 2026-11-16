@@ -522,7 +522,7 @@ export class AsyncDispatcher {
         this.taskStore.upsertTask(current);
         return;
       }
-      current.status = isRework ? 'reworking' : 'running';
+      current.status = 'running';
       current.summary.lastOutputSnippet = 'Executing in background...';
       this.taskStore.upsertTask(current);
       thread = current;
@@ -769,7 +769,7 @@ export class AsyncDispatcher {
     const freshRound = fresh ? findInFlightRound(fresh) : undefined;
     if (
       !fresh ||
-      (fresh.status !== 'queued' && fresh.status !== 'running' && fresh.status !== 'reworking') ||
+      (fresh.status !== 'queued' && fresh.status !== 'running') ||
       fresh.targetAgent !== thread.targetAgent ||
       fresh.reviewBlocked ||
       isReviewerBootstrapPending(fresh) ||

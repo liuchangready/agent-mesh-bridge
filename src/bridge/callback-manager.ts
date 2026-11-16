@@ -155,7 +155,6 @@ export class CallbackManager extends EventEmitter {
     if (
       inFlight ||
       thread.status === 'running' ||
-      thread.status === 'reworking' ||
       thread.status === 'queued'
     ) {
       console.warn(

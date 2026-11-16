@@ -75,7 +75,7 @@ export class TaskControlService {
   }
 
   /**
-   * Pause a queued/running/reworking task. The current round is marked
+   * Pause a queued/running task. The current round is marked
    * `paused` and keeps the original prompt so it can be resumed later.
    */
   public pauseTask(threadId: string, reason: string, by: string = 'user'): TaskControlResult {
@@ -216,7 +216,6 @@ export class TaskControlService {
     const normalizedReason = (reason || '').trim() || 'Deleted by user';
     const active =
       thread.status === 'running' ||
-      thread.status === 'reworking' ||
       thread.status === 'queued' ||
       thread.status === 'paused' ||
       thread.status === 'waiting_merge' ||

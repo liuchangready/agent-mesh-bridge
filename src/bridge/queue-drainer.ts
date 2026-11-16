@@ -57,7 +57,7 @@ export class QueueDrainer {
           return false;
         }
         if (thread.reviewBlocked || isReviewerBootstrapPending(thread)) return false;
-        return thread.status === 'queued' || thread.status === 'running' || thread.status === 'reworking';
+        return thread.status === 'queued' || thread.status === 'running';
       })
       .map((thread) => ({ thread, round: findInFlightRound(thread) }))
       .filter((target): target is QueuedExecution => Boolean(target.round?.prompt))

@@ -1207,7 +1207,7 @@ describe('review_failed lifecycle status', () => {
   });
 
   test('never downgrades a task that is no longer waiting for review', () => {
-    for (const status of ['completed', 'reworking', 'paused', 'queued'] as const) {
+    for (const status of ['completed', 'running', 'paused', 'queued'] as const) {
       const thread = baseThread();
       thread.status = status;
       assert.strictEqual(

@@ -12,6 +12,7 @@ import {
   TokenUsageComponent,
   appendInterruption,
   isMergePending,
+  findInFlightRound,
 } from './types';
 import {
   archiveCompletedTaskLogs,
@@ -42,6 +43,19 @@ function canEvictForCapacity(task: DelegationThread): boolean {
     worktree.integration?.phase !== 'validation_failed' &&
     (!worktree.headCommit || worktree.headCommit === worktree.baseCommit)
   );
+}
+
+/**
+ * Normalize legacy thread status in-place.
+ * Historical ledgers may carry `status: 'reworking'`; normalize it to `'running'`
+ * on read while preserving all rounds, sessions, worktree, token usage, and interruptions.
+ */
+export function normalizeThread(thread: DelegationThread): DelegationThread {
+  if (!thread) return thread;
+  if ((thread.status as string) === 'reworking') {
+    thread.status = 'running';
+  }
+  return thread;
 }
 
 /**
@@ -360,7 +374,7 @@ export class TaskStore extends EventEmitter {
         const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
         if (parsed && parsed.threadId && parsed.workspace?.id && parsed.workspace?.executionPath &&
             (!parsed.worktree || parsed.worktree.path === parsed.workspace.executionPath)) {
-          this.tasks.set(parsed.threadId, parsed as DelegationThread);
+          this.tasks.set(parsed.threadId, normalizeThread(parsed as DelegationThread));
           this.knownMtimes.set(name, mtime);
         } else {
           this.tasks.delete(name.slice(0, -'.json'.length));
@@ -534,6 +548,7 @@ export class TaskStore extends EventEmitter {
    * Upsert a task thread.
    */
   public upsertTask(thread: DelegationThread): void {
+    if (thread) normalizeThread(thread);
     const incomingMergeRevision = thread.mergeControl?.revision || 0;
     if (!thread.workspace?.id || !thread.workspace.executionPath ||
         (thread.worktree && thread.workspace.executionPath !== thread.worktree.path)) {
@@ -554,7 +569,7 @@ export class TaskStore extends EventEmitter {
     let onDisk: DelegationThread | undefined;
     try {
       const file = this.threadFilePath(thread.threadId);
-      if (fs.existsSync(file)) onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (fs.existsSync(file)) onDisk = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
     } catch {}
     const inMemory = this.tasks.get(thread.threadId);
     if ((onDisk || inMemory) && onDisk !== thread) {
@@ -835,13 +850,15 @@ export class TaskStore extends EventEmitter {
           (t) =>
             t.status === 'running' ||
             t.status === 'waiting_review' ||
-            t.status === 'reworking' ||
             t.status === 'queued' ||
             t.status === 'waiting_merge' ||
             t.status === 'wait_decision' ||
             t.status === 'merge_failed' ||
             t.status === 'paused',
         );
+      } else if (statusFilter === 'reworking') {
+        // Compatibility alias: match tasks normalized to 'running' whose in-flight round is rework
+        all = all.filter((t) => t.status === 'running' && findInFlightRound(t)?.type === 'rework');
       } else {
         all = all.filter((t) => t.status === statusFilter);
       }
