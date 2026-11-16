@@ -554,7 +554,9 @@ export class MergeCoordinator {
         const safeId = threadId.replace(/[^A-Za-z0-9_-]/g, '_');
         const dir = path.join(latest.artifactDir || path.join(this.storageDir, 'merge-logs', safeId), 'merge_log');
         fs.mkdirSync(dir, { recursive: true });
-        const logPath = path.join(dir, `${safeId}_merge_${number}.log`);
+        let logNumber = number;
+        while (fs.existsSync(path.join(dir, `${safeId}_merge_${logNumber}.log`))) logNumber++;
+        const logPath = path.join(dir, `${safeId}_merge_${logNumber}.log`);
         fs.writeFileSync(logPath, `Merge attempt ${number} for ${threadId}\n`, { encoding: 'utf8', flag: 'wx' });
         const id = crypto.randomUUID();
         this.attemptLogs.set(threadId, { id, number, path: logPath, candidateTree: worktree.approvedSnapshot?.tree });
@@ -778,6 +780,8 @@ export class MergeCoordinator {
         }
       }
     } catch (error) {
+      const failedAttempt = this.attemptLogs.get(threadId);
+      if (failedAttempt) try { fs.appendFileSync(failedAttempt.path, `\n[error] ${String(error)}\n`, 'utf8'); } catch {}
       // If update-ref succeeded but a later transaction/ledger write failed,
       // retain the landed fact and finish the same transaction before reporting.
       if (await this.hasLandedCandidate(threadId)) {
@@ -794,6 +798,7 @@ export class MergeCoordinator {
         }
       }
       if (!this.isMergeStillAllowed(threadId, sourceCommit)) return { status: 'stale', message: 'Task was paused or deleted during integration.' };
+      if (/Could not durably persist task/i.test(String(error))) throw error;
       const latest = this.store.getTask(threadId);
       if (latest?.status === 'waiting_merge' && latest.worktree?.deliveryTarget) {
         const reason = `Could not safely deliver to ${targetRef}: ${String(error)}`;

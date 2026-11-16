@@ -57,6 +57,7 @@ export class ReworkController {
   private readonly mergeCoordinator: MergeCoordinator;
   private readonly mergeWorkers = new Set<string>();
   private readonly blockedMergeRetries = new Map<string, string>();
+  private readonly mergePersistenceRetries = new Map<string, { attempts: number; timer: NodeJS.Timeout }>();
   private mergeWatch?: NodeJS.Timeout;
 
   constructor(
@@ -993,24 +994,43 @@ export class ReworkController {
       if (blockedAt) this.blockedMergeRetries.delete(thread.threadId);
       if (this.mergeWorkers.has(thread.threadId)) continue;
       this.mergeWorkers.add(thread.threadId);
-      void this.mergeApproved(thread.threadId).catch(async (error: any) => {
+      void this.mergeApproved(thread.threadId).then(() => {
+        const previous = this.mergePersistenceRetries.get(thread.threadId);
+        if (previous) { clearTimeout(previous.timer); this.mergePersistenceRetries.delete(thread.threadId); }
+      }).catch(async (error: any) => {
         if (await this.mergeCoordinator.hasLandedCandidate(thread.threadId)) {
           const latest = this.taskStore.getTask(thread.threadId);
           if (latest) this.blockedMergeRetries.set(thread.threadId, latest.updatedAt);
           console.error(`[ReworkController] Target ref is updated for ${thread.threadId}, but its durable ledger record still needs recovery: ${error?.message || error}`);
           return;
         }
-        const latest = this.taskStore.getTask(thread.threadId);
-        if (latest?.status !== 'waiting_merge' || !latest.worktree) return;
+        const current = this.taskStore.getTask(thread.threadId);
+        if (current?.status !== 'waiting_merge' || !current.worktree) return;
+        const latest = structuredClone(current);
         latest.status = 'waiting_merge';
         const failure = `Merge coordinator failed: ${error?.message || error}`;
-        latest.worktree.integration = { ...latest.worktree.integration, phase: 'blocked', error: failure, updatedAt: new Date().toISOString() };
+        latest.worktree!.integration = { ...latest.worktree!.integration, phase: 'blocked', error: failure, updatedAt: new Date().toISOString() };
         const budget = noteMergeFailure(latest, 'coordinator', 'COORDINATOR_ERROR', failure);
         latest.mergeHistory = [...(latest.mergeHistory || []), { id: crypto.randomUUID(), number: (latest.mergeHistory?.length || 0) + 1,
           at: new Date().toISOString(), phase: 'coordinator', result: 'failed', error: failure.slice(-5000), ...budget }];
         latest.summary.lastOutputSnippet = failure;
         try { this.taskStore.upsertTask(latest); }
-        catch (persistError: any) { console.error(`[ReworkController] Could not persist merge failure for ${thread.threadId}: ${persistError?.message || persistError}`); }
+        catch (persistError: any) {
+          console.error(`[ReworkController] Could not persist merge failure for ${thread.threadId}; retrying with backoff: ${persistError?.message || persistError}`);
+          const previous = this.mergePersistenceRetries.get(thread.threadId);
+          if (previous) clearTimeout(previous.timer);
+          const attempts = (previous?.attempts || 0) + 1;
+          this.blockedMergeRetries.set(thread.threadId, current.updatedAt);
+          const timer = setTimeout(() => {
+            this.blockedMergeRetries.delete(thread.threadId);
+            this.resumePendingMerges();
+          }, Math.min(60_000, 3_000 * 2 ** Math.min(attempts - 1, 5)));
+          timer.unref();
+          this.mergePersistenceRetries.set(thread.threadId, { attempts, timer });
+          return;
+        }
+        const previous = this.mergePersistenceRetries.get(thread.threadId);
+        if (previous) { clearTimeout(previous.timer); this.mergePersistenceRetries.delete(thread.threadId); }
         const reviewRound = [...(latest.rounds || [])].reverse().find((round) => round.type !== 'approval');
         if (reviewRound && latest.status === 'waiting_merge') void this.callbackManager.notifyCaller(latest, reviewRound);
       }).finally(() => this.mergeWorkers.delete(thread.threadId));
@@ -1020,6 +1040,8 @@ export class ReworkController {
   public dispose(): void {
     if (this.mergeWatch) clearInterval(this.mergeWatch);
     this.mergeWatch = undefined;
+    for (const retry of this.mergePersistenceRetries.values()) clearTimeout(retry.timer);
+    this.mergePersistenceRetries.clear();
   }
 
   private async executeReworkBackground(

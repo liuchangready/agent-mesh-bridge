@@ -88,13 +88,17 @@ test('pre-ref merge infrastructure failure returns a concrete error to the origi
   const notified: DelegationThread[] = []; callback.notifyCaller = async (thread) => { notified.push(thread); return true; };
   const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector);
   t.after(() => { store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
-  store.upsertTask({ ...makeThread('thread_merge_review_error', worktree), status: 'waiting_merge', worktree: { ...worktree, approvedCommit: worktree.headCommit, integration: { phase: 'waiting', updatedAt: new Date().toISOString() } } });
+  const original = makeThread('thread_merge_review_error', worktree); original.callerSessionId = 'reviewer-session-original';
+  store.upsertTask({ ...original, status: 'waiting_merge', worktree: { ...worktree, approvedCommit: worktree.headCommit, integration: { phase: 'waiting', updatedAt: new Date().toISOString() } } });
   controller.resumePendingMerges();
   await waitFor(() => notified.length === 1);
   const latest = store.getTask('thread_merge_review_error')!;
-  assert.equal(latest.status, 'waiting_review');
+  assert.equal(latest.status, 'waiting_merge');
+  assert.equal(latest.worktree?.approvedCommit, worktree.headCommit);
   assert.match(latest.worktree?.integration?.error || '', /Git|fatal|unknown revision|not a valid object/i);
   assert.equal(notified[0].threadId, 'thread_merge_review_error');
+  assert.equal(notified[0].callerSessionId, original.callerSessionId);
+  assert.ok(latest.mergeHistory?.some((entry) => entry.phase === 'coordinator' && entry.result === 'failed' && /Git|fatal|revision|object/i.test(entry.error || '')));
 });
 
 test('a landed ref with repeated ledger EIO is not retried in a loop and recovers after host restart', async (t) => {
@@ -105,18 +109,25 @@ test('a landed ref with repeated ledger EIO is not retried in a loop and recover
   const task = makeThread('thread_resident_ledger_eio', worktree); task.status = 'waiting_merge'; task.worktree!.approvedCommit = worktree.headCommit;
   task.worktree!.integration = { phase: 'waiting', updatedAt: new Date().toISOString() };
   const store = new TaskStore(storage); store.upsertTask(task);
-  let host = makeController(store, true);
+  let host: ReworkController;
   const mutableFs = createRequire(__filename)('fs') as { renameSync: typeof fs.renameSync };
   const realRename = mutableFs.renameSync; const taskFile = path.join(storage, 'threads', 'thread_resident_ledger_eio.json');
-  let writeFailures = 0;
+  const txFile = path.join(storage, 'merge-transactions', 'thread_resident_ledger_eio.json'); let writeFailures = 0;
   mutableFs.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
-    if (String(to) === taskFile) { writeFailures++; const error: NodeJS.ErrnoException = new Error('injected EIO'); error.code = 'EIO'; throw error; }
+    if (String(to) === taskFile && fs.existsSync(txFile) && JSON.parse(fs.readFileSync(txFile, 'utf8')).phase === 'ref_updated') { writeFailures++; const error: NodeJS.ErrnoException = new Error('injected EIO'); error.code = 'EIO'; throw error; }
     return realRename(from, to);
   }) as typeof fs.renameSync;
+  host = makeController(store, true);
   t.after(() => { mutableFs.renameSync = realRename; host.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
   await waitFor(() => gitOutput(repo, ['rev-parse', target.targetRef]) !== target.baseCommit);
+  const landed = gitOutput(repo, ['rev-parse', target.targetRef]);
+  await waitFor(() => writeFailures > 0);
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  const failuresAfterSettlement = writeFailures;
   await new Promise((resolve) => setTimeout(resolve, 1_500));
-  assert.equal(writeFailures, 2, 'the host records the durability failure and parks the transaction instead of retrying each poll');
+  assert.equal(writeFailures, failuresAfterSettlement, 'the landed transaction is parked instead of retrying each poll');
+  assert.equal(gitOutput(repo, ['rev-parse', target.targetRef]), landed);
+  assert.equal(JSON.parse(fs.readFileSync(txFile, 'utf8')).phase, 'ref_updated');
   assert.equal(store.getTask('thread_resident_ledger_eio')?.status, 'waiting_merge');
   assert.equal(JSON.parse(fs.readFileSync(taskFile, 'utf8')).status, 'waiting_merge');
 
@@ -126,4 +137,38 @@ test('a landed ref with repeated ledger EIO is not retried in a loop and recover
   t.after(() => { host.dispose(); restartedStore.dispose(); });
   await waitFor(() => restartedStore.getTask('thread_resident_ledger_eio')?.status === 'completed');
   assert.equal(gitOutput(repo, ['rev-parse', target.targetRef]), restartedStore.getTask('thread_resident_ledger_eio')?.worktree?.integration?.mergedCommit);
+  assert.equal(gitOutput(repo, ['rev-parse', target.targetRef]), landed, 'recovery preserves the landed commit');
+});
+
+test('an initial ledger EIO is logged and backed off until the same host can recover', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-resident-pre-ref-eio-'));
+  const repo = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repo);
+  const target = resolveGitRepository(repo, storage); const id = 'thread_resident_pre_ref_eio';
+  const worktree = createTaskWorktree(target, id, storage);
+  fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'changed\n'); worktree.headCommit = commitTaskChanges(worktree, 'task change');
+  const task = makeThread(id, worktree); task.status = 'waiting_merge'; task.worktree!.approvedCommit = worktree.headCommit;
+  task.worktree!.integration = { phase: 'waiting', updatedAt: new Date().toISOString() };
+  const store = new TaskStore(storage); store.upsertTask(task);
+  const detector = new AgentDetector(); const callback = new CallbackManager(detector); let wakes = 0;
+  callback.notifyCaller = async () => { wakes++; return true; };
+  const mutableFs = createRequire(__filename)('fs') as { renameSync: typeof fs.renameSync };
+  const realRename = mutableFs.renameSync; const taskFile = path.join(storage, 'threads', `${id}.json`); let failures = 0;
+  mutableFs.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
+    if (String(to) === taskFile) { failures++; const error: NodeJS.ErrnoException = new Error('injected EIO'); error.code = 'EIO'; throw error; }
+    return realRename(from, to);
+  }) as typeof fs.renameSync;
+  const host = new ReworkController(store, new AutonomousRunner(detector), callback, detector, undefined, true);
+  t.after(() => { mutableFs.renameSync = realRename; host.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  await waitFor(() => failures >= 2);
+  const failuresAfterSettlement = failures;
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  assert.equal(failures, failuresAfterSettlement, 'one-second host polls must not retry a failed ledger write');
+  assert.equal(wakes, 0); assert.equal(gitOutput(repo, ['rev-parse', target.targetRef]), target.baseCommit);
+  assert.equal(store.getTask(id)?.status, 'waiting_merge');
+  const logs = path.join(storage, 'merge-logs', id, 'merge_log');
+  assert.match(fs.readFileSync(path.join(logs, fs.readdirSync(logs)[0]), 'utf8'), /EIO/i);
+  mutableFs.renameSync = realRename;
+  await waitFor(() => store.getTask(id)?.status === 'completed', 30_000);
+  assert.notEqual(gitOutput(repo, ['rev-parse', target.targetRef]), target.baseCommit);
+  assert.equal(store.getTask(id)?.threadId, id);
 });
