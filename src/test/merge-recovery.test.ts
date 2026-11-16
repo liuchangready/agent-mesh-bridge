@@ -15,6 +15,7 @@ import { archiveCompletedTaskLogs, isTerminalThreadStatus, removeTaskArtifacts, 
 import * as zlib from 'node:zlib';
 import { ReviewWakeScheduler } from '../bridge/review-wake-scheduler';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
+import { TaskControlService } from '../bridge/task-control';
 
 function task(root: string): DelegationThread {
   const now = new Date().toISOString();
@@ -86,6 +87,32 @@ test('retry_merge preserves the task identities and history while starting a new
   assert.equal(result.retryGeneration, 3); assert.equal(saved.status, 'waiting_merge');
   assert.equal(saved.receiverSessionId, thread.receiverSessionId); assert.equal(saved.callerSessionId, thread.callerSessionId);
   assert.equal(saved.worktree!.approvedCommit, 'candidate'); assert.equal(saved.mergeHistory!.length, 2);
+  controller.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('pending stash metadata recovery survives stale writes and pause/resume without waking a reviewer', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-recovery-retry-'));
+  const store = new TaskStore(root); const detector = new AgentDetector(); const callback = new CallbackManager(detector, root);
+  let wakes = 0; callback.notifyCaller = async () => { wakes++; return true; };
+  const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector);
+  const thread = task(root); store.upsertTask(thread); const stale = structuredClone(thread);
+  thread.worktree!.integration!.stashRecoveryPending = true; thread.worktree!.integration!.stashRecoveryLockHeld = true; store.upsertTask(thread);
+  stale.updatedAt = new Date(Date.now() + 60_000).toISOString(); stale.worktree!.integration!.updatedAt = stale.updatedAt;
+  stale.worktree!.approvedCommit = 'stale-candidate'; store.upsertTask(stale);
+  assert.equal(store.getTask(thread.threadId)!.worktree!.integration!.stashRecoveryLockHeld, true);
+  assert.equal(store.getTask(thread.threadId)!.worktree!.approvedCommit, 'candidate');
+  await assert.rejects(() => controller.requestRework({ threadId: thread.threadId, feedback: 'change it' }), /stash metadata recovery/i);
+  assert.throws(() => controller.approveTask({ threadId: thread.threadId }), /stash metadata recovery/i);
+  assert.throws(() => controller.requestMergeDecision(thread.threadId, 'Choose?', '', ''), /stash metadata recovery/i);
+  const control = new TaskControlService(store, undefined, undefined, root);
+  assert.equal(control.pauseTask(thread.threadId, 'pause', 'test').status, 'PAUSED');
+  await controller.resumePausedTask(thread.threadId);
+  assert.equal(store.getTask(thread.threadId)!.status, 'waiting_merge');
+  assert.equal(store.getTask(thread.threadId)!.worktree!.integration!.stashRecoveryLockHeld, true);
+  const saved = store.getTask(thread.threadId)!;
+  assert.equal(wakes, 0);
+  assert.equal(saved.worktree!.integration!.phase, 'blocked'); assert.equal(saved.worktree!.integration!.stashRecoveryPending, true);
+  assert.equal(saved.callerSessionId, thread.callerSessionId); assert.equal(saved.receiverSessionId, thread.receiverSessionId);
   controller.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true });
 });
 
