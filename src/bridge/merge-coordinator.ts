@@ -336,7 +336,11 @@ try {
 $workerArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $args[0], $args[1], $args[2], $args[0], $args[3])
 $command = 'powershell.exe ' + (($workerArgs | ForEach-Object { '"' + $_.Replace('"', '""') + '"' }) -join ' ')
 try {
-  $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $command }
+  # The worker outlives this launcher, so it must not flash a console window.
+  # Only Win32_ProcessStartup can carry the hidden window state across the WMI
+  # boundary: the launcher's own windowHide does not reach a grandchild.
+  $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+  $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $command; ProcessStartupInformation = $startup }
   if ($result.ReturnValue -ne 0) { throw "Win32_Process.Create returned $($result.ReturnValue)" }
   [System.IO.File]::WriteAllText($args[2] + '.helper-pid', [string]$result.ProcessId)
 } catch {
