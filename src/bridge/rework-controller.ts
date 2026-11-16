@@ -764,6 +764,12 @@ export class ReworkController {
       try {
         snapshot = snapshotTaskWorktree(worktree);
         gitOutput(worktree.path, ['update-ref', `refs/mesh/candidates/${thread.threadId}`, snapshot.commit]);
+        if (worktree.approvedCommit !== snapshot.commit && worktree.mergeResolutionPath) {
+          worktree.supersededMergeResolutionPaths = [...new Set([...(worktree.supersededMergeResolutionPaths || []), worktree.mergeResolutionPath])];
+          worktree.mergeResolutionPath = undefined;
+          worktree.mergeResolutionSubmitted = false;
+          worktree.mergeResolutionSourceCommit = undefined;
+        }
         worktree.approvedSnapshot = snapshot;
       } catch (error) {
         const failure = `Could not create approved snapshot: ${String(error)}`;
@@ -844,6 +850,9 @@ export class ReworkController {
     const worktree = thread?.worktree;
     if (!thread || thread.status !== 'waiting_merge' || !worktree?.approvedSnapshot || !worktree.mergeResolutionPath || !worktree.integration?.targetOldCommit) {
       throw new Error('No approved merge resolution workspace is awaiting submission.');
+    }
+    if ((worktree.mergeResolutionSourceCommit || worktree.integration.sourceCommit) !== worktree.approvedSnapshot.commit) {
+      throw new Error('The resolution workspace belongs to a different approved candidate.');
     }
     const cwd = worktree.mergeResolutionPath;
     const allowedRoots = [path.resolve(this.storageDir, 'merge-worktrees')];

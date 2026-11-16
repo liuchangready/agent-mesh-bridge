@@ -557,6 +557,8 @@ export interface WorktreeInfo {
   approvedSnapshot?: { commit: string; tree: string; sourceCommit: string };
   mergeResolutionPath?: string;
   mergeResolutionSubmitted?: boolean;
+  mergeResolutionSourceCommit?: string;
+  supersededMergeResolutionPaths?: string[];
   integration?: {
     phase: 'ready' | 'no_changes' | 'waiting' | 'merging' | 'conflict' | 'validation_failed' | 'blocked' | 'merged';
     sourceCommit?: string;

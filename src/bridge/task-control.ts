@@ -245,8 +245,8 @@ export class TaskControlService {
         if (latest && hasUnmergedOutput(latest) && !force) {
           throw new Error(`Refusing to delete task ${threadId}: its approved work has not been integrated locally. Wait for integration or pass force: true to discard the unmerged worktree output.`);
         }
-        const resolution = latest?.worktree?.mergeResolutionPath;
-        if (resolution) {
+        const resolutions = [...new Set([...(latest?.worktree?.supersededMergeResolutionPaths || []), latest?.worktree?.mergeResolutionPath].filter((entry): entry is string => !!entry))];
+        for (const resolution of resolutions) {
           const resolved = path.resolve(resolution);
           const roots = [path.resolve(this.storageDir, 'merge-worktrees')];
           if (latest?.artifactDir) roots.push(path.resolve(taskValidationDir(latest.artifactDir)));

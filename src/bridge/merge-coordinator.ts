@@ -541,12 +541,78 @@ export class MergeCoordinator {
         return { status: 'merged', message: 'Recovered completed merge transaction.', commit: sync.commit || prior.candidateCommit };
       }
       const resolutionPath = worktree.mergeResolutionSubmitted ? worktree.mergeResolutionPath : undefined;
-      if (resolutionPath && worktree.integration?.targetOldCommit !== targetOldCommit) {
-        const reason = `Target advanced since resolution began; the existing resolution at ${resolutionPath} was preserved.`;
+      if (resolutionPath && (worktree.mergeResolutionSourceCommit || worktree.integration?.sourceCommit) !== sourceCommit) {
+        const reason = 'The submitted resolution belongs to a different approved candidate.';
         this.finishBlocked(threadId, reason, worktree.integration?.targetOldCommit || '', sourceCommit);
         return { status: 'blocked', message: reason };
       }
-      if (prior?.validationPath && prior.validationPath !== resolutionPath) this.cleanupValidationWorktree(repoPath, threadId, prior.validationPath);
+      if (resolutionPath && worktree.integration?.targetOldCommit !== targetOldCommit) {
+        const oldTarget = worktree.integration?.targetOldCommit;
+        const prepared = prior?.phase === 'resolution_rebase_prepared' && prior.sourceCommit === sourceCommit && prior.validationPath === resolutionPath ? prior : undefined;
+        if (!oldTarget || (prepared && prepared.targetOldCommit !== targetOldCommit)) {
+          const reason = 'Target changed while a resolution update was in progress; the resolution workspace was preserved.';
+          this.finishBlocked(threadId, reason, oldTarget || '', sourceCommit, undefined, resolutionPath);
+          return { status: 'blocked', message: reason };
+        }
+        const head = currentHead(resolutionPath);
+        let resolutionCommit: string = prepared?.resolutionCommit;
+        if (!prepared) {
+          if (head !== oldTarget || gitOutput(resolutionPath, ['diff', '--name-only', '--diff-filter=U']) ||
+              gitOutput(resolutionPath, ['diff', '--name-only']) || gitOutput(resolutionPath, ['ls-files', '--others', '--exclude-standard']) ||
+              gitOutput(resolutionPath, ['ls-files', '--others', '--ignored', '--exclude-standard'])) {
+            const reason = 'Resolution workspace has unstaged, untracked, ignored, or unresolved files; it was preserved.';
+            this.finishBlocked(threadId, reason, oldTarget, sourceCommit, undefined, resolutionPath);
+            return { status: 'blocked', message: reason };
+          }
+          const tree = gitOutput(resolutionPath, ['write-tree']);
+          resolutionCommit = gitOutput(resolutionPath, ['-c', 'user.name=Agent Mesh Bridge', '-c', 'user.email=agent-mesh-bridge@localhost', 'commit-tree', tree, '-p', oldTarget, '-m', `Resolution ${threadId}`]);
+          gitOutput(repoPath, ['update-ref', `refs/mesh/resolutions/${threadId}`, resolutionCommit]);
+          this.writeTransaction(txPath, { threadId, sourceCommit, targetOldCommit, validationPath: resolutionPath,
+            phase: 'resolution_rebase_prepared', resolutionCommit, resolutionBaseCommit: oldTarget, at: new Date().toISOString() });
+        }
+        if (!this.isMergeStillAllowed(threadId, sourceCommit)) return { status: 'stale', message: 'Task was paused or deleted before updating the resolution.' };
+        if (head === oldTarget) {
+          if (gitOutput(resolutionPath, ['write-tree']) !== gitOutput(repoPath, ['rev-parse', `${resolutionCommit}^{tree}`]) ||
+              gitOutput(resolutionPath, ['diff', '--name-only']) || gitOutput(resolutionPath, ['ls-files', '--others', '--exclude-standard']) ||
+              gitOutput(resolutionPath, ['ls-files', '--others', '--ignored', '--exclude-standard'])) {
+            const reason = 'The staged resolution changed after its recovery snapshot was saved; it was preserved.';
+            this.finishBlocked(threadId, reason, oldTarget, sourceCommit, undefined, resolutionPath);
+            return { status: 'blocked', message: reason };
+          }
+          gitOutput(resolutionPath, ['reset', '--hard', targetOldCommit]);
+        } else if (head !== targetOldCommit) {
+          const reason = 'Resolution workspace HEAD changed during recovery; it was preserved.';
+          this.finishBlocked(threadId, reason, oldTarget, sourceCommit, undefined, resolutionPath);
+          return { status: 'blocked', message: reason };
+        }
+        let merging = false;
+        try { gitOutput(resolutionPath, ['rev-parse', '--verify', 'MERGE_HEAD']); merging = true; } catch {}
+        if (!merging) {
+          if (gitOutput(resolutionPath, ['diff', '--name-only']) || gitOutput(resolutionPath, ['ls-files', '--others', '--exclude-standard']) ||
+              gitOutput(resolutionPath, ['ls-files', '--others', '--ignored', '--exclude-standard'])) {
+            const reason = 'Resolution workspace gained unstaged, untracked, or ignored files during recovery; it was preserved.';
+            this.finishBlocked(threadId, reason, oldTarget, sourceCommit, undefined, resolutionPath);
+            return { status: 'blocked', message: reason };
+          }
+          try { gitOutput(resolutionPath, ['merge', '--no-commit', '--no-ff', resolutionCommit]); }
+          catch (error) {
+            const conflicts = gitOutput(resolutionPath, ['diff', '--name-only', '--diff-filter=U']).split(/\r?\n/).filter(Boolean);
+            const message = `Resolution conflicts with advanced target ${targetOldCommit}: ${conflicts.join(', ') || String(error)}`;
+            this.finishMergeFailure(threadId, 'conflict', message, targetOldCommit, sourceCommit, conflicts, resolutionPath);
+            return { status: 'conflict', message };
+          }
+        }
+        const conflicts = gitOutput(resolutionPath, ['diff', '--name-only', '--diff-filter=U']).split(/\r?\n/).filter(Boolean);
+        if (conflicts.length) {
+          const message = `Resolution conflicts with advanced target ${targetOldCommit}: ${conflicts.join(', ')}`;
+          this.finishMergeFailure(threadId, 'conflict', message, targetOldCommit, sourceCommit, conflicts, resolutionPath);
+          return { status: 'conflict', message };
+        }
+        worktree.integration = { ...worktree.integration!, phase: 'waiting', targetOldCommit, sourceCommit, updatedAt: new Date().toISOString() };
+        thread.updatedAt = worktree.integration.updatedAt;
+        this.store.upsertTask(thread);
+      }
+      if (prior?.validationPath && prior.validationPath !== resolutionPath && !(worktree.supersededMergeResolutionPaths || []).includes(prior.validationPath)) this.cleanupValidationWorktree(repoPath, threadId, prior.validationPath);
       const tx = { threadId, sourceCommit, targetOldCommit, phase: 'preparing', at: new Date().toISOString() } as any;
       this.writeTransaction(txPath, tx);
       const scratchRoot = thread.artifactDir
@@ -722,7 +788,7 @@ export class MergeCoordinator {
     const current = this.store.getTask(threadId); if (!current?.worktree) return;
     const thread = structuredClone(current);
     thread.status = 'waiting_merge';
-    if (resolutionPath) { thread.worktree!.mergeResolutionPath = resolutionPath; thread.worktree!.mergeResolutionSubmitted = false; }
+    if (resolutionPath) { thread.worktree!.mergeResolutionPath = resolutionPath; thread.worktree!.mergeResolutionSourceCommit = sourceCommit; }
     thread.worktree!.integration = { ...thread.worktree!.integration, phase: 'blocked', error: reason, targetOldCommit, targetPath, sourceCommit, updatedAt: new Date().toISOString() };
     thread.summary.lastOutputSnippet = reason; thread.updatedAt = new Date().toISOString(); this.store.upsertTask(thread);
     if (thread.worktree!.approvedSnapshot) {
@@ -818,7 +884,7 @@ export class MergeCoordinator {
     const thread = structuredClone(current);
     const worktree = thread.worktree!;
     thread.status = resolutionPath ? 'waiting_merge' : 'waiting_review';
-    if (resolutionPath) { worktree.mergeResolutionPath = resolutionPath; worktree.mergeResolutionSubmitted = false; } else worktree.approvedCommit = undefined;
+    if (resolutionPath) { worktree.mergeResolutionPath = resolutionPath; worktree.mergeResolutionSubmitted = false; worktree.mergeResolutionSourceCommit = sourceCommit; } else worktree.approvedCommit = undefined;
     const at = new Date().toISOString();
     if (resolutionPath) {
       const number = (thread.mergeHistory?.length || 0) + 1;

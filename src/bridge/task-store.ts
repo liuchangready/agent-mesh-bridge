@@ -657,6 +657,8 @@ export class TaskStore extends EventEmitter {
         }
         if (priorPhase === 'merged') thread.status = 'completed';
         else if (priorAt > nextAt) thread.status = prior.status;
+        const superseded = [...new Set([...(prior.worktree.supersededMergeResolutionPaths || []), ...(thread.worktree.supersededMergeResolutionPaths || [])])];
+        if (superseded.length) thread.worktree.supersededMergeResolutionPaths = superseded;
       }
       const highestKnown = Math.max(
         onDisk?.currentRound || 0,
