@@ -679,6 +679,7 @@ export function getTaskExecutionPath(thread: DelegationThread): string {
 }
 
 export interface DelegationThread {
+  taskTemplate?: import('./task-templates').TaskTemplate;
   threadId: string; // e.g. "thread_20261016_163000_a7f9"
   title: string; // Brief title, e.g. "Fix TCP cursor drift"
   initiatorAgent: AgentId; // Initiator (Caller A)
@@ -848,6 +849,7 @@ export interface DelegationThread {
 }
 
 export interface DispatchTaskParams {
+  templateId?: string;
   targetAgent?: TargetAgentSelection;
   title: string;
   prompt: string;

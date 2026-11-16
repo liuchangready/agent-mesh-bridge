@@ -1,3 +1,4 @@
+import { appendTemplateInstructions } from './task-templates';
 import { getTaskExecutionPath } from './types';
 import {
   DelegationThread,
@@ -1138,7 +1139,7 @@ export class ReworkController {
       try {
         result = await this.runner.execute({
           agent: thread.targetAgent,
-          prompt: isRework ? appendCompactionProtocol(feedback, roundNumber) : feedback,
+          prompt: appendTemplateInstructions(isRework ? appendCompactionProtocol(feedback, roundNumber) : feedback, thread.taskTemplate, 'worker'),
           isRework,
           receiverSessionId: thread.receiverSessionId,
           title: thread.title,

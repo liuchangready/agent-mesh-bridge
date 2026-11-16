@@ -74,6 +74,26 @@ describe('TaskStore Tests', () => {
     secondStore.dispose();
   });
 
+  test('preserves task template snapshot when an old copy is saved after reload', () => {
+    const now = new Date().toISOString();
+    const snapshot = { id: 'programming', version: '1', label: 'Programming', summary: 'Code', workerInstructions: 'worker original', reviewerInstructions: 'reviewer original', sourceFileName: 'programming.md', selectedAt: now };
+    const thread: DelegationThread = { threadId: 'thread_template_snapshot', title: 'Template', initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'queued', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session', workspace: testWorkspace(tempDir), rounds: [], summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 }, taskTemplate: snapshot };
+    taskStore.upsertTask(thread);
+    const stale = structuredClone(thread);
+    delete stale.taskTemplate;
+    const second = new TaskStore(tempDir);
+    try {
+      assert.deepStrictEqual(second.getTask(thread.threadId)?.taskTemplate, snapshot);
+      second.upsertTask(stale);
+      second.loadFromDisk();
+      assert.deepStrictEqual(second.getTask(thread.threadId)?.taskTemplate, snapshot);
+      const changed = structuredClone(stale); changed.taskTemplate = { ...snapshot, workerInstructions: 'drift', reviewerInstructions: 'drift' };
+      second.upsertTask(changed);
+      second.loadFromDisk();
+      assert.deepStrictEqual(second.getTask(thread.threadId)?.taskTemplate, snapshot);
+    } finally { second.dispose(); }
+  });
+
   test('should update round and refresh summary accurately', () => {
     const thread: DelegationThread = {
       threadId: 'thread_update_test',

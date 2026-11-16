@@ -70,6 +70,11 @@ export function resolveGitRepository(startPath: string, storageDir: string, requ
   return { commonDir, repositoryPath, targetRef, deliveryTarget, baseCommit };
 }
 
+export function resolveTemplateWorkspaceRoot(root: string): string {
+  const commonDir = git(root, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+  return resolveMainWorkspaceRoot(root, commonDir) || physicalDirectory(root);
+}
+
 /** Identify a linked checkout's main workspace without changing its delivery target. */
 export function resolveMainWorkspaceRoot(startPath: string, commonDir: string): string | undefined {
   const checkout = physicalDirectory(git(startPath, ['rev-parse', '--show-toplevel']));

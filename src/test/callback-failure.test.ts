@@ -97,6 +97,13 @@ describe('CallbackManager failure wake-ups', () => {
     assert.match(captured!.prompt, /session-8b5dc091/);
   });
 
+  test('failure callback sends only reviewer template instructions', async () => {
+    const manager = new CallbackManager(new AgentDetector()); let prompt = '';
+    (manager as any).launchCaller = (_t: any, _s: any, text: string, _r: any, _k: any, release: () => void) => { prompt = text; release(); return true; };
+    const thread = makeThread({taskTemplate: {id:'t',version:'1',label:'T',summary:'S',workerInstructions:'WORKER SECRET',reviewerInstructions:'REVIEWER SNAPSHOT',sourceFileName:'t.md',selectedAt:'now'}});
+    assert.equal(await manager.notifyCallerOfFailure(thread,2),true); assert.equal(prompt.split('REVIEWER SNAPSHOT').length-1,1); assert.ok(!prompt.includes('WORKER SECRET'));
+  });
+
   test('does not wake the caller twice for the same failed round', async () => {
     const manager = new CallbackManager(new AgentDetector());
     let launches = 0;

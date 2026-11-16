@@ -1,4 +1,5 @@
 import { getTaskExecutionPath } from './types';
+import { resolveTaskTemplate, appendTemplateInstructions } from './task-templates';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -147,6 +148,7 @@ export class AsyncDispatcher {
         physicalDirectory(requestedWorkspace.rootPath) !== repositoryPath) {
       throw new Error('WORKSPACE_MISMATCH');
     }
+    const taskTemplate = params.templateId !== undefined ? resolveTaskTemplate(selected.rootPath, params.templateId) : undefined;
     const windowContext = params.workspaceOrigin
       ? readWindow(this.storageDir, params.workspaceOrigin)
       : params.suppressWorkspaceOriginInference ? undefined : findUniqueWindow(this.storageDir, selected.rootPath);
@@ -244,6 +246,7 @@ export class AsyncDispatcher {
       throw error;
     }
     const tempCandidate: DelegationThread = {
+      taskTemplate,
       threadId,
       title: params.title || 'Untitled Delegation Task',
       initiatorAgent,
@@ -565,7 +568,7 @@ export class AsyncDispatcher {
       try {
         result = await this.runner.execute({
           agent: thread.targetAgent,
-          prompt: isRework ? appendCompactionProtocol(prompt, roundNumber) : prompt,
+          prompt: appendTemplateInstructions(isRework ? appendCompactionProtocol(prompt, roundNumber) : prompt, thread.taskTemplate, 'worker'),
           isRework,
           receiverSessionId: thread.receiverSessionId,
           title: thread.title,

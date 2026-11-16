@@ -625,3 +625,11 @@ test('bootstrap attempts are capped so a permanently racy host still terminates'
   store.dispose();
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('bootstrap includes only the reviewer template snapshot', () => {
+  const template = { id: 't', version: '1', label: 'T', summary: 'S', workerInstructions: 'WORKER SECRET', reviewerInstructions: 'REVIEWER REQUIREMENT', sourceFileName: 't.md', selectedAt: 'now' };
+  const prompt = buildReviewerBootstrapPrompt(makeDedicatedThread('thread_template_bootstrap', { taskTemplate: template }), 'token');
+  assert.ok(prompt.includes(template.reviewerInstructions)); assert.ok(!prompt.includes(template.workerInstructions));
+  assert.equal(prompt.split(template.reviewerInstructions).length - 1, 1);
+  assert.ok(!buildReviewerBootstrapPrompt(makeDedicatedThread('thread_legacy'), 'token').includes(template.reviewerInstructions));
+});

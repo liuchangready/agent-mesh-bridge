@@ -52,7 +52,9 @@ import {
 } from './reviewer-log';
 import { aggregateThreadTokenUsage } from './token-usage-collector';
 import { assertCanExecute } from './agent-capabilities';
-import { WorkspaceRegistry, readWindow, matchingWindows, physicalDirectory } from './workspace';
+import { WorkspaceRegistry, WorkspaceResolver, readWindow, matchingWindows, physicalDirectory } from './workspace';
+import { listTaskTemplates } from './task-templates';
+import { resolveTemplateWorkspaceRoot } from './git-worktree';
 
 /** Older non-compacted rounds are excerpted to this many characters. */
 const DETAIL_HISTORY_OUTPUT_MAX_CHARS = 4_000;
@@ -64,6 +66,7 @@ const DETAIL_HISTORY_OUTPUT_MAX_CHARS = 4_000;
  */
 const FORWARDING_TOOLS = new Set([
   'dispatch_task',
+  'list_task_templates',
   'submit_mesh_task',
   'invoke_agent',
   'invoke_antigravity',
@@ -404,9 +407,11 @@ export class MCPServer {
    */
   public getToolDefinitions() {
     const tools = [
+      { name: 'list_task_templates', description: 'Before each ordinary dispatch, list workspace template summaries and select a suitable templateId, or omit it if none fits. Reviewer bootstrap must only confirm dispatch and must not call this tool.', inputSchema: { type: 'object', properties: { workspaceId: { type: 'string' }, workspaceRoot: { type: 'string' } } } },
       {
         name: 'dispatch_task',
         description:
+          'Before ordinary dispatch call list_task_templates for this workspace and select a suitable templateId, or omit it if none fits. Reviewer bootstrap must only confirm dispatch. ' +
           'Asynchronously delegate a new task to another agent (Codex, Claude Code, Antigravity, DeepSeek Harness) without blocking the current turn. ' +
           'After this call returns you MUST end your turn immediately and wait for the callback: the bridge wakes your native session when the round finishes, whether it succeeds or fails. ' +
           'Do NOT poll `get_thread_details` / `get_recent_logs` / `list_recent_tasks` to watch the task — that keeps the user paying for a turn that has nothing left to do, and repeated reads at unchanged progress are answered with a short `repeatPoll` stub instead of the details. ' +
@@ -448,6 +453,7 @@ export class MCPServer {
               description: 'Absolute local workspace root directory.',
             },
             workspaceId: { type: 'string', description: 'Registered Bridge workspace ID.' },
+            templateId: { type: 'string', description: 'Optional template selected from list_task_templates.' },
             targetBranch: {
               type: 'string',
               description: 'Existing local branch to merge the approved task into. Defaults to the source checkout branch and is pinned for this task.',
@@ -1260,6 +1266,19 @@ export class MCPServer {
       throw new Error('A merge_failed task only permits retry_merge or delete_task.');
     }
     switch (name) {
+      case 'list_task_templates': {
+        const explicit = !!(args.workspaceId || args.workspaceRoot);
+        let context = this.workspaceContext;
+        try { context = await this.resolveClientWorkspaceContext(); } catch (e: any) { if (!explicit || !String(e?.message).includes('WORKSPACE_AMBIGUOUS')) throw e; }
+        const storage = path.dirname(this.taskStore.getStoragePath());
+        const window = context?.origin && readWindow(storage, context.origin);
+        const id = args.workspaceId || (!args.workspaceRoot ? window?.defaultWorkspaceId || context?.id : undefined);
+        const registry = new WorkspaceRegistry(storage);
+        const requested = new WorkspaceResolver(registry).resolve(id, args.workspaceRoot);
+        const workspace = registry.register(resolveTemplateWorkspaceRoot(requested.rootPath));
+        const result = listTaskTemplates(workspace.rootPath);
+        return { workspaceId: workspace.id, templates: result.templates.map(({id, label, summary, version}) => ({id, label, summary, version})), diagnostics: result.diagnostics };
+      }
       case 'dispatch_task':
       {
         // Dedicated reviewer bootstrap: this process is the fresh reviewer
@@ -1297,6 +1316,7 @@ export class MCPServer {
             inheritedWorkspaceId ? resolvedContext?.source || 'explicit' : 'explicit',
           workspaceOrigin: windowContext ? resolvedContext?.origin : undefined,
           suppressWorkspaceOriginInference: true,
+          templateId: args.templateId,
           targetBranch: args.targetBranch,
           model: args.model,
           modelRequestedByUser: args.modelRequestedByUser === true,
@@ -1504,6 +1524,7 @@ export class MCPServer {
         // the derived token rollup so a list can be compared by cost.
         return tasks.map((task) => ({
           ...task,
+          taskTemplate: task.taskTemplate && { id: task.taskTemplate.id, version: task.taskTemplate.version, label: task.taskTemplate.label, summary: task.taskTemplate.summary },
           modelRouting: getModelRouting(task),
           archived: !!task.archivedAt,
           finalSummary: task.finalSummary?.summary || null,

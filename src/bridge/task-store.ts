@@ -577,6 +577,7 @@ export class TaskStore extends EventEmitter {
         }
       }
       for (const prior of authority) preferBinding(thread, prior);
+      thread.taskTemplate = structuredClone(onDisk?.taskTemplate || inMemory?.taskTemplate || thread.taskTemplate);
       const mergeEvents = new Map<string, NonNullable<DelegationThread['mergeHistory']>[number]>();
       for (const source of [onDisk, inMemory, thread]) {
         for (const event of source?.mergeHistory || []) if (!mergeEvents.has(event.id)) mergeEvents.set(event.id, event);
