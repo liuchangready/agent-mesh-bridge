@@ -6,7 +6,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import { createRequire } from 'module';
-import { resolveGitRepository, createTaskWorktree, commitTaskChanges, gitOutput, removeTaskWorktree } from '../bridge/git-worktree';
+import { resolveGitRepository, createTaskWorktree, commitTaskChanges, gitOutput, removeTaskWorktree, snapshotTaskWorktree } from '../bridge/git-worktree';
 import { buildPosixLockHelperCommand, MergeCoordinator, MeshFileLock, validationNodeDirs } from '../bridge/merge-coordinator';
 import { TaskRoleLock } from '../bridge/task-role-lock';
 import { TaskStore } from '../bridge/task-store';
@@ -75,6 +75,41 @@ async function waitFor(file: string, attempts = 300): Promise<void> {
   }
   throw new Error(`Timed out waiting for ${file}`);
 }
+
+test('candidate snapshots preserve the worker index and exclude ignored and later changes', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-snapshot-'));
+  const repository = path.join(root, 'repo');
+  initRepo(repository);
+  const worktree = createTaskWorktree(resolveGitRepository(repository, path.join(root, 'ledger')), 'thread_snapshot', path.join(root, 'ledger'));
+  t.after(() => {
+    removeTaskWorktree(worktree);
+    const writable = (dir: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const file = path.join(dir, entry.name);
+        if (entry.isDirectory()) writable(file); else fs.chmodSync(file, 0o666);
+      }
+    };
+    writable(root);
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  fs.writeFileSync(path.join(worktree.path, '.gitignore'), 'ignored.txt\n');
+  fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'staged\n');
+  git(worktree.path, 'add', 'shared.txt');
+  fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'final\n');
+  fs.writeFileSync(path.join(worktree.path, 'new.txt'), 'new\n');
+  fs.writeFileSync(path.join(worktree.path, 'ignored.txt'), 'ignored\n');
+  fs.unlinkSync(path.join(worktree.path, 'validate.js'));
+  const status = git(worktree.path, 'status', '--porcelain');
+  const head = git(worktree.path, 'rev-parse', 'HEAD');
+  const candidate = snapshotTaskWorktree(worktree);
+  assert.equal(git(worktree.path, 'rev-parse', 'HEAD'), head);
+  assert.equal(git(worktree.path, 'status', '--porcelain'), status);
+  fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'later\n');
+  assert.equal(git(worktree.path, 'show', `${candidate.commit}:shared.txt`), 'final');
+  assert.equal(git(worktree.path, 'show', `${candidate.commit}:new.txt`), 'new');
+  assert.equal(git(worktree.path, 'ls-tree', '--name-only', candidate.commit, 'ignored.txt', 'validate.js'), '');
+  assert.equal(git(worktree.path, 'rev-parse', `${candidate.commit}^{tree}`), candidate.tree);
+});
 
 async function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;

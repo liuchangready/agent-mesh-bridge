@@ -15,11 +15,11 @@ export interface GitRepository {
 
 interface TaskTargetMarker { targetRef: string; deliveryTarget?: { branch: string; ref: string; repositoryPath: string; checkoutPath?: string; baseCommit?: string }; commonDir?: string; repositoryPath?: string; }
 
-function git(cwd: string, args: string[]): string {
+function git(cwd: string, args: string[], env?: NodeJS.ProcessEnv): string {
   const candidates = [process.env.MESH_GIT_PATH, process.env.GIT_EXECUTABLE, 'git.exe', 'git'].filter(Boolean) as string[];
   let result: ReturnType<typeof spawnSync> | undefined;
   for (const executable of candidates) {
-    result = spawnSync(executable, args, { cwd, encoding: 'utf8', windowsHide: true, timeout: 30_000 });
+    result = spawnSync(executable, args, { cwd, encoding: 'utf8', windowsHide: true, timeout: 30_000, env });
     if (!result.error || (result.error as NodeJS.ErrnoException).code !== 'ENOENT') break;
   }
   if (!result || result.error || result.status !== 0) {
@@ -163,6 +163,26 @@ export function createTaskWorktree(repo: GitRepository, threadId: string, storag
 export function gitOutput(cwd: string, args: string[]): string { return git(cwd, args); }
 
 export function currentHead(cwd: string): string { return git(cwd, ['rev-parse', '--verify', 'HEAD^{commit}']); }
+
+/** Build an immutable candidate without changing the worker index or branch. */
+export function snapshotTaskWorktree(worktree: WorktreeInfo): { commit: string; tree: string; sourceCommit: string } {
+  const cwd = worktree.path;
+  const sourceCommit = currentHead(cwd);
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-candidate-'));
+  try {
+    const indexPath = path.resolve(cwd, git(cwd, ['rev-parse', '--git-path', 'index']));
+    const temporaryIndex = path.join(tempDir, 'index');
+    const env = { ...process.env, GIT_INDEX_FILE: temporaryIndex };
+    if (fs.existsSync(indexPath)) fs.copyFileSync(indexPath, temporaryIndex);
+    else git(cwd, ['read-tree', sourceCommit], env);
+    git(cwd, ['add', '-A', '--', '.'], env);
+    const tree = git(cwd, ['write-tree'], env);
+    const commit = git(cwd, ['-c', 'user.name=Agent Mesh Bridge', '-c', 'user.email=agent-mesh-bridge@localhost', 'commit-tree', tree, '-p', sourceCommit, '-m', 'Approved task candidate'], env);
+    return { commit, tree, sourceCommit };
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
 
 export function changedFiles(cwd: string): string[] {
   return git(cwd, ['status', '--porcelain', '-z', '--untracked-files=all'])
