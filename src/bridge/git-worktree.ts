@@ -198,6 +198,8 @@ export function commitTaskChanges(worktree: WorktreeInfo, message: string): stri
 }
 
 export function removeTaskWorktree(worktree: WorktreeInfo): void {
+  const taskId = (worktree.taskBranch || '').match(/^mesh\/task\/([A-Za-z0-9_-]+)$/)?.[1];
+  if (taskId) { try { git(worktree.mainPath, ['update-ref', '-d', `refs/mesh/candidates/${taskId}`]); } catch {} }
   try { git(worktree.mainPath, ['worktree', 'remove', '--force', worktree.path]); } catch {}
   try { git(worktree.mainPath, ['branch', '-D', worktree.taskBranch || worktree.branch || '']); } catch {}
 }

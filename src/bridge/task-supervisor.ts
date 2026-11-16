@@ -29,7 +29,7 @@ import {
   readTextFilePaged,
   roundExecutionLogPath,
 } from './round-log';
-import { commitTaskChanges, changedFiles, currentHead } from './git-worktree';
+import { changedFiles, currentHead } from './git-worktree';
 
 /** `get_recent_logs` reads a bounded tail, not a whole multi-megabyte log. */
 const RECENT_LOG_EXCERPT_BYTES = 512 * 1024;
@@ -594,10 +594,10 @@ export class TaskSupervisor extends EventEmitter {
       let isSuccess = !interruption && !pausedByControl && responseOk;
       if (isSuccess && isIsolatedTaskWorktree(currentThread.worktree)) {
         try {
-          currentThread.worktree.headCommit = commitTaskChanges(currentThread.worktree, `Agent work ${currentThread.threadId} round ${roundNumber}`);
-          currentThread.worktree.integration = { phase: currentThread.worktree.headCommit === currentThread.worktree.baseCommit ? 'no_changes' : 'ready', sourceCommit: currentThread.worktree.headCommit, updatedAt: new Date().toISOString() };
+          currentThread.worktree.headCommit = currentHead(currentThread.worktree.path);
+          currentThread.worktree.integration = { phase: 'ready', sourceCommit: currentThread.worktree.headCommit, updatedAt: new Date().toISOString() };
         } catch (error: any) {
-          result.error = `Could not create the task delivery commit: ${error?.message || error}`;
+          result.error = `Could not inspect the task worktree: ${error?.message || error}`;
           result.exitCode = 1;
           isSuccess = false;
         }

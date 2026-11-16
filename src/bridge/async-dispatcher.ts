@@ -28,7 +28,7 @@ import { ActiveAgentResolver } from './active-agent-resolver';
 import { AutonomousRunner, RunResult } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
 import { TaskSupervisor } from './task-supervisor';
-import { resolveGitRepository, resolveMainWorkspaceRoot, createTaskWorktree, removeTaskWorktree, commitTaskChanges, changedFiles, currentHead } from './git-worktree';
+import { resolveGitRepository, resolveMainWorkspaceRoot, createTaskWorktree, removeTaskWorktree, changedFiles, currentHead } from './git-worktree';
 import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
 import { TaskExecutionOwner, TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 import { QueueDrainer, QueuedExecution } from './queue-drainer';
@@ -636,10 +636,10 @@ export class AsyncDispatcher {
       let isSuccess = !interruption && !pausedByControl && responseOk;
       if (isSuccess && isIsolatedTaskWorktree(latest.worktree)) {
         try {
-          latest.worktree.headCommit = commitTaskChanges(latest.worktree, `Agent work ${latest.threadId} round ${roundNumber}`);
-          latest.worktree.integration = { phase: latest.worktree.headCommit === latest.worktree.baseCommit ? 'no_changes' : 'ready', sourceCommit: latest.worktree.headCommit, updatedAt: new Date().toISOString() };
+          latest.worktree.headCommit = currentHead(latest.worktree.path);
+          latest.worktree.integration = { phase: 'ready', sourceCommit: latest.worktree.headCommit, updatedAt: new Date().toISOString() };
         } catch (error: any) {
-          result.error = `Could not create the task delivery commit: ${error?.message || error}`;
+          result.error = `Could not inspect the task worktree: ${error?.message || error}`;
           result.exitCode = 1;
           isSuccess = false;
         }

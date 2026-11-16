@@ -509,8 +509,8 @@ export class MergeCoordinator {
     const sourceCommit = worktree.approvedCommit!;
     await this.waitForReviewerExit(thread, sourceCommit);
     if (!this.isMergeStillAllowed(threadId, sourceCommit)) return { status: 'stale', message: 'Task was paused or deleted before integration started.' };
-    const current = currentHead(worktree.path);
-    if (current !== sourceCommit || changedFiles(worktree.path).length) {
+    const current = worktree.approvedSnapshot ? sourceCommit : currentHead(worktree.path);
+    if (!worktree.approvedSnapshot && (current !== sourceCommit || changedFiles(worktree.path).length)) {
       this.markNeedsReview(thread, `Approved commit ${sourceCommit} is stale: current HEAD is ${current} and/or the worktree has uncommitted changes.`);
       return { status: 'stale', message: 'The approved task worktree changed; reviewer must inspect it again.' };
     }
@@ -520,8 +520,8 @@ export class MergeCoordinator {
     try {
       // This is intentionally the first target read in the critical section.
       if (!this.isMergeStillAllowed(threadId, sourceCommit)) return { status: 'stale', message: 'Task was paused or deleted before integration started.' };
-      const lockedHead = currentHead(worktree.path);
-      if (lockedHead !== sourceCommit || changedFiles(worktree.path).length) {
+      const lockedHead = worktree.approvedSnapshot ? sourceCommit : currentHead(worktree.path);
+      if (!worktree.approvedSnapshot && (lockedHead !== sourceCommit || changedFiles(worktree.path).length)) {
         this.markNeedsReview(thread, `Approved commit ${sourceCommit} changed while waiting for integration (HEAD ${lockedHead}, dirty worktree present).`);
         return { status: 'stale', message: 'The approved task worktree changed while waiting; reviewer must inspect the new state.' };
       }
@@ -570,8 +570,8 @@ export class MergeCoordinator {
           return { status: 'validation_failed', message: validation.error };
         }
         if (!this.isMergeStillAllowed(threadId, sourceCommit)) { validationResult = 'cancelled'; return { status: 'stale', message: 'Task was paused or deleted during combined validation.' }; }
-        const validatedHead = currentHead(worktree.path);
-        if (validatedHead !== sourceCommit || changedFiles(worktree.path).length) {
+        const validatedHead = worktree.approvedSnapshot ? sourceCommit : currentHead(worktree.path);
+        if (!worktree.approvedSnapshot && (validatedHead !== sourceCommit || changedFiles(worktree.path).length)) {
           this.markNeedsReview(thread, `Approved commit ${sourceCommit} changed during combined validation (HEAD ${validatedHead}, dirty worktree present).`);
           return { status: 'stale', message: 'The approved task worktree changed during validation; reviewer must inspect the new state.' };
         }

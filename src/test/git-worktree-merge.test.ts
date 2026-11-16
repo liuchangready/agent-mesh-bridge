@@ -18,6 +18,7 @@ import { ActiveAgentResolver } from '../bridge/active-agent-resolver';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
+import { ReworkController } from '../bridge/rework-controller';
 
 const gitExe = process.env.MESH_GIT_PATH || (process.platform === 'win32' ? 'D:\\Git\\cmd\\git.exe' : 'git');
 process.env.MESH_GIT_PATH = gitExe;
@@ -109,6 +110,58 @@ test('candidate snapshots preserve the worker index and exclude ignored and late
   assert.equal(git(worktree.path, 'show', `${candidate.commit}:new.txt`), 'new');
   assert.equal(git(worktree.path, 'ls-tree', '--name-only', candidate.commit, 'ignored.txt', 'validate.js'), '');
   assert.equal(git(worktree.path, 'rev-parse', `${candidate.commit}^{tree}`), candidate.tree);
+});
+
+test('approval integrates the frozen dirty candidate after later worker edits', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-snapshot-approval-'));
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger');
+  initRepo(repository);
+  const target = resolveGitRepository(repository, storage);
+  const worktree = createTaskWorktree(target, 'thread_approval_snapshot', storage);
+  const store = new TaskStore(storage);
+  const detector = new AgentDetector();
+  const controller = new ReworkController(store, new AutonomousRunner(detector), new CallbackManager(detector, storage), detector);
+  t.after(() => { controller.dispose(); store.dispose(); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
+  const item = thread('thread_approval_snapshot', worktree);
+  item.status = 'waiting_review';
+  item.worktree!.approvedCommit = undefined;
+  item.worktree!.integration = { phase: 'ready', updatedAt: new Date().toISOString() };
+  store.upsertTask(item);
+  fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A approved\nmiddle\nbeta\n');
+  const before = git(worktree.path, 'status', '--porcelain');
+  const head = git(worktree.path, 'rev-parse', 'HEAD');
+  assert.equal(controller.approveTask({ threadId: item.threadId }).status, 'WAITING_MERGE');
+  assert.equal(git(worktree.path, 'status', '--porcelain'), before);
+  assert.equal(git(worktree.path, 'rev-parse', 'HEAD'), head);
+  fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'later change\n');
+  const result = await controller.mergeApproved(item.threadId);
+  assert.equal(result.status, 'merged', result.message);
+  assert.equal(git(repository, 'show', `${target.targetRef}:shared.txt`), 'A approved\nmiddle\nbeta');
+  assert.equal(fs.readFileSync(path.join(worktree.path, 'shared.txt'), 'utf8'), 'later change\n');
+});
+
+test('snapshot failure records a blocked merge and requests a reviewer wake', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-snapshot-failure-'));
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger');
+  initRepo(repository);
+  const worktree = createTaskWorktree(resolveGitRepository(repository, storage), 'thread_snapshot_failure', storage);
+  const store = new TaskStore(storage); const detector = new AgentDetector();
+  const callback = new CallbackManager(detector, storage);
+  let woken = false; callback.notifyCaller = async () => { woken = true; return true; };
+  const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector);
+  t.after(() => { controller.dispose(); store.dispose(); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
+  const item = thread('thread_snapshot_failure', worktree);
+  item.status = 'waiting_review'; item.worktree!.approvedCommit = undefined;
+  store.upsertTask(item);
+  removeTaskWorktree(worktree);
+  assert.equal(controller.approveTask({ threadId: item.threadId }).status, 'WAITING_MERGE');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const saved = store.getTask(item.threadId)!;
+  assert.equal(saved.status, 'waiting_merge');
+  assert.equal(saved.worktree!.integration!.phase, 'blocked');
+  assert.equal(saved.mergeHistory![0].phase, 'snapshot');
+  assert.match(fs.readFileSync(saved.mergeHistory![0].logPath!, 'utf8'), /Could not create approved snapshot/);
+  assert.equal(woken, true);
 });
 
 async function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {

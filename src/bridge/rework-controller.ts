@@ -19,6 +19,7 @@ import {
 } from './types';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { roundExecutionLogPath } from './round-log';
 import { archiveCompletedTaskLogs } from './task-summary';
 import { TaskStore } from './task-store';
@@ -36,7 +37,7 @@ import { ModelApprovalHandler } from './model-approval';
 import { TaskRetargetService, latestRetarget } from './task-retarget';
 import { appendCompactionProtocol, compactRoundBestEffort } from './context-compactor';
 import { readStoredRoundUsage } from './token-usage-collector';
-import { currentHead, changedFiles, commitTaskChanges } from './git-worktree';
+import { currentHead, changedFiles, snapshotTaskWorktree, gitOutput } from './git-worktree';
 import { MergeCoordinator, MergeResult } from './merge-coordinator';
 import { assertCanExecute } from './agent-capabilities';
 
@@ -759,18 +760,39 @@ export class ReworkController {
     let status: ApproveResult['status'] = 'COMPLETED';
     if (isIsolatedTaskWorktree(thread.worktree)) {
       const worktree = thread.worktree;
-      if (!worktree.headCommit) throw new Error(`Task ${thread.threadId} has no recorded task commit; it cannot be approved.`);
-      const head = currentHead(worktree.path);
-      if (head !== worktree.headCommit || changedFiles(worktree.path).length) {
-        throw new Error(`Task worktree changed after review began (approved candidate ${worktree.headCommit}, current HEAD ${head}); review the new state before approval.`);
+      let snapshot: ReturnType<typeof snapshotTaskWorktree>;
+      try {
+        snapshot = snapshotTaskWorktree(worktree);
+        gitOutput(worktree.path, ['update-ref', `refs/mesh/candidates/${thread.threadId}`, snapshot.commit]);
+        worktree.approvedSnapshot = snapshot;
+      } catch (error) {
+        const failure = `Could not create approved snapshot: ${String(error)}`;
+        const number = (thread.mergeHistory?.length || 0) + 1;
+        const safeId = thread.threadId.replace(/[^A-Za-z0-9_-]/g, '_');
+        const dir = path.join(thread.artifactDir || path.join(this.storageDir, 'merge-logs', safeId), 'merge_log');
+        fs.mkdirSync(dir, { recursive: true });
+        const logPath = path.join(dir, `${safeId}_merge_${number}.log`);
+        fs.writeFileSync(logPath, `${failure}\n`, 'utf8');
+        thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number, at: nowIso, phase: 'snapshot', result: 'failed', error: failure, logPath }];
+        worktree.approvedCommit = undefined;
+        worktree.approvedSnapshot = undefined;
+        worktree.mergePending = true;
+        worktree.integration = { phase: 'blocked', error: failure, updatedAt: nowIso };
+        thread.status = 'waiting_merge';
+        thread.updatedAt = nowIso;
+        this.taskStore.upsertTask(thread);
+        const reviewRound = [...thread.rounds].reverse().find((round) => round.type !== 'approval');
+        if (reviewRound) setTimeout(() => { void this.callbackManager.notifyCaller(thread, reviewRound); }, 0).unref();
+        return { threadId: thread.threadId, status: 'WAITING_MERGE', message: failure };
       }
-      if (head === worktree.baseCommit) {
-        worktree.integration = { phase: 'no_changes', sourceCommit: head, updatedAt: nowIso };
+      if (snapshot.tree === gitOutput(worktree.path, ['rev-parse', `${worktree.baseCommit}^{tree}`])) {
+        worktree.approvedCommit = undefined;
+        worktree.integration = { phase: 'no_changes', sourceCommit: snapshot.commit, updatedAt: nowIso };
         worktree.mergePending = false;
         thread.status = 'completed';
       } else {
-        worktree.approvedCommit = head;
-        worktree.integration = { phase: 'waiting', sourceCommit: head, updatedAt: nowIso };
+        worktree.approvedCommit = snapshot.commit;
+        worktree.integration = { phase: 'waiting', sourceCommit: snapshot.commit, updatedAt: nowIso };
         worktree.mergePending = true;
         thread.status = 'waiting_merge';
         status = 'WAITING_MERGE';
@@ -1011,10 +1033,10 @@ export class ReworkController {
       let isSuccess = !interruption && !pausedByControl && responseOk;
       if (isSuccess && isIsolatedTaskWorktree(latest.worktree)) {
         try {
-          latest.worktree.headCommit = commitTaskChanges(latest.worktree, `Agent work ${latest.threadId} round ${roundNumber}`);
-          latest.worktree.integration = { phase: latest.worktree.headCommit === latest.worktree.baseCommit ? 'no_changes' : 'ready', sourceCommit: latest.worktree.headCommit, updatedAt: new Date().toISOString() };
+          latest.worktree.headCommit = currentHead(latest.worktree.path);
+          latest.worktree.integration = { phase: 'ready', sourceCommit: latest.worktree.headCommit, updatedAt: new Date().toISOString() };
         } catch (error: any) {
-          result.error = `Could not create the task delivery commit: ${error?.message || error}`;
+          result.error = `Could not inspect the task worktree: ${error?.message || error}`;
           result.exitCode = 1;
           isSuccess = false;
         }

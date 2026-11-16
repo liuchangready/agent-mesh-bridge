@@ -537,7 +537,7 @@ export class MCPServer {
       {
         name: 'approve_task',
         description:
-          'Approve the reviewed task commit. Code changes enter waiting_merge until serialized local integration and combined validation succeed; no-change tasks complete immediately.',
+          'Approve a snapshot of the reviewed task worktree. Code changes enter waiting_merge until serialized local integration and combined validation succeed; no-change tasks complete immediately.',
         inputSchema: {
           type: 'object',
           properties: {

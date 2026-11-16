@@ -548,6 +548,7 @@ export interface WorktreeInfo {
   taskBranch?: string;
   headCommit?: string;
   approvedCommit?: string;
+  approvedSnapshot?: { commit: string; tree: string; sourceCommit: string };
   integration?: {
     phase: 'ready' | 'no_changes' | 'waiting' | 'merging' | 'conflict' | 'validation_failed' | 'blocked' | 'merged';
     sourceCommit?: string;
@@ -674,6 +675,7 @@ export interface DelegationThread {
   currentRound: number; // Current round (1: initial, 2+: rework)
   createdAt: string; // ISO8601 creation timestamp
   updatedAt: string; // ISO8601 update timestamp
+  mergeHistory?: Array<{ id: string; number: number; at: string; phase: string; result: string; error?: string; logPath?: string }>;
 
   // Native session bindings for continuous rework resume
   receiverSessionId: string; // Native session ID for target agent
