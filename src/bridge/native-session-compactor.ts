@@ -1,4 +1,4 @@
-import { getTaskExecutionPath } from './types';
+import { getTaskExecutionPath, isReviewerWakeEligible } from './types';
 import * as crypto from 'crypto';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
@@ -273,7 +273,7 @@ export class NativeSessionCompactor {
     if (!fresh || fresh.archivedAt || freshAgent !== agent || freshSession !== sessionId ||
         freshModel !== model || worktreeChanged || cancellation ||
         (role === 'developer' && !['running', 'reworking', 'queued'].includes(fresh.status)) ||
-        (role === 'reviewer' && fresh.status !== 'waiting_review' && !(reviewerBootstrap && fresh.status === 'queued' && fresh.reviewBootstrap?.phase === 'launching'))) {
+        (role === 'reviewer' && !isReviewerWakeEligible(fresh) && !(reviewerBootstrap && fresh.status === 'queued' && fresh.reviewBootstrap?.phase === 'launching'))) {
       new NativeSessionLock(root).release(lease);
       throw new Error('Task state, cancellation, model, worktree, or native session changed before resume preparation.');
     }
@@ -471,7 +471,7 @@ export class NativeSessionCompactor {
     });
     const statusAllowed = latestThread && (role === 'developer'
       ? ['running', 'reworking', 'queued'].includes(latestThread.status)
-      : latestThread.status === 'waiting_review' || reviewerBootstrap && latestThread.status === 'queued' && latestThread.reviewBootstrap?.phase === 'launching');
+      : isReviewerWakeEligible(latestThread) || reviewerBootstrap && latestThread.status === 'queued' && latestThread.reviewBootstrap?.phase === 'launching');
     if (!latestThread || latestThread.archivedAt || !statusAllowed || latestAgent !== agent || latestSession !== sessionId ||
         latestModel !== model || latestWorktree !== originalWorktree || new CancellationRegistry(root).peek(threadId) ||
         new TaskRoleLock(root).getOwner(threadId)?.token !== roleOwnerAtStart.token) {

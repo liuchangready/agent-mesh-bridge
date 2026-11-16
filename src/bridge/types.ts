@@ -37,6 +37,12 @@ export type ThreadStatus =
   | 'completed'
   | 'failed';
 
+/** States in which a completed developer round can be reviewed. */
+export function isReviewerWakeEligible(thread: DelegationThread): boolean {
+  return thread.status === 'waiting_review' ||
+    (thread.status === 'waiting_merge' && ['blocked', 'conflict', 'validation_failed'].includes(thread.worktree?.integration?.phase || ''));
+}
+
 /**
  * Why a task/round stopped executing before it could finish normally.
  *
@@ -549,6 +555,8 @@ export interface WorktreeInfo {
   headCommit?: string;
   approvedCommit?: string;
   approvedSnapshot?: { commit: string; tree: string; sourceCommit: string };
+  mergeResolutionPath?: string;
+  mergeResolutionSubmitted?: boolean;
   integration?: {
     phase: 'ready' | 'no_changes' | 'waiting' | 'merging' | 'conflict' | 'validation_failed' | 'blocked' | 'merged';
     sourceCommit?: string;
@@ -675,7 +683,9 @@ export interface DelegationThread {
   currentRound: number; // Current round (1: initial, 2+: rework)
   createdAt: string; // ISO8601 creation timestamp
   updatedAt: string; // ISO8601 update timestamp
-  mergeHistory?: Array<{ id: string; number: number; at: string; phase: string; result: string; error?: string; logPath?: string }>;
+  mergeHistory?: Array<{ id: string; number: number; at: string; phase: string; result: string; error?: string; logPath?: string;
+    targetRef?: string; targetOldCommit?: string; candidateCommit?: string; candidateTree?: string; conflictFiles?: string[];
+    mergedCommit?: string; changedFiles?: string[] }>;
 
   // Native session bindings for continuous rework resume
   receiverSessionId: string; // Native session ID for target agent

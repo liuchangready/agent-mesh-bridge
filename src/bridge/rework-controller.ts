@@ -839,11 +839,38 @@ export class ReworkController {
     return this.mergeCoordinator.mergeApproved(threadId);
   }
 
+  public submitMergeResolution(threadId: string): { threadId: string; status: 'WAITING_MERGE'; message: string } {
+    const thread = this.taskStore.getTask(threadId);
+    const worktree = thread?.worktree;
+    if (!thread || thread.status !== 'waiting_merge' || !worktree?.approvedSnapshot || !worktree.mergeResolutionPath || !worktree.integration?.targetOldCommit) {
+      throw new Error('No approved merge resolution workspace is awaiting submission.');
+    }
+    const cwd = worktree.mergeResolutionPath;
+    const allowedRoots = [path.resolve(this.storageDir, 'merge-worktrees')];
+    if (thread.artifactDir) allowedRoots.push(path.resolve(thread.artifactDir, 'validation'));
+    const resolved = path.resolve(cwd);
+    const normalize = (value: string) => process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value);
+    if (!allowedRoots.includes(path.dirname(resolved)) || !path.basename(resolved).startsWith(`${threadId}-`) ||
+        normalize(gitOutput(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir'])) !== normalize(worktree.commonDir || '')) {
+      throw new Error('Invalid merge resolution workspace.');
+    }
+    if (currentHead(cwd) !== worktree.integration.targetOldCommit) throw new Error('Resolution workspace HEAD changed; restore the original merge state before submission.');
+    if (gitOutput(cwd, ['diff', '--name-only', '--diff-filter=U'])) throw new Error('Resolve and stage all conflicts before submitting.');
+    if (gitOutput(cwd, ['diff', '--name-only']) || gitOutput(cwd, ['ls-files', '--others', '--exclude-standard'])) {
+      throw new Error('Stage all resolution changes before submitting.');
+    }
+    worktree.mergeResolutionSubmitted = true;
+    worktree.integration = { ...worktree.integration, phase: 'waiting', updatedAt: new Date().toISOString() };
+    thread.updatedAt = new Date().toISOString();
+    this.taskStore.upsertTask(thread);
+    return { threadId, status: 'WAITING_MERGE', message: 'Resolution submitted; end the reviewer turn so the bridge can validate and integrate it.' };
+  }
+
   public resumePendingMerges(): void {
     this.taskStore.loadFromDisk();
     for (const thread of this.taskStore.getAllTasks()) {
       if (thread.status !== 'waiting_merge') continue;
-      if (thread.worktree?.integration?.phase === 'blocked') continue;
+      if (['blocked', 'conflict', 'validation_failed'].includes(thread.worktree?.integration?.phase || '')) continue;
       const blockedAt = this.blockedMergeRetries.get(thread.threadId);
       if (blockedAt && blockedAt === thread.updatedAt) continue;
       if (blockedAt) this.blockedMergeRetries.delete(thread.threadId);
@@ -858,10 +885,9 @@ export class ReworkController {
         }
         const latest = this.taskStore.getTask(thread.threadId);
         if (latest?.status !== 'waiting_merge' || !latest.worktree) return;
-        latest.status = 'waiting_review';
-        latest.worktree.approvedCommit = undefined;
+        latest.status = 'waiting_merge';
         const failure = `Merge coordinator failed: ${error?.message || error}`;
-        latest.worktree.integration = { ...latest.worktree.integration, phase: 'validation_failed', error: failure, updatedAt: new Date().toISOString() };
+        latest.worktree.integration = { ...latest.worktree.integration, phase: 'blocked', error: failure, updatedAt: new Date().toISOString() };
         latest.summary.lastOutputSnippet = failure;
         try { this.taskStore.upsertTask(latest); }
         catch (persistError: any) { console.error(`[ReworkController] Could not persist merge failure for ${thread.threadId}: ${persistError?.message || persistError}`); }

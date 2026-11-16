@@ -1,8 +1,9 @@
-import { getTaskExecutionPath } from './types';
+import { getTaskExecutionPath, isReviewerWakeEligible } from './types';
 import * as child_process from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import {
   DelegationThread,
@@ -106,7 +107,7 @@ export class CallbackManager extends EventEmitter {
       return;
     }
     if (next.kind === 'review') {
-      if (thread.status !== 'waiting_review' && thread.status !== 'review_failed' && !(thread.status === 'waiting_merge' && thread.worktree?.integration?.phase === 'blocked')) {
+      if (!isReviewerWakeEligible(thread) && thread.status !== 'review_failed') {
         console.log(
           `[CallbackManager] Dropping queued review wake for ${next.threadId}: status is now "${thread.status}".`,
         );
@@ -168,7 +169,7 @@ export class CallbackManager extends EventEmitter {
         this.taskStore?.upsertTask(thread);
       } catch {}
     }
-    if (thread.status !== 'waiting_review' && !(thread.status === 'waiting_merge' && thread.worktree?.integration?.phase === 'blocked')) {
+    if (!isReviewerWakeEligible(thread)) {
       console.warn(
         `[CallbackManager] Refusing to wake reviewer for ${thread.threadId}: ` +
           `task status is "${thread.status}", not "waiting_review".`,
@@ -209,7 +210,7 @@ export class CallbackManager extends EventEmitter {
         `[CallbackManager] Refusing duplicate reviewer for ${thread.threadId}: ` +
           `${roleLock.describe(owner)} still owns the task role.`,
       );
-      return false;
+      return owner?.role === 'reviewer' ? this.deferWake(callerSessionId, wakeRequest) : false;
     }
 
     let reviewerPreparation: Awaited<ReturnType<NativeSessionCompactor['prepareBeforeResume']>> | undefined;
@@ -221,6 +222,7 @@ export class CallbackManager extends EventEmitter {
           .prepareBeforeResume(thread.threadId, 'reviewer', reviewerModel);
       } catch (error: any) {
         roleLock.release(roleLease);
+        this.wakeQueue.release(callerSessionId);
         if (String(error?.message || error).includes('already owned by another Bridge process')) {
           return this.deferWake(callerSessionId, wakeRequest);
         }
@@ -253,7 +255,7 @@ export class CallbackManager extends EventEmitter {
           thread.threadId,
           reviewRound.round,
           thread.initiatorAgent,
-          getTaskExecutionPath(thread),
+          thread.status === 'waiting_merge' && thread.worktree?.mergeResolutionPath || getTaskExecutionPath(thread),
           'reviewer',
         );
         ownsExecutionRegistration = true;
@@ -274,7 +276,7 @@ export class CallbackManager extends EventEmitter {
       const bindingMatches = !!reviewerSessionLease && fresh?.reviewerSessionId === callerSessionId && fresh.reviewerSessionCaptured &&
         fresh.initiatorAgent === thread.initiatorAgent && fresh.reviewerModel === thread.reviewerModel &&
         JSON.stringify(fresh.worktree) === JSON.stringify(thread.worktree);
-      if (!fresh || fresh.archivedAt || (fresh.status !== 'waiting_review' && !(fresh.status === 'waiting_merge' && fresh.worktree?.integration?.phase === 'blocked')) || !bindingMatches ||
+      if (!fresh || fresh.archivedAt || !isReviewerWakeEligible(fresh) || !bindingMatches ||
           (reviewerPreparation?.pauseReason !== undefined) ||
           owner?.token !== roleLease.token || new CancellationRegistry(path.dirname(this.taskStore.getStoragePath())).peek(thread.threadId)) {
         if (reviewerSessionLease) nativeLock.release(reviewerSessionLease);
@@ -314,7 +316,7 @@ export class CallbackManager extends EventEmitter {
     const promptMessage = `[Agent Mesh Bridge 自动化闭环验收指令] 任务【${thread.title}】第 ${reviewRound.round} 轮已由 ${thread.targetAgent} 执行完成。\n结果摘要: ${preview}${tokenLine}\n\n本任务已有中间文档链保存在任务账本（历轮指令 / 开发报告 / 返修意见）。get_thread_details(threadId="${thread.threadId}") 默认返回有界视图：最新轮完整，较早轮次可能是「提纯胶囊」卡片；需要逐字核对某一历史轮时用 get_round_raw_log(threadId="${thread.threadId}", round=<轮号>)，不要为此读取整段历史。必须沿用同一 threadId 与当前 callerSessionId 继续，禁止新建任务、另起会话或转派给其他 Agent。\n\n请作为任务下发方立即执行自动化检视闭环（判据只看**本任务自身范围**）：\n1. 审查本任务范围的代码与产出，并在当前工作区实际运行相关测试验证；\n2. 本任务范围内存在编译报错、测试未通过或功能缺陷：立即调用 request_rework(threadId="${thread.threadId}", feedback="具体报错与修复要求")；\n3. 本任务范围已通过、只是同批其他任务/依赖尚未交付：**不要**再发一轮 rework 空转，改用 request_rework(threadId="${thread.threadId}", feedback="阻塞说明", blocked=true, waitingForThreadId="<被依赖的 threadId>") 挂起；桥接不占用轮次，并在依赖到达 completed/failed 时自动唤醒你；\n4. 本任务范围通过即调用 approve_task(threadId="${thread.threadId}", remarks="本任务范围的验收结论与测试结果")。**不要用同批其他任务的 skip/失败否决本任务**——批次门禁属于收口阶段，由你在第 5 步统一处理；\n5. 验收通过后，由你作为调用者统一收口一个 MR：汇总该任务及同一批尚未推送的改动，只创建一个 MR，使用仓库既有远端与 gh/glab/等价 CLI 推送到远端；然后调用 mcp 工具 record_merge_request(threadId="${thread.threadId}", url="MR URL", branch="源分支", commit="提交 SHA", remote="origin", status="synced", summary="MR 摘要") 记录 MR 信息。不要每个子任务各推一次，不要新建任务/会话；开发者(receiver)不负责提交/推送。\n注意：上一轮没有任何文件改动时，本轮若再提交几乎相同的 rework 指令会被桥接拒绝（REWORK_NOOP_LOOP），只能 approve_task 或 blocked=true。\n请注意：请直接调用上述 MCP 工具完成闭环，请勿仅输出文本结论。`;
 
     const wakeMessage = thread.status === 'waiting_merge'
-      ? `The approved task could not be integrated: ${thread.worktree?.integration?.error || 'unknown error'}. Inspect get_thread_details for task ${thread.threadId}, its merge history and logs. Preserve the existing thread and reviewer session; resolve the environment or request rework only if the candidate itself needs changes.`
+      ? `The approved task could not be integrated: ${thread.worktree?.integration?.error || 'unknown error'}. Resolution workspace: ${thread.worktree?.mergeResolutionPath || 'not available'}. Worker assessment: ${JSON.stringify(reviewRound.assessment || null)}. Interruptions: ${JSON.stringify(thread.interruptions || [])}. Inspect get_thread_details and get_round_raw_log for task ${thread.threadId}. Preserve the existing thread and reviewer session; use standard Git to resolve and stage changes, then call submit_merge_resolution. Request rework only if the candidate itself needs changes.`
       : promptMessage;
     let released = false;
     let sessionLeaseReleased = !reviewerSessionLease;
@@ -615,7 +617,7 @@ export class CallbackManager extends EventEmitter {
   ): boolean {
     assertCanExecute(thread.initiatorAgent, 'resume as a reviewer', 'initiator');
     const initiator = thread.initiatorAgent;
-    const cwd = getTaskExecutionPath(thread);
+    const cwd = thread.status === 'waiting_merge' && thread.worktree?.mergeResolutionPath || getTaskExecutionPath(thread);
     // Wake the caller on its SENDER-side default model, which is configured
     // separately from the receiver-side default: the same agent can dispatch a
     // task to itself and execute it with a different model. An empty sender
@@ -993,7 +995,8 @@ export class CallbackManager extends EventEmitter {
       }
     }
 
-    if (target.status === 'completed' || target.status === 'waiting_merge') {
+    const mergeWake = thread.status === 'waiting_merge' && isReviewerWakeEligible(thread);
+    if (target.status === 'completed' || (target.status === 'waiting_merge' && (!mergeWake || !isReviewerWakeEligible(target)))) {
       if (target.reviewWake?.round === round.round) {
         target.reviewWake = undefined;
         target.updatedAt = new Date().toISOString();
@@ -1005,7 +1008,7 @@ export class CallbackManager extends EventEmitter {
     }
 
     // Paused/failed/deleted/review_failed tasks no longer own a review slot.
-    if (target.status !== 'waiting_review') return undefined;
+    if (target.status !== 'waiting_review' && !(mergeWake && isReviewerWakeEligible(target))) return undefined;
 
     const handedOff =
       (target.rounds || []).some((candidate) => candidate.round > round.round && candidate.type !== 'approval') ||
@@ -1024,7 +1027,7 @@ export class CallbackManager extends EventEmitter {
     }
 
     // A callback for a prior round cannot write a retry plan for the new one.
-    if (target.currentRound !== round.round) return undefined;
+    if (!mergeWake && target.currentRound !== round.round) return undefined;
 
     const failure = clean
       ? 'REVIEW_NO_DECISION: reviewer exited successfully without a recorded approve_task, request_rework, or review block'
@@ -1053,7 +1056,13 @@ export class CallbackManager extends EventEmitter {
     });
     target.reviewWake = state;
     target.updatedAt = new Date().toISOString();
-    if (state.gaveUp) {
+    if (mergeWake) {
+      state.autoRetryAt = undefined;
+      const number = (target.mergeHistory?.length || 0) + 1;
+      target.mergeHistory = [...(target.mergeHistory || []), {
+        id: crypto.randomUUID(), number, at: target.updatedAt, phase: 'reviewer', result: 'failed', error: state.lastError,
+      }];
+    } else if (state.gaveUp) {
       // The retry budget is spent: no reviewer will ever be woken again on its
       // own. Surface that as a terminal `review_failed` (releasing the queue
       // slot) with the concrete cause, rather than a silent `waiting_review`.

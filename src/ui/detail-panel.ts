@@ -1148,6 +1148,16 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
     ${roundsHtml}
   </div>
 
+  ${(thread.mergeHistory || []).length ? `<div class="timeline"><h3>Merge Timeline / 合并记录</h3>${thread.mergeHistory!.map((event) => `
+    <div class="meta-item"><strong>#${event.number} ${escapeHtml(event.phase)} · ${escapeHtml(event.result)}</strong> · ${escapeHtml(event.at)}
+      ${event.targetOldCommit ? `<div>Target: ${escapeHtml(event.targetRef || '')} @ ${escapeHtml(event.targetOldCommit)}</div>` : ''}
+      ${event.error ? `<pre class="code-block">${escapeHtml(event.error)}</pre>` : ''}
+      ${event.conflictFiles?.length ? `<div>Conflicts: ${event.conflictFiles.map(escapeHtml).join(', ')}</div>` : ''}
+      ${event.logPath ? `<div>Log: ${escapeHtml(event.logPath)} · get_merge_log #${event.number}</div>` : ''}
+      ${event.changedFiles?.length ? `<pre class="code-block">${escapeHtml(event.changedFiles.join('\n'))}</pre>` : ''}
+      ${event.mergedCommit ? `<div>Revert by creating a new commit: <code>git revert -m 1 ${escapeHtml(event.mergedCommit)}</code></div>` : ''}
+    </div>`).join('')}</div>` : ''}
+
   ${
     thread.status !== 'completed'
       ? `

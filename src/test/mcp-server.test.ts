@@ -245,7 +245,9 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'workspacePath'));
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'expectedFiles'));
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'allowNoScope'));
-    assert.strictEqual(toolNames.length, 20);
+    assert.ok(toolNames.includes('submit_merge_resolution'));
+    assert.ok(toolNames.includes('get_merge_log'));
+    assert.strictEqual(toolNames.length, 22);
   });
 
   test('list_agent_models reports the receiver and sender defaults separately', async () => {
@@ -541,6 +543,20 @@ describe('MCPServer Protocol Tests', () => {
       await call('get_round_raw_log', { threadId, round: 1, maxBytes: 10_000_000 }),
     );
     assert.ok(clamped.content.length <= 200_000);
+  });
+
+  test('get_merge_log reads bounded pages from the task-owned log', async () => {
+    const threadId = 'thread_merge_log_page'; const now = new Date().toISOString();
+    const logPath = path.join(tempDir, 'merge-logs', threadId, 'merge_log', `${threadId}_merge_1.log`);
+    fs.mkdirSync(path.dirname(logPath), { recursive: true }); fs.writeFileSync(logPath, 'abcdefghij');
+    taskStore.upsertTask({ threadId, title: 'merge log', initiatorAgent: 'codex', targetAgent: 'claude_code',
+      status: 'waiting_merge', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-abcdef12',
+      workspace: testWorkspace(tempDir), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 }, rounds: [],
+      mergeHistory: [{ id: 'one', number: 1, at: now, phase: 'conflict', result: 'failed', logPath }] });
+    const res = await mcpServer.handleRpcMessage({ jsonrpc: '2.0', id: 800, method: 'tools/call',
+      params: { name: 'get_merge_log', arguments: { threadId, number: 1, offset: 2, limit: 4 } } });
+    const page = JSON.parse(res.result.content[0].text);
+    assert.equal(page.content, 'cdef'); assert.equal(page.nextOffset, 6); assert.equal(page.size, 10);
   });
 
   test('get_task_token_usage reports task rollup and single-round detail', async () => {

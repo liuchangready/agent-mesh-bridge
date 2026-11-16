@@ -347,6 +347,16 @@ export function archiveCompletedTaskLogs(
     }
   }
 
+  const mergeDir = artifactDir ? path.join(artifactDir, 'merge_log') : path.join(bridgeHomeDir(root), 'merge-logs', safe, 'merge_log');
+  if (fs.existsSync(mergeDir)) {
+    for (const name of fs.readdirSync(mergeDir)) {
+      if (!name.startsWith(`${safe}_merge_`) || !name.endsWith('.log')) continue;
+      const full = path.join(mergeDir, name);
+      const stat = fs.statSync(full);
+      if (stat.isFile()) entries.push({ name: `merge_log/${name}`, content: fs.readFileSync(full), mtime: stat.mtime });
+    }
+  }
+
   // 3. Bridge-generated one-run model overlays (currently DSH patches).
   if (artifactDir) {
     const overlayDir = taskModelOverlayDir(artifactDir);
@@ -382,6 +392,7 @@ export function archiveCompletedTaskLogs(
     archivedAt: thread.archivedAt || new Date().toISOString(),
     finalSummary: thread.finalSummary,
     mergeRequest: thread.mergeRequest,
+    mergeHistory: thread.mergeHistory,
     archivedLogFiles: entries.map((e) => e.name),
   };
   const summaryJsonStr = JSON.stringify(manifest, null, 2);
@@ -449,7 +460,7 @@ export function removeTaskArtifacts(
   const artifactDir = options.artifactDir;
 
   const targetDirs = artifactDir
-    ? [taskWorkerLogDir(artifactDir), taskReviewerLogDir(artifactDir)]
+    ? [taskWorkerLogDir(artifactDir), taskReviewerLogDir(artifactDir), path.join(artifactDir, 'merge_log')]
     : Array.from(
         new Set([
           getWorkerLogDir(options.targetAgent, root),
@@ -457,6 +468,7 @@ export function removeTaskArtifacts(
           getReviewerLogDir(options.initiatorAgent, root),
           getReviewerLogDir(undefined, root),
           bridgeLogsDir(root),
+          path.join(bridgeHomeDir(root), 'merge-logs', safe, 'merge_log'),
         ]),
       );
 

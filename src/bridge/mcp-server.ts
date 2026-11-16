@@ -79,6 +79,7 @@ const CONTROL_TOOLS = new Set([
   'retarget_task',
   'delete_task',
   'record_merge_request',
+  'submit_merge_resolution',
 ]);
 
 
@@ -533,6 +534,16 @@ export class MCPServer {
           },
           required: ['threadId', 'feedback'],
         },
+      },
+      {
+        name: 'get_merge_log',
+        description: 'Read a bounded page of a recorded merge log.',
+        inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, number: { type: 'integer' }, offset: { type: 'integer' }, limit: { type: 'integer' } }, required: ['threadId', 'number'] },
+      },
+      {
+        name: 'submit_merge_resolution',
+        description: 'Submit staged changes in the retained merge resolution workspace for validation and local integration.',
+        inputSchema: { type: 'object', properties: { threadId: { type: 'string' } }, required: ['threadId'] },
       },
       {
         name: 'approve_task',
@@ -1313,6 +1324,30 @@ export class MCPServer {
         // message; that is not an active review decision anymore.
         new TaskRoleLock().releaseIfRole(args.threadId, 'reviewer');
         return result;
+      }
+
+      case 'get_merge_log': {
+        const thread = this.taskStore.getTask(args.threadId);
+        const event = thread?.mergeHistory?.find((entry) => entry.number === Number(args.number));
+        if (!thread || !event?.logPath) throw new Error('Merge log not found.');
+        const safeId = thread.threadId.replace(/[^A-Za-z0-9_-]/g, '_');
+        const root = thread.artifactDir || path.join(path.dirname(this.taskStore.getStoragePath()), 'merge-logs', safeId);
+        const expected = path.join(root, 'merge_log', `${safeId}_merge_${event.number}.log`);
+        if (path.resolve(event.logPath) !== path.resolve(expected)) throw new Error('Invalid merge log path.');
+        const offset = Math.max(0, Math.floor(Number(args.offset) || 0));
+        const limit = Math.min(200 * 1024, Math.max(1, Math.floor(Number(args.limit) || 20 * 1024)));
+        const fd = fs.openSync(expected, 'r');
+        try {
+          const size = fs.fstatSync(fd).size;
+          const buffer = Buffer.alloc(Math.min(limit, Math.max(0, size - offset)));
+          const bytes = fs.readSync(fd, buffer, 0, buffer.length, offset);
+          return { threadId: thread.threadId, number: event.number, offset, nextOffset: offset + bytes, size, content: buffer.subarray(0, bytes).toString('utf8') };
+        } finally { fs.closeSync(fd); }
+      }
+
+      case 'submit_merge_resolution': {
+        this.assertActiveReviewerRole(args.threadId);
+        return this.reworkController.submitMergeResolution(args.threadId);
       }
 
       case 'approve_task': {

@@ -27,6 +27,7 @@ import { TaskRoleLock } from '../bridge/task-role-lock';
 import { NativeSessionCompactor } from '../bridge/native-session-compactor';
 import { CancellationRegistry } from '../bridge/cancellation-registry';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
+import { NativeSessionLock } from '../bridge/native-session-lock';
 
 describe('Review wake failure policy', () => {
   const now = Date.parse('2026-10-23T12:00:00.000Z');
@@ -171,6 +172,51 @@ describe('CallbackManager records stalled reviewer wakes', () => {
     assert.equal(store.getTask(thread.threadId)!.status, 'paused');
     assert.equal(launches, 0);
     assert.equal(new TaskExecutionRegistry(dir).getOwner(thread.threadId), undefined);
+    store.dispose();
+  });
+
+  test('a blocked merge resumes its dedicated reviewer through real preparation and releases leases', async () => {
+    const { dir, store, manager } = setup();
+    const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1';
+    const workspace = dirWorkspace();
+    const thread = makeThread({ threadId: 'thread_blocked_merge_wake', status: 'waiting_merge', reviewFlow: 'dedicated',
+      reviewBootstrap: { phase: 'confirmed', attempts: 1 }, reviewerSessionId: sessionId,
+      reviewerSessionCaptured: true, callerSessionId: sessionId, reviewerModel: 'test-model',
+      worktree: { path: workspace, mainPath: workspace, integration: { phase: 'blocked', error: 'snapshot failed', updatedAt: new Date().toISOString() } } });
+    store.upsertTask(thread);
+    let release: (() => void) | undefined;
+    let onChildPid: ((pid: number | undefined) => void) | undefined;
+    let observedSession = '';
+    (manager as any).launchCaller = (...args: any[]) => {
+      observedSession = args[1]; release = args[5]; onChildPid = args[6];
+      onChildPid?.(process.pid);
+      return true;
+    };
+    assert.equal(await manager.notifyCaller(thread, thread.rounds[0]), true);
+    assert.equal(observedSession, sessionId);
+    assert.equal(new TaskRoleLock(dir).getOwner(thread.threadId)?.role, 'reviewer');
+    assert.ok(new TaskExecutionRegistry(dir).getOwner(thread.threadId));
+    assert.equal(new NativeSessionLock(dir).acquire('codex', sessionId), undefined);
+    onChildPid?.(undefined); release?.();
+    assert.equal(new TaskRoleLock(dir).getOwner(thread.threadId), undefined);
+    assert.equal(new TaskExecutionRegistry(dir).getOwner(thread.threadId), undefined);
+    const lease = new NativeSessionLock(dir).acquire('codex', sessionId);
+    assert.ok(lease); new NativeSessionLock(dir).release(lease!);
+    store.dispose();
+  });
+
+  test('a failed merge reviewer is recorded without treating waiting_merge as a successful handoff', () => {
+    const { store, manager } = setup();
+    const workspace = dirWorkspace();
+    const thread = makeThread({ threadId: 'thread_failed_merge_reviewer', status: 'waiting_merge',
+      worktree: { path: workspace, mainPath: workspace, integration: { phase: 'blocked', error: 'snapshot failed', updatedAt: new Date().toISOString() } } });
+    store.upsertTask(thread);
+    const state = manager.finalizeWake(thread, thread.rounds[0], thread.callerSessionId!, { exitCode: 1, output: 'permission denied' });
+    assert.ok(state);
+    const saved = store.getTask(thread.threadId)!;
+    assert.equal(saved.status, 'waiting_merge');
+    assert.equal(saved.mergeHistory![0].phase, 'reviewer');
+    assert.match(saved.mergeHistory![0].error!, /permission denied/);
     store.dispose();
   });
 

@@ -536,37 +536,51 @@ export class MergeCoordinator {
         if (!sync.ok) { this.finishBlocked(threadId, sync.error, prior.targetOldCommit, sourceCommit, sync.path); return { status: 'blocked', message: sync.error }; }
         const validationStatus = prior.validationPath ? this.cleanupValidationWorktree(repoPath, threadId, prior.validationPath) : undefined;
         this.finishMerged(threadId, sync.commit || prior.candidateCommit!, prior.targetOldCommit, sync.path,
-          prior.validationPath ? this.validationRecord(prior.validationPath, prior.validationCommit, prior.validationResult, validationStatus) : undefined);
+          prior.validationPath ? this.validationRecord(prior.validationPath, prior.validationCommit, prior.validationResult, validationStatus) : undefined, prior.candidateCommit);
         prior.phase = 'ledger_written'; this.writeTransaction(txPath, prior);
         return { status: 'merged', message: 'Recovered completed merge transaction.', commit: sync.commit || prior.candidateCommit };
       }
-      if (prior?.validationPath) this.cleanupValidationWorktree(repoPath, threadId, prior.validationPath);
+      const resolutionPath = worktree.mergeResolutionSubmitted ? worktree.mergeResolutionPath : undefined;
+      if (resolutionPath && worktree.integration?.targetOldCommit !== targetOldCommit) {
+        const reason = `Target advanced since resolution began; the existing resolution at ${resolutionPath} was preserved.`;
+        this.finishBlocked(threadId, reason, worktree.integration?.targetOldCommit || '', sourceCommit);
+        return { status: 'blocked', message: reason };
+      }
+      if (prior?.validationPath && prior.validationPath !== resolutionPath) this.cleanupValidationWorktree(repoPath, threadId, prior.validationPath);
       const tx = { threadId, sourceCommit, targetOldCommit, phase: 'preparing', at: new Date().toISOString() } as any;
       this.writeTransaction(txPath, tx);
       const scratchRoot = thread.artifactDir
         ? taskValidationDir(thread.artifactDir)
         : path.join(this.storageDir, 'merge-worktrees');
-      const scratch = path.join(scratchRoot, `${threadId}-${crypto.randomUUID()}`);
+      const scratch = resolutionPath || path.join(scratchRoot, `${threadId}-${crypto.randomUUID()}`);
       fs.mkdirSync(scratchRoot, { recursive: true });
       tx.validationPath = scratch; this.writeTransaction(txPath, tx);
-      let added = false;
+      let added = !!resolutionPath;
       let validationCommit: string | undefined;
       let validationResult: 'passed' | 'failed' | 'cancelled' | undefined;
+      let retainForResolution = !!resolutionPath;
       try {
-        gitOutput(repoPath, ['worktree', 'add', '--detach', scratch, targetOldCommit]); added = true;
-        try { gitOutput(scratch, ['merge', '--no-commit', '--no-ff', sourceCommit]); }
+        if (!resolutionPath) { gitOutput(repoPath, ['worktree', 'add', '--detach', scratch, targetOldCommit]); added = true; }
+        try { if (!resolutionPath) gitOutput(scratch, ['merge', '--no-commit', '--no-ff', sourceCommit]); }
         catch (error) {
           const conflicts = gitOutput(scratch, ['diff', '--name-only', '--diff-filter=U']).split(/\r?\n/).filter(Boolean);
           const message = `Merge conflict against ${targetOldCommit}: ${conflicts.join(', ') || String(error)}`;
-          this.finishMergeFailure(threadId, 'conflict', message, targetOldCommit, sourceCommit, conflicts);
+          retainForResolution = !!worktree.approvedSnapshot;
+          this.finishMergeFailure(threadId, 'conflict', message, targetOldCommit, sourceCommit, conflicts, retainForResolution ? scratch : undefined);
           return { status: 'conflict', message };
         }
+        if (resolutionPath && (currentHead(scratch) !== targetOldCommit || gitOutput(scratch, ['diff', '--name-only', '--diff-filter=U']) || gitOutput(scratch, ['diff', '--name-only']) || gitOutput(scratch, ['ls-files', '--others', '--exclude-standard']))) {
+          this.finishMergeFailure(threadId, 'conflict', 'Resolution workspace changed or contains unstaged or unresolved files.', targetOldCommit, sourceCommit, undefined, scratch);
+          return { status: 'conflict', message: 'Resolution workspace changed or contains unstaged or unresolved files.' };
+        }
+        const treeBeforeValidation = gitOutput(scratch, ['write-tree']);
         const validation = await this.validate(scratch, repoPath, threadId, sourceCommit);
         validationResult = validation.ok ? 'passed' : 'failed';
         tx.validationResult = validationResult; this.writeTransaction(txPath, tx);
         if (!validation.ok) {
           if (!this.isMergeStillAllowed(threadId, sourceCommit)) { validationResult = 'cancelled'; return { status: 'stale', message: 'Task was paused or deleted during combined validation.' }; }
-          this.finishMergeFailure(threadId, 'validation_failed', validation.error, targetOldCommit, sourceCommit);
+          retainForResolution = !!worktree.approvedSnapshot;
+          this.finishMergeFailure(threadId, 'validation_failed', validation.error, targetOldCommit, sourceCommit, undefined, retainForResolution ? scratch : undefined);
           return { status: 'validation_failed', message: validation.error };
         }
         if (!this.isMergeStillAllowed(threadId, sourceCommit)) { validationResult = 'cancelled'; return { status: 'stale', message: 'Task was paused or deleted during combined validation.' }; }
@@ -576,18 +590,24 @@ export class MergeCoordinator {
           return { status: 'stale', message: 'The approved task worktree changed during validation; reviewer must inspect the new state.' };
         }
         const validationTree = gitOutput(scratch, ['write-tree']);
+        if (validationTree !== treeBeforeValidation || gitOutput(scratch, ['diff', '--name-only'])) {
+          const error = 'Combined validation changed the staged or tracked working tree; the tested tree cannot be safely integrated.';
+          retainForResolution = !!worktree.approvedSnapshot;
+          this.finishMergeFailure(threadId, 'validation_failed', error, targetOldCommit, sourceCommit, undefined, retainForResolution ? scratch : undefined);
+          return { status: 'validation_failed', message: error };
+        }
         const candidateCommit = gitOutput(scratch, ['-c', 'user.name=Agent Mesh Bridge', '-c', 'user.email=agent-mesh-bridge@localhost', 'commit-tree', validationTree, '-p', targetOldCommit, '-p', sourceCommit, '-m', `Merge ${threadId}`]);
-        gitOutput(scratch, ['reset', '--hard', candidateCommit]);
         if (gitOutput(scratch, ['rev-parse', `${candidateCommit}^{tree}`]) !== validationTree || gitOutput(scratch, ['write-tree']) !== validationTree) {
           throw new Error('The recorded validation commit does not match the combined tree that was validated.');
         }
         validationCommit = candidateCommit;
         tx.validationCommit = validationCommit;
         tx.phase = 'validated'; tx.candidateCommit = candidateCommit; this.writeTransaction(txPath, tx);
+        retainForResolution = !!worktree.approvedSnapshot;
         if (!this.isMergeStillAllowed(threadId, sourceCommit)) { validationResult = 'cancelled'; return { status: 'stale', message: 'Task was paused or deleted before the validated integration could be written.' }; }
         const beforeLanding = this.syncCheckedOutTarget(repoPath, targetRef, candidateCommit, true, targetOldCommit);
         if (!beforeLanding.ok) {
-          this.finishBlocked(threadId, beforeLanding.error, targetOldCommit, sourceCommit, beforeLanding.path);
+          this.finishBlocked(threadId, beforeLanding.error, targetOldCommit, sourceCommit, beforeLanding.path, retainForResolution ? scratch : undefined);
           return { status: 'blocked', message: beforeLanding.error };
         }
         if (!this.isMergeStillAllowed(threadId, sourceCommit)) { validationResult = 'cancelled'; return { status: 'stale', message: 'Task was paused or deleted before the target ref update.' }; }
@@ -595,13 +615,15 @@ export class MergeCoordinator {
         gitOutput(repoPath, ['update-ref', targetRef, candidateCommit, targetOldCommit]);
         tx.phase = 'ref_updated'; this.writeTransaction(txPath, tx);
         const synced = this.syncCheckedOutTarget(repoPath, targetRef, candidateCommit, false, targetOldCommit);
-        if (!synced.ok) { this.finishBlocked(threadId, synced.error, targetOldCommit, sourceCommit, synced.path); return { status: 'blocked', message: synced.error }; }
+        if (!synced.ok) { this.finishBlocked(threadId, synced.error, targetOldCommit, sourceCommit, synced.path, retainForResolution ? scratch : undefined); return { status: 'blocked', message: synced.error }; }
         const validationStatus = this.removeValidationWorktree(repoPath, scratch) ? 'cleaned' : 'present'; added = validationStatus === 'present';
-        this.finishMerged(threadId, synced.commit || candidateCommit, targetOldCommit, synced.path, this.validationRecord(scratch, validationCommit, validationResult, validationStatus));
+        this.finishMerged(threadId, synced.commit || candidateCommit, targetOldCommit, synced.path, this.validationRecord(scratch, validationCommit, validationResult, validationStatus), candidateCommit);
         tx.phase = 'ledger_written'; this.writeTransaction(txPath, tx);
       return { status: 'merged', message: 'Merged and validated.', commit: synced.commit || candidateCommit };
       } finally {
-        if (added) {
+        if (added && retainForResolution) {
+          this.recordValidation(threadId, scratch, validationCommit, 'present', validationResult);
+        } else if (added) {
           const validationStatus = this.removeValidationWorktree(repoPath, scratch) ? 'cleaned' : 'present';
           this.recordValidation(threadId, scratch, validationCommit, validationStatus, validationResult);
         }
@@ -616,7 +638,7 @@ export class MergeCoordinator {
           if (!sync.ok) { this.finishBlocked(threadId, sync.error, tx.targetOldCommit, sourceCommit, sync.path); return { status: 'blocked', message: sync.error }; }
           const validationStatus = tx.validationPath ? this.cleanupValidationWorktree(repoPath, threadId, tx.validationPath) : undefined;
           this.finishMerged(threadId, sync.commit || tx.candidateCommit, tx.targetOldCommit, sync.path,
-            tx.validationPath ? this.validationRecord(tx.validationPath, tx.validationCommit, tx.validationResult, validationStatus) : undefined);
+            tx.validationPath ? this.validationRecord(tx.validationPath, tx.validationCommit, tx.validationResult, validationStatus) : undefined, tx.candidateCommit);
           tx.phase = 'ledger_written';
           this.writeTransaction(this.transactionPath(threadId), tx);
           return { status: 'merged', message: 'Recovered target update after a durable ledger write failure.', commit: sync.commit || tx.candidateCommit };
@@ -625,7 +647,8 @@ export class MergeCoordinator {
       const latest = this.store.getTask(threadId);
       if (latest?.status === 'waiting_merge' && latest.worktree?.deliveryTarget) {
         const reason = `Could not safely deliver to ${targetRef}: ${String(error)}`;
-        this.finishBlocked(threadId, reason, latest.worktree?.integration?.targetOldCommit || '', sourceCommit);
+        this.finishBlocked(threadId, reason, latest.worktree?.integration?.targetOldCommit || '', sourceCommit, undefined,
+          latest.worktree.approvedSnapshot ? latest.worktree.validation?.path : undefined);
         return { status: 'blocked', message: reason };
       }
       throw error;
@@ -695,12 +718,20 @@ export class MergeCoordinator {
     return { path: validationPath, commit, status, result, updatedAt: new Date().toISOString() };
   }
 
-  private finishBlocked(threadId: string, reason: string, targetOldCommit: string, sourceCommit: string, targetPath?: string): void {
+  private finishBlocked(threadId: string, reason: string, targetOldCommit: string, sourceCommit: string, targetPath?: string, resolutionPath?: string): void {
     const current = this.store.getTask(threadId); if (!current?.worktree) return;
     const thread = structuredClone(current);
     thread.status = 'waiting_merge';
+    if (resolutionPath) { thread.worktree!.mergeResolutionPath = resolutionPath; thread.worktree!.mergeResolutionSubmitted = false; }
     thread.worktree!.integration = { ...thread.worktree!.integration, phase: 'blocked', error: reason, targetOldCommit, targetPath, sourceCommit, updatedAt: new Date().toISOString() };
     thread.summary.lastOutputSnippet = reason; thread.updatedAt = new Date().toISOString(); this.store.upsertTask(thread);
+    if (thread.worktree!.approvedSnapshot) {
+      const timer = setTimeout(() => {
+        const latest = this.store.getTask(threadId);
+        if (latest?.status === 'waiting_merge' && latest.worktree?.integration?.phase === 'blocked') this.requestReview?.(latest);
+      }, 0);
+      timer.unref();
+    }
   }
 
   private isAncestor(cwd: string, ancestor: string, commit: string): boolean {
@@ -755,7 +786,7 @@ export class MergeCoordinator {
       try { await this.lock.attachChildPid(child.pid, () => !this.isMergeStillAllowed(threadId, sourceCommit)); }
       catch (error) { trackingError = error as Error; killProcessTree(child); }
       const result = await resultPromise;
-      if (result.code !== 0) return { ok: false, error: `${step.label} failed (exit ${result.code}): ${result.output.slice(-5000)}` };
+      if (result.code !== 0) return { ok: false, error: `${step.label} failed (exit ${result.code}): ${result.output}` };
       if (!this.isMergeStillAllowed(threadId, sourceCommit)) return { ok: false, error: 'Task was paused or deleted during combined validation.' };
     }
     return { ok: true, error: '' };
@@ -782,27 +813,51 @@ export class MergeCoordinator {
     timer.unref();
   }
 
-  private finishMergeFailure(threadId: string, phase: 'conflict' | 'validation_failed', error: string, targetOldCommit: string, sourceCommit: string, conflictFiles?: string[]): void {
+  private finishMergeFailure(threadId: string, phase: 'conflict' | 'validation_failed', error: string, targetOldCommit: string, sourceCommit: string, conflictFiles?: string[], resolutionPath?: string): void {
     const current = this.store.getTask(threadId); if (!current?.worktree) return;
     const thread = structuredClone(current);
     const worktree = thread.worktree!;
-    thread.status = 'waiting_review'; worktree.approvedCommit = undefined;
-    worktree.integration = { phase, error, targetOldCommit, sourceCommit, conflictFiles, updatedAt: new Date().toISOString() };
-    thread.summary.lastOutputSnippet = `${phase}: ${error}`; thread.updatedAt = new Date().toISOString(); this.store.upsertTask(thread);
+    thread.status = resolutionPath ? 'waiting_merge' : 'waiting_review';
+    if (resolutionPath) { worktree.mergeResolutionPath = resolutionPath; worktree.mergeResolutionSubmitted = false; } else worktree.approvedCommit = undefined;
+    const at = new Date().toISOString();
+    if (resolutionPath) {
+      const number = (thread.mergeHistory?.length || 0) + 1;
+      const safeId = threadId.replace(/[^A-Za-z0-9_-]/g, '_');
+      const dir = path.join(thread.artifactDir || path.join(this.storageDir, 'merge-logs', safeId), 'merge_log');
+      let logPath: string | undefined;
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+        logPath = path.join(dir, `${safeId}_merge_${number}.log`);
+        fs.writeFileSync(logPath, `${phase}: ${error}\n`, 'utf8');
+      } catch { logPath = undefined; }
+      thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number, at, phase, result: 'failed',
+        error: error.slice(-5000), logPath, targetRef: worktree.deliveryTarget?.ref || worktree.targetRef,
+        targetOldCommit, candidateCommit: sourceCommit, candidateTree: worktree.approvedSnapshot?.tree, conflictFiles }];
+    }
+    worktree.integration = { phase, error: error.slice(-5000), targetOldCommit, sourceCommit, conflictFiles, updatedAt: at };
+    thread.summary.lastOutputSnippet = `${phase}: ${error.slice(-5000)}`; thread.updatedAt = at; this.store.upsertTask(thread);
     const file = this.transactionPath(threadId);
     this.writeTransaction(file, { threadId, sourceCommit, targetOldCommit, phase, error, conflictFiles, at: new Date().toISOString() });
     const timer = setTimeout(() => {
       const latest = this.store.getTask(threadId);
-      if (latest?.status === 'waiting_review') this.requestReview?.(latest);
+      if (latest && (latest.status === 'waiting_review' || (latest.status === 'waiting_merge' && latest.worktree?.mergeResolutionPath === resolutionPath))) this.requestReview?.(latest);
     }, 0);
     timer.unref();
   }
 
-  private finishMerged(threadId: string, commit: string, targetOldCommit?: string, targetPath?: string, validation?: NonNullable<DelegationThread['worktree']>['validation']): void {
+  private finishMerged(threadId: string, commit: string, targetOldCommit?: string, targetPath?: string, validation?: NonNullable<DelegationThread['worktree']>['validation'], mergedCommit = commit): void {
     const current = this.store.getTask(threadId); if (!current?.worktree) return;
     const thread = structuredClone(current);
     const worktree = thread.worktree!;
-    thread.status = 'completed'; worktree.integration = { ...worktree.integration, phase: 'merged', targetOldCommit, targetCommit: commit, targetPath, mergedCommit: commit, updatedAt: new Date().toISOString() };
+    if (worktree.approvedSnapshot && targetOldCommit && !(thread.mergeHistory || []).some((entry) => entry.mergedCommit === mergedCommit)) {
+      const repo = worktree.deliveryTarget?.repositoryPath || worktree.repositoryPath || worktree.mainPath;
+      const changedFiles = gitOutput(repo, ['diff', '--name-status', `${targetOldCommit}..${mergedCommit}`]).split(/\r?\n/).filter(Boolean);
+      const number = (thread.mergeHistory?.length || 0) + 1;
+      thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number, at: new Date().toISOString(),
+        phase: 'merged', result: 'merged', targetRef: worktree.deliveryTarget?.ref || worktree.targetRef, targetOldCommit,
+        candidateCommit: worktree.approvedSnapshot.commit, candidateTree: worktree.approvedSnapshot.tree, mergedCommit, changedFiles }];
+    }
+    thread.status = 'completed'; worktree.integration = { ...worktree.integration, phase: 'merged', targetOldCommit, targetCommit: commit, targetPath, mergedCommit, updatedAt: new Date().toISOString() };
     if (worktree.deliveryTarget) worktree.deliveryTarget.checkoutPath = targetPath;
     if (validation) worktree.validation = validation;
     worktree.mergePending = false; thread.updatedAt = new Date().toISOString(); this.store.upsertTask(thread);
