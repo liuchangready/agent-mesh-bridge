@@ -161,6 +161,7 @@ export function buildFinalSummary(
       targetPath: thread.worktree.integration?.targetPath || thread.worktree.deliveryTarget?.checkoutPath,
       targetCommit: thread.worktree.integration?.targetCommit || thread.worktree.integration?.targetOldCommit || thread.worktree.deliveryTarget?.baseCommit,
       mergeState: thread.worktree.integration?.phase, blockedReason: thread.worktree.integration?.error,
+      stashRestore: thread.worktree.integration?.stashRestore,
       validationPath: thread.worktree.validation?.path, validationCommit: thread.worktree.validation?.commit,
       validationStatus: thread.worktree.validation?.status, validationResult: thread.worktree.validation?.result,
     } } : {}),

@@ -486,7 +486,7 @@ export class MergeCoordinator {
     this.executions = new TaskExecutionRegistry(storageDir);
   }
 
-  private async loggedGit(threadId: string, cwd: string, args: string[]): Promise<string> {
+  private async loggedGit(threadId: string, cwd: string, args: string[], raw = false): Promise<string> {
     const thread = this.store.getTask(threadId);
     if (!thread?.worktree?.approvedCommit || !this.isMergeStillAllowed(threadId, thread.worktree.approvedCommit)) throw new Error('Merge task was paused or deleted before Git could start.');
     const logPath = this.attemptLogs.get(threadId)?.path;
@@ -516,7 +516,7 @@ export class MergeCoordinator {
       const result = await completion;
       if (logPath) fs.appendFileSync(logPath, `\n[exit ${result.code}]\n`, 'utf8');
       if (trackingError || result.error || result.code !== 0) throw new Error(`Git command failed (${args.join(' ')}): ${trackingError?.message || result.error?.message || stderr.trim() || `exit ${result.code}`}`);
-      return stdout.trim();
+      return raw ? stdout : stdout.trim();
     } finally {
       clearTimeout(timer); this.lock.detachChildPid(child.pid); this.executions.end(registration);
     }
@@ -524,6 +524,13 @@ export class MergeCoordinator {
 
   /** Approval is tied to the exact clean task commit, then serialized with target read through durable ledger write. */
   async mergeApproved(threadId: string): Promise<MergeResult> {
+    for (;;) {
+      const result = await this.mergeApprovedOnce(threadId);
+      if (!('retryTarget' in result)) return result;
+    }
+  }
+
+  private async mergeApprovedOnce(threadId: string): Promise<MergeResult | (MergeResult & { retryTarget: true })> {
     const thread = this.store.getTask(threadId);
     if (!thread?.worktree?.targetRef || !thread.worktree.approvedCommit) throw new Error(`Task ${threadId} has no approved isolated worktree commit.`);
     if (thread.status !== 'waiting_merge') throw new Error(`Task ${threadId} is not waiting to merge.`);
@@ -596,9 +603,26 @@ export class MergeCoordinator {
       }
       const txPath = this.transactionPath(threadId);
       const prior = this.readTransaction(txPath);
+      if (prior?.phase === 'resolution_rebase_prepared' && prior.sourceCommit === sourceCommit && worktree.mergeResolutionSubmitted &&
+          prior.validationPath && prior.validationPath !== worktree.mergeResolutionPath) {
+        const candidate = path.resolve(prior.validationPath);
+        const root = path.resolve(thread.artifactDir ? taskValidationDir(thread.artifactDir) : path.join(this.storageDir, 'merge-worktrees'));
+        const samePath = (a: string, b: string) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+        const registered = (await this.loggedGit(threadId, repoPath, ['worktree', 'list', '--porcelain'])).split(/\r?\n/)
+          .some((line) => line.startsWith('worktree ') && samePath(path.resolve(line.slice(9)), candidate));
+        if (samePath(path.dirname(candidate), root) && path.basename(candidate).startsWith(`${threadId}-`) && registered && fs.existsSync(candidate) &&
+            await this.loggedGit(threadId, candidate, ['rev-parse', '--verify', 'HEAD^{commit}']) === prior.targetOldCommit &&
+            !(await this.loggedGit(threadId, candidate, ['status', '--porcelain', '--untracked-files=all']))) {
+          const latest = this.store.getTask(threadId)!; const updated = structuredClone(latest);
+          if (updated.worktree!.mergeResolutionPath) updated.worktree!.supersededMergeResolutionPaths = [...new Set([...(updated.worktree!.supersededMergeResolutionPaths || []), updated.worktree!.mergeResolutionPath])];
+          updated.worktree!.mergeResolutionPath = candidate;
+          this.store.upsertTask(updated);
+          worktree.mergeResolutionPath = candidate; worktree.supersededMergeResolutionPaths = updated.worktree!.supersededMergeResolutionPaths;
+        }
+      }
       let recovered = false;
       if (prior?.candidateCommit && prior.sourceCommit === sourceCommit &&
-          (prior.phase === 'validated' || prior.phase === 'ref_updated' || prior.phase === 'ledger_written')) {
+          ['validated', 'stash_creating', 'stash_created', 'ref_updated', 'checkout_synced', 'stash_restoring', 'stash_applied', 'stash_cleanup_started', 'stash_cleanup_prepared', 'stash_reflog_published', 'stash_ref_published', 'stash_cleanup_rolled_back', 'stash_cleanup_needs_recovery', 'stash_restored', 'stash_restore_conflict', 'ledger_written'].includes(prior.phase)) {
         if (prior.candidateCommit === targetOldCommit) recovered = true;
         else {
           try { await this.loggedGit(threadId, repoPath, ['merge-base', '--is-ancestor', prior.candidateCommit, targetOldCommit]); recovered = true; }
@@ -606,15 +630,36 @@ export class MergeCoordinator {
         }
       }
       if (recovered) {
-        const sync = await this.syncCheckedOutTarget(repoPath, targetRef, prior.candidateCommit!, false, prior.targetOldCommit, threadId);
+        const sync = ['checkout_synced', 'stash_restoring', 'stash_applied', 'stash_cleanup_started', 'stash_cleanup_prepared', 'stash_reflog_published', 'stash_ref_published', 'stash_cleanup_rolled_back', 'stash_cleanup_needs_recovery', 'stash_restored', 'stash_restore_conflict', 'ledger_written'].includes(prior.phase)
+          ? { ok: true, error: '', path: prior.checkoutPath, commit: targetOldCommit }
+          : await this.syncCheckedOutTarget(repoPath, targetRef, prior.candidateCommit!, false, prior.targetOldCommit, threadId);
         if (!sync.ok) { this.finishBlocked(threadId, sync.error, prior.targetOldCommit, sourceCommit, sync.path); return { status: 'blocked', message: sync.error }; }
+        if (!['stash_restoring', 'stash_applied', 'stash_cleanup_started', 'stash_cleanup_prepared', 'stash_reflog_published', 'stash_ref_published', 'stash_cleanup_rolled_back', 'stash_cleanup_needs_recovery', 'stash_restored', 'stash_restore_conflict', 'ledger_written'].includes(prior.phase)) {
+          prior.phase = 'checkout_synced'; this.writeTransaction(txPath, prior);
+        }
+        await this.restoreLandingStash(threadId, prior, txPath);
+        if (prior.stashCleanupPending) return this.finishStashRecoveryPending(threadId, prior);
         const validationStatus = prior.validationPath ? await this.cleanupValidationWorktree(repoPath, threadId, prior.validationPath) : undefined;
         await this.finishMerged(threadId, sync.commit || prior.candidateCommit!, prior.targetOldCommit, sync.path,
           prior.validationPath ? this.validationRecord(prior.validationPath, prior.validationCommit, prior.validationResult, validationStatus) : undefined, prior.candidateCommit);
         prior.phase = 'ledger_written'; this.writeTransaction(txPath, prior);
         return { status: 'merged', message: 'Recovered completed merge transaction.', commit: sync.commit || prior.candidateCommit };
       }
-      const resolutionPath = worktree.mergeResolutionSubmitted ? worktree.mergeResolutionPath : undefined;
+      if (prior?.stashToken && prior.phase === 'stash_restore_conflict') {
+        const reason = 'The previous landing stash needs manual recovery before another merge attempt.';
+        this.finishBlocked(threadId, reason, prior.targetOldCommit, sourceCommit, prior.checkoutPath);
+        return { status: 'blocked', message: reason };
+      }
+      if (prior?.stashToken && !['stash_restored', 'stash_restore_conflict', 'ledger_written'].includes(prior.phase)) {
+        const restored = await this.restoreLandingStash(threadId, prior, txPath);
+        if (prior.stashCleanupPending) return this.finishStashRecoveryPending(threadId, prior);
+        if (!restored) {
+          const reason = 'The previous landing stash could not be safely restored; its checkout and stash were preserved.';
+          this.finishBlocked(threadId, reason, prior.targetOldCommit, sourceCommit, prior.checkoutPath);
+          return { status: 'blocked', message: reason };
+        }
+      }
+      let resolutionPath = worktree.mergeResolutionSubmitted ? worktree.mergeResolutionPath : undefined;
       if (resolutionPath && (worktree.mergeResolutionSourceCommit || worktree.integration?.sourceCommit) !== sourceCommit) {
         const reason = 'The submitted resolution belongs to a different approved candidate.';
         this.finishBlocked(threadId, reason, worktree.integration?.targetOldCommit || '', sourceCommit);
@@ -623,12 +668,39 @@ export class MergeCoordinator {
       if (resolutionPath && worktree.integration?.targetOldCommit !== targetOldCommit) {
         const oldTarget = worktree.integration?.targetOldCommit;
         const prepared = prior?.phase === 'resolution_rebase_prepared' && prior.sourceCommit === sourceCommit && prior.validationPath === resolutionPath ? prior : undefined;
-        if (!oldTarget || (prepared && prepared.targetOldCommit !== targetOldCommit)) {
+        if (!oldTarget) {
           const reason = 'Target changed while a resolution update was in progress; the resolution workspace was preserved.';
           this.finishBlocked(threadId, reason, oldTarget || '', sourceCommit, undefined, resolutionPath);
           return { status: 'blocked', message: reason };
         }
-        const head = await this.loggedGit(threadId, resolutionPath, ['rev-parse', '--verify', 'HEAD^{commit}']);
+        let head = await this.loggedGit(threadId, resolutionPath, ['rev-parse', '--verify', 'HEAD^{commit}']);
+        if (prepared && prepared.targetOldCommit !== targetOldCommit) {
+          let mergeInProgress = false;
+          try { await this.loggedGit(threadId, resolutionPath, ['rev-parse', '--verify', 'MERGE_HEAD']); mergeInProgress = true; } catch {}
+          if (head === prepared.targetOldCommit &&
+              !mergeInProgress &&
+              !(await this.loggedGit(threadId, resolutionPath, ['diff', '--name-only'])) &&
+              !(await this.loggedGit(threadId, resolutionPath, ['ls-files', '--others', '--exclude-standard'])) &&
+              !(await this.loggedGit(threadId, resolutionPath, ['ls-files', '--others', '--ignored', '--exclude-standard'])) &&
+              (await this.loggedGit(threadId, resolutionPath, ['write-tree'])) === (await this.loggedGit(threadId, repoPath, ['rev-parse', `${head}^{tree}`]))) {
+            await this.loggedGit(threadId, resolutionPath, ['reset', '--hard', targetOldCommit]);
+            head = targetOldCommit;
+          } else if (head !== oldTarget || mergeInProgress) {
+            const previousResolution = resolutionPath;
+            const scratchRoot = thread.artifactDir ? taskValidationDir(thread.artifactDir) : path.join(this.storageDir, 'merge-worktrees');
+            fs.mkdirSync(scratchRoot, { recursive: true });
+            const nextResolution = path.join(scratchRoot, `${threadId}-${crypto.randomUUID()}`);
+            await this.loggedGit(threadId, repoPath, ['worktree', 'add', '--detach', nextResolution, targetOldCommit]);
+            prepared.validationPath = nextResolution; prepared.targetOldCommit = targetOldCommit; this.writeTransaction(txPath, prepared);
+            const latest = this.store.getTask(threadId)!; const updated = structuredClone(latest);
+            updated.worktree!.supersededMergeResolutionPaths = [...new Set([...(updated.worktree!.supersededMergeResolutionPaths || []), previousResolution])];
+            updated.worktree!.mergeResolutionPath = nextResolution;
+            this.store.upsertTask(updated);
+            worktree.supersededMergeResolutionPaths = updated.worktree!.supersededMergeResolutionPaths;
+            worktree.mergeResolutionPath = nextResolution; resolutionPath = nextResolution; head = targetOldCommit;
+          }
+          prepared.targetOldCommit = targetOldCommit; this.writeTransaction(txPath, prepared);
+        }
         let resolutionCommit: string = prepared?.resolutionCommit;
         if (!prepared) {
           if (head !== oldTarget || await this.loggedGit(threadId, resolutionPath, ['diff', '--name-only', '--diff-filter=U']) ||
@@ -672,6 +744,11 @@ export class MergeCoordinator {
           catch (error) {
             if (!this.isMergeStillAllowed(threadId, sourceCommit)) return { status: 'stale', message: 'Task was paused or deleted during resolution merge.' };
             const conflicts = (await this.loggedGit(threadId, resolutionPath, ['diff', '--name-only', '--diff-filter=U'])).split(/\r?\n/).filter(Boolean);
+            if (!conflicts.length) {
+              const message = `Could not merge the saved resolution: ${String(error)}`;
+              this.finishBlocked(threadId, message, oldTarget, sourceCommit, undefined, resolutionPath);
+              return { status: 'blocked', message };
+            }
             const message = `Resolution conflicts with advanced target ${targetOldCommit}: ${conflicts.join(', ') || String(error)}`;
             this.finishMergeFailure(threadId, 'conflict', message, targetOldCommit, sourceCommit, conflicts, resolutionPath);
             return { status: 'conflict', message };
@@ -706,6 +783,12 @@ export class MergeCoordinator {
         catch (error) {
           if (!this.isMergeStillAllowed(threadId, sourceCommit)) { validationResult = 'cancelled'; return { status: 'stale', message: 'Task was paused or deleted during merge.' }; }
           const conflicts = (await this.loggedGit(threadId, scratch, ['diff', '--name-only', '--diff-filter=U'])).split(/\r?\n/).filter(Boolean);
+          if (!conflicts.length) {
+            const message = `Git could not start the merge: ${String(error)}`;
+            retainForResolution = true;
+            this.finishBlocked(threadId, message, targetOldCommit, sourceCommit, undefined, scratch);
+            return { status: 'blocked', message };
+          }
           const message = `Merge conflict against ${targetOldCommit}: ${conflicts.join(', ') || String(error)}`;
           retainForResolution = true;
           this.finishMergeFailure(threadId, 'conflict', message, targetOldCommit, sourceCommit, conflicts, retainForResolution ? scratch : undefined);
@@ -757,16 +840,67 @@ export class MergeCoordinator {
         retainForResolution = true;
         if (!this.isMergeStillAllowed(threadId, sourceCommit)) { validationResult = 'cancelled'; return { status: 'stale', message: 'Task was paused or deleted before the validated integration could be written.' }; }
         const beforeLanding = await this.syncCheckedOutTarget(repoPath, targetRef, candidateCommit, true, targetOldCommit, threadId);
+        if (beforeLanding.commit && beforeLanding.commit !== targetOldCommit) {
+          const current = this.store.getTask(threadId);
+          if (current) {
+            const updated = structuredClone(current);
+            updated.mergeHistory = [...(updated.mergeHistory || []), { id: crypto.randomUUID(), number: (updated.mergeHistory?.length || 0) + 1,
+              at: new Date().toISOString(), phase: 'blocked', result: 'failed', errorCode: 'TARGET_MOVED',
+              targetRef, targetOldCommit, targetCommit: beforeLanding.commit, candidateCommit: sourceCommit, attemptId: this.attemptLogs.get(threadId)?.id }];
+            this.store.upsertTask(updated);
+          }
+          return { status: 'blocked', message: 'Target advanced; retrying integration.', retryTarget: true };
+        }
         if (!beforeLanding.ok) {
           this.finishBlocked(threadId, beforeLanding.error, targetOldCommit, sourceCommit, beforeLanding.path, retainForResolution ? scratch : undefined);
           return { status: 'blocked', message: beforeLanding.error };
         }
-        if (!this.isMergeStillAllowed(threadId, sourceCommit)) { validationResult = 'cancelled'; return { status: 'stale', message: 'Task was paused or deleted before the target ref update.' }; }
+        if (beforeLanding.path) {
+          tx.checkoutPath = beforeLanding.path;
+          try {
+            await this.createLandingStash(threadId, tx, txPath);
+            const ignored = (await this.loggedGit(threadId, beforeLanding.path, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], true)).split('\0').filter(Boolean);
+            const incoming = (await this.loggedGit(threadId, repoPath, ['diff', '--name-only', '--diff-filter=AMRT', '-z', targetOldCommit, candidateCommit], true)).split('\0').filter(Boolean);
+            const normalize = (value: string) => process.platform === 'win32' ? value.replace(/\/$/, '').toLowerCase() : value.replace(/\/$/, '');
+            const blockers = ignored.filter((file) => incoming.some((name) => {
+              const a = normalize(file); const b = normalize(name);
+              return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+            }));
+            if (blockers.length) throw new Error(`Ignored checkout files prevent synchronization: ${blockers.join(', ')}`);
+            await this.loggedGit(threadId, beforeLanding.path, ['read-tree', '-n', '-u', '-m', targetOldCommit, candidateCommit]);
+          } catch (error) {
+            await this.restoreLandingStash(threadId, tx, txPath);
+            if (tx.stashCleanupPending) return this.finishStashRecoveryPending(threadId, tx);
+            throw error;
+          }
+        }
+        if (!this.isMergeStillAllowed(threadId, sourceCommit)) { await this.restoreLandingStash(threadId, tx, txPath); if (tx.stashCleanupPending) return this.finishStashRecoveryPending(threadId, tx); validationResult = 'cancelled'; return { status: 'stale', message: 'Task was paused or deleted before the target ref update.' }; }
         // update-ref's old-value argument prevents overwriting a ref changed outside this lock.
-        await this.loggedGit(threadId, repoPath, ['update-ref', targetRef, candidateCommit, targetOldCommit]);
+        try {
+          await this.loggedGit(threadId, repoPath, ['update-ref', targetRef, candidateCommit, targetOldCommit]);
+        } catch (error) {
+          const restored = await this.restoreLandingStash(threadId, tx, txPath);
+          if (tx.stashCleanupPending) return this.finishStashRecoveryPending(threadId, tx);
+          if (!restored) throw new Error(`Could not restore local changes after target update failed: ${String(error)}`);
+          const latestTarget = await this.loggedGit(threadId, repoPath, ['rev-parse', '--verify', `${targetRef}^{commit}`]);
+          if (latestTarget === targetOldCommit) throw error;
+          const current = this.store.getTask(threadId);
+          if (current) {
+            const updated = structuredClone(current);
+            updated.mergeHistory = [...(updated.mergeHistory || []), { id: crypto.randomUUID(), number: (updated.mergeHistory?.length || 0) + 1,
+              at: new Date().toISOString(), phase: 'blocked', result: 'failed', errorCode: 'CAS_FAILED',
+              error: String(error).slice(-5000), targetRef, targetOldCommit, targetCommit: latestTarget,
+              candidateCommit: sourceCommit, attemptId: this.attemptLogs.get(threadId)?.id }];
+            this.store.upsertTask(updated);
+          }
+          return { status: 'blocked', message: 'Target advanced; retrying integration against its latest commit.', retryTarget: true };
+        }
         tx.phase = 'ref_updated'; this.writeTransaction(txPath, tx);
         const synced = await this.syncCheckedOutTarget(repoPath, targetRef, candidateCommit, false, targetOldCommit, threadId);
         if (!synced.ok) { this.finishBlocked(threadId, synced.error, targetOldCommit, sourceCommit, synced.path, retainForResolution ? scratch : undefined); return { status: 'blocked', message: synced.error }; }
+        tx.phase = 'checkout_synced'; this.writeTransaction(txPath, tx);
+        await this.restoreLandingStash(threadId, tx, txPath);
+        if (tx.stashCleanupPending) return this.finishStashRecoveryPending(threadId, tx);
         const validationStatus = await this.removeValidationWorktree(repoPath, scratch, threadId) ? 'cleaned' : 'present'; added = validationStatus === 'present';
         await this.finishMerged(threadId, synced.commit || candidateCommit, targetOldCommit, synced.path, this.validationRecord(scratch, validationCommit, validationResult, validationStatus), candidateCommit);
         tx.phase = 'ledger_written'; this.writeTransaction(txPath, tx);
@@ -787,8 +921,13 @@ export class MergeCoordinator {
       if (await this.hasLandedCandidate(threadId)) {
         const tx = this.readTransaction(this.transactionPath(threadId));
         if (tx?.candidateCommit) {
-          const sync = await this.syncCheckedOutTarget(repoPath, targetRef, tx.candidateCommit, false, tx.targetOldCommit, threadId);
+          const sync = ['checkout_synced', 'stash_restoring', 'stash_applied', 'stash_cleanup_started', 'stash_cleanup_prepared', 'stash_reflog_published', 'stash_ref_published', 'stash_cleanup_rolled_back', 'stash_cleanup_needs_recovery', 'stash_restored', 'stash_restore_conflict', 'ledger_written'].includes(tx.phase)
+            ? { ok: true, error: '', path: tx.checkoutPath, commit: tx.candidateCommit }
+            : await this.syncCheckedOutTarget(repoPath, targetRef, tx.candidateCommit, false, tx.targetOldCommit, this.isMergeStillAllowed(threadId, sourceCommit) ? threadId : undefined);
           if (!sync.ok) { this.finishBlocked(threadId, sync.error, tx.targetOldCommit, sourceCommit, sync.path); return { status: 'blocked', message: sync.error }; }
+          if (!['stash_restoring', 'stash_applied', 'stash_cleanup_started', 'stash_cleanup_prepared', 'stash_reflog_published', 'stash_ref_published', 'stash_cleanup_rolled_back', 'stash_cleanup_needs_recovery', 'stash_restored', 'stash_restore_conflict', 'ledger_written'].includes(tx.phase)) { tx.phase = 'checkout_synced'; this.writeTransaction(this.transactionPath(threadId), tx); }
+          await this.restoreLandingStash(threadId, tx, this.transactionPath(threadId));
+          if (tx.stashCleanupPending) return this.finishStashRecoveryPending(threadId, tx);
           const validationStatus = tx.validationPath ? await this.cleanupValidationWorktree(repoPath, threadId, tx.validationPath) : undefined;
           await this.finishMerged(threadId, sync.commit || tx.candidateCommit, tx.targetOldCommit, sync.path,
             tx.validationPath ? this.validationRecord(tx.validationPath, tx.validationCommit, tx.validationResult, validationStatus) : undefined, tx.candidateCommit);
@@ -827,6 +966,336 @@ export class MergeCoordinator {
     }
   }
 
+  private async createLandingStash(threadId: string, tx: any, file: string): Promise<void> {
+    const cwd = tx.checkoutPath as string;
+    if (!await this.loggedGit(threadId, cwd, ['status', '--porcelain', '--untracked-files=all'])) return;
+    tx.stashBefore = (await this.loggedGit(threadId, cwd, ['for-each-ref', '--format=%(objectname)', 'refs/stash'])) || null;
+    tx.stashToken = `mesh-landing-${threadId}-${crypto.randomUUID()}`;
+    tx.phase = 'stash_creating'; this.writeTransaction(file, tx);
+    await this.loggedGit(threadId, cwd, ['-c', 'core.autocrlf=false', 'stash', 'push', '--include-untracked', '-m', tx.stashToken]);
+    const matches = this.findLandingStash(cwd, tx.stashToken);
+    if (matches.length !== 1 || matches[0].sha === tx.stashBefore) throw new Error('Could not uniquely identify the newly created landing stash.');
+    tx.stashSha = matches[0].sha; tx.phase = 'stash_created'; this.writeTransaction(file, tx);
+    if (await this.loggedGit(threadId, cwd, ['status', '--porcelain', '--untracked-files=all'])) throw new Error('Target checkout is not clean after creating the landing stash.');
+  }
+
+  private findLandingStash(cwd: string, token: string): Array<{ ref: string; sha: string }> {
+    return gitOutput(cwd, ['stash', 'list', '--format=%gd%x09%H%x09%gs']).split(/\r?\n/).filter(Boolean).map((line) => {
+      const [ref, sha, ...message] = line.split('\t'); return { ref, sha, message: message.join('\t') };
+    }).filter((entry) => entry.message.endsWith(`: ${token}`)).map(({ ref, sha }) => ({ ref, sha }));
+  }
+
+  private writeLockedGitFile(file: string, data: Buffer): void {
+    const temporary = `${file}.mesh-${crypto.randomUUID()}.lock`;
+    const mode = fs.statSync(file).mode & 0o777;
+    try {
+      const fd = fs.openSync(temporary, 'wx', mode);
+      try { fs.writeFileSync(fd, data); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      fs.renameSync(temporary, file);
+      if (process.platform !== 'win32') { const dir = fs.openSync(path.dirname(file), 'r'); try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); } }
+    } finally { try { fs.unlinkSync(temporary); } catch {} }
+  }
+
+  private async removeMultipleLandingStash(threadId: string, cwd: string, tx: any, file: string): Promise<boolean> {
+    if (gitOutput(cwd, ['rev-parse', '--show-ref-format']) !== 'files') return false;
+    const common = fs.realpathSync(gitOutput(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+    const refPath = path.join(common, 'refs', 'stash');
+    const logPath = path.join(common, 'logs', 'refs', 'stash');
+    const samePath = (a: string, b: string) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+    if (!samePath(path.resolve(gitOutput(cwd, ['rev-parse', '--path-format=absolute', '--git-path', 'refs/stash'])), refPath) ||
+        !samePath(path.resolve(gitOutput(cwd, ['rev-parse', '--path-format=absolute', '--git-path', 'logs/refs/stash'])), logPath)) return false;
+    const parse = (data: Buffer, contiguous = true): Array<{ old: string; next: string; tail: string }> => {
+      if (data.length > 2 * 1024 * 1024 || !data.length || data[data.length - 1] !== 10) throw new Error('Stash reflog is empty, malformed, or exceeds the cleanup limit.');
+      const lines = data.toString('latin1').slice(0, -1).split('\n');
+      if (lines.length > 10000) throw new Error('Stash reflog exceeds the cleanup entry limit.');
+      const result = lines.map((line) => {
+        const match = /^([0-9a-f]+) ([0-9a-f]+) ([^\n]*\t[^\n]*)$/i.exec(line);
+        if (!match || match[1].length !== tx.stashSha.length || match[2].length !== tx.stashSha.length) throw new Error('Stash reflog contains an invalid entry.');
+        return { old: match[1], next: match[2], tail: match[3] };
+      });
+      if (contiguous && (!/^0+$/.test(result[0].old) || result.some((entry, index) => index > 0 && entry.old !== result[index - 1].next))) throw new Error('Stash reflog history is not contiguous.');
+      return result;
+    };
+    const encode = (entries: Array<{ old: string; next: string; tail: string }>) => Buffer.from(entries.map((entry) => `${entry.old} ${entry.next} ${entry.tail}\n`).join(''), 'latin1');
+    const build = (head: string, before: Buffer) => {
+      const entries = parse(before);
+      if (entries[entries.length - 1].next !== head) throw new Error('Stash ref and reflog do not agree.');
+      const indexes = entries.map((entry, index) => entry.next === tx.stashSha && entry.tail.endsWith(`: ${tx.stashToken}`) ? index : -1).filter((index) => index >= 0);
+      if (indexes.length !== 1 || entries.length < 2) throw new Error('Landing stash identity is not unique in a multi-entry reflog.');
+      const index = indexes[0]; const removed = entries[index]; entries.splice(index, 1);
+      if (index < entries.length) entries[index].old = removed.old;
+      return { after: encode(entries), afterRef: entries[entries.length - 1].next };
+    };
+    const prepare = (head: string, before: Buffer) => {
+      const { after, afterRef } = build(head, before);
+      tx.stashCleanup = { common, beforeRef: head, afterRef, beforeLog: before.toString('base64'), afterLog: after.toString('base64') };
+      tx.phase = 'stash_cleanup_prepared'; this.writeTransaction(file, tx);
+      return { after, afterRef: tx.stashCleanup.afterRef as string };
+    };
+    const apply = (head: string) => {
+      if (!fs.lstatSync(refPath).isFile() || !fs.lstatSync(logPath).isFile()) throw new Error('Stash ref or reflog is not a regular file.');
+      if (fs.statSync(logPath).size > 2 * 1024 * 1024) throw new Error('Stash reflog exceeds the cleanup size limit.');
+      const refContents = fs.readFileSync(refPath, 'utf8');
+      if (refContents !== `${head}\n` && refContents !== head) throw new Error('Stash ref changed while obtaining its lock.');
+      let current = fs.readFileSync(logPath);
+      let evidence = tx.stashCleanup;
+      if (evidence && !samePath(evidence.common, common)) throw new Error('Stash cleanup repository identity changed.');
+      if (evidence && (typeof evidence.beforeLog !== 'string' || typeof evidence.afterLog !== 'string' ||
+          evidence.beforeLog.length > 2_796_208 || evidence.afterLog.length > 2_796_208)) throw new Error('Stash cleanup evidence is invalid or exceeds its size limit.');
+      let before = evidence ? Buffer.from(evidence.beforeLog, 'base64') : undefined;
+      let after = evidence ? Buffer.from(evidence.afterLog, 'base64') : undefined;
+      if (!evidence || (before && current.length > before.length && current.subarray(0, before.length).equals(before))) {
+        const next = prepare(head, current); evidence = tx.stashCleanup; before = Buffer.from(evidence.beforeLog, 'base64'); after = next.after;
+      }
+      if (!before || !after) throw new Error('Stash cleanup evidence is missing.');
+      const expected = build(evidence.beforeRef, before);
+      if (!after.equals(expected.after) || evidence.afterRef !== expected.afterRef) throw new Error('Stash cleanup evidence does not match its original reflog.');
+      if (current.equals(before) && head === evidence.beforeRef) {
+        this.writeLockedGitFile(logPath, after);
+        tx.phase = 'stash_reflog_published'; this.writeTransaction(file, tx);
+        current = after;
+      }
+      if (current.equals(after) && (head === evidence.beforeRef || head === evidence.afterRef)) {
+        if (head !== evidence.afterRef) this.writeLockedGitFile(refPath, Buffer.from(`${evidence.afterRef}\n`, 'ascii'));
+        tx.phase = 'stash_ref_published'; this.writeTransaction(file, tx);
+        return true;
+      }
+      if (current.length > after.length && current.subarray(0, after.length).equals(after)) {
+        const suffix = current.subarray(after.length); const appended = parse(Buffer.concat([Buffer.from(`${'0'.repeat(tx.stashSha.length)} ${evidence.afterRef} mesh <mesh@localhost> 0 +0000\tanchor\n`, 'ascii'), suffix]), false);
+        if (appended[1]?.old === evidence.beforeRef && evidence.beforeRef !== evidence.afterRef) appended[1].old = evidence.afterRef;
+        if (appended[1]?.old !== evidence.afterRef || appended[appended.length - 1].next !== head || appended.slice(1).some((entry) => entry.next === tx.stashSha && entry.tail.endsWith(`: ${tx.stashToken}`)) || appended.slice(2).some((entry, index) => entry.old !== appended[index + 1].next)) throw new Error('Stash reflog changed in an unrecognizable way after cleanup.');
+        this.writeLockedGitFile(logPath, Buffer.concat([after, encode(appended.slice(1))]));
+        tx.phase = 'stash_ref_published'; this.writeTransaction(file, tx);
+        return true;
+      }
+      throw new Error('Stash cleanup state changed and cannot be safely reconciled.');
+    };
+    const lockPath = `${refPath}.lock`;
+    const markerRoot = path.join(common, 'agent-mesh-bridge', 'stash-locks');
+    const ownsLock = (markerPath: string, marker: string) => {
+      const lock = fs.lstatSync(lockPath); const owner = fs.lstatSync(markerPath);
+      return lock.isFile() && owner.isFile() && lock.dev === owner.dev && lock.ino === owner.ino && fs.readFileSync(lockPath, 'utf8') === marker;
+    };
+    const priorLock = tx.stashCleanupLock;
+    let markerPath = ''; let marker = ''; let owned = false; let protectOnExit = false;
+    if (priorLock) {
+      const expectedMarker = path.join(markerRoot, priorLock.token || '');
+      if (!/^[0-9a-f-]{36}$/i.test(priorLock.token || '') || !Number.isInteger(priorLock.ownerPid) || priorLock.ownerPid <= 0 || !samePath(priorLock.markerPath || '', expectedMarker)) throw new Error('Stash lock recovery metadata is invalid.');
+      if (priorLock.ownerPid !== process.pid) {
+        try {
+          process.kill(priorLock.ownerPid, 0);
+          // The global merge lock proves a live previous owner has handed off this protected recovery.
+          if (tx.phase !== 'stash_cleanup_needs_recovery' || !tx.stashCleanupPending) throw new Error('The previous stash cleanup owner is still alive.');
+        } catch (failure: any) { if (failure?.code !== 'ESRCH') throw failure; }
+      }
+      const priorMarker = `mesh-stash-lock ${priorLock.token}\n`;
+      try {
+        if (fs.existsSync(lockPath)) {
+          let ownedByPrior = false;
+          try { ownedByPrior = ownsLock(expectedMarker, priorMarker); } catch (failure: any) { if (failure?.code !== 'ENOENT') throw failure; }
+          if (ownedByPrior) {
+            markerPath = expectedMarker; marker = priorMarker; owned = true; protectOnExit = true;
+            priorLock.ownerPid = process.pid; this.writeTransaction(file, tx);
+          } else if (fs.readFileSync(lockPath, 'utf8') === priorMarker) throw new Error('Cannot prove ownership of the stale stash lock.');
+        }
+      } catch (failure: any) { if (failure?.code !== 'ENOENT') throw failure; }
+      if (!owned) {
+        try { if (fs.readFileSync(expectedMarker, 'utf8') === priorMarker) fs.unlinkSync(expectedMarker); } catch (failure: any) { if (failure?.code !== 'ENOENT') throw failure; }
+        delete tx.stashCleanupLock; this.writeTransaction(file, tx);
+      }
+    }
+    if (!owned) {
+      const token = crypto.randomUUID();
+      fs.mkdirSync(markerRoot, { recursive: true });
+      markerPath = path.join(markerRoot, token); marker = `mesh-stash-lock ${token}\n`;
+      const fd = fs.openSync(markerPath, 'wx', 0o600);
+      try { fs.writeFileSync(fd, marker); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      tx.stashCleanupLock = { token, markerPath, ownerPid: process.pid };
+      try { this.writeTransaction(file, tx); } catch (failure) { try { fs.unlinkSync(markerPath); } catch {} throw failure; }
+    }
+    const release = (): boolean => {
+      if (owned) {
+        try {
+          if (fs.existsSync(lockPath)) {
+            if (!ownsLock(markerPath, marker)) return false;
+            fs.unlinkSync(lockPath);
+          }
+        } catch { return false; }
+      }
+      try { if (fs.readFileSync(markerPath, 'utf8') === marker) fs.unlinkSync(markerPath); } catch {}
+      owned = false; return true;
+    };
+    const releaseOnExit = () => { if (!protectOnExit) release(); };
+    process.once('exit', releaseOnExit);
+    try {
+      for (let attempt = 0; !owned && attempt < 100; attempt++) {
+        try { fs.linkSync(markerPath, lockPath); owned = true; break; }
+        catch (failure: any) {
+          if (failure?.code !== 'EEXIST') throw failure;
+          if (!this.isMergeStillAllowed(threadId, tx.sourceCommit)) return false;
+          await sleep(100);
+        }
+      }
+      if (!owned) return false;
+      const head = gitOutput(cwd, ['for-each-ref', '--format=%(objectname)', 'refs/stash']);
+      if (!/^[0-9a-f]{40,64}$/i.test(head)) return false;
+      try {
+        const result = apply(head);
+        delete tx.stashCleanupPending; delete tx.stashRestoreError; protectOnExit = false;
+        return result;
+      } catch (failure) {
+        const evidence = tx.stashCleanup;
+        if (!evidence) throw failure;
+        try {
+          if (!samePath(evidence.common, common) || typeof evidence.beforeLog !== 'string' || typeof evidence.afterLog !== 'string' || evidence.beforeLog.length > 2_796_208 || evidence.afterLog.length > 2_796_208) throw new Error('Invalid stash cleanup evidence.');
+          const before = Buffer.from(evidence.beforeLog, 'base64'); const after = Buffer.from(evidence.afterLog, 'base64');
+          const expected = build(evidence.beforeRef, before);
+          if (!after.equals(expected.after) || evidence.afterRef !== expected.afterRef) throw new Error('Stash cleanup evidence does not match its original reflog.');
+          const actualLog = fs.readFileSync(logPath); const actualRef = fs.readFileSync(refPath, 'utf8').trim();
+          if (actualLog.equals(after) && actualRef === evidence.afterRef) {
+            tx.phase = 'stash_ref_published'; delete tx.stashCleanupPending; delete tx.stashRestoreError; this.writeTransaction(file, tx);
+            protectOnExit = false; return true;
+          }
+          if (actualLog.equals(after) && actualRef === evidence.beforeRef && evidence.beforeRef !== evidence.afterRef) {
+            protectOnExit = true;
+            this.writeLockedGitFile(logPath, before);
+            if (!fs.readFileSync(logPath).equals(before) || fs.readFileSync(refPath, 'utf8').trim() !== evidence.beforeRef) throw new Error('Stash reflog rollback could not be verified.');
+            tx.phase = 'stash_cleanup_rolled_back'; tx.stashCleanupPending = true; tx.stashRestoreError = String(failure);
+            this.writeTransaction(file, tx); protectOnExit = false; return false;
+          }
+          if (actualLog.equals(before) && actualRef === evidence.beforeRef) throw failure;
+          throw new Error('Stash ref and reflog cannot be safely reconciled after publication failure.');
+        } catch (recoveryFailure) {
+          if (recoveryFailure === failure && !protectOnExit) throw failure;
+          protectOnExit = true; tx.phase = 'stash_cleanup_needs_recovery'; tx.stashCleanupPending = true;
+          tx.stashRestoreError = `${String(failure)}; rollback: ${String(recoveryFailure)}`;
+          try { this.writeTransaction(file, tx); } catch {}
+          return false;
+        }
+      }
+    } finally {
+      process.removeListener('exit', releaseOnExit);
+      if (!protectOnExit) {
+        if (!release()) { process.once('exit', releaseOnExit); this.writeTransaction(file, tx); throw new Error('Could not safely release the stash ref lock; recovery metadata was retained.'); }
+        delete tx.stashCleanupLock; this.writeTransaction(file, tx);
+      }
+    }
+  }
+
+  private async removeSoleLandingStash(threadId: string, cwd: string, sha: string, token: string, recoverMissingLog = false): Promise<boolean> {
+    if (!/^[0-9a-f]{40,64}$/i.test(sha)) throw new Error('Invalid landing stash SHA.');
+    const registration = this.executions.begin(threadId, this.store.getTask(threadId)?.currentRound || 0, 'merge-git', cwd);
+    let child: ReturnType<typeof spawn>;
+    try { child = spawn(gitExecutable(), ['update-ref', '--stdin'], { cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }); }
+    catch (failure) { this.executions.end(registration); throw failure; }
+    let output = ''; let error = ''; let prepared = false; let committed = false;
+    const completion = new Promise<boolean>((resolve) => {
+      child.stdin!.on('error', (failure) => { error += failure.message; });
+      child.stdout!.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
+        if (!prepared && output.includes('prepare: ok')) {
+          prepared = true;
+          try {
+            const entries = gitOutput(cwd, ['stash', 'list', '--format=%H%x09%gs']).split(/\r?\n/).filter(Boolean);
+            const matches = this.findLandingStash(cwd, token);
+            const format = gitOutput(cwd, ['rev-parse', '--show-ref-format']);
+            const logPath = gitOutput(cwd, ['rev-parse', '--git-path', 'logs/refs/stash']);
+            const absoluteLogPath = path.resolve(cwd, logPath);
+            const hasLog = format === 'files' && fs.existsSync(absoluteLogPath);
+            const rawLog = hasLog ? fs.readFileSync(absoluteLogPath, 'utf8') : '';
+            const lines = rawLog.endsWith('\n') ? rawLog.slice(0, -1).split('\n') : [];
+            const line = lines.length === 1 ? lines[0].match(/^([0-9a-f]+) ([0-9a-f]+) [^\n]*\t([^\n]*)$/i) : undefined;
+            committed = entries.length === 1 && matches.length === 1 && matches[0].sha === sha &&
+              !!line && line[1].length === sha.length && /^0+$/.test(line[1]) && line[2] === sha && line[3].endsWith(`: ${token}`);
+            if (recoverMissingLog && format === 'files' && !hasLog && entries.length === 0 && matches.length === 0) committed = true;
+            child.stdin!.end(committed ? 'commit\n' : 'abort\n');
+          } catch (failure) { error = String(failure); child.stdin!.end('abort\n'); }
+        }
+      });
+      child.stderr!.on('data', (chunk: Buffer) => { error += chunk.toString(); });
+      child.once('error', (failure) => { error += failure.message; resolve(false); });
+      child.once('close', (code) => resolve(code === 0 && committed && output.includes('commit: ok')));
+    });
+    const timer = setTimeout(() => killProcessTree(child), 30_000);
+    try {
+      this.executions.attachChildPid(child.pid, registration);
+      await this.lock.attachChildPid(child.pid);
+      child.stdin!.write(`start\noption no-deref\ndelete refs/stash ${sha}\nprepare\n`);
+      const removed = await completion;
+      if (!removed && error) {
+        const log = this.attemptLogs.get(threadId)?.path;
+        if (log) fs.appendFileSync(log, `\n[local stash cleanup] ${error}\n`, 'utf8');
+      }
+      return removed;
+    } catch (failure) { killProcessTree(child); await completion; throw failure; }
+    finally { clearTimeout(timer); this.lock.detachChildPid(child.pid); this.executions.end(registration); }
+  }
+
+  private async restoreLandingStash(threadId: string, tx: any, file: string): Promise<boolean> {
+    if (!tx.stashToken || tx.phase === 'stash_restored' || tx.phase === 'ledger_written') return true;
+    if (tx.phase === 'stash_restore_conflict') return false;
+    const cwd = tx.checkoutPath as string;
+    const log = this.attemptLogs.get(threadId)?.path;
+    let error = '';
+    try {
+      if (tx.phase === 'stash_restoring') throw new Error('Stash restoration was interrupted; its result is uncertain. The stash and checkout were left untouched.');
+      const multiRecovery = ['stash_cleanup_prepared', 'stash_reflog_published', 'stash_ref_published', 'stash_cleanup_rolled_back', 'stash_cleanup_needs_recovery'].includes(tx.phase);
+      const alreadyApplied = tx.phase === 'stash_applied' || tx.phase === 'stash_cleanup_started' || multiRecovery;
+      const recoveringCleanup = tx.phase === 'stash_cleanup_started';
+      const matches = multiRecovery ? [] : this.findLandingStash(cwd, tx.stashToken);
+      if (!alreadyApplied) {
+        if (matches.length !== 1 || (tx.stashSha && matches[0].sha !== tx.stashSha) || matches[0].sha === tx.stashBefore) throw new Error('The landing stash cannot be uniquely identified.');
+        tx.stashSha = matches[0].sha;
+        tx.phase = 'stash_restoring'; this.writeTransaction(file, tx);
+        if (gitOutput(cwd, ['rev-parse', '--verify', `${matches[0].ref}^{commit}`]) !== tx.stashSha) throw new Error('The landing stash moved before restoration.');
+        if (log) fs.appendFileSync(log, `\n[local stash restore] ${matches[0].ref} ${tx.stashSha}\n`, 'utf8');
+        gitOutput(cwd, ['-c', 'core.autocrlf=false', 'stash', 'apply', '--index', tx.stashSha]);
+        tx.phase = 'stash_applied'; this.writeTransaction(file, tx);
+      }
+      if (!multiRecovery) { tx.phase = 'stash_cleanup_started'; this.writeTransaction(file, tx); }
+      const currentStashRef = recoveringCleanup && matches.length === 0
+        ? gitOutput(cwd, ['for-each-ref', '--format=%(objectname)', 'refs/stash']) : undefined;
+      let removed = recoveringCleanup && matches.length === 0 && !currentStashRef;
+      const uncertain = recoveringCleanup && matches.length === 0 && !!currentStashRef && currentStashRef !== tx.stashSha;
+      if (uncertain) {
+        tx.stashCleanupUncertain = true;
+        tx.stashRestoreError = 'The stash reflog changed after cleanup started; the cleanup outcome is uncertain and other entries were left untouched.';
+      }
+      try {
+        if (multiRecovery) removed = await this.removeMultipleLandingStash(threadId, cwd, tx, file);
+        else if (!removed && !uncertain) {
+          removed = await this.removeSoleLandingStash(threadId, cwd, tx.stashSha, tx.stashToken, recoveringCleanup);
+          if (!removed && (!recoveringCleanup || matches.length === 1)) removed = await this.removeMultipleLandingStash(threadId, cwd, tx, file);
+        }
+      } catch (failure) {
+        tx.stashRestoreError = `Stash cleanup failed: ${String(failure)}`;
+        if (tx.stashCleanup && !tx.stashCleanupPending) {
+          try { removed = await this.removeMultipleLandingStash(threadId, cwd, tx, file); }
+          catch (recoveryFailure) { tx.stashCleanupUncertain = true; tx.stashRestoreError += `; recovery: ${String(recoveryFailure)}`; }
+        }
+      }
+      if (multiRecovery && !removed && !tx.stashCleanupPending) {
+        tx.phase = 'stash_cleanup_needs_recovery'; tx.stashCleanupPending = true;
+        tx.stashRestoreError ||= 'Stash metadata recovery could not be confirmed; its journal was retained.';
+        this.writeTransaction(file, tx);
+      }
+      if (tx.stashCleanupPending) return false;
+      tx.stashRetained = !removed;
+      if (removed) { delete tx.stashRestoreError; delete tx.stashCleanupUncertain; }
+      if (!removed && !tx.stashRestoreError) tx.stashRestoreError = 'The restored stash was retained because the reflog contains other entries or its identity could not be verified under the Git ref lock.';
+      tx.phase = 'stash_restored'; this.writeTransaction(file, tx);
+      if (log) fs.appendFileSync(log, removed ? '[local stash restore] completed; stash removed\n' : `[local stash restore] applied; ${tx.stashSha} retained: ${tx.stashRestoreError}\n`, 'utf8');
+      return true;
+    } catch (failure) {
+      if (tx.stashCleanupPending) throw failure;
+      if (tx.phase === 'stash_restored' && !tx.stashRetained) throw failure;
+      error = String(failure);
+    }
+    tx.phase = 'stash_restore_conflict'; tx.stashRestoreError = error; this.writeTransaction(file, tx);
+    if (log) fs.appendFileSync(log, `\n[local stash restore] ${error}\n`, 'utf8');
+    return false;
+  }
+
   private async syncCheckedOutTarget(repoPath: string, targetRef: string, commit: string, preflight = false, previousCommit?: string, threadId?: string): Promise<{ ok: boolean; error: string; path?: string; commit?: string }> {
     const run = (cwd: string, args: string[]) => threadId ? this.loggedGit(threadId, cwd, args) : Promise.resolve(gitOutput(cwd, args));
     const head = (cwd: string) => run(cwd, ['rev-parse', '--verify', 'HEAD^{commit}']);
@@ -837,8 +1306,7 @@ export class MergeCoordinator {
     if (preflight) {
       if (!row?.worktree) return { ok: true, error: '', commit: targetCommit };
       if (!fs.existsSync(row.worktree)) return { ok: false, error: `Target branch ${targetRef} is registered at missing worktree ${row.worktree}; restore or remove that worktree registration, then retry merge.` };
-      const dirty = await run(row.worktree, ['status', '--porcelain', '--untracked-files=all']);
-      if (targetCommit !== previousCommit || await head(row.worktree) !== targetCommit || dirty) return { ok: false, path: row.worktree, error: `Target branch ${targetRef} changed or has uncommitted files in ${row.worktree}. Preserve or commit those changes, then retry merge; the bridge left them untouched.` };
+      if (targetCommit !== previousCommit || await head(row.worktree) !== targetCommit) return { ok: false, path: row.worktree, commit: targetCommit, error: `Target branch ${targetRef} changed before landing.` };
       return { ok: true, error: '', path: row.worktree, commit: targetCommit };
     }
     if (targetCommit !== commit) {
@@ -893,6 +1361,30 @@ export class MergeCoordinator {
 
   private validationRecord(validationPath: string, commit: string | undefined, result?: 'passed' | 'failed' | 'cancelled', status: 'cleaned' | 'present' = 'present'): NonNullable<DelegationThread['worktree']>['validation'] {
     return { path: validationPath, commit, status, result, updatedAt: new Date().toISOString() };
+  }
+
+  private finishStashRecoveryPending(threadId: string, tx: any): MergeResult {
+    const current = this.store.getTask(threadId);
+    const message = `Stash metadata cleanup requires recovery (${tx.phase}): ${tx.stashRestoreError || 'publication was interrupted'}`;
+    if (!current?.worktree) return { status: 'blocked', message };
+    const thread = structuredClone(current); const worktree = thread.worktree!; const at = new Date().toISOString();
+    let landedTarget: string | undefined;
+    try {
+      const repo = worktree.deliveryTarget?.repositoryPath || worktree.repositoryPath || worktree.mainPath;
+      const ref = worktree.deliveryTarget?.ref || worktree.targetRef!;
+      const target = gitOutput(repo, ['rev-parse', '--verify', `${ref}^{commit}`]);
+      if (target !== tx.candidateCommit) gitOutput(repo, ['merge-base', '--is-ancestor', tx.candidateCommit, target]);
+      landedTarget = target;
+    } catch {}
+    if (thread.status !== 'paused') thread.status = 'waiting_merge';
+    worktree.integration = { ...worktree.integration, phase: 'blocked', sourceCommit: tx.sourceCommit, candidateCommit: tx.candidateCommit,
+      targetOldCommit: tx.targetOldCommit, targetPath: tx.checkoutPath, stashRecoveryPending: true, stashRecoveryLockHeld: tx.phase === 'stash_cleanup_needs_recovery',
+      ...(landedTarget ? { targetCommit: landedTarget, mergedCommit: tx.candidateCommit } : {}),
+      stashRestore: { status: 'stash_cleanup_uncertain', sha: tx.stashSha, error: tx.stashRestoreError }, error: message, updatedAt: at };
+    thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number: (thread.mergeHistory?.length || 0) + 1,
+      at, phase: 'stash_cleanup', result: 'pending', error: message, errorCode: 'STASH_CLEANUP_PENDING', attemptId: this.attemptLogs.get(threadId)?.id }];
+    thread.summary.lastOutputSnippet = message; thread.updatedAt = at; this.store.upsertTask(thread);
+    return landedTarget ? { status: 'merged', message: `The merge is landed, but ${message}`, commit: tx.candidateCommit } : { status: 'blocked', message };
   }
 
   private finishBlocked(threadId: string, reason: string, targetOldCommit: string, sourceCommit: string, targetPath?: string, resolutionPath?: string): void {
@@ -1042,16 +1534,24 @@ export class MergeCoordinator {
     const current = this.store.getTask(threadId); if (!current?.worktree) return;
     const thread = structuredClone(current);
     const worktree = thread.worktree!;
+    const tx = this.readTransaction(this.transactionPath(threadId));
+    const stashRestore = tx?.stashToken ? { status: tx.stashCleanupUncertain ? 'stash_cleanup_uncertain' : tx.stashRetained && tx.phase === 'stash_restored' ? 'stash_restored_retained' : tx.phase, sha: tx.stashSha, error: tx.stashRestoreError } : undefined;
     if (thread.mergeControl) thread.mergeControl = { ...thread.mergeControl, revision: thread.mergeControl.revision + 1, failureFingerprint: undefined, consecutiveRetries: 0 };
     if (this.attemptLogs.has(threadId) && targetOldCommit && !(thread.mergeHistory || []).some((entry) => entry.mergedCommit === mergedCommit)) {
       const repo = worktree.deliveryTarget?.repositoryPath || worktree.repositoryPath || worktree.mainPath;
-      const changedFiles = (await this.loggedGit(threadId, repo, ['diff', '--name-status', `${targetOldCommit}..${mergedCommit}`])).split(/\r?\n/).filter(Boolean);
+      const changedFiles = (this.isMergeStillAllowed(threadId, worktree.approvedCommit || '')
+        ? await this.loggedGit(threadId, repo, ['diff', '--name-status', `${targetOldCommit}..${mergedCommit}`])
+        : gitOutput(repo, ['diff', '--name-status', `${targetOldCommit}..${mergedCommit}`])).split(/\r?\n/).filter(Boolean);
       const number = (thread.mergeHistory?.length || 0) + 1;
       thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number, at: new Date().toISOString(),
         phase: 'merged', result: 'merged', targetRef: worktree.deliveryTarget?.ref || worktree.targetRef, targetOldCommit,
         targetCommit: commit, sourceCommit: worktree.approvedSnapshot?.sourceCommit, candidateCommit: worktree.approvedCommit, candidateTree: this.attemptLogs.get(threadId)?.candidateTree || worktree.approvedSnapshot?.tree, mergedCommit, changedFiles, exitCode: 0, attemptId: this.attemptLogs.get(threadId)?.id }];
     }
-    thread.status = 'completed'; worktree.integration = { ...worktree.integration, phase: 'merged', targetOldCommit, targetCommit: commit, targetPath, mergedCommit, updatedAt: new Date().toISOString() };
+    if (stashRestore && !(thread.mergeHistory || []).some((entry) => entry.phase === 'stash_restore' && entry.attemptId === this.attemptLogs.get(threadId)?.id)) {
+      thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number: (thread.mergeHistory?.length || 0) + 1,
+        at: new Date().toISOString(), phase: 'stash_restore', result: stashRestore.status, error: stashRestore.error, attemptId: this.attemptLogs.get(threadId)?.id }];
+    }
+    thread.status = 'completed'; worktree.integration = { ...worktree.integration, phase: 'merged', targetOldCommit, targetCommit: commit, targetPath, mergedCommit, stashRecoveryPending: false, stashRecoveryLockHeld: false, stashRestore, updatedAt: new Date().toISOString() };
     if (worktree.deliveryTarget) worktree.deliveryTarget.checkoutPath = targetPath;
     if (validation) worktree.validation = validation;
     worktree.mergePending = false; thread.updatedAt = new Date().toISOString(); this.store.upsertTask(thread);
@@ -1063,9 +1563,7 @@ export class MergeCoordinator {
     const thread = this.store.getTask(threadId);
     if (!tx?.candidateCommit || !thread?.worktree?.targetRef || !thread.worktree.repositoryPath) return false;
     try {
-      const run = (args: string[]) => this.attemptLogs.has(threadId)
-        ? this.loggedGit(threadId, thread.worktree!.repositoryPath!, args)
-        : Promise.resolve(gitOutput(thread.worktree!.repositoryPath!, args));
+      const run = (args: string[]) => Promise.resolve(gitOutput(thread.worktree!.repositoryPath!, args));
       const head = await run(['rev-parse', '--verify', `${thread.worktree.targetRef}^{commit}`]);
       if (head === tx.candidateCommit) return true;
       try { await run(['merge-base', '--is-ancestor', tx.candidateCommit, head]); return true; } catch { return false; }
@@ -1076,10 +1574,12 @@ export class MergeCoordinator {
   private readTransaction(file: string): any { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return undefined; } }
   private writeTransaction(file: string, value: unknown): void {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    const tmp = `${file}.${process.pid}.tmp`;
-    const fd = fs.openSync(tmp, 'w');
-    try { fs.writeFileSync(fd, JSON.stringify(value, null, 2)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-    fs.renameSync(tmp, file);
-    if (process.platform !== 'win32') { const dirFd = fs.openSync(path.dirname(file), 'r'); try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); } }
+    const tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    try {
+      const fd = fs.openSync(tmp, 'wx', 0o600);
+      try { fs.writeFileSync(fd, JSON.stringify(value, null, 2)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      fs.renameSync(tmp, file);
+      if (process.platform !== 'win32') { const dirFd = fs.openSync(path.dirname(file), 'r'); try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); } }
+    } finally { try { fs.unlinkSync(tmp); } catch {} }
   }
 }

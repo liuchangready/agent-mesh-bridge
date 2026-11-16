@@ -150,6 +150,7 @@ export class ReworkController {
       throw new Error(`Cannot request rework: task ${params.threadId} is paused; resume it first.`);
     }
     if (thread.status === 'merge_failed' || thread.status === 'wait_decision') throw new Error(`Cannot request rework while task is ${thread.status}.`);
+    if (thread.worktree?.integration?.stashRecoveryPending) throw new Error(`Cannot request rework while stash metadata recovery is pending.`);
     this.assertDedicatedReviewerReady(thread, 'request rework');
     assertCanExecute(params.targetAgent || thread.targetAgent, 'receive rework');
     if (
@@ -518,7 +519,7 @@ export class ReworkController {
           finally { roles.release(role); }
         }
         const round = [...thread.rounds].reverse().find((entry) => entry.type !== 'approval') || thread.rounds[thread.rounds.length - 1];
-        if (round && ['conflict', 'validation_failed', 'blocked'].includes(thread.worktree?.integration?.phase || '')) {
+        if (round && !thread.worktree?.integration?.stashRecoveryPending && ['conflict', 'validation_failed', 'blocked'].includes(thread.worktree?.integration?.phase || '')) {
           setTimeout(() => { void this.callbackManager.notifyCaller(thread!, round); }, 0).unref();
         }
         return round;
@@ -700,6 +701,7 @@ export class ReworkController {
 
   private assertReworkStillEligible(thread: DelegationThread, params: RequestReworkParams): void {
     if (thread.status === 'merge_failed' || thread.status === 'wait_decision') throw new Error(`Cannot request rework while task is ${thread.status}.`);
+    if (thread.worktree?.integration?.stashRecoveryPending) throw new Error('Cannot request rework while stash metadata recovery is pending.');
     if (thread.archivedAt || thread.status === 'completed') {
       throw new Error(`Cannot request rework: task ${thread.threadId} became completed or archived during retarget.`);
     }
@@ -804,6 +806,7 @@ export class ReworkController {
       };
     }
     if (thread.status === 'merge_failed' || thread.status === 'wait_decision') throw new Error(`Cannot approve while task is ${thread.status}.`);
+    if (thread.worktree?.integration?.stashRecoveryPending) throw new Error('Cannot approve while stash metadata recovery is pending.');
 
     const nowIso = new Date().toISOString();
     let status: ApproveResult['status'] = 'COMPLETED';
@@ -900,6 +903,7 @@ export class ReworkController {
   public requestMergeDecision(threadId: string, question: string, background: string, suggestion: string, conflictFiles: string[] = [], logPath?: string): { threadId: string; status: 'wait_decision'; decisionId: string; nextAction: string; message: string } {
     const current = this.taskStore.getTask(threadId);
     if (!current || current.status !== 'waiting_merge' || !question?.trim()) throw new Error('A waiting merge and a non-empty question are required.');
+    if (current.worktree?.integration?.stashRecoveryPending) throw new Error('Cannot request a merge decision while stash metadata recovery is pending.');
     const thread = structuredClone(current);
     const decisionId = crypto.randomUUID(); const at = new Date().toISOString();
     const files = Array.isArray(conflictFiles) && conflictFiles.length ? conflictFiles : thread.worktree?.integration?.conflictFiles || [];
@@ -960,6 +964,7 @@ export class ReworkController {
     if (!thread || thread.status !== 'waiting_merge' || !worktree?.approvedCommit || !worktree.mergeResolutionPath || !worktree.integration?.targetOldCommit) {
       throw new Error('No approved merge resolution workspace is awaiting submission.');
     }
+    if (worktree.integration.stashRecoveryPending) throw new Error('Cannot submit a merge resolution while stash metadata recovery is pending.');
     if ((worktree.mergeResolutionSourceCommit || worktree.integration.sourceCommit) !== worktree.approvedCommit) {
       throw new Error('The resolution workspace belongs to a different approved candidate.');
     }

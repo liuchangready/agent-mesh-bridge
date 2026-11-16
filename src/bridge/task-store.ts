@@ -657,6 +657,13 @@ export class TaskStore extends EventEmitter {
         };
         const priorPhase = prior.worktree.integration?.phase;
         const incomingPhase = thread.worktree.integration?.phase;
+        if (prior.worktree.integration?.stashRecoveryPending && !thread.worktree.integration?.stashRecoveryPending &&
+            !(incomingPhase === 'merged' && thread.worktree.integration?.stashRecoveryPending === false)) {
+          const validation = thread.worktree.validation;
+          thread.worktree = { ...thread.worktree, ...prior.worktree, validation: validation || prior.worktree.validation };
+          thread.status = prior.status;
+          continue;
+        }
         if (incomingPhase === 'merged') {
           // Local integration is monotonic even when a stale writer carries a
           // later wall-clock timestamp (for example after clock skew).

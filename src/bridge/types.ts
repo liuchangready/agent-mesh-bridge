@@ -529,6 +529,7 @@ export interface TaskFinalSummary {
     taskBranch?: string; taskPath?: string; approvedCommit?: string;
     targetBranch?: string; targetRef?: string; targetRepositoryPath?: string; targetPath?: string; targetCommit?: string;
     mergeState?: string; blockedReason?: string;
+    stashRestore?: { status: string; sha?: string; error?: string };
     validationPath?: string; validationCommit?: string; validationStatus?: string; validationResult?: string;
   };
 }
@@ -568,6 +569,9 @@ export interface WorktreeInfo {
     targetPath?: string;
     candidateCommit?: string;
     mergedCommit?: string;
+    stashRecoveryPending?: boolean;
+    stashRecoveryLockHeld?: boolean;
+    stashRestore?: { status: string; sha?: string; error?: string };
     error?: string;
     conflictFiles?: string[];
     updatedAt: string;

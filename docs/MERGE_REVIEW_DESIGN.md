@@ -1,6 +1,7 @@
 # 合并检视与决策流程设计
 
-> 状态：待检视设计，尚未实现。
+
+> 状态：已实现，持续回归验证。
 
 ## 目标
 
@@ -50,7 +51,9 @@
 | `timeout` / `watchdog` / `error` 中断 | 读取 `interruption{kind,reason,at,by}`；系统超时/看门狗可在预算内重试，用户 pause/stop/delete 不自动重试。 |
 | `RATE_LIMITED` / quota | 尊重 `retryAfter`/quota 恢复信息，延后同会话唤醒；不在限流窗口内快速重试。耗尽预算后转入合并失败收口，不伪造代码返修。 |
 | 认证失败、权限拒绝、CLI 缺失或启动失败 | 不重复执行必然失败的合并命令；附上日志与恢复要求，请求用户决定或等待用户处理环境后重启。 |
-| Git 冲突、目标分支推进、dirty checkout、CAS 失败 | 保留冲突现场和目标 SHA；Reviewer 解决冲突、等待 checkout 清洁或基于最新目标重试，绝不覆盖用户改动或目标 ref。 |
+| Git 冲突 | 保留隔离工作区和目标 SHA，由 Reviewer 解决实际冲突。 |
+| 目标分支推进、CAS 失败 | 基于最新目标重新合并和验证，不因竞争要求用户决策。 |
+| dirty checkout | 仅在落地短窗口暂存本地改动，完成同步后恢复；恢复冲突独立记录，合并仍完成。 |
 | 组合测试/构建失败 | 记录失败命令与摘要；Reviewer 判断是候选代码缺陷（返修）还是集成环境/外部依赖（决定或等待），不得直接标记合并成功。 |
 
 `assessment.success === false`、退出码非零、空输出或中断都必须传给 Reviewer；`success === true` 且只有 gap warning 则不能被误记为 worker 失败。挂起窗口仍按 worker 规则从活动时长和 timeout 预算中扣除。worker 的原始轮次、输出归档和 token 计量保持原样；合并 Reviewer 的处理记录写入 `mergeHistory`，不覆盖 worker 轮次。
@@ -95,7 +98,11 @@ stateDiagram-v2
 
 合并工作区从该次尝试读取的 `targetOldCommit` 派生，持久记录路径、基线和状态，供 Reviewer 的原生会话以该目录作为工作目录。它与执行者 worktree 分离，不改变 `workspace.executionPath` 或已经批准的原始候选快照。Reviewer 对合并工作区的改动表示“解决目标分支集成冲突”，纳入最终 merge commit 和 `changedFiles[]`；不得把它们回写成开发者的轮次输出。下一次尝试可以复用 Reviewer 修复后的合并工作区，或在目标 ref 已前进时基于最新目标重建并重新应用已记录的解决方案。
 
-目标 checkout 若有用户未提交改动，桥接不覆盖文件、不强制 reset/checkout；合并记录标为 `blocked`，任务保留 `waiting_merge`，在详情页给出阻塞原因和安全恢复操作。目标 ref 已成功更新但 checkout 同步失败时，明确记录“ref 已更新、checkout 未同步”，不得谎报未合入或重复创建合并 commit。
+目标 checkout 的未提交改动不参与合并判定。验证通过后，在全局锁内用 `git stash push --include-untracked` 暂存，并持久化操作前 stash ref、唯一标识和新 stash SHA；确认 checkout 清洁且忽略文件不妨碍同步后才更新目标 ref。同步后定位本次 stash 并用 `--index` 恢复暂存状态；恢复冲突保留现场及 stash，在合并已完成的记录中单独说明。恢复操作若中断且无法确认是否已执行，不再次应用。ref 更新前失败或取消时尽力恢复；ref 已更新时继续同一事务，不重复创建合并 commit。
+
+清理多条 stash 时，files backend 使用 Git 兼容的 `refs/stash.lock` 锁保护 ref 和 reflog，在锁内重新核对 common-dir、ref、完整 reflog、token 与 SHA；仅删除匹配条目并按 Git reflog 的链规则修正相邻旧值。锁使用带随机标识的耐久记录，恢复时只清理可确认属于已退出进程的锁。发布前持久化有界的前后 reflog 和 ref 证据，再依次原子发布 reflog 与必要的 ref，避免额外写入 reflog。恢复时校验证据并接续未完成的发布；如期间新增了 stash，在可证明的追加场景下保留新增项。reflog 超出 2 MiB 或 10,000 条、非 files backend、路径或状态无法确认时保留现场并记录原因。
+
+若 reflog 已发布而 ref 发布失败，桥接在同一把锁内验证证据并回滚 reflog；若 ref 实际已发布，则识别一致状态并向前完成。回滚也失败时保留带所有权证明的锁、原始证据与 `stash_cleanup_needs_recovery` 阶段；任务显示等待 stash 元数据恢复，可从详情重试同一事务，不重新 apply 或创建合并 commit。保护锁仍持有时不允许删除任务或丢弃恢复资料。
 
 ### Reviewer 处理失败并继续合入
 
@@ -134,7 +141,7 @@ stateDiagram-v2
 1. staged、unstaged、删除和未跟踪改动无需 Agent commit 即可固化并被准确合入；验收后新增的改动不进入已批准快照。
 2. 目标分支在任务运行期间前进时，桥接按最新目标做标准 Git 合并和组合验证；冲突会唤醒 Reviewer。
 3. 自动合并冲突后任务仍为 `waiting_merge`，Reviewer 可在专用合并工作区多次尝试并逐次留档；只有成功合并和验证后任务才完成。
-4. 验证失败、CAS 失败、dirty checkout 阻塞均留有 merge record 和可读日志；成功记录准确包含合入 commit、前后目标 SHA、修改文件清单及安全回退命令。
+4. 验证失败、CAS 失败均留有 merge record 和可读日志；dirty checkout 不阻止合并。成功记录包含合入 commit、前后目标 SHA、修改文件清单及安全回退命令，本地恢复冲突单独记录。
 5. Reviewer 请求决定后任务进入 `wait_decision`、释放角色与并发资源；提交决定后任务回到 `waiting_merge`，同一 Reviewer 会话恢复，重复提交不会重复唤醒。
 6. worker 的非零退出、空输出、流停滞、warning、限流、超时/看门狗、权限/认证/启动失败均按策略传给 Reviewer；用户中断不被自动重试，warning 不被当成失败。
 7. 同一 fingerprint 连续第六次 retry 失败后进入 `merge_failed`、清空活跃锁并停止自动唤醒；界面只允许重试合并或删除。重试沿用快照和合并工作区，保留历史并开启新一代失败计数。其他 fingerprint 的失败不错误继承计数。
