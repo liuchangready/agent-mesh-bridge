@@ -283,7 +283,7 @@ export function activate(context: vscode.ExtensionContext) {
     if (folder.uri.scheme !== 'file') return [];
     try { return [physicalDirectory(folder.uri.fsPath)]; } catch { return []; }
   });
-  const windowWorkspace = new WindowWorkspace(workspaceStorage, currentWindowRoots());
+  const windowWorkspace = new WindowWorkspace(workspaceStorage, currentWindowRoots(), context.workspaceState);
   const knownWorkspaceTasks = new Set(taskStore.getAllTasks().map((task) => task.threadId));
   const windowHeartbeat = setInterval(() => {
     try { windowWorkspace.publish(); } catch (error) { console.warn('[Agent Mesh Bridge] Workspace heartbeat failed:', error); }
@@ -868,11 +868,11 @@ export function activate(context: vscode.ExtensionContext) {
         if (!folders?.length || folders[0].scheme !== 'file') return;
         id = workspaceRegistry.register(folders[0].fsPath, 'user').id;
       }
-      windowWorkspace.setDefault(id);
+      await windowWorkspace.setDefault(id);
       activeTreeProvider.refresh(); recentTreeProvider.refresh(); void agentNodesProvider.refresh(false);
     }),
-    vscode.commands.registerCommand('agent-mesh-bridge.clearWorkspace', () => {
-      windowWorkspace.setDefault(undefined);
+    vscode.commands.registerCommand('agent-mesh-bridge.clearWorkspace', async () => {
+      await windowWorkspace.setDefault(undefined);
       activeTreeProvider.refresh(); recentTreeProvider.refresh(); void agentNodesProvider.refresh(false);
     }),
     vscode.commands.registerCommand('agent-mesh-bridge.filterWorkspaces', async () => {
