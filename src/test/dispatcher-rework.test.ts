@@ -566,7 +566,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     const thread = taskStore.getTask(dispatchRes.threadId);
     assert.ok(thread);
     assert.strictEqual(thread.currentRound, 2);
-    assert.strictEqual(thread.status, 'reworking');
+    assert.strictEqual(thread.status, 'running');
     assert.strictEqual(thread.receiverSessionId, originalSessionId);
     assert.strictEqual(thread.rounds.length, 2);
     assert.strictEqual(thread.rounds[1].type, 'rework');
@@ -721,7 +721,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
 
     const recoveredThread = taskStore.getTask(dispatchRes.threadId);
     assert.ok(recoveredThread);
-    assert.strictEqual(recoveredThread.status, 'reworking');
+    assert.strictEqual(recoveredThread.status, 'running');
     assert.strictEqual(recoveredThread.rounds.length, 2); // No duplicate round created!
     assert.strictEqual(recoveredThread.rounds[1].status, 'running');
   });

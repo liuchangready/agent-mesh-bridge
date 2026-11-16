@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { TaskStore } from '../bridge/task-store';
 import { ReworkController } from '../bridge/rework-controller';
-import { DelegationThread } from '../bridge/types';
+import { DelegationThread, findInFlightRound } from '../bridge/types';
 import { TaskSupervisor } from '../bridge/task-supervisor';
 import {
   findExistingExecutionLog,
@@ -234,7 +234,7 @@ export class TaskDetailPanel {
       return;
     }
 
-    if (thread.status === 'running' || thread.status === 'reworking') {
+    if (thread.status === 'running') {
       vscode.window.showInformationMessage(
         `任务当前正在由 ${thread.targetAgent} 自主执行中（Round ${thread.currentRound || 1}），无需重复触发。`,
       );
@@ -438,7 +438,6 @@ export class TaskDetailPanel {
     const statusBadgeColors: Record<string, string> = {
       queued: '#a855f7',
       running: '#f59e0b',
-      reworking: '#f59e0b',
       waiting_review: '#3b82f6',
       waiting_merge: '#8b5cf6',
       wait_decision: '#eab308',
@@ -1111,15 +1110,26 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
       <div style="font-size: 12px; opacity: 0.75; margin-top: 4px;">Agent 进程已停止，当前轮次与原生会话已保留。点击下方“恢复执行”可从原轮次继续。</div>
     </div>
   </div>`
-      : (thread.status === 'running' || thread.status === 'reworking')
-      ? `
+      : thread.status === 'running'
+      ? (() => {
+          const inFlight = findInFlightRound(thread);
+          const isRework = inFlight?.type === 'rework';
+          const activeRound = inFlight?.round ?? thread.currentRound ?? 1;
+          const bannerTitle = isRework
+            ? `第 ${activeRound} 轮返修正在自主执行中 (${escapeHtml(thread.targetAgent)})`
+            : `第 ${activeRound} 轮正在自主执行中 (${escapeHtml(thread.targetAgent)})`;
+          const bannerDesc = isRework
+            ? `<strong>${escapeHtml(thread.targetAgent)}</strong> 正在原生会话中按 Reviewer 意见返修代码与编写测试，后台每 30 秒流式同步一次最新输出，无需人工干预。`
+            : `<strong>${escapeHtml(thread.targetAgent)}</strong> 正在原生会话中修改代码与编写测试，后台每 30 秒流式同步一次最新输出，无需人工干预。`;
+          return `
   <div style="background: rgba(245, 158, 11, 0.15); border: 1px solid #f59e0b; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
     <div style="font-size: 28px;">⏳</div>
     <div>
-      <div style="font-weight: 700; font-size: 16px; color: #fbbf24;">第 ${thread.currentRound || 1} 轮正在自主执行中 (${escapeHtml(thread.targetAgent)})</div>
-      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;"><strong>${escapeHtml(thread.targetAgent)}</strong> 正在原生会话中修改代码与编写测试，后台每 30 秒流式同步一次最新输出，无需人工干预。</div>
+      <div style="font-weight: 700; font-size: 16px; color: #fbbf24;">${bannerTitle}</div>
+      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">${bannerDesc}</div>
     </div>
-  </div>`
+  </div>`;
+        })()
       : thread.status === 'failed'
       ? `
   <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
@@ -1137,7 +1147,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
     ${(thread.status === 'failed' || thread.rounds.some((r) => r.status === 'failed')) ? `<button class="retry-btn" style="background: #dc2626; color: white;" onclick="retryFailedRound()">🔄 重试失败轮次 (Retry Failed)</button>` : ''}
     ${thread.status === 'waiting_review' && thread.reviewWake && thread.reviewWake.round === (thread.currentRound || 1) ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（唤醒失败）</button>` : ''}
     ${thread.status === 'review_failed' ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（检视失败）</button>` : ''}
-    ${(thread.status === 'running' || thread.status === 'reworking' || thread.status === 'queued' || thread.status === 'waiting_merge') ? `<button style="background:#ea580c;color:white;" onclick="pauseTask()">⏸ 暂停任务 (Pause)</button>` : ''}
+    ${(thread.status === 'running' || thread.status === 'queued' || thread.status === 'waiting_merge') ? `<button style="background:#ea580c;color:white;" onclick="pauseTask()">⏸ 暂停任务 (Pause)</button>` : ''}
     ${thread.status === 'paused' ? `<button class="resume-btn" onclick="resumeTask()">▶ 恢复执行 (Resume)</button>` : ''}
     ${(thread.status === 'failed' || thread.status === 'waiting_review' || thread.status === 'review_failed') ? `<button class="resume-btn" onclick="resumeTask()">▶ 下发返修要求 / 重新执行</button>` : ''}
     ${(thread.status === 'waiting_review' || thread.status === 'failed' || thread.status === 'review_failed') ? `<button onclick="approveTask()">✓ 手动验收通过 (Approve Task)</button>` : ''}
@@ -1149,7 +1159,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
   <div class="live-logs-box" style="${thread.status === 'merge_failed' ? 'display:none;' : ''}margin-top: 16px; margin-bottom: 24px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; padding: 16px;">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px; flex-wrap:wrap; gap:8px;">
       <div style="font-weight:600; font-size:14px; display:flex; align-items:center; gap:8px;">
-        ${thread.status === 'running' || thread.status === 'reworking' ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;"></span>` : ''}
+        ${thread.status === 'running' ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;"></span>` : ''}
         <span>最近 1,000 行实时日志 (Live Logs)</span>
         <span style="font-size:12px;opacity:0.6;font-weight:normal;">(${recentLogs.returnedLines} / ${recentLogs.totalLines} 行${recentLogs.isRunning ? ' · 实时运行中' : ''})</span>
       </div>

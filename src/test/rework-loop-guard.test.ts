@@ -124,7 +124,7 @@ describe('review block and terminal state', () => {
   });
 
   test('blockReview refuses a task that is not waiting for review', () => {
-    store.upsertTask(makeThread({ status: 'reworking' }));
+    store.upsertTask(makeThread({ status: 'running' }));
     assert.throws(
       () => controller.blockReview({ threadId: 'thread_loop_1', reason: 'x' }),
       /not "waiting_review"/,

@@ -296,7 +296,7 @@ sequenceDiagram
 
 ```typescript
 export type AgentId = 'antigravity' | 'claude_code' | 'codex' | 'deepseek_harness';
-export type ThreadStatus = 'queued' | 'running' | 'waiting_review' | 'reworking' | 'paused' | 'review_failed' | 'completed' | 'failed';
+export type ThreadStatus = 'queued' | 'running' | 'waiting_review' | 'waiting_merge' | 'wait_decision' | 'merge_failed' | 'paused' | 'review_failed' | 'completed' | 'failed';
 export type RoundStatus = 'running' | 'paused' | 'completed' | 'failed';
 export type InterruptionKind = 'paused' | 'stopped' | 'deleted' | 'timeout' | 'watchdog' | 'error';
 
@@ -436,7 +436,7 @@ export interface DelegationRound {
 - **功能**：检索最近的委派任务列表（上限 1000 条）。
 - **参数**：
   - `limit` (number, 可选): 默认 20，最大 1000
-  - `statusFilter` (string, 可选): `'all' | 'active' | 'running' | 'waiting_review' | 'review_failed' | 'reworking' | 'paused' | 'completed' | 'failed'`
+  - `statusFilter` (string, 可选): `'all' | 'active' | 'running' | 'waiting_review' | 'waiting_merge' | 'wait_decision' | 'merge_failed' | 'review_failed' | 'paused' | 'completed' | 'failed'`（兼容别名 `'reworking'` 仍作为输入别名支持，筛选规范化为 running 且活动轮次为 rework 的任务）
 - **返回值**：包含 `threadId, title, initiatorAgent, targetAgent, status, currentRound, summary` 的对象数组。
 
 ### 5. `get_thread_details`（查看单条任务完整交互历史）

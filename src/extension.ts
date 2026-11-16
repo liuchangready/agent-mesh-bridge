@@ -761,7 +761,7 @@ export function activate(context: vscode.ExtensionContext) {
     const title = thread ? thread.title : threadId;
     const worktree = thread?.worktree;
     const mergeGate = !!thread && isMergePending(thread);
-    const running = !!thread && (thread.status === 'running' || thread.status === 'reworking' || thread.status === 'waiting_merge');
+    const running = !!thread && (thread.status === 'running' || thread.status === 'waiting_merge');
 
     const details = [
       force ? `确定要【强制删除】任务【${title}】吗？` : `确定要永久删除任务【${title}】吗？`,
@@ -1298,7 +1298,7 @@ export function activate(context: vscode.ExtensionContext) {
           thread.rounds.find((r) => r.round === thread.currentRound && r.status === 'running') ||
           runningRounds[runningRounds.length - 1];
 
-        // If currently in running/reworking and has a round waiting to execute
+        // If currently running and has a round waiting to execute
         if (targetRound && targetRound.prompt) {
           supervisor.executeThreadRound(thread, targetRound);
           vscode.window.showInformationMessage(

@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { TaskStore } from '../bridge/task-store';
-import { DelegationThread, describeModelRouting, getModelRouting } from '../bridge/types';
+import { DelegationThread, describeModelRouting, getModelRouting, findInFlightRound } from '../bridge/types';
+import { formatTaskTreeStatus } from './task-status-formatter';
 import { aggregateThreadTokenUsage, formatTokenCount } from '../bridge/token-usage-collector';
 import { groupWorkspaceTasks } from '../bridge/workspace';
 
@@ -56,53 +57,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     const label = `[${fromAbbr} ➔ ${toAbbr}] ${thread.title}`;
 
     const roundText = `Round ${thread.currentRound || 1}`;
-    let iconName = 'symbol-misc';
-    let statusLabel = thread.status.toUpperCase();
-
-    switch (thread.status) {
-      case 'queued':
-        iconName = 'clock';
-        statusLabel = `Queued (排队中)`;
-        break;
-      case 'running':
-      case 'reworking':
-        iconName = 'sync~spin';
-        statusLabel =
-          thread.status === 'reworking' ? `Reworking (${roundText})` : `Running (${roundText})`;
-        break;
-      case 'waiting_merge':
-        iconName = 'git-merge';
-        statusLabel = 'Waiting for verified integration';
-        break;
-      case 'wait_decision':
-        iconName = 'question';
-        statusLabel = 'Waiting for user decision';
-        break;
-      case 'merge_failed':
-        iconName = 'error';
-        statusLabel = 'Merge failed; retry or delete';
-        break;
-      case 'waiting_review':
-        iconName = 'eye';
-        statusLabel = `In-Review (${roundText})`;
-        break;
-      case 'review_failed':
-        iconName = 'warning';
-        statusLabel = `Review Failed · 检视失败 (${roundText})`;
-        break;
-      case 'paused':
-        iconName = 'debug-pause';
-        statusLabel = `Paused (已暂停)`;
-        break;
-      case 'completed':
-        iconName = 'check';
-        statusLabel = `Completed (${roundText})`;
-        break;
-      case 'failed':
-        iconName = 'error';
-        statusLabel = `Failed (${roundText})`;
-        break;
-    }
+    let { iconName, statusLabel } = formatTaskTreeStatus(thread);
 
     const durationSec = Math.round((thread.summary.totalDurationMs || 0) / 1000);
     const durationText =

@@ -13,7 +13,7 @@ import { getReviewerLogDir, getWorkerLogDir, safeThreadIdPart, taskReviewerLogDi
 import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 import { TaskRoleLock, TaskRole } from './task-role-lock';
 import { TaskStore } from './task-store';
-import { AgentId, DelegationThread, NativeSessionCompactionOperation, TokenUsageComponent, appendInterruption, isValidSessionId } from './types';
+import { AgentId, DelegationThread, NativeSessionCompactionOperation, TokenUsageComponent, appendInterruption, isValidSessionId, findInFlightRound } from './types';
 import { appendTokenUsageComponent } from './token-usage-collector';
 import { readBridgePolicy } from './bridge-policy';
 
@@ -272,7 +272,7 @@ export class NativeSessionCompactor {
     });
     if (!fresh || fresh.archivedAt || freshAgent !== agent || freshSession !== sessionId ||
         freshModel !== model || worktreeChanged || cancellation ||
-        (role === 'developer' && !['running', 'reworking', 'queued'].includes(fresh.status)) ||
+        (role === 'developer' && !['running', 'queued'].includes(fresh.status)) ||
         (role === 'reviewer' && !isReviewerWakeEligible(fresh) && !(reviewerBootstrap && fresh.status === 'queued' && fresh.reviewBootstrap?.phase === 'launching'))) {
       new NativeSessionLock(root).release(lease);
       throw new Error('Task state, cancellation, model, worktree, or native session changed before resume preparation.');
@@ -470,7 +470,7 @@ export class NativeSessionCompactor {
       head: thread.worktree.headCommit, approved: thread.worktree.approvedCommit,
     });
     const statusAllowed = latestThread && (role === 'developer'
-      ? ['running', 'reworking', 'queued'].includes(latestThread.status)
+      ? ['running', 'queued'].includes(latestThread.status)
       : isReviewerWakeEligible(latestThread) || reviewerBootstrap && latestThread.status === 'queued' && latestThread.reviewBootstrap?.phase === 'launching');
     if (!latestThread || latestThread.archivedAt || !statusAllowed || latestAgent !== agent || latestSession !== sessionId ||
         latestModel !== model || latestWorktree !== originalWorktree || new CancellationRegistry(root).peek(threadId) ||
@@ -657,8 +657,8 @@ export class NativeSessionCompactor {
     if (!thread || thread.archivedAt) return;
     const boundSessionId = role === 'developer' ? thread.receiverSessionId : thread.reviewerSessionId;
     const successfulStatus = role === 'developer'
-      ? ['running', 'reworking', 'queued'].includes(thread.status)
-      : ['reworking', 'waiting_merge', 'completed'].includes(thread.status);
+      ? ['running', 'queued'].includes(thread.status)
+      : ['waiting_merge', 'completed'].includes(thread.status) || (['running', 'queued'].includes(thread.status) && findInFlightRound(thread)?.type === 'rework');
     if (boundSessionId !== sessionId || !successfulStatus || new CancellationRegistry(root).peek(threadId)) return;
     const old = thread.nativeSessionCompaction?.[role];
     const cursor = old?.sessionId === sessionId ? old : { sessionId, turnsSinceCompaction: 0 };

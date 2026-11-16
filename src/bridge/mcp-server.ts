@@ -579,7 +579,7 @@ export class MCPServer {
       {
         name: 'pause_task',
         description:
-          'Pause a queued/running/reworking task. The current agent process is stopped, the round is preserved as paused, and the interruption reason is recorded.',
+          'Pause a queued/running task. The current agent process is stopped, the round is preserved as paused, and the interruption reason is recorded.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -772,7 +772,6 @@ export class MCPServer {
                 'wait_decision',
                 'merge_failed',
                 'review_failed',
-                'reworking',
                 'paused',
                 'completed',
                 'failed',

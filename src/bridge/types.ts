@@ -33,7 +33,6 @@ export type ThreadStatus =
   | 'waiting_merge'
   | 'wait_decision'
   | 'merge_failed'
-  | 'reworking'
   | 'paused'
   | 'review_failed'
   | 'completed'

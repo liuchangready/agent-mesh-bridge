@@ -73,8 +73,8 @@ stateDiagram-v2
   waiting_merge --> merge_failed: 同一问题连续六次 retry 失败
   merge_failed --> waiting_merge: 用户选择重试合并
   merge_failed --> deleted: 用户选择删除任务
-  waiting_merge --> reworking: Reviewer 判定必须修改原始候选代码
-  reworking --> waiting_review: 开发者返修完成，等待 Reviewer 重新验收
+  waiting_merge --> running: Reviewer 判定必须修改原始候选代码（返修）
+  running --> waiting_review: 开发者返修完成，等待 Reviewer 重新验收
   waiting_review --> waiting_merge: Reviewer 批准新的候选快照
 ```
 
@@ -102,7 +102,7 @@ stateDiagram-v2
 桥接用原有专用 Reviewer 会话唤醒 Reviewer，并附上失败尝试摘要、冲突文件、目标 SHA、候选快照信息、合并工作区路径及日志读取工具路径。此时任务仍是 `waiting_merge`；Reviewer 是合并修复角色，直到成功合入或请求用户决策。自动合并失败本身不返回普通 `waiting_review`，也不要求 Reviewer 再次批准原始快照。
 
 - 目标侧冲突可直接解决：Reviewer 在合并工作区修复冲突，通过 `submit_merge_resolution` 触发验证和 CAS 合入；失败后继续沿用同一会话和工作区分析、修复、再提交。
-- 候选代码本身有缺陷、必须由执行者修改：Reviewer 调用 `request_rework`，任务进入 `reworking`；开发者基于同一 task/native session 修改。完成后 Reviewer 重新验收并固化新快照，随后状态回到 `waiting_merge`，继续合并闭环。
+- 候选代码本身有缺陷、必须由执行者修改：Reviewer 调用 `request_rework`，任务进入 `running`（活动轮次为 `rework`）；开发者基于同一 task/native session 修改。完成后 Reviewer 重新验收并固化新快照，随后状态回到 `waiting_merge`，继续合并闭环。
 - 存在产品语义、取舍或其他需要用户裁决的问题：Reviewer 调用决策请求工具，任务进入 `wait_decision` 并释放角色锁。提交用户决定后状态回到 `waiting_merge`，同一 Reviewer 会话继续处理。
 - Reviewer 能依据已有规则给出明确方向：记录结论并继续解决或重新尝试。每次重试生成新的 merge record，保留之前失败记录。
 

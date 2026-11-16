@@ -425,7 +425,7 @@ test('concurrency: a running task in another workspace does not block a pending 
   const store = new TaskStore(dir);
   const otherWorkspace = makeTempDir('bridge-bootstrap-other-ws-');
   const older = makeDedicatedThread('thread_other_ws', {
-    status: 'reworking',
+    status: 'running',
     createdAt: '2026-10-31T23:00:00.000Z',
     workspace: testWorkspace(otherWorkspace),
   });

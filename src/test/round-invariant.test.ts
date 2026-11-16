@@ -48,7 +48,7 @@ function makeThread(rounds: DelegationRound[], currentRound: number): Delegation
     title: 'Round invariant probe',
     initiatorAgent: 'codex',
     targetAgent: 'antigravity',
-    status: 'reworking',
+    status: 'running',
     currentRound,
     createdAt: '2026-10-19T00:00:00.000Z',
     updatedAt: '2026-10-19T00:00:00.000Z',
@@ -213,7 +213,7 @@ describe('Round invariant - ReworkController refuses to overlap rounds', () => {
     );
 
     const thread = taskStore.getTask('thread_test_0001')!;
-    assert.strictEqual(thread.status, 'reworking', 'must not be marked completed');
+    assert.strictEqual(thread.status, 'running', 'must not be marked completed');
     assert.strictEqual(thread.rounds.length, 1, 'no approval round appended');
   });
 
