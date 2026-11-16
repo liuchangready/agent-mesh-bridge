@@ -230,9 +230,11 @@ src/
 
 ## 5. 开发、构建与验证指令
 
-```bash
-# 1. 安装开发依赖
-npm install
+安装/打包环境、VSIX 安装及安装后验证步骤见 [安装与打包文档](docs/INSTALLATION.md)。
+
+```powershell
+# 1. 安装锁定的开发依赖
+npm ci
 
 # 2. 编译 TypeScript
 npm run compile
@@ -243,11 +245,12 @@ npm run watch
 # 4. 运行单测
 npm test
 
-# 5. 打包为 VSCode 插件 (.vsix)
-npm run package
+# 5. 打包并在临时 VS Code Extension Host 中验证 VSIX（命令内含打包）
+npm run smoke:extension-host
 
-# 6. 安装本地插件到 VS Code
-code --install-extension agent-mesh-bridge-1.0.0.vsix
+# 6. 安装本次生成的 VSIX
+$version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+code --install-extension "./agent-mesh-bridge-$version.vsix" --force
 ```
 
 ---

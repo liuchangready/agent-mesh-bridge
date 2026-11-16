@@ -1,0 +1,14 @@
+{
+  "name": "agent-mesh-bridge-extension-host-harness",
+  "publisher": "agent-mesh",
+  "displayName": "Agent Mesh Bridge Extension Host Smoke Harness",
+  "version": "0.0.0",
+  "private": true,
+  "engines": {
+    "vscode": "^1.101.0"
+  },
+  "main": "./extension.cjs",
+  "activationEvents": [
+    "onStartupFinished"
+  ]
+}

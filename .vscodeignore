@@ -19,6 +19,7 @@ out/review-*.log
 AGENTS.md
 DESIGN.md
 docs/**
+scripts/**
 eslint.config.mjs
 .prettierrc
 .prettierignore
