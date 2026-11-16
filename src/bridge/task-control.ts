@@ -176,6 +176,10 @@ export class TaskControlService {
       throw new Error(`Task thread not found: ${threadId}`);
     }
 
+    if (thread.worktree?.integration?.stashRecoveryLockHeld) {
+      throw new Error(`Cannot delete ${threadId} while stash metadata recovery is pending; retry the recovery first.`);
+    }
+
     const hasUnmergedOutput = (candidate: DelegationThread): boolean => !!candidate.worktree && (() => {
       try {
         const worktree = candidate.worktree!;
@@ -239,6 +243,7 @@ export class TaskControlService {
       try {
         this.taskStore.loadFromDisk();
         const latest = this.taskStore.getTask(threadId);
+        if (latest?.worktree?.integration?.stashRecoveryLockHeld) throw new Error(`Cannot delete ${threadId} while a stash recovery lock is held; retry the recovery first.`);
         if (latest?.status === 'completed' && latest.worktree?.integration?.phase === 'merged') {
           thread.status = latest.status;
           thread.worktree = latest.worktree;

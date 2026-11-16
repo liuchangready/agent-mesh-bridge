@@ -198,7 +198,8 @@ export class TaskDetailPanel {
         return;
       }
       const result = await this.reworkController.mergeApproved(this.currentThreadId);
-      if (result.status === 'merged') vscode.window.showInformationMessage(`Task ${this.currentThreadId} merged into its pinned local target.`);
+      if (result.status === 'merged' && this.taskStore.getTask(this.currentThreadId)?.worktree?.integration?.stashRecoveryPending) vscode.window.showWarningMessage(result.message);
+      else if (result.status === 'merged') vscode.window.showInformationMessage(`Task ${this.currentThreadId} merged into its pinned local target.`);
       else vscode.window.showWarningMessage(result.message);
     } catch (err: any) { vscode.window.showErrorMessage(`Merge retry failed: ${err.message}`); }
     this.update();
@@ -1084,7 +1085,13 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
     </div>
   </div>`
       : thread.status === 'waiting_merge'
+      ? thread.worktree?.integration?.stashRecoveryPending
       ? `
+  <div style="background: rgba(245, 158, 11, 0.15); border: 1px solid #f59e0b; border-radius: 8px; padding: 16px; margin-bottom: 20px;">
+    <strong>${thread.worktree.integration.mergedCommit ? '代码已合入；stash 元数据需要恢复。' : 'stash 元数据需要恢复。'}</strong>
+    <div style="margin-top:6px">${escapeHtml(thread.worktree.integration.error || '请处理本地故障后重试恢复；不会重新 apply 或创建合并提交。')}</div>
+  </div>`
+      : `
   <div style="background: rgba(139, 92, 246, 0.15); border: 1px solid #8b5cf6; border-radius: 8px; padding: 16px; margin-bottom: 20px;">
     <strong>Review approved; waiting for serialized local merge and combined validation.</strong>
     <div style="margin-top:6px">This task remains open until its approved commit is merged into the batch target and validation passes.</div>
@@ -1183,6 +1190,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
   }
 
   ${(thread.status === 'failed' && thread.failure?.stage === 'merge') ? `<div class="action-bar"><button onclick="retryMerge()">重试合并</button><button onclick="deleteTask()">删除任务</button></div>` : ''}
+  ${thread.status === 'waiting_merge' && thread.worktree?.integration?.stashRecoveryPending ? `<div class="action-bar"><button onclick="retryMerge()">重试恢复 stash 元数据</button></div>` : ''}
   <div class="action-bar" ${(thread.status === 'failed' && thread.failure?.stage === 'merge') ? 'style="display:none"' : ''}>
     ${thread.status === 'failed' && thread.failure?.stage === 'execution' ? `<button class="retry-btn" style="background: #dc2626; color: white;" onclick="retryFailedRound()">🔄 重试失败轮次 (Retry Failed)</button>` : ''}
     ${thread.status === 'waiting_review' && thread.reviewWake && thread.reviewWake.round === (thread.currentRound || 1) ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（唤醒失败）</button>` : ''}
@@ -1191,7 +1199,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
     ${thread.status === 'paused' ? `<button class="resume-btn" onclick="resumeTask()">▶ 恢复执行 (Resume)</button>` : ''}
     ${(thread.status === 'waiting_review' || (thread.status === 'failed' && ['execution', 'review'].includes(thread.failure?.stage || ''))) ? `<button class="resume-btn" onclick="resumeTask()">▶ 下发返修要求 / 重新执行</button>` : ''}
     ${(thread.status === 'waiting_review' || (thread.status === 'failed' && ['execution', 'review'].includes(thread.failure?.stage || ''))) ? `<button onclick="approveTask()">✓ 手动验收通过 (Approve Task)</button>` : ''}
-    <button style="background:#7f1d1d;color:white;" onclick="deleteTask()">🗑 删除任务 (Delete)</button>
+    ${!thread.worktree?.integration?.stashRecoveryLockHeld ? `<button style="background:#7f1d1d;color:white;" onclick="deleteTask()">🗑 删除任务 (Delete)</button>` : ''}
     <button class="secondary" onclick="printRecentLogs()">📄 打印最近1000行日志 (Print 1,000 Lines)</button>
     <button class="secondary" onclick="refresh()">⟳ Refresh</button>
   </div>

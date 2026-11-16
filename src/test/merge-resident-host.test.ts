@@ -117,7 +117,7 @@ test('a landed ref with repeated ledger EIO is not retried in a loop and recover
   const realRename = mutableFs.renameSync; const taskFile = path.join(storage, 'threads', 'thread_resident_ledger_eio.json');
   const txFile = path.join(storage, 'merge-transactions', 'thread_resident_ledger_eio.json'); let writeFailures = 0;
   mutableFs.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
-    if (String(to) === taskFile && fs.existsSync(txFile) && JSON.parse(fs.readFileSync(txFile, 'utf8')).phase === 'ref_updated') { writeFailures++; const error: NodeJS.ErrnoException = new Error('injected EIO'); error.code = 'EIO'; throw error; }
+    if (String(to) === taskFile && fs.existsSync(txFile) && ['ref_updated', 'checkout_synced'].includes(JSON.parse(fs.readFileSync(txFile, 'utf8')).phase)) { writeFailures++; const error: NodeJS.ErrnoException = new Error('injected EIO'); error.code = 'EIO'; throw error; }
     return realRename(from, to);
   }) as typeof fs.renameSync;
   host = makeController(store, true);
@@ -130,7 +130,7 @@ test('a landed ref with repeated ledger EIO is not retried in a loop and recover
   await new Promise((resolve) => setTimeout(resolve, 1_500));
   assert.equal(writeFailures, failuresAfterSettlement, 'the landed transaction is parked instead of retrying each poll');
   assert.equal(gitOutput(repo, ['rev-parse', target.targetRef]), landed);
-  assert.equal(JSON.parse(fs.readFileSync(txFile, 'utf8')).phase, 'ref_updated');
+  assert.equal(JSON.parse(fs.readFileSync(txFile, 'utf8')).phase, 'checkout_synced');
   assert.equal(store.getTask('thread_resident_ledger_eio')?.status, 'waiting_merge');
   assert.equal(JSON.parse(fs.readFileSync(taskFile, 'utf8')).status, 'waiting_merge');
 
