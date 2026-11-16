@@ -958,7 +958,11 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
           : ''
       }
       <div class="meta-item">
-        <div class="meta-label">Workspace</div>
+        <div class="meta-label">Workspace / 工作空间</div>
+        <div class="meta-val">${escapeHtml(thread.workspace.rootPath)}</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">Execution Directory / 执行目录</div>
         <div class="meta-val">${escapeHtml(getTaskExecutionPath(thread))}</div>
       </div>
       <div class="meta-item" style="grid-column:1/-1;">
