@@ -780,7 +780,7 @@ describe('ReviewWakeScheduler', () => {
         assert.ok(result);
         assert.match(result!.lastError, /REVIEW_NO_DECISION/);
         const failed = store.getTask(thread.threadId)!;
-        assert.strictEqual(failed.status, 'review_failed');
+        assert.strictEqual(failed.status, 'failed'); assert.strictEqual(failed.failure?.stage, 'review'); assert.ok(failed.failure?.reason); assert.ok((failed.failureRevision || 0) > 0);
         assert.strictEqual(failed.reviewWake!.autoRetryAttempts, 5);
         assert.strictEqual(failed.reviewWake!.gaveUp, true);
         assert.strictEqual(await scheduler.runDue(), 0);
@@ -945,7 +945,7 @@ describe('ReviewWakeScheduler', () => {
     const stored = store.getTask('thread_review_wake_sched')!;
     assert.strictEqual(stored.reviewWake!.gaveUp, true);
     // Exhausted retries are a terminal review failure, not a silent wait.
-    assert.strictEqual(stored.status, 'review_failed');
+    assert.strictEqual(stored.status, 'failed'); assert.strictEqual(stored.failure?.stage, 'review'); assert.ok(stored.failure?.reason); assert.ok((stored.failureRevision || 0) > 0);
     assert.strictEqual(stored.reviewFailure?.kind, 'retries_exhausted');
     assert.match(stored.reviewFailure?.reason || '', /429 Too Many Requests/);
     scheduler.dispose();
@@ -1078,7 +1078,7 @@ describe('ReviewWakeScheduler', () => {
       assert.strictEqual(stalled.reviewBlocked, undefined, 'the dead park must be cleared');
       // `review_failed` is the visible terminal status, and the caller's own
       // parked reason must survive in the failure record.
-      assert.strictEqual(stalled.status, 'review_failed');
+      assert.strictEqual(stalled.status, 'failed'); assert.strictEqual(stalled.failure?.stage, 'review'); assert.ok(stalled.failure?.reason); assert.ok((stalled.failureRevision || 0) > 0);
       assert.strictEqual(stalled.reviewFailure?.kind, 'unresolvable_park');
       assert.match(stalled.reviewFailure?.reason || '', /blocked on the full batch/);
 
@@ -1110,7 +1110,7 @@ describe('ReviewWakeScheduler', () => {
       assert.match(stalled.reviewWake!.lastError, /已不在账本/);
       assert.strictEqual(stalled.reviewWake!.gaveUp, true);
       assert.strictEqual(stalled.reviewBlocked, undefined);
-      assert.strictEqual(stalled.status, 'review_failed');
+      assert.strictEqual(stalled.status, 'failed'); assert.strictEqual(stalled.failure?.stage, 'review'); assert.ok(stalled.failure?.reason); assert.ok((stalled.failureRevision || 0) > 0);
       assert.strictEqual(stalled.reviewFailure?.kind, 'unresolvable_park');
       assert.match(stalled.reviewFailure?.reason || '', /thread_deleted_dependency/);
       scheduler.dispose();
@@ -1139,7 +1139,7 @@ describe('ReviewWakeScheduler', () => {
       assert.strictEqual(await scheduler.runWatchdog(), 1);
 
       const healed = store.getTask('thread_review_wake_sched')!;
-      assert.strictEqual(healed.status, 'review_failed');
+      assert.strictEqual(healed.status, 'failed'); assert.strictEqual(healed.failure?.stage, 'review'); assert.ok(healed.failure?.reason); assert.ok((healed.failureRevision || 0) > 0);
       assert.strictEqual(healed.reviewFailure?.kind, 'unresolvable_park');
       assert.match(healed.reviewFailure?.reason || '', /waitingForThreadId/);
       // Idempotent: once terminal, the watchdog does not touch it again.
@@ -1196,7 +1196,7 @@ describe('review_failed lifecycle status', () => {
     });
 
     assert.strictEqual(changed, true);
-    assert.strictEqual(thread.status, 'review_failed');
+    assert.strictEqual(thread.status, 'failed'); assert.strictEqual(thread.failure?.stage, 'review'); assert.ok(thread.failure?.reason); assert.ok((thread.failureRevision || 0) > 0);
     assert.strictEqual(thread.reviewFailure?.kind, 'unresolvable_park');
     // The reason is normalized (newlines folded), never dropped.
     assert.match(thread.reviewFailure?.reason || '', /外部 Client 控制投影修复/);

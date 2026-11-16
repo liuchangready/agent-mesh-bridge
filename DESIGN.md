@@ -223,8 +223,8 @@ New tasks pin the real local delivery branch selected at dispatch (`targetBranch
 
 终态与保留边界（`AGENTS.md` 第 23 条）：
 
-- `completed` / `failed` / `review_failed` 时生成确定性 `finalSummary`，`get_task_summary` 可读；归档只保留摘要与轻量元数据。
-- 检视失败（`reviewWake.gaveUp`：自动重试耗尽或挂起在不可观测依赖上）转成终态 `review_failed`，`thread.reviewFailure` 记录 `{ kind, reason, at, round, by }` 并释放队列槽；重新检视会 `reopenFailedReview()` 回到 `waiting_review` 并保留失败记录。
+- `completed` / `failed` 时生成确定性 `finalSummary`，`get_task_summary` 可读；归档只保留摘要与轻量元数据。
+- 检视失败（`reviewWake.gaveUp`：自动重试耗尽或挂起在不可观测依赖上）转成终态 `failed` (failure.stage=review)，`thread.reviewFailure` 记录 `{ kind, reason, at, round, by }` 并释放队列槽；重新检视会 `reopenFailedReview()` 回到 `waiting_review` 并保留失败记录。
 - 默认保留最新 20 个任务，超出的终态任务自动归档：清空 rounds、会话 id、bootstrap/wake 状态，删除 bridge 日志与 native 会话；`mergePending` worktree 任务不自动归档。
 - `delete_task` 是彻底清除：账本条目、bridge 日志、bootstrap token、native 会话全部删除；legacy 请求方会话永不清理。
 
@@ -296,7 +296,8 @@ sequenceDiagram
 
 ```typescript
 export type AgentId = 'antigravity' | 'claude_code' | 'codex' | 'deepseek_harness';
-export type ThreadStatus = 'queued' | 'running' | 'waiting_review' | 'waiting_merge' | 'wait_decision' | 'merge_failed' | 'paused' | 'review_failed' | 'completed' | 'failed';
+export type ThreadStatus = 'queued' | 'running' | 'waiting_review' | 'waiting_merge' | 'wait_decision' | 'paused' | 'completed' | 'failed';
+
 export type RoundStatus = 'running' | 'paused' | 'completed' | 'failed';
 export type InterruptionKind = 'paused' | 'stopped' | 'deleted' | 'timeout' | 'watchdog' | 'error';
 
@@ -355,6 +356,8 @@ export interface DelegationRound {
   interruption?: TaskInterruption; // 该轮被暂停/中断的原因
 }
 ```
+
+`failed` carries `failure.stage` (`bootstrap`, `execution`, `review`, or `merge`) and a monotonic `failureRevision`. Legacy ledger statuses and the deprecated `review_failed` / `merge_failed` filter inputs are normalized on read. Only `retry_merge` can restart a merge failure; unmerged results remain protected from archival and capacity eviction. See [FAILED_STATE_UNIFICATION_DESIGN.md](docs/FAILED_STATE_UNIFICATION_DESIGN.md).
 
 ### 4.2 1000 条容量控制与磁盘持久化规则
 
@@ -436,7 +439,7 @@ export interface DelegationRound {
 - **功能**：检索最近的委派任务列表（上限 1000 条）。
 - **参数**：
   - `limit` (number, 可选): 默认 20，最大 1000
-  - `statusFilter` (string, 可选): `'all' | 'active' | 'running' | 'waiting_review' | 'waiting_merge' | 'wait_decision' | 'merge_failed' | 'review_failed' | 'paused' | 'completed' | 'failed'`（兼容别名 `'reworking'` 仍作为输入别名支持，筛选规范化为 running 且活动轮次为 rework 的任务）
+  - `statusFilter` (string, 可选): `'all' | 'active' | 'queued' | 'running' | 'waiting_review' | 'waiting_merge' | 'wait_decision' | 'paused' | 'completed' | 'failed'`。旧输入别名 `'reworking'` 筛选运行中的返修，`'review_failed'` / `'merge_failed'` 分别筛选失败的检视 / 合并阶段；返回状态均为新值。
 - **返回值**：包含 `threadId, title, initiatorAgent, targetAgent, status, currentRound, summary` 的对象数组。
 
 ### 5. `get_thread_details`（查看单条任务完整交互历史）

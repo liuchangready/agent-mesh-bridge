@@ -13,6 +13,7 @@ import {
   appendInterruption,
   isMergePending,
   findInFlightRound,
+  enterTaskFailure,
 } from './types';
 import {
   archiveCompletedTaskLogs,
@@ -20,6 +21,7 @@ import {
   buildFinalSummary,
   ensureFinalSummary,
   isTerminalThreadStatus,
+  canArchiveTask,
   removeTaskArtifacts,
 } from './task-summary';
 import { cleanupThreadNativeSessions, collectThreadSessionRefs } from './native-session-cleanup';
@@ -33,6 +35,7 @@ function canEvictForCapacity(task: DelegationThread): boolean {
     return !task.worktree || task.worktree.integration?.phase === 'merged' || task.worktree.integration?.phase === 'no_changes';
   }
   if (task.status !== 'failed') return false;
+  if (task.failure?.stage === 'merge' || task.failure?.stage === 'review') return false;
   const worktree = task.worktree;
   return !worktree || (
     !worktree.approvedCommit &&
@@ -41,7 +44,7 @@ function canEvictForCapacity(task: DelegationThread): boolean {
     worktree.integration?.phase !== 'merging' &&
     worktree.integration?.phase !== 'conflict' &&
     worktree.integration?.phase !== 'validation_failed' &&
-    (!worktree.headCommit || worktree.headCommit === worktree.baseCommit)
+    !!worktree.headCommit && !!worktree.baseCommit && worktree.headCommit === worktree.baseCommit
   );
 }
 
@@ -52,8 +55,28 @@ function canEvictForCapacity(task: DelegationThread): boolean {
  */
 export function normalizeThread(thread: DelegationThread): DelegationThread {
   if (!thread) return thread;
-  if ((thread.status as string) === 'reworking') {
+  const oldStatus = thread.status as string;
+  if (oldStatus === 'reworking') {
     thread.status = 'running';
+  }
+  if (oldStatus === 'review_failed' || oldStatus === 'merge_failed' || oldStatus === 'failed') {
+    const validStage = thread.failure?.stage && ['bootstrap', 'execution', 'review', 'merge'].includes(thread.failure.stage)
+      ? thread.failure.stage : undefined;
+    const stage = oldStatus === 'review_failed' ? 'review' : oldStatus === 'merge_failed' ? 'merge' :
+      validStage || (thread.reviewBootstrap?.phase === 'failed' ? 'bootstrap' : 'execution');
+    const work = [...(thread.rounds || [])].reverse().find(r => r.type !== 'approval');
+    const merge = [...(thread.mergeHistory || [])].reverse().find(e => e.result === 'failed');
+    const reason = oldStatus === 'review_failed' ? thread.reviewFailure?.reason : oldStatus === 'merge_failed' ? merge?.error :
+      thread.failure?.reason || (stage === 'bootstrap' ? thread.reviewBootstrap?.lastError : stage === 'review' ? thread.reviewFailure?.reason :
+        stage === 'merge' ? merge?.error : work?.error || work?.interruption?.reason);
+    thread.status = 'failed';
+    thread.failure = { ...(oldStatus === 'failed' ? thread.failure : undefined), stage,
+      reason: reason?.trim() || '旧任务失败，原因未记录',
+      at: (oldStatus === 'failed' && thread.failure?.at) || (stage === 'review' ? thread.reviewFailure?.at : stage === 'merge' ? merge?.at : undefined) || thread.updatedAt || thread.createdAt };
+  }
+  if ((thread.finalSummary?.kind as string) === 'review_failed' && thread.finalSummary) {
+    thread.finalSummary.kind = 'failed';
+    thread.finalSummary.failureStage = 'review';
   }
   return thread;
 }
@@ -572,6 +595,10 @@ export class TaskStore extends EventEmitter {
       if (fs.existsSync(file)) onDisk = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
     } catch {}
     const inMemory = this.tasks.get(thread.threadId);
+    if (onDisk?.archivedAt && !thread.archivedAt) {
+      this.tasks.set(thread.threadId, onDisk);
+      return;
+    }
     if ((onDisk || inMemory) && onDisk !== thread) {
       const authority = [inMemory, onDisk].filter(Boolean) as DelegationThread[];
       for (const prior of authority) {
@@ -686,6 +713,16 @@ export class TaskStore extends EventEmitter {
       const newestControl = authoritative.filter((entry) => (entry.mergeControl?.revision || 0) > incomingMergeRevision)
         .sort((a, b) => (b.mergeControl?.revision || 0) - (a.mergeControl?.revision || 0))[0];
       if (newestControl?.mergeControl) { thread.mergeControl = structuredClone(newestControl.mergeControl); thread.status = newestControl.status; }
+      const persisted = onDisk || inMemory;
+      if (persisted && ((persisted.failureRevision || 0) > (thread.failureRevision || 0) ||
+          ((persisted.failureRevision || 0) === (thread.failureRevision || 0) &&
+           ((persisted.status !== thread.status && (persisted.status === 'failed' || thread.status === 'failed')) ||
+            (persisted.status === 'failed' && JSON.stringify(persisted.failure) !== JSON.stringify(thread.failure)))))) {
+        thread.failureRevision = persisted.failureRevision;
+        thread.failure = persisted.failure;
+        thread.status = persisted.status;
+      }
+      if (thread.worktree?.integration?.phase === 'merged') { thread.status = 'completed'; thread.failure = undefined; }
       const highestKnown = Math.max(
         onDisk?.currentRound || 0,
         inMemory?.currentRound || 0,
@@ -729,10 +766,17 @@ export class TaskStore extends EventEmitter {
     receiverSessionId?: string,
     callerSessionId?: string,
     interruption?: TaskInterruption,
+    expected?: { failureRevision: number; roundTimestamp?: string },
   ): DelegationThread | undefined {
     this.ensureUpToDate();
     const thread = this.tasks.get(threadId);
     if (!thread) return undefined;
+    if (expected) {
+      const round = [...thread.rounds].reverse().find(r => r.round === roundNumber);
+      if (thread.archivedAt || (thread.failureRevision || 0) !== expected.failureRevision ||
+          thread.currentRound !== roundNumber || !round || round.timestamp !== expected.roundTimestamp ||
+          (thread.status !== 'running' && thread.status !== 'paused')) return undefined;
+    }
 
     if (receiverSessionId) {
       thread.receiverSessionId = receiverSessionId;
@@ -806,8 +850,11 @@ export class TaskStore extends EventEmitter {
       // Only transition thread status if this round is the latest round or newer,
       // or if explicitly closing task
       const isLatest = !thread.currentRound || roundNumber >= thread.currentRound;
-      if (isLatest || newThreadStatus === 'completed' || newThreadStatus === 'failed') {
-        thread.status = newThreadStatus;
+      if (isLatest) {
+        if (newThreadStatus === 'failed') {
+          enterTaskFailure(thread, { stage: 'execution', reason: roundUpdate.error || interruption?.reason || 'Execution failed',
+            at: new Date().toISOString(), round: roundNumber, code: roundUpdate.assessment?.errorCode });
+        } else thread.status = newThreadStatus;
       }
     }
 
@@ -853,9 +900,12 @@ export class TaskStore extends EventEmitter {
             t.status === 'queued' ||
             t.status === 'waiting_merge' ||
             t.status === 'wait_decision' ||
-            t.status === 'merge_failed' ||
+            (t.status === 'failed' && t.failure?.stage === 'merge') ||
             t.status === 'paused',
         );
+      } else if (statusFilter === 'review_failed' || statusFilter === 'merge_failed') {
+        const stage = statusFilter === 'review_failed' ? 'review' : 'merge';
+        all = all.filter(t => t.status === 'failed' && t.failure?.stage === stage);
       } else if (statusFilter === 'reworking') {
         // Compatibility alias: match tasks normalized to 'running' whose in-flight round is rework
         all = all.filter((t) => t.status === 'running' && findInFlightRound(t)?.type === 'rework');
@@ -922,7 +972,7 @@ export class TaskStore extends EventEmitter {
     this.ensureUpToDate();
     const source = this.tasks.get(threadId);
     const thread = source && JSON.parse(JSON.stringify(source)) as DelegationThread;
-    if (!thread || thread.archivedAt || !isTerminalThreadStatus(thread.status)) return undefined;
+    if (!thread || !canArchiveTask(thread)) return undefined;
     // Do not discard the source until a complete archive and archived ledger row are durable.
     const nativeLock = new NativeSessionLock(this.storageDir);
     const leases: NativeSessionLease[] = [];

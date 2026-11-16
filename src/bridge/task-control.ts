@@ -98,13 +98,7 @@ export class TaskControlService {
         `Cannot pause task ${threadId}: it is waiting for the caller's review, not executing.`,
       );
     }
-    if (thread.status === 'review_failed') {
-      throw new Error(
-        `Cannot pause task ${threadId}: its review already failed (terminal). ` +
-          `Use re-review / rework / retry instead.`,
-      );
-    }
-    if (thread.status === 'merge_failed' || thread.status === 'wait_decision') {
+    if (thread.status === 'wait_decision') {
       throw new Error(`Cannot pause task ${threadId} while it is ${thread.status}.`);
     }
 

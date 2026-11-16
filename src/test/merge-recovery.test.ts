@@ -34,7 +34,7 @@ test('merge failures count the sixth retry, reset on a different fingerprint and
     assert.equal(result.consecutiveRetries, i); assert.equal(thread.status, 'waiting_merge');
   }
   assert.equal(noteMergeFailure(thread, 'conflict', 'CONFLICT', 'same failure', ['a.txt']).consecutiveRetries, 6);
-  assert.equal(thread.status, 'merge_failed'); assert.equal(isTerminalThreadStatus(thread.status), false);
+  assert.equal(thread.status, 'failed'); assert.equal(thread.failure?.stage, 'merge'); assert.equal(thread.failure?.reason, 'same failure'); assert.equal(thread.failureRevision, 1); assert.equal(isTerminalThreadStatus(thread.status), true);
   resetMergeBudget(thread); thread.status = 'waiting_merge';
   assert.equal(noteMergeFailure(thread, 'conflict', 'CONFLICT', 'same failure', ['a.txt']).consecutiveRetries, 0);
   assert.equal(noteMergeFailure(thread, 'conflict', 'CONFLICT', 'same failure', ['b.txt']).consecutiveRetries, 0);
@@ -78,7 +78,7 @@ test('retry_merge preserves the task identities and history while starting a new
   const store = new TaskStore(root); const detector = new AgentDetector(); const callback = new CallbackManager(detector, root);
   callback.notifyCaller = async () => true;
   const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector);
-  const thread = task(root); thread.status = 'merge_failed';
+  const thread = task(root); thread.status = 'failed'; thread.failure = { stage: 'merge', reason: 'conflict', at: thread.updatedAt }; thread.failureRevision = 1;
   thread.mergeControl = { revision: 7, retryGeneration: 2, consecutiveRetries: 6, failureFingerprint: 'old' };
   thread.mergeHistory = [{ id: 'old', number: 1, at: thread.updatedAt, phase: 'conflict', result: 'failed' }];
   store.upsertTask(thread);
@@ -108,7 +108,7 @@ test('actual merge reviewer failures consume the budget, but waiting for a wake 
   assert.equal(store.getTask(initial.threadId)!.mergeControl!.consecutiveRetries, 5);
   const current = store.getTask(initial.threadId)!;
   callback.finalizeWake(current, current.rounds[0], current.callerSessionId!, { exitCode: 1, output: 'process failed' });
-  assert.equal(store.getTask(initial.threadId)!.status, 'merge_failed');
+  assert.equal(store.getTask(initial.threadId)!.status, 'failed'); assert.equal(store.getTask(initial.threadId)!.failure?.stage, 'merge'); assert.equal(store.getTask(initial.threadId)!.failure?.reason, 'process failed'); assert.equal(store.getTask(initial.threadId)!.failureRevision, 1);
   assert.equal(store.getTask(initial.threadId)!.mergeControl!.consecutiveRetries, 6);
   assert.equal(await scheduler.runDue(), 0); scheduler.dispose();
 });
@@ -203,9 +203,10 @@ test('reviewer watchdog interruption is recorded without changing the worker rou
 
 test('nonterminal merge states remain unfinished and are not selected for archive', () => {
   const root = os.tmpdir();
-  for (const status of ['waiting_merge', 'wait_decision', 'merge_failed'] as const) {
+  for (const status of ['waiting_merge', 'wait_decision', 'failed'] as const) {
     const thread = task(root); thread.status = status;
-    assert.equal(isTerminalThreadStatus(status), false);
+    if (status === 'failed') thread.failure = { stage: 'merge', reason: 'conflict', at: thread.updatedAt };
+    assert.equal(isTerminalThreadStatus(status), status === 'failed');
     assert.deepEqual(selectTasksToArchive([thread], 0), []);
   }
 });
@@ -213,9 +214,9 @@ test('nonterminal merge states remain unfinished and are not selected for archiv
 test('a ledger full of merge waiting states has no capacity eviction candidate', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-merge-capacity-')); const store = new TaskStore(root);
   try {
-    const states = ['waiting_merge', 'wait_decision', 'merge_failed'] as const;
+    const states = ['waiting_merge', 'wait_decision', 'failed'] as const;
     const rows = new Map<string, DelegationThread>();
-    for (let n = 0; n < 1000; n++) { const item = task(root); item.threadId = `thread_capacity_${n}`; item.status = states[n % states.length]; rows.set(item.threadId, item); }
+    for (let n = 0; n < 1000; n++) { const item = task(root); item.threadId = `thread_capacity_${n}`; item.status = states[n % states.length]; if (item.status === 'failed') item.failure = {stage: 'merge', reason: 'conflict', at: item.updatedAt}; rows.set(item.threadId, item); }
     (store as any).tasks = rows; (store as any).lastDirMtimeMs = Number.POSITIVE_INFINITY;
     assert.equal(store.canAcceptTask(), false);
   } finally { store.dispose(); fs.rmSync(root, { recursive: true, force: true }); }

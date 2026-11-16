@@ -1,4 +1,5 @@
 import { testWorkspace } from './workspace-fixture';
+import { enterTaskFailure } from '../bridge/types';
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -291,7 +292,7 @@ describe('Running and Reworking Status Merge Tests', () => {
     // Simulate failure of round 2
     reworkThread.rounds[1].status = 'failed';
     reworkThread.rounds[1].error = 'Simulated timeout';
-    reworkThread.status = 'failed';
+    enterTaskFailure(reworkThread, { stage: 'execution', reason: 'Simulated timeout', at: new Date().toISOString(), round: 2 });
     taskStore.upsertTask(reworkThread);
 
     // 2. Retry failed round 2

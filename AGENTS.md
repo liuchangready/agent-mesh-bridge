@@ -24,7 +24,7 @@
       - 角色锁存于 `~/.agent-mesh-bridge/roles/<threadId>.json`，带心跳与僵尸回收。
       - reviewer 在 `request_rework` / `approve_task` 成功时视为完成交接并释放角色；developer 轮次结束后、唤醒 reviewer 前释放 developer 角色。
       - 中断后**不得新建任务或另起会话**：必须沿用同一 `threadId`、同一 `receiverSessionId` / `callerSessionId`，并基于账本中的历轮指令、开发报告、返修意见（中间文档链）继续。
-  13. **候选独立调度**：每个可执行轮次独立参与调度；只有同任务角色、bootstrap、明确启用的并发限额会阻止启动。暂停、待检视、返修和 bootstrap pending 不阻挡其他任务。并发工作目录隔离由 Git worktree 保证，不按文件范围排队。`review_failed` 仅在重试预算耗尽或不可恢复挂起时进入，释放调度资源；只有本地集成成功或 no_changes 的任务可归档/淘汰。
+  13. **候选独立调度**：每个可执行轮次独立参与调度；只有同任务角色、bootstrap、明确启用的并发限额会阻止启动。暂停、待检视、返修和 bootstrap pending 不阻挡其他任务。并发工作目录隔离由 Git worktree 保证，不按文件范围排队。`failed` (failure.stage=review) 仅在重试预算耗尽或不可恢复挂起时进入，释放调度资源；只有本地集成成功或 no_changes 的任务可归档/淘汰。
   14. **MR 收口由调用者完成**：任务（或同一批任务）验收通过后，由**调用者/检视方**统一合成一个 MR 并同步远端；开发者(receiver)不负责提交/推送。
       - 调用者汇总该任务及同批尚未推送的改动，只创建一个 MR，使用仓库既有远端与 `gh` / `glab` / 等价 CLI 推送。
       - 推送后必须调用 `record_merge_request(threadId, url, branch, commit, remote, status, summary)` 把 MR 信息写回账本。
@@ -101,7 +101,7 @@
       - **存量任务**：`reviewFlow` 缺失 = legacy；legacy 仍 resume `callerSessionId` 并使用旧的 thread 级角色锁，不得套用专用 reviewer 的会话锁/模型不等校验。
 
   23. **终态摘要、归档与删除（硬不变量）**：任务的对话内容必须有明确的保留边界。
-      - `completed` / `failed` / `review_failed` 时由 `buildFinalSummary()` 生成**确定性只读摘要** `thread.finalSummary`（verdict、摘要正文、改动文件、错误、轮数、MR、token 汇总），在 `TaskStore.upsertTask()` 统一落账；不得调用模型生成摘要。`review_failed` 的 `verdict`/`error` 取 `thread.reviewFailure.reason`。`get_task_summary(threadId)` 是读取摘要的专用工具；运行中返回 `finalSummary: null`。
+      - `completed` / `failed` 时由 `buildFinalSummary()` 生成**确定性只读摘要** `thread.finalSummary`（verdict、摘要正文、改动文件、错误、轮数、MR、token 汇总），在 `TaskStore.upsertTask()` 统一落账；不得调用模型生成摘要。`failed` (failure.stage=review) 的 `verdict`/`error` 取 `thread.reviewFailure.reason`。`get_task_summary(threadId)` 是读取摘要的专用工具；运行中返回 `finalSummary: null`。
       - **日志三目录分层与归档**：新任务统一使用 `agentMeshBridge.taskDataRoot/<threadId>/` 下的 `worker_log/`、`reviewer_log/` 与 `Archive/`；旧任务继续使用账本记录的路径，既有 `bridge-policy.json` 中的旧日志目录仅用于读取兼容。每个任务日志目录维护以下结构：
         1. `worker_log/`：存储执行者工作日志，包括原始 stdio 日志（`<threadId>_round_<n>.log`）与压缩前的输出归档（`<threadId>_round_<n>.output.md`）。
         2. `reviewer_log/`：存储检视者 review 日志，包括轮次审阅日志（`<threadId>_round_<n>.reviewer.log`）与独立 Reviewer Bootstrap 日志（`<threadId>_bootstrap.log`）。
@@ -298,7 +298,7 @@ code --install-extension "./agent-mesh-bridge-$version.vsix" --force
 14. **候选扫描不可退化为队头 FIFO**：
    - `TaskSupervisor` / `QueueDrainer` 扫描所有 ready 候选；某个候选因角色、bootstrap handoff 或可选限额受阻时，继续检查后续候选。
    - `paused` / `waiting_review` / blocked / bootstrap pending 只阻挡相应 thread 自身，不得挡住其他任务。   - `findQueueHead()` / `isTaskUnfinished()` 可为兼容保留，但不得作为运行时是否启动其它任务的条件。
-   - `failed` / `review_failed` 仍是终态；重试 / 重新检视后仅该 thread 重新进入候选扫描。
+   - `failed` 仍是终态；重试 / 重新检视后仅该 thread 重新进入候选扫描。
 
 15. **MR 收口不可绕过调用者**：
    - 开发者(receiver)只交付代码与测试报告，不提交、不推送、不建 MR。

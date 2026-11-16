@@ -47,6 +47,8 @@ describe('CallbackManager failure wake-ups', () => {
     targetAgent: 'deepseek_harness',
     status: 'failed',
     currentRound: 2,
+    failure: { stage: 'execution', reason: 'dsh: TRANSPORT: Connection error.', at: '2026-10-20T04:39:07.796Z', round: 2 },
+    failureRevision: 1,
     createdAt: '2026-10-20T03:17:38.487Z',
     updatedAt: '2026-10-20T04:39:07.796Z',
     receiverSessionId: 'session-8b5dc091-3d68-43d9-bd08-05b383c4b972',

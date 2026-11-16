@@ -1,7 +1,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import { DelegationThread } from './types';
+import { DelegationThread, enterTaskFailure } from './types';
 
 export function createMergeLog(dir: string, safeId: string, number: number, content: string): { logPath: string; logFileNumber: number } {
   fs.mkdirSync(dir, { recursive: true });
@@ -33,7 +33,9 @@ export function noteMergeFailure(thread: DelegationThread, phase: string, code: 
   const retryGeneration = previous?.retryGeneration || 0;
   const consecutiveRetries = previous?.failureFingerprint === fingerprint ? previous.consecutiveRetries + 1 : 0;
   thread.mergeControl = { ...previous, revision: (previous?.revision || 0) + 1, retryGeneration, failureFingerprint: fingerprint, consecutiveRetries };
-  if (consecutiveRetries >= 6) thread.status = 'merge_failed';
+  if (consecutiveRetries >= 6 && !(thread.status === 'failed' && thread.failure?.stage === 'merge')) {
+    enterTaskFailure(thread, { stage: 'merge', reason: summary.trim() || code, code, at: new Date().toISOString(), round: thread.currentRound });
+  }
   return { fingerprint, retryGeneration, consecutiveRetries };
 }
 

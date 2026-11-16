@@ -27,9 +27,7 @@ export type ThreadStatus =
   | 'waiting_review'
   | 'waiting_merge'
   | 'wait_decision'
-  | 'merge_failed'
   | 'paused'
-  | 'review_failed'
   | 'completed'
   | 'failed';
 ```

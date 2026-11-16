@@ -619,7 +619,7 @@ describe('MCPServer Protocol Tests', () => {
 
   test('merge_failed rejects ordinary controls and retry_merge keeps task identity', async () => {
     const threadId = 'thread_merge_failed_control'; const now = new Date().toISOString();
-    taskStore.upsertTask({ threadId, title: 'merge failure', initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'merge_failed',
+    taskStore.upsertTask({ threadId, title: 'merge failure', initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'failed', failure: { stage: 'merge', reason: 'conflict', at: now }, failureRevision: 1,
       currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-abcdef12', callerSessionId: 'reviewer-session',
       workspace: testWorkspace(tempDir), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 }, rounds: [],
       mergeControl: { revision: 1, retryGeneration: 0, consecutiveRetries: 6, failureFingerprint: 'failure' } });

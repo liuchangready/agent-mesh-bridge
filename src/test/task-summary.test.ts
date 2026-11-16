@@ -118,7 +118,7 @@ test('final summary - failed task records the terminal error', () => {
 
 test('final summary - review_failed records why no verdict was reached', () => {
   const thread = makeThread({
-    status: 'review_failed',
+    status: 'failed',
     reviewFailure: {
       kind: 'unresolvable_park',
       reason: '检视挂起在桥接无法观测的依赖上：等待外部 Client 控制投影修复',
@@ -128,8 +128,9 @@ test('final summary - review_failed records why no verdict was reached', () => {
       agent: 'codex',
     },
   });
+  thread.failure = { stage: 'review', reason: thread.reviewFailure!.reason, at: thread.reviewFailure!.at };
   const summary = buildFinalSummary(thread);
-  assert.strictEqual(summary.kind, 'review_failed');
+  assert.strictEqual(summary.kind, 'failed');
   assert.match(summary.error || '', /外部 Client 控制投影修复/);
   assert.match(summary.verdict || '', /外部 Client 控制投影修复/);
   assert.match(summary.summary, /检视失败/);
@@ -147,7 +148,7 @@ test('final summary - only terminal tasks get one', () => {
   assert.strictEqual(ensureFinalSummary(done), false, 'idempotent');
 
   const failedReview = makeThread({
-    status: 'review_failed',
+    status: 'failed',
     reviewFailure: {
       kind: 'retries_exhausted',
       reason: '检视唤醒自动重试已耗尽（6 次失败）：429 Too Many Requests',
@@ -155,8 +156,9 @@ test('final summary - only terminal tasks get one', () => {
       round: 1,
     },
   });
+  failedReview.failure = { stage: 'review', reason: failedReview.reviewFailure!.reason, at: failedReview.reviewFailure!.at };
   assert.strictEqual(ensureFinalSummary(failedReview), true);
-  assert.strictEqual(failedReview.finalSummary?.kind, 'review_failed');
+  assert.strictEqual(failedReview.finalSummary?.kind, 'failed');
 });
 
 test('archive - keeps only the digest and metadata', () => {

@@ -55,10 +55,12 @@ export class CallbackManager extends EventEmitter {
   private runner?: AutonomousRunner;
   private wakeQueue: CallerWakeQueue;
   private taskStore?: TaskStore;
+  private readonly storageDir?: string;
 
   constructor(detector: AgentDetector, storageDir?: string) {
     super();
     this.detector = detector;
+    this.storageDir = storageDir;
     this.wakeQueue = new CallerWakeQueue(storageDir);
   }
 
@@ -105,14 +107,14 @@ export class CallbackManager extends EventEmitter {
     }
     const thread = this.taskStore.getTask(next.threadId);
     const round = thread?.rounds?.find((r) => r.round === next.round);
-    if (!thread || !round) {
+    if (!thread || thread.archivedAt || !round || (thread.failureRevision || 0) !== (next.failureRevision || 0)) {
       console.warn(
         `[CallbackManager] Dropping queued wake for ${next.threadId} round ${next.round}: it no longer exists.`,
       );
       return;
     }
     if (next.kind === 'review') {
-      if (!isReviewerWakeEligible(thread) && thread.status !== 'review_failed') {
+      if (!isReviewerWakeEligible(thread)) {
         console.log(
           `[CallbackManager] Dropping queued review wake for ${next.threadId}: status is now "${thread.status}".`,
         );
@@ -121,7 +123,7 @@ export class CallbackManager extends EventEmitter {
       void this.notifyCaller(thread, round);
       return;
     }
-    if (thread.status !== 'failed') {
+    if (thread.status !== 'failed' || thread.failure?.stage !== 'execution') {
       console.log(
         `[CallbackManager] Dropping queued failure wake for ${next.threadId}: status is now "${thread.status}".`,
       );
@@ -167,7 +169,7 @@ export class CallbackManager extends EventEmitter {
     // there, only the verdict is missing. Waking the reviewer again turns the
     // task back into a live review (and re-occupies its queue slot) on the same
     // round and native session; the recorded failure stays as audit history.
-    if (thread.status === 'review_failed') {
+    if (thread.status === 'failed' && thread.failure?.stage === 'review') {
       reopenFailedReview(thread);
       try {
         this.taskStore?.upsertTask(thread);
@@ -192,6 +194,7 @@ export class CallbackManager extends EventEmitter {
       threadId: thread.threadId,
       round: reviewRound.round,
       kind: 'review',
+      failureRevision: thread.failureRevision || 0,
       enqueuedAt: Date.now(),
     };
     if (!this.wakeQueue.tryAcquire(callerSessionId)) {
@@ -379,6 +382,7 @@ export class CallbackManager extends EventEmitter {
       },
       reviewerPreparation?.recoveryVersion,
       mergeWakeId,
+      roleLease.token,
     );
     if (!launched) {
       release();
@@ -403,7 +407,7 @@ export class CallbackManager extends EventEmitter {
     roundNumber: number,
     result?: { error?: string; exitCode?: number; assessment?: { errorCode?: string; reason?: string } },
   ): Promise<boolean> {
-    if (thread.status !== 'failed') {
+    if (thread.status !== 'failed' || thread.failure?.stage !== 'execution') {
       // Paused/stopped tasks are user decisions, not failures to triage.
       return false;
     }
@@ -477,6 +481,7 @@ export class CallbackManager extends EventEmitter {
         threadId: thread.threadId,
         round: roundNumber,
         kind: 'failure',
+        failureRevision: thread.failureRevision || 0,
         enqueuedAt: Date.now(),
       });
     }
@@ -489,7 +494,7 @@ export class CallbackManager extends EventEmitter {
     if (!roleLease || !sessionLease) {
       if (roleLease) roleLock.release(roleLease);
       this.wakeQueue.release(callerSessionId);
-      return this.deferWake(callerSessionId, { threadId: thread.threadId, round: roundNumber, kind: 'failure', enqueuedAt: Date.now() });
+      return this.deferWake(callerSessionId, { threadId: thread.threadId, round: roundNumber, kind: 'failure', failureRevision: thread.failureRevision || 0, enqueuedAt: Date.now() });
     }
     const executionRegistry = new TaskExecutionRegistry(storageRoot);
     let executionRegistration: TaskExecutionRegistration;
@@ -510,7 +515,7 @@ export class CallbackManager extends EventEmitter {
       this.taskStore.loadFromDisk();
       const fresh = this.taskStore.getTask(thread.threadId);
       const freshSession = fresh?.reviewFlow === 'dedicated' ? fresh.reviewerSessionId : fresh?.callerSessionId;
-      if (!fresh || fresh.archivedAt || fresh.status !== 'failed' || freshSession !== callerSessionId ||
+      if (!fresh || fresh.archivedAt || fresh.status !== 'failed' || fresh.failure?.stage !== 'execution' || freshSession !== callerSessionId ||
           roleLock.getOwner(thread.threadId)?.token !== roleLease.token ||
           new CancellationRegistry(storageRoot).peek(thread.threadId)) {
         nativeLock.release(sessionLease); roleLock.release(roleLease);
@@ -631,8 +636,10 @@ export class CallbackManager extends EventEmitter {
     onChildPid?: (pid: number | undefined) => void,
     recoveryVersion?: string,
     mergeWakeId?: string,
+    roleToken?: string,
   ): boolean {
     assertCanExecute(thread.initiatorAgent, 'resume as a reviewer', 'initiator');
+    const startedThread = structuredClone(thread);
     const initiator = thread.initiatorAgent;
     const cwd = thread.status === 'waiting_merge' && thread.worktree?.mergeResolutionPath || getTaskExecutionPath(thread);
     // Wake the caller on its SENDER-side default model, which is configured
@@ -765,17 +772,19 @@ export class CallbackManager extends EventEmitter {
               firstOutputAtMs, lastOutputAtMs, maxGapMs, rawMaxGapMs, excludedSuspensionMs, suspensionCount: suspension.suspensionCount,
               gapThresholdMs: 10 * 60_000, interruption }) : undefined;
         try {
-          const state = this.finalizeWake(thread, round, callerSessionId, {
+          const root = this.taskStore ? path.dirname(this.taskStore.getStoragePath()) : this.storageDir;
+          const stillOwnsRole = !roleToken || new TaskRoleLock(root).getOwner(thread.threadId)?.token === roleToken;
+          const state = stillOwnsRole ? this.finalizeWake(startedThread, round, callerSessionId, {
             ...outcome,
             output: capture.text(),
             assessment,
             interruption,
             attemptId: mergeWakeId,
-          }, wakeKind);
+          }, wakeKind) : undefined;
           if (outcome.exitCode === 0 && (!assessment || assessment.success) && wakeKind === 'review' && thread.reviewFlow === 'dedicated' && this.taskStore) {
             this.taskStore.loadFromDisk();
             const current = this.taskStore.getTask(thread.threadId);
-            if (current && !isReviewerWakeEligible(current) && current.status !== 'failed' && current.status !== 'review_failed') {
+            if (current && !isReviewerWakeEligible(current) && current.status !== 'failed') {
               const cursor = current.nativeSessionCompaction?.reviewer;
               new NativeSessionCompactor(this.taskStore, this.detector).recordBusinessSuccess(
                 thread.threadId,
@@ -1038,7 +1047,7 @@ export class CallbackManager extends EventEmitter {
         const current = this.taskStore.getTask(thread.threadId);
         // Deleted and archived tasks must never be resurrected from this
         // callback's stale in-memory copy.
-        if (!current || current.archivedAt) return undefined;
+        if (!current || current.archivedAt || (current.failureRevision || 0) !== (thread.failureRevision || 0)) return undefined;
         target = current;
       } catch {
         return undefined;
@@ -1133,7 +1142,7 @@ export class CallbackManager extends EventEmitter {
         /spawn.*(?:enoent|not found)|failed to launch/i.test(outcome.error || '') ? 'CLI_START_FAILED' :
           (outcome.assessment?.errorCode || (outcome.exitCode === undefined ? 'CLI_START_FAILED' : `EXIT_${outcome.exitCode}`));
       const budget = noteMergeFailure(target, 'reviewer', code, reason);
-      if (target.status === 'merge_failed' || code === 'AUTH_OR_PERMISSION') { state.autoRetryAt = undefined; state.gaveUp = true; }
+      if ((target.status === 'failed' && target.failure?.stage === 'merge') || code === 'AUTH_OR_PERMISSION') { state.autoRetryAt = undefined; state.gaveUp = true; }
       const number = (target.mergeHistory?.length || 0) + 1;
       target.mergeHistory = [...(target.mergeHistory || []), {
         id: crypto.randomUUID(), number, at: target.updatedAt, phase: 'reviewer', result: 'failed', attemptId: outcome.attemptId, error: state.lastError, errorCode: code, exitCode: outcome.exitCode, assessment: outcome.assessment, interruption: outcome.interruption, ...budget,

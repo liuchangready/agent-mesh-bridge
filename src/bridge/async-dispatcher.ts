@@ -337,6 +337,10 @@ export class AsyncDispatcher {
       }, this.storageDir, taskDirs.artifactDir);
       if (!tokenWritten) {
         thread.status = 'failed';
+        thread.failureRevision = (thread.failureRevision || 0) + 1;
+        thread.failure = { stage: 'bootstrap', reason: 'token write failed', at: nowIso, round: thread.currentRound };
+        const placeholder = thread.rounds.find(r => r.round === thread.currentRound);
+        if (placeholder) { placeholder.status = 'failed'; placeholder.error = 'token write failed'; }
         thread.reviewBootstrap = { phase: 'failed', attempts: 0, lastError: 'token write failed' };
         thread.summary.lastOutputSnippet = '[Reviewer bootstrap failed] could not write the dispatch token';
         this.taskStore.upsertTask(thread);
@@ -481,7 +485,6 @@ export class AsyncDispatcher {
       const terminal =
         current.status === 'completed' ||
         current.status === 'failed' ||
-        current.status === 'review_failed' ||
         current.status === 'paused' ||
         current.status === 'waiting_review';
       if (
@@ -515,10 +518,10 @@ export class AsyncDispatcher {
         );
       } catch (error: any) {
         roleLock.release(roleLease);
-        current.status = 'failed';
         currentRound.status = 'failed';
         currentRound.error = `Could not register task execution: ${error?.message || error}`;
         current.updatedAt = new Date().toISOString();
+        enterTaskFailure(current, { stage: 'execution', reason: currentRound.error, at: current.updatedAt, round: currentRound.round });
         this.taskStore.upsertTask(current);
         return;
       }
@@ -531,6 +534,8 @@ export class AsyncDispatcher {
         `[AsyncDispatcher] Starting background execution: ${thread.threadId} (Round ${roundNumber}) on ${thread.targetAgent}`,
       );
 
+      const startedFailureRevision = thread.failureRevision || 0;
+      const startedRoundTimestamp = thread.rounds.filter(r => r.round === roundNumber).slice(-1)[0]?.timestamp;
       let streamedOutput = '';
       const startTime = Date.now();
       let streamTimer: NodeJS.Timeout | null = null;
@@ -545,7 +550,7 @@ export class AsyncDispatcher {
           output: cleanSnippet,
           durationMs: elapsedMs,
           status: 'running',
-        });
+        }, undefined, undefined, undefined, undefined, { failureRevision: startedFailureRevision, roundTimestamp: startedRoundTimestamp });
       }, this.streamSyncIntervalMs);
 
       const logFilePath = roundExecutionLogPath(
@@ -628,6 +633,11 @@ export class AsyncDispatcher {
         return;
       }
 
+      const liveRound = latest.rounds.filter(r => r.round === roundNumber).slice(-1)[0];
+      if (latest.archivedAt || (latest.failureRevision || 0) !== startedFailureRevision ||
+          latest.currentRound !== roundNumber || !liveRound || liveRound.timestamp !== startedRoundTimestamp ||
+          roleLock.getOwner(thread.threadId)?.token !== roleLease.token) return;
+
       // A pause may have landed after the child exited but before this handler
       // ran; the control plane's state wins over a "successful" result.
       const pausedByControl = latest.status === 'paused';
@@ -690,6 +700,7 @@ export class AsyncDispatcher {
         nativeSessionId,
         undefined,
         interruption,
+        { failureRevision: startedFailureRevision, roundTimestamp: startedRoundTimestamp },
       );
 
       if (updatedThread && this.taskStore.getTask(updatedThread.threadId)) {
@@ -799,3 +810,4 @@ export class AsyncDispatcher {
     return `thread_${ymd}_${hms}_${rand}`;
   }
 }
+import { enterTaskFailure } from './types';

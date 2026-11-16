@@ -192,7 +192,7 @@ export class TaskDetailPanel {
 
   private async handleRetryMerge() {
     try {
-      if (this.taskStore.getTask(this.currentThreadId)?.status === 'merge_failed') {
+      if ((() => { const task = this.taskStore.getTask(this.currentThreadId); return task?.status === 'failed' && task.failure?.stage === 'merge'; })()) {
         this.reworkController.retryMerge(this.currentThreadId);
         this.update();
         return;
@@ -869,7 +869,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
     }
   </style>
 </head>
-<body class="${thread.status === 'merge_failed' ? 'merge-failed' : ''}">
+<body class="${(thread.status === 'failed' && thread.failure?.stage === 'merge') ? 'merge-failed' : ''}">
   <style>.merge-failed .timeline button { display: none; }</style>
   <div class="header">
     <div class="title-row">
@@ -1124,13 +1124,13 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
       <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">已主动唤醒 <strong>${escapeHtml(thread.initiatorAgent)}</strong>，正在后台独立执行全量构建与回归跑测（通常耗时 30~60 秒）。任务正常流转中，请等待审查结论。</div>
     </div>
   </div>`
-      : thread.status === 'review_failed'
+      : (thread.status === 'failed' && thread.failure?.stage === 'review')
       ? `
   <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
     <div style="font-size: 28px;">🚫</div>
     <div>
       <div style="font-weight: 700; font-size: 16px; color: #f87171;">检视失败 · 第 ${thread.reviewFailure?.round || thread.currentRound || 1} 轮未取得检视结论 (Review Failed)</div>
-      <div style="font-size: 13px; opacity: 0.95; margin-top: 6px;"><strong>失败原因：</strong>${escapeHtml(thread.reviewFailure?.reason || '未记录原因')}</div>
+      <div style="font-size: 13px; opacity: 0.95; margin-top: 6px;"><strong>失败原因：</strong>${escapeHtml(thread.failure?.reason || '未记录原因')}</div>
       <div style="font-size: 12px; opacity: 0.8; margin-top: 4px;">
         ${thread.reviewFailure?.kind === 'unresolvable_park'
           ? '检视方挂起在一个桥接无法观测的外部依赖上（未记录 waitingForThreadId），自动恢复不可能成功。'
@@ -1175,28 +1175,28 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
   <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
     <div style="font-size: 28px;">⚠️</div>
     <div>
-      <div style="font-weight: 700; font-size: 16px; color: #f87171;">第 ${thread.currentRound || 1} 轮执行异常中断</div>
-      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">${thread.interruption?.reason ? `<strong>中断原因：</strong>${escapeHtml(thread.interruption.reason)}<br/>` : ''}进程非零退出、看门狗或执行超时。可点击下方“重试失败轮次”按钮重新执行该轮次。</div>
+      <div style="font-weight: 700; font-size: 16px; color: #f87171;">${thread.failure?.stage === 'merge' ? '合并失败' : thread.failure?.stage === 'bootstrap' ? '初始化失败' : '开发失败'}</div>
+      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">${escapeHtml(thread.failure?.reason || '原因未记录')}</div>
     </div>
   </div>`
       : ''
   }
 
-  ${thread.status === 'merge_failed' ? `<div class="action-bar"><button onclick="retryMerge()">重试合并</button><button onclick="deleteTask()">删除任务</button></div>` : ''}
-  <div class="action-bar" ${thread.status === 'merge_failed' ? 'style="display:none"' : ''}>
-    ${(thread.status === 'failed' || thread.rounds.some((r) => r.status === 'failed')) ? `<button class="retry-btn" style="background: #dc2626; color: white;" onclick="retryFailedRound()">🔄 重试失败轮次 (Retry Failed)</button>` : ''}
+  ${(thread.status === 'failed' && thread.failure?.stage === 'merge') ? `<div class="action-bar"><button onclick="retryMerge()">重试合并</button><button onclick="deleteTask()">删除任务</button></div>` : ''}
+  <div class="action-bar" ${(thread.status === 'failed' && thread.failure?.stage === 'merge') ? 'style="display:none"' : ''}>
+    ${thread.status === 'failed' && thread.failure?.stage === 'execution' ? `<button class="retry-btn" style="background: #dc2626; color: white;" onclick="retryFailedRound()">🔄 重试失败轮次 (Retry Failed)</button>` : ''}
     ${thread.status === 'waiting_review' && thread.reviewWake && thread.reviewWake.round === (thread.currentRound || 1) ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（唤醒失败）</button>` : ''}
-    ${thread.status === 'review_failed' ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（检视失败）</button>` : ''}
+    ${(thread.status === 'failed' && thread.failure?.stage === 'review') ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（检视失败）</button>` : ''}
     ${(thread.status === 'running' || thread.status === 'queued' || thread.status === 'waiting_merge') ? `<button style="background:#ea580c;color:white;" onclick="pauseTask()">⏸ 暂停任务 (Pause)</button>` : ''}
     ${thread.status === 'paused' ? `<button class="resume-btn" onclick="resumeTask()">▶ 恢复执行 (Resume)</button>` : ''}
-    ${(thread.status === 'failed' || thread.status === 'waiting_review' || thread.status === 'review_failed') ? `<button class="resume-btn" onclick="resumeTask()">▶ 下发返修要求 / 重新执行</button>` : ''}
-    ${(thread.status === 'waiting_review' || thread.status === 'failed' || thread.status === 'review_failed') ? `<button onclick="approveTask()">✓ 手动验收通过 (Approve Task)</button>` : ''}
+    ${(thread.status === 'waiting_review' || (thread.status === 'failed' && ['execution', 'review'].includes(thread.failure?.stage || ''))) ? `<button class="resume-btn" onclick="resumeTask()">▶ 下发返修要求 / 重新执行</button>` : ''}
+    ${(thread.status === 'waiting_review' || (thread.status === 'failed' && ['execution', 'review'].includes(thread.failure?.stage || ''))) ? `<button onclick="approveTask()">✓ 手动验收通过 (Approve Task)</button>` : ''}
     <button style="background:#7f1d1d;color:white;" onclick="deleteTask()">🗑 删除任务 (Delete)</button>
     <button class="secondary" onclick="printRecentLogs()">📄 打印最近1000行日志 (Print 1,000 Lines)</button>
     <button class="secondary" onclick="refresh()">⟳ Refresh</button>
   </div>
 
-  <div class="live-logs-box" style="${thread.status === 'merge_failed' ? 'display:none;' : ''}margin-top: 16px; margin-bottom: 24px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; padding: 16px;">
+  <div class="live-logs-box" style="${(thread.status === 'failed' && thread.failure?.stage === 'merge') ? 'display:none;' : ''}margin-top: 16px; margin-bottom: 24px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; padding: 16px;">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px; flex-wrap:wrap; gap:8px;">
       <div style="font-weight:600; font-size:14px; display:flex; align-items:center; gap:8px;">
         ${thread.status === 'running' ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;"></span>` : ''}
@@ -1233,7 +1233,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
   ${thread.status === 'wait_decision' ? `<div class="rework-box"><h3>提交合并决定</h3><textarea id="mergeDecision" placeholder="输入您的决定"></textarea><button onclick="submitMergeDecision()">提交决定并唤醒 Reviewer</button></div>` : ''}
 
   ${
-    thread.status !== 'completed' && thread.status !== 'merge_failed' && thread.status !== 'wait_decision'
+    thread.status !== 'completed' && !(thread.status === 'failed' && thread.failure?.stage === 'merge') && thread.status !== 'wait_decision'
       ? `
   <div class="rework-box">
     <h3>Manual Rework Intervention</h3>

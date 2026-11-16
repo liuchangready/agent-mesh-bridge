@@ -11,7 +11,7 @@ import { ReworkController } from '../bridge/rework-controller';
 import { readReviewerBootstrapToken, writeReviewerBootstrapToken } from '../bridge/reviewer-bootstrap';
 import { TaskStore } from '../bridge/task-store';
 import { TaskSupervisor } from '../bridge/task-supervisor';
-import { DelegationRound, DelegationThread, isReviewerBootstrapPending } from '../bridge/types';
+import { DelegationRound, DelegationThread, isReviewerBootstrapPending, clearTaskFailure } from '../bridge/types';
 
 const now = '2026-11-05T00:00:00.000Z';
 const reviewerSessionId = 'reviewer-session-0123';
@@ -113,6 +113,7 @@ test('failed bootstrap retry rejects before retarget or ledger mutation', async 
       controller.retryFailedRound(failed.threadId, { targetAgent: 'antigravity' }),
       /dedicated reviewer bootstrap is failed/i,
     );
+    assert.throws(() => controller.approveTask({ threadId: failed.threadId }), /bootstrap/i);
 
     assert.deepEqual(persisted(store.getTask(failed.threadId)), before);
   });
@@ -187,6 +188,7 @@ test('retry does not revive a task completed during executor approval', async ()
     const retrying = controller.retryFailedRound(failed.threadId, { targetAgent: 'antigravity' });
     await approvalStarted;
     const completed = store.getTask(failed.threadId)!;
+    clearTaskFailure(completed);
     completed.status = 'completed';
     store.upsertTask(completed);
     finishRetarget();

@@ -4,6 +4,8 @@ import {
   RateLimitInfo,
   ReviewFailure,
   ReviewWakeState,
+  enterTaskFailure,
+  clearTaskFailure,
 } from './types';
 
 /**
@@ -249,7 +251,7 @@ export function applyReviewFailure(thread: DelegationThread, input: ReviewFailur
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 500) || 'review ended without a verdict';
-  thread.status = 'review_failed';
+  enterTaskFailure(thread, { stage: 'review', reason, at: now, round: input.round ?? (thread.currentRound || 1), by: input.by });
   thread.reviewFailure = {
     kind: input.kind,
     reason,
@@ -275,7 +277,8 @@ export function applyReviewFailure(thread: DelegationThread, input: ReviewFailur
  * record is deliberately KEPT as audit history.
  */
 export function reopenFailedReview(thread: DelegationThread): boolean {
-  if (thread.status !== 'review_failed') return false;
+  if (thread.status !== 'failed' || thread.failure?.stage !== 'review' || thread.archivedAt) return false;
+  clearTaskFailure(thread);
   thread.status = 'waiting_review';
   thread.reviewWake = undefined;
   thread.updatedAt = new Date().toISOString();

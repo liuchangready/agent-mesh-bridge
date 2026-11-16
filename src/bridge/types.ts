@@ -32,11 +32,35 @@ export type ThreadStatus =
   | 'waiting_review'
   | 'waiting_merge'
   | 'wait_decision'
-  | 'merge_failed'
   | 'paused'
-  | 'review_failed'
   | 'completed'
   | 'failed';
+
+export type FailureStage = 'bootstrap' | 'execution' | 'review' | 'merge';
+export interface TaskFailure {
+  stage: FailureStage;
+  reason: string;
+  at: string;
+  round?: number;
+  by?: string;
+  code?: string;
+}
+
+export function enterTaskFailure(thread: DelegationThread, failure: TaskFailure): void {
+  failure = { ...failure, reason: failure.reason.trim() || 'Task failed; no reason was recorded' };
+  if (thread.status === 'failed' && thread.failure && thread.failure.stage === failure.stage &&
+      thread.failure.reason === failure.reason && thread.failure.round === failure.round && thread.failure.code === failure.code) return;
+  thread.failureRevision = (thread.failureRevision || 0) + 1;
+  thread.status = 'failed';
+  thread.failure = failure;
+}
+
+export function clearTaskFailure(thread: DelegationThread): void {
+  if (thread.status === 'failed') {
+    thread.failureRevision = (thread.failureRevision || 0) + 1;
+    thread.failure = undefined;
+  }
+}
 
 /** States in which a completed developer round can be reviewed. */
 export function isReviewerWakeEligible(thread: DelegationThread): boolean {
@@ -504,7 +528,9 @@ export interface ReviewerBootstrapState {
  * `get_task_summary` can answer after the rounds/logs/native sessions are gone.
  */
 export interface TaskFinalSummary {
-  kind: 'completed' | 'failed' | 'review_failed';
+  kind: 'completed' | 'failed';
+  failureStage?: FailureStage;
+  failureRevision?: number;
   at: string;
   title: string;
   /** Reviewer's approval remarks (completed) or the terminal error (failed). */
@@ -678,6 +704,8 @@ export function getTaskExecutionPath(thread: DelegationThread): string {
 }
 
 export interface DelegationThread {
+  failure?: TaskFailure;
+  failureRevision?: number;
   taskTemplate?: import('./task-templates').TaskTemplate;
   threadId: string; // e.g. "thread_20261016_163000_a7f9"
   title: string; // Brief title, e.g. "Fix TCP cursor drift"
@@ -1178,8 +1206,7 @@ export function shouldResumeNativeSession(
 export function isTaskUnfinished(thread: DelegationThread): boolean {
   return (
     thread.status !== 'completed' &&
-    thread.status !== 'failed' &&
-    thread.status !== 'review_failed'
+    thread.status !== 'failed'
   );
 }
 
@@ -1241,10 +1268,7 @@ export function findQueueHead(tasks: DelegationThread[]): DelegationThread | und
 export function isMergePending(thread: DelegationThread): boolean {
   const state = thread?.worktree?.integration?.phase;
   if (!thread?.worktree || state === 'merged' || state === 'no_changes') return false;
-  return thread.status === 'waiting_merge' || thread.worktree.approvedCommit !== undefined ||
-    (!!thread.worktree.baseCommit && !!thread.worktree.path && !['completed', 'review_failed', 'archived'].includes(thread.status)) ||
-    state === 'ready' || state === 'waiting' || state === 'merging' || state === 'conflict' || state === 'validation_failed' ||
-    thread.status === 'completed';
+  return true;
 }
 
 /**
@@ -1255,7 +1279,8 @@ export function isMergePending(thread: DelegationThread): boolean {
  */
 export function pendingMerges(tasks: DelegationThread[]): DelegationThread[] {
   return (tasks || [])
-    .filter((task) => !!task && isMergePending(task))
+    .filter((task) => !!task && isMergePending(task) &&
+      !(task.status === 'running' && !task.worktree?.integration && !task.worktree?.approvedCommit))
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 }
 
