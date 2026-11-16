@@ -1360,8 +1360,19 @@ export class MCPServer {
         if (!thread || !event?.logPath) throw new Error('Merge log not found.');
         const safeId = thread.threadId.replace(/[^A-Za-z0-9_-]/g, '_');
         const root = thread.artifactDir || path.join(path.dirname(this.taskStore.getStoragePath()), 'merge-logs', safeId);
-        const expected = path.join(root, 'merge_log', `${safeId}_merge_${event.number}.log`);
+        const source = event.phase === 'decision' && event.logNumber
+          ? thread.mergeHistory?.find((entry) => entry.number === event.logNumber && entry.logPath === event.logPath)
+          : event;
+        if (!source) throw new Error('Invalid merge log reference.');
+        const filename = path.basename(source.logPath!);
+        const prefix = `${safeId}_merge_`;
+        const digits = filename.startsWith(prefix) && filename.endsWith('.log') ? filename.slice(prefix.length, -4) : '';
+        const fileNumber = source.logFileNumber ?? Number(digits);
+        if (!Number.isSafeInteger(fileNumber) || fileNumber < 1 || digits !== String(fileNumber)) throw new Error('Invalid merge log path.');
+        const expected = path.join(root, 'merge_log', `${safeId}_merge_${fileNumber}.log`);
         if (path.resolve(event.logPath) !== path.resolve(expected)) throw new Error('Invalid merge log path.');
+        if (fs.realpathSync(path.dirname(expected)) !== path.join(fs.realpathSync(root), 'merge_log')) throw new Error('Invalid merge log path.');
+        if (fs.lstatSync(expected).isSymbolicLink()) throw new Error('Invalid merge log path.');
         const offset = Math.max(0, Math.floor(Number(args.offset) || 0));
         const limit = Math.min(200 * 1024, Math.max(1, Math.floor(Number(args.limit) || 20 * 1024)));
         const fd = fs.openSync(expected, 'r');

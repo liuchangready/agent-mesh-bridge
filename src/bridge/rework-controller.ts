@@ -40,7 +40,7 @@ import { readStoredRoundUsage } from './token-usage-collector';
 import { currentHead, changedFiles, snapshotTaskWorktree, gitOutput } from './git-worktree';
 import { MergeCoordinator, MergeResult } from './merge-coordinator';
 import { assertCanExecute } from './agent-capabilities';
-import { noteMergeFailure, resetMergeBudget } from './merge-recovery';
+import { createMergeLog, noteMergeFailure, resetMergeBudget } from './merge-recovery';
 import { NativeSessionLock } from './native-session-lock';
 import { CancellationRegistry } from './cancellation-registry';
 
@@ -825,15 +825,13 @@ export class ReworkController {
         const number = (thread.mergeHistory?.length || 0) + 1;
         const safeId = thread.threadId.replace(/[^A-Za-z0-9_-]/g, '_');
         const dir = path.join(thread.artifactDir || path.join(this.storageDir, 'merge-logs', safeId), 'merge_log');
-        let logPath: string | undefined;
+        let logPath: string | undefined; let logFileNumber: number | undefined;
         try {
-          fs.mkdirSync(dir, { recursive: true });
-          logPath = path.join(dir, `${safeId}_merge_${number}.log`);
-          fs.writeFileSync(logPath, `${failure}\n`, 'utf8');
+          ({ logPath, logFileNumber } = createMergeLog(dir, safeId, number, `${failure}\n`));
         } catch (logError) { logPath = undefined; failure += `; could not write merge log: ${String(logError)}`; }
         thread.status = 'waiting_merge';
         const budget = noteMergeFailure(thread, 'snapshot', 'SNAPSHOT_FAILED', failure);
-        thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number, at: nowIso, phase: 'snapshot', result: 'failed', error: failure, logPath, ...budget }];
+        thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number, at: nowIso, phase: 'snapshot', result: 'failed', error: failure, logPath, logFileNumber, ...budget }];
         worktree.approvedCommit = undefined;
         worktree.approvedSnapshot = undefined;
         worktree.mergePending = true;
@@ -906,9 +904,10 @@ export class ReworkController {
     const files = Array.isArray(conflictFiles) && conflictFiles.length ? conflictFiles : thread.worktree?.integration?.conflictFiles || [];
     if (logPath && !(thread.mergeHistory || []).some((entry) => entry.logPath === logPath)) throw new Error('Decision log must refer to an existing merge log.');
     const contextLog = logPath || [...(thread.mergeHistory || [])].reverse().find((entry) => entry.logPath)?.logPath;
-    const contextLogNumber = (thread.mergeHistory || []).find((entry) => entry.logPath === contextLog)?.number;
+    const contextEvent = (thread.mergeHistory || []).find((entry) => entry.logPath === contextLog && entry.phase !== 'decision');
+    const contextLogNumber = contextEvent?.number;
     thread.mergeHistory = [...(thread.mergeHistory || []), { id: decisionId, decisionId, number: (thread.mergeHistory?.length || 0) + 1, at,
-      phase: 'decision', result: 'requested', question: question.trim(), background: (background || '').trim(), suggestion: (suggestion || '').trim(), conflictFiles: files, logPath: contextLog, logNumber: contextLogNumber }];
+      phase: 'decision', result: 'requested', question: question.trim(), background: (background || '').trim(), suggestion: (suggestion || '').trim(), conflictFiles: files, logPath: contextLog, logNumber: contextLogNumber, logFileNumber: contextEvent?.logFileNumber }];
     const prior = thread.mergeControl;
     thread.mergeControl = { ...prior, revision: (prior?.revision || 0) + 1, retryGeneration: prior?.retryGeneration || 0,
       consecutiveRetries: prior?.consecutiveRetries || 0, pendingDecisionId: decisionId };

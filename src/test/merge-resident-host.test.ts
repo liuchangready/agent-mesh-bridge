@@ -13,6 +13,9 @@ import { createTaskWorktree, resolveGitRepository, commitTaskChanges, gitOutput 
 import { ReworkController } from '../bridge/rework-controller';
 import { TaskStore } from '../bridge/task-store';
 import { DelegationThread } from '../bridge/types';
+import { MCPServer } from '../bridge/mcp-server';
+import { ActiveAgentResolver } from '../bridge/active-agent-resolver';
+import { AsyncDispatcher } from '../bridge/async-dispatcher';
 
 // Nested test merges must not contend with an outer production integration lock.
 const residentHome = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-resident-home-'));
@@ -166,9 +169,26 @@ test('an initial ledger EIO is logged and backed off until the same host can rec
   assert.equal(wakes, 0); assert.equal(gitOutput(repo, ['rev-parse', target.targetRef]), target.baseCommit);
   assert.equal(store.getTask(id)?.status, 'waiting_merge');
   const logs = path.join(storage, 'merge-logs', id, 'merge_log');
-  assert.match(fs.readFileSync(path.join(logs, fs.readdirSync(logs)[0]), 'utf8'), /EIO/i);
+  const originalLog = path.join(logs, `${id}_merge_1.log`);
+  const originalContent = fs.readFileSync(originalLog, 'utf8'); assert.match(originalContent, /EIO/i);
   mutableFs.renameSync = realRename;
   await waitFor(() => store.getTask(id)?.status === 'completed', 30_000);
   assert.notEqual(gitOutput(repo, ['rev-parse', target.targetRef]), target.baseCommit);
   assert.equal(store.getTask(id)?.threadId, id);
+  const event = store.getTask(id)!.mergeHistory!.find((entry) => entry.phase === 'attempt' && entry.result === 'started')!;
+  assert.equal(event.number, 1); assert.equal(event.logFileNumber, 2);
+  const mcp = new MCPServer({} as AsyncDispatcher, host, store, detector, new ActiveAgentResolver(detector), new AutonomousRunner(detector));
+  const first = await mcp.handleToolCall('get_merge_log', { threadId: id, number: event.number, limit: 16 });
+  const second = await mcp.handleToolCall('get_merge_log', { threadId: id, number: event.number, offset: first.nextOffset, limit: 16 });
+  const savedLog = fs.readFileSync(event.logPath!);
+  assert.equal(first.content, savedLog.subarray(0, 16).toString('utf8')); assert.equal(first.nextOffset, 16);
+  assert.equal(second.content, savedLog.subarray(16, 32).toString('utf8')); assert.equal(second.nextOffset, 32);
+  assert.equal(second.size, savedLog.length); assert.match(savedLog.toString('utf8'), /\$ git/);
+  let fullLog = first.content + second.content; let offset = second.nextOffset;
+  while (offset < second.size) {
+    const page = await mcp.handleToolCall('get_merge_log', { threadId: id, number: event.number, offset, limit: 64 });
+    assert.ok(page.nextOffset > offset); fullLog += page.content; offset = page.nextOffset;
+  }
+  assert.equal(fullLog, savedLog.toString('utf8'));
+  assert.equal(fs.readFileSync(originalLog, 'utf8'), originalContent);
 });

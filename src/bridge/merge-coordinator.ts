@@ -11,7 +11,7 @@ import { TaskExecutionRegistry } from './task-execution-registry';
 import { killProcessTree } from './platform';
 import { taskValidationDir } from './round-log';
 import { resolveNodeCommand } from './deepseek-harness';
-import { noteMergeFailure } from './merge-recovery';
+import { createMergeLog, noteMergeFailure } from './merge-recovery';
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const CHILD_ACK_TIMEOUT_MS = 10_000;
@@ -553,16 +553,12 @@ export class MergeCoordinator {
         const number = (latest.mergeHistory?.length || 0) + 1;
         const safeId = threadId.replace(/[^A-Za-z0-9_-]/g, '_');
         const dir = path.join(latest.artifactDir || path.join(this.storageDir, 'merge-logs', safeId), 'merge_log');
-        fs.mkdirSync(dir, { recursive: true });
-        let logNumber = number;
-        while (fs.existsSync(path.join(dir, `${safeId}_merge_${logNumber}.log`))) logNumber++;
-        const logPath = path.join(dir, `${safeId}_merge_${logNumber}.log`);
-        fs.writeFileSync(logPath, `Merge attempt ${number} for ${threadId}\n`, { encoding: 'utf8', flag: 'wx' });
+        const { logPath, logFileNumber } = createMergeLog(dir, safeId, number, `Merge attempt ${number} for ${threadId}\n`);
         const id = crypto.randomUUID();
         this.attemptLogs.set(threadId, { id, number, path: logPath, candidateTree: worktree.approvedSnapshot?.tree });
         const updated = structuredClone(latest);
         updated.mergeHistory = [...(updated.mergeHistory || []), { id, number, at: new Date().toISOString(), phase: 'attempt', result: 'started',
-          logPath, targetRef, sourceCommit: worktree.approvedSnapshot?.sourceCommit, candidateCommit: sourceCommit, candidateTree: worktree.approvedSnapshot?.tree,
+          logPath, logFileNumber, targetRef, sourceCommit: worktree.approvedSnapshot?.sourceCommit, candidateCommit: sourceCommit, candidateTree: worktree.approvedSnapshot?.tree,
           retryGeneration: updated.mergeControl?.retryGeneration || 0,
           decisionId: [...(updated.mergeHistory || [])].reverse().find((entry) => entry.phase === 'decision' && entry.result === 'answered')?.decisionId }];
         this.store.upsertTask(updated);
@@ -1017,16 +1013,14 @@ export class MergeCoordinator {
       const number = (thread.mergeHistory?.length || 0) + 1;
       const safeId = threadId.replace(/[^A-Za-z0-9_-]/g, '_');
       const dir = path.join(thread.artifactDir || path.join(this.storageDir, 'merge-logs', safeId), 'merge_log');
-      let logPath: string | undefined;
+      let logPath: string | undefined; let logFileNumber: number | undefined;
       try {
-        fs.mkdirSync(dir, { recursive: true });
-        logPath = path.join(dir, `${safeId}_merge_${number}.log`);
-        fs.writeFileSync(logPath, `${phase}: ${error}\n`, 'utf8');
+        ({ logPath, logFileNumber } = createMergeLog(dir, safeId, number, `${phase}: ${error}\n`));
       } catch { logPath = undefined; }
       const code = phase === 'validation_failed' ? (error.match(/exit\s+(-?\d+)/i)?.[1] || 'VALIDATION_FAILED') : 'CONFLICT';
       const budget = noteMergeFailure(thread, phase, code, error, conflictFiles);
       thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number, at, phase, result: 'failed', ...budget, attemptId: this.attemptLogs.get(threadId)?.id,
-        error: error.slice(-5000), errorCode: phase === 'conflict' ? 'CONFLICT' : 'VALIDATION_FAILED', logPath, exitCode: phase === 'conflict' ? 1 : Number(error.match(/exit\s+(-?\d+)/i)?.[1] || -1), targetRef: worktree.deliveryTarget?.ref || worktree.targetRef,
+        error: error.slice(-5000), errorCode: phase === 'conflict' ? 'CONFLICT' : 'VALIDATION_FAILED', logPath, logFileNumber, exitCode: phase === 'conflict' ? 1 : Number(error.match(/exit\s+(-?\d+)/i)?.[1] || -1), targetRef: worktree.deliveryTarget?.ref || worktree.targetRef,
         targetOldCommit, candidateCommit: sourceCommit, candidateTree: this.attemptLogs.get(threadId)?.candidateTree || worktree.approvedSnapshot?.tree, conflictFiles }];
     }
     worktree.integration = { phase, error: error.slice(-5000), targetOldCommit, sourceCommit, conflictFiles, updatedAt: at };

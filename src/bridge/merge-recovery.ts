@@ -1,5 +1,16 @@
 import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { DelegationThread } from './types';
+
+export function createMergeLog(dir: string, safeId: string, number: number, content: string): { logPath: string; logFileNumber: number } {
+  fs.mkdirSync(dir, { recursive: true });
+  for (let logFileNumber = number; ; logFileNumber++) {
+    const logPath = path.join(dir, `${safeId}_merge_${logFileNumber}.log`);
+    try { fs.writeFileSync(logPath, content, { encoding: 'utf8', flag: 'wx' }); return { logPath, logFileNumber }; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+  }
+}
 
 export function failureFingerprint(phase: string, code: string, summary: string, items: string[] = []): string {
   const normalized = summary.toLowerCase().replace(/\u001b\[[0-9;]*m/g, '')

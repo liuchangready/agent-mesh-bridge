@@ -690,7 +690,7 @@ export interface DelegationThread {
   mergeHistory?: Array<{ id: string; number: number; at: string; phase: string; result: string; error?: string; logPath?: string;
     targetRef?: string; targetOldCommit?: string; targetCommit?: string; sourceCommit?: string; candidateCommit?: string; candidateTree?: string; conflictFiles?: string[];
     mergedCommit?: string; changedFiles?: string[]; decisionId?: string; question?: string; background?: string; suggestion?: string;
-    answer?: string; fingerprint?: string; retryGeneration?: number; consecutiveRetries?: number; errorCode?: string; exitCode?: number; attemptId?: string; logNumber?: number; assessment?: ResponseAssessment; interruption?: TaskInterruption }>;
+    answer?: string; fingerprint?: string; retryGeneration?: number; consecutiveRetries?: number; errorCode?: string; exitCode?: number; attemptId?: string; logNumber?: number; logFileNumber?: number; assessment?: ResponseAssessment; interruption?: TaskInterruption }>;
   mergeControl?: { revision: number; retryGeneration: number; failureFingerprint?: string; consecutiveRetries: number; pendingDecisionId?: string };
 
   // Native session bindings for continuous rework resume
