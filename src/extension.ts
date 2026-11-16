@@ -449,10 +449,10 @@ export function activate(context: vscode.ExtensionContext) {
       .map((t) => `【${t.title}】`)
       .join('、');
     const more = threads.length > 5 ? ` 等 ${threads.length} 个任务` : '';
-    const terminalFailures = threads.filter((t) => t.status === 'review_failed').length;
+    const terminalFailures = threads.filter((t) => t.status === 'failed' && t.failure?.stage === 'review').length;
     const tail =
       terminalFailures > 0
-        ? `已记录为“检视失败”(review_failed, 终态) 并释放队列槽；需手动重新检视或下发返修。`
+        ? `已记录为“检视失败”(failed/review，终态) 并释放队列槽；需手动重新检视或下发返修。`
         : '已记录为检视卡住并安排自动重新检视。';
     vscode.window
       .showWarningMessage(`⚠️ [Agent Bridge] 检视未完成：${names}${more}${tail}`, '查看首个任务 (Details)')
@@ -640,7 +640,7 @@ export function activate(context: vscode.ExtensionContext) {
       if (t.status !== 'waiting_review') continue;
       const dependency = byThreadId.get(blocked.waitingForThreadId);
       if (!dependency) continue;
-      if (dependency.status !== 'completed' && dependency.status !== 'failed' && dependency.status !== 'review_failed') continue;
+      if (dependency.status !== 'completed' && dependency.status !== 'failed') continue;
 
       const reviewRound = [...(t.rounds || [])]
         .reverse()
@@ -1435,7 +1435,7 @@ export function activate(context: vscode.ExtensionContext) {
         // `reviewWake` first made that impossible: a lost wake could only be
         // fixed by editing the ledger by hand. A terminal `review_failed` task is
         // precisely a review that needs another chance, so it re-opens here.
-        if (thread.status === 'review_failed') {
+        if (thread.status === 'failed' && thread.failure?.stage === 'review') {
           reopenFailedReview(thread);
           taskStore.upsertTask(thread);
           vscode.window.showInformationMessage(

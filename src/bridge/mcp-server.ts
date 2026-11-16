@@ -550,7 +550,7 @@ export class MCPServer {
       },
       {
         name: 'retry_merge',
-        description: 'Restart a merge_failed task with a fresh retry budget and its existing snapshot and session.',
+        description: 'Restart a failed task at the merge stage with a fresh retry budget and its existing snapshot and session.',
         inputSchema: { type: 'object', properties: { threadId: { type: 'string' } }, required: ['threadId'] },
       },
       {
@@ -773,6 +773,7 @@ export class MCPServer {
                 'active',
                 'queued',
                 'running',
+                'reworking',
                 'waiting_review',
                 'waiting_merge',
                 'wait_decision',
@@ -782,7 +783,7 @@ export class MCPServer {
                 'completed',
                 'failed',
               ],
-              description: 'Filter by lifecycle status.',
+              description: 'Filter by lifecycle status. review_failed and merge_failed are deprecated input aliases for failed at the corresponding stage; reworking is an alias for running rework.',
             },
           },
         },
@@ -1260,9 +1261,9 @@ export class MCPServer {
   public async handleToolCall(name: string, args: any): Promise<any> {
     this.assertReceiverMayCall(name, args);
     const controlledTask = typeof args?.threadId === 'string' ? this.taskStore.getTask(args.threadId) : undefined;
-    if (controlledTask?.status === 'merge_failed' && name !== 'retry_merge' && name !== 'delete_task' &&
+    if (controlledTask?.status === 'failed' && controlledTask.failure?.stage === 'merge' && name !== 'retry_merge' && name !== 'delete_task' &&
         (CONTROL_TOOLS.has(name) || name === 'request_rework' || name === 'approve_task')) {
-      throw new Error('A merge_failed task only permits retry_merge or delete_task.');
+      throw new Error('A failed merge only permits retry_merge or delete_task.');
     }
     switch (name) {
       case 'list_task_templates': {
@@ -1654,13 +1655,15 @@ export class MCPServer {
         if (!task) {
           throw new Error(`Thread not found: ${args.threadId}`);
         }
-        const summary =
-          task.finalSummary ||
-          (isTerminalThreadStatus(task.status) ? buildFinalSummary(task) : undefined);
+        const summary = isTerminalThreadStatus(task.status)
+          ? task.finalSummary || (task.archivedAt ? undefined : buildFinalSummary(task))
+          : undefined;
         return {
           threadId: task.threadId,
           title: task.title,
           status: task.status,
+          failureStage: task.failure?.stage,
+          failureRevision: task.failureRevision,
           archived: !!task.archivedAt,
           ...(task.archivedAt ? { archivedAt: task.archivedAt } : {}),
           createdAt: task.createdAt,
@@ -1678,7 +1681,7 @@ export class MCPServer {
             : {
                 hint:
                   'The task is still running (or was created before summaries existed); ' +
-                  'the read-only digest is written once it reaches completed/failed/review_failed.',
+                  'the read-only digest is written once it reaches completed/failed.',
               }),
         };
       }

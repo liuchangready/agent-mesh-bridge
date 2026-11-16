@@ -741,7 +741,9 @@ export class ReviewerBootstrapService {
     const fresh = this.deps.taskStore.getTask(thread.threadId);
     const root = this.deps.storageDir || path.dirname(this.deps.taskStore.getStoragePath());
     const cancellation = new CancellationRegistry(root).peek(thread.threadId);
-    if (!fresh || fresh.status === 'paused' || cancellation?.action === 'pause' || cancellation?.action === 'delete') {
+    if (!fresh || fresh.archivedAt || fresh.status !== 'queued' ||
+        (fresh.failureRevision || 0) !== (thread.failureRevision || 0) ||
+        cancellation?.action === 'pause' || cancellation?.action === 'delete') {
       return;
     }
     const at = new Date().toISOString();
@@ -752,6 +754,8 @@ export class ReviewerBootstrapService {
       retryAfter: undefined,
     };
     fresh.status = 'failed';
+    fresh.failureRevision = (fresh.failureRevision || 0) + 1;
+    fresh.failure = { stage: 'bootstrap', reason: detail.trim() || 'Reviewer bootstrap failed', at, round: fresh.currentRound };
     fresh.summary.lastOutputSnippet = `[Reviewer bootstrap failed] ${detail.slice(0, 140)}`;
     const round = fresh.rounds && fresh.rounds.length > 0
       ? fresh.rounds[fresh.rounds.length - 1]

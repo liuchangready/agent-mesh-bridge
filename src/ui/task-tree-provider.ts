@@ -123,8 +123,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     // A failed review is terminal (it released the queue slot). Show WHY on the
     // row: without the reason the user only sees that nobody reviewed.
     const reviewFailureBadge =
-      thread.status === 'review_failed'
-        ? ` · 🚫${(thread.reviewFailure?.reason || '未记录原因').slice(0, 60)}`
+      thread.status === 'failed' && thread.failure?.stage === 'review'
+        ? ` · 🚫${(thread.failure?.reason || '未记录原因').slice(0, 60)}`
         : '';
 
     // Derived from the rounds (never a stored aggregate): cheap, and cannot go
@@ -141,8 +141,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     item.description = description;
     item.iconPath = new vscode.ThemeIcon(iconName);
     item.contextValue =
-      thread.status === 'merge_failed'
-        ? 'merge_failed'
+      thread.status === 'failed' && thread.failure?.stage === 'merge'
+        ? 'failed_merge'
         : thread.status === 'wait_decision'
         ? 'wait_decision'
         : thread.status === 'waiting_merge'
@@ -158,9 +158,11 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
             : 'waiting_review'
         : thread.status === 'paused'
           ? 'paused_task'
-          : thread.status === 'review_failed'
-            ? 'review_failed'
-            : 'task_item';
+          : thread.status === 'failed' && thread.failure?.stage === 'review'
+            ? 'failed_review'
+            : thread.status === 'failed'
+              ? (thread.failure?.stage === 'bootstrap' ? 'failed_bootstrap' : 'failed_execution')
+              : 'task_item';
 
     // Click command
     item.command = {

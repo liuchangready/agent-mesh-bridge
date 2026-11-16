@@ -40,17 +40,9 @@ export function formatTaskTreeStatus(thread: DelegationThread): TaskStatusDispla
       iconName = 'question';
       statusLabel = 'Waiting for user decision';
       break;
-    case 'merge_failed':
-      iconName = 'error';
-      statusLabel = 'Merge failed; retry or delete';
-      break;
     case 'waiting_review':
       iconName = 'eye';
       statusLabel = `In-Review (${roundText})`;
-      break;
-    case 'review_failed':
-      iconName = 'warning';
-      statusLabel = `Review Failed · 检视失败 (${roundText})`;
       break;
     case 'paused':
       iconName = 'debug-pause';
@@ -62,7 +54,7 @@ export function formatTaskTreeStatus(thread: DelegationThread): TaskStatusDispla
       break;
     case 'failed':
       iconName = 'error';
-      statusLabel = `Failed (${roundText})`;
+      statusLabel = `${({ bootstrap: '初始化失败', execution: '开发失败', review: '检视失败', merge: '合并失败' } as const)[thread.failure?.stage || 'execution']} (${roundText})`;
       break;
   }
 

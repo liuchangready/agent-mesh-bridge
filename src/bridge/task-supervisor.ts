@@ -363,7 +363,7 @@ export class TaskSupervisor extends EventEmitter {
           pendingRound.status = 'failed';
           pendingRound.error = reason;
         }
-        stored.status = 'failed';
+        enterTaskFailure(stored, { stage: 'execution', reason, at: new Date().toISOString(), round: pendingRound?.round });
         stored.summary.lastOutputSnippet = reason;
         this.taskStore.upsertTask(stored);
         console.warn(`[TaskSupervisor] Refusing unsupported agent for task ${stored.threadId}: ${reason}`);
@@ -378,7 +378,7 @@ export class TaskSupervisor extends EventEmitter {
     const inFlight = findInFlightRound(fresh);
     if (
       fresh.status === 'paused' || fresh.status === 'waiting_review' ||
-      fresh.status === 'completed' || fresh.status === 'failed' || fresh.status === 'review_failed' ||
+      fresh.status === 'completed' || fresh.status === 'failed' ||
       fresh.targetAgent !== thread.targetAgent || !inFlight || inFlight.round !== round.round ||
       inFlight.status !== 'running' || inFlight.prompt !== round.prompt
     ) {
@@ -400,7 +400,7 @@ export class TaskSupervisor extends EventEmitter {
     const latestRound = latest?.rounds.filter((entry) => entry.round === round.round).slice(-1)[0];
     if (
       !latest || latest.status === 'paused' || latest.status === 'waiting_review' ||
-      latest.status === 'completed' || latest.status === 'failed' || latest.status === 'review_failed' ||
+      latest.status === 'completed' || latest.status === 'failed' ||
       latest.targetAgent !== thread.targetAgent || !latestRound || latestRound.status !== 'running' ||
       latestRound.prompt !== round.prompt || findInFlightRound(latest)?.round !== round.round ||
       isReviewerBootstrapPending(latest)
@@ -432,10 +432,10 @@ export class TaskSupervisor extends EventEmitter {
       );
     } catch (error: any) {
       roleLock.release(roleLease);
-      latest.status = 'failed';
       latestRound.status = 'failed';
       latestRound.error = `Could not register task execution: ${error?.message || error}`;
       latest.updatedAt = new Date().toISOString();
+      enterTaskFailure(latest, { stage: 'execution', reason: latestRound.error, at: latest.updatedAt, round: latestRound.round });
       this.taskStore.upsertTask(latest);
       return Promise.resolve();
     }
@@ -461,6 +461,8 @@ export class TaskSupervisor extends EventEmitter {
 
       this.emit('taskStarted', { thread, round });
 
+      const startedFailureRevision = latest.failureRevision || 0;
+      const startedRoundTimestamp = latestRound.timestamp;
       let streamedOutput = '';
       const startTime = Date.now();
       let streamTimer: NodeJS.Timeout | null = null;
@@ -491,6 +493,7 @@ export class TaskSupervisor extends EventEmitter {
             durationMs: elapsedMs,
             status: 'running',
           },
+          undefined, undefined, undefined, undefined, { failureRevision: startedFailureRevision, roundTimestamp: startedRoundTimestamp },
         );
 
         this.emit('taskProgress', {
@@ -584,6 +587,11 @@ export class TaskSupervisor extends EventEmitter {
         return;
       }
 
+      const liveRound = currentThread.rounds.filter(r => r.round === roundNumber).slice(-1)[0];
+      if (currentThread.archivedAt || (currentThread.failureRevision || 0) !== startedFailureRevision ||
+          currentThread.currentRound !== roundNumber || !liveRound || liveRound.timestamp !== startedRoundTimestamp ||
+          roleLock.getOwner(thread.threadId)?.token !== roleLease.token) return;
+
       // A pause may have landed after the child exited but before this handler
       // ran; the control plane's state wins over a "successful" result.
       const pausedByControl = currentThread.status === 'paused';
@@ -653,6 +661,7 @@ export class TaskSupervisor extends EventEmitter {
         nativeSessionId,
         undefined,
         interruption,
+        { failureRevision: startedFailureRevision, roundTimestamp: startedRoundTimestamp },
       );
 
         if (updatedThread && this.taskStore.getTask(updatedThread.threadId)) {
@@ -848,3 +857,4 @@ export class TaskSupervisor extends EventEmitter {
     } catch {}
   }
 }
+import { enterTaskFailure } from './types';

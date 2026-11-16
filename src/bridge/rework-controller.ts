@@ -17,6 +17,8 @@ import {
   shouldResumeNativeSession,
   ThreadStatus,
   isIsolatedTaskWorktree,
+  clearTaskFailure,
+  enterTaskFailure,
 } from './types';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -149,7 +151,7 @@ export class ReworkController {
     if (thread.status === 'paused') {
       throw new Error(`Cannot request rework: task ${params.threadId} is paused; resume it first.`);
     }
-    if (thread.status === 'merge_failed' || thread.status === 'wait_decision') throw new Error(`Cannot request rework while task is ${thread.status}.`);
+    if ((thread.status === 'failed' && thread.failure?.stage === 'merge') || thread.status === 'wait_decision') throw new Error(`Cannot request rework while task is ${thread.status}.`);
     this.assertDedicatedReviewerReady(thread, 'request rework');
     assertCanExecute(params.targetAgent || thread.targetAgent, 'receive rework');
     if (
@@ -240,6 +242,7 @@ export class ReworkController {
     const resumesNativeSession = shouldResumeNativeSession(thread, reworkRound);
 
     thread.currentRound = nextRound;
+    clearTaskFailure(thread);
     thread.status = 'running';
     thread.interruption = undefined;
     thread.updatedAt = nowIso;
@@ -339,19 +342,19 @@ export class ReworkController {
     }
     this.assertDedicatedReviewerReady(thread, 'retry failed round');
 
-    if (thread.status !== 'failed' && thread.status !== 'review_failed') {
+    if (thread.status !== 'failed' || thread.failure?.stage !== 'execution') {
       throw new Error(
-        `Cannot retry task ${threadId} while it is ${thread.status}; retry is only for a failed task's current failed round.`,
+        thread.failure?.stage === 'review' ? 'Review failed; use re-review.' :
+          thread.failure?.stage === 'merge' ? 'Merge failed; use retry_merge.' :
+          thread.failure?.stage === 'bootstrap' ? 'Reviewer bootstrap failed; the original handoff must be safely restored.' :
+          `Cannot retry task ${threadId} while it is ${thread.status}; retry is only for a failed task's current failed round.`,
       );
     }
 
     const candidateRound = latestWorkRound(thread);
     if (!candidateRound || candidateRound.status !== 'failed') {
       throw new Error(
-        `No current failed execution round found for task ${threadId}. ` +
-          (thread.status === 'review_failed'
-            ? 'The delivered work is awaiting an explicit reviewer recovery; use wakeUpCaller to review it.'
-            : 'Only the latest failed execution round can be retried.'),
+        `No current failed execution round found for task ${threadId}. Only the latest failed execution round can be retried.`,
       );
     }
 
@@ -367,7 +370,7 @@ export class ReworkController {
       throw new Error(`Cannot retry task ${threadId}: it became completed or archived during retarget.`);
     }
     this.assertDedicatedReviewerReady(thread, 'retry failed round');
-    if (thread.status !== 'failed' && thread.status !== 'review_failed') {
+    if (thread.status !== 'failed' || thread.failure?.stage !== 'execution') {
       throw new Error(`Cannot retry task ${threadId}: it became ${thread.status} during retarget.`);
     }
     const refreshedRound = latestWorkRound(thread);
@@ -394,6 +397,7 @@ export class ReworkController {
     // Never rewind the thread's notion of "latest round"; retrying an older
     // round must not make a newer one look current again.
     thread.currentRound = Math.max(thread.currentRound || 1, failedRound.round);
+    clearTaskFailure(thread);
     thread.status = 'running';
     thread.interruption = undefined;
     thread.updatedAt = nowIso;
@@ -625,6 +629,8 @@ export class ReworkController {
           ? 'The one-time reviewer token is unavailable and its native session was never captured; the original reviewer session cannot be resumed safely.'
           : 'The original reviewer bootstrap token is missing, so a replacement token or session cannot be created safely.';
         thread.status = 'failed';
+        thread.failureRevision = (thread.failureRevision || 0) + 1;
+        thread.failure = { stage: 'bootstrap', reason, at: nowIso, round: pausedRound.round };
         pausedRound.status = 'failed';
         pausedRound.error = reason;
         thread.reviewBootstrap = { ...previousBootstrap, phase: 'failed', lastError: reason };
@@ -699,7 +705,7 @@ export class ReworkController {
   }
 
   private assertReworkStillEligible(thread: DelegationThread, params: RequestReworkParams): void {
-    if (thread.status === 'merge_failed' || thread.status === 'wait_decision') throw new Error(`Cannot request rework while task is ${thread.status}.`);
+    if ((thread.status === 'failed' && thread.failure?.stage === 'merge') || thread.status === 'wait_decision') throw new Error(`Cannot request rework while task is ${thread.status}.`);
     if (thread.archivedAt || thread.status === 'completed') {
       throw new Error(`Cannot request rework: task ${thread.threadId} became completed or archived during retarget.`);
     }
@@ -789,6 +795,8 @@ export class ReworkController {
     if (!thread) {
       throw new Error(`Task thread not found: ${params.threadId}`);
     }
+    if (thread.archivedAt) throw new Error(`Cannot approve archived task ${params.threadId}.`);
+    if (thread.status === 'failed' && thread.failure?.stage === 'bootstrap') throw new Error('Cannot approve before the reviewer bootstrap handoff.');
 
     const inFlight = findInFlightRound(thread);
     if (inFlight) {
@@ -803,10 +811,12 @@ export class ReworkController {
         message: `Task ${thread.threadId} is already approved and archived; nothing to do.`,
       };
     }
-    if (thread.status === 'merge_failed' || thread.status === 'wait_decision') throw new Error(`Cannot approve while task is ${thread.status}.`);
+    this.assertDedicatedReviewerReady(thread, 'approve task');
+    if ((thread.status === 'failed' && thread.failure?.stage === 'merge') || thread.status === 'wait_decision') throw new Error(`Cannot approve while task is ${thread.status}.`);
 
     const nowIso = new Date().toISOString();
     let status: ApproveResult['status'] = 'COMPLETED';
+    clearTaskFailure(thread);
     if (isIsolatedTaskWorktree(thread.worktree)) {
       const worktree = thread.worktree;
       let snapshot: ReturnType<typeof snapshotTaskWorktree>;
@@ -935,8 +945,8 @@ export class ReworkController {
 
   public retryMerge(threadId: string): { threadId: string; status: 'waiting_merge'; retryGeneration: number } {
     const current = this.taskStore.getTask(threadId);
-    if (!current || current.status !== 'merge_failed') throw new Error('Only a merge_failed task can restart its merge budget.');
-    const thread = structuredClone(current); resetMergeBudget(thread); thread.status = 'waiting_merge';
+    if (!current || current.archivedAt || current.status !== 'failed' || current.failure?.stage !== 'merge') throw new Error('Only a merge failure can restart its merge budget.');
+    const thread = structuredClone(current); resetMergeBudget(thread); clearTaskFailure(thread); thread.status = 'waiting_merge';
     const at = new Date().toISOString(); thread.updatedAt = at;
     if (thread.worktree?.integration) {
       const phase = thread.worktree.mergeResolutionSubmitted ? 'waiting' :
@@ -1069,7 +1079,7 @@ export class ReworkController {
     const latestRound = latest?.rounds.filter((entry) => entry.round === roundNumber).slice(-1)[0];
     if (
       !latest || latest.status === 'paused' || latest.status === 'waiting_review' ||
-      latest.status === 'completed' || latest.status === 'failed' || latest.status === 'review_failed' ||
+      latest.status === 'completed' || latest.status === 'failed' ||
       latest.targetAgent !== thread.targetAgent || !latestRound || latestRound.status !== 'running' ||
       latestRound.prompt !== feedback || findInFlightRound(latest)?.round !== roundNumber ||
       isReviewerBootstrapPending(latest)
@@ -1101,10 +1111,10 @@ export class ReworkController {
       );
     } catch (error: any) {
       roleLock.release(roleLease);
-      latest.status = 'failed';
       latestRound.status = 'failed';
       latestRound.error = `Could not register task execution: ${error?.message || error}`;
       latest.updatedAt = new Date().toISOString();
+      enterTaskFailure(latest, { stage: 'execution', reason: latestRound.error, at: latest.updatedAt, round: latestRound.round });
       this.taskStore.upsertTask(latest);
       return;
     }
@@ -1121,6 +1131,8 @@ export class ReworkController {
       );
 
       let result;
+      const startedFailureRevision = thread.failureRevision || 0;
+      const startedRoundTimestamp = thread.rounds.filter(r => r.round === roundNumber).slice(-1)[0]?.timestamp;
       const workspaceBefore = captureWorkspaceSnapshot(getTaskExecutionPath(thread));
       // Rework rounds used to run without a per-round stdio log, so the "raw
       // execution log" existed only for dispatch/supervisor rounds. Capture it
@@ -1190,6 +1202,11 @@ export class ReworkController {
         return;
       }
 
+      const liveRound = latest.rounds.filter(r => r.round === roundNumber).slice(-1)[0];
+      if (latest.archivedAt || (latest.failureRevision || 0) !== startedFailureRevision ||
+          latest.currentRound !== roundNumber || !liveRound || liveRound.timestamp !== startedRoundTimestamp ||
+          roleLock.getOwner(thread.threadId)?.token !== roleLease.token) return;
+
       // A pause may have landed after the child exited but before this handler
       // ran; the control plane's state wins over a "successful" result.
       const pausedByControl = latest.status === 'paused';
@@ -1252,6 +1269,7 @@ export class ReworkController {
         nativeSessionId,
         undefined,
         interruption,
+        { failureRevision: startedFailureRevision, roundTimestamp: startedRoundTimestamp },
       );
 
       if (updatedThread && this.taskStore.getTask(updatedThread.threadId)) {

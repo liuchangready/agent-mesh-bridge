@@ -250,12 +250,12 @@ test('six repeated merge retries enter merge_failed and retry_merge starts a new
     assert.equal((await controller.mergeApproved(item.threadId)).status, 'validation_failed');
     const saved = store.getTask(item.threadId)!;
     assert.equal(saved.mergeControl!.consecutiveRetries, n);
-    assert.equal(saved.status, n === 6 ? 'merge_failed' : 'waiting_merge');
+    assert.equal(saved.status, n === 6 ? 'failed' : 'waiting_merge'); if (n === 6) { assert.equal(saved.failure?.stage, 'merge'); assert.ok(saved.failure.reason); assert.ok((saved.failureRevision || 0) > 0); }
   }
   const before = store.getTask(item.threadId)!;
   const pathBefore = before.worktree!.mergeResolutionPath; const sessionBefore = before.receiverSessionId;
   assert.throws(() => controller.submitMergeResolution(item.threadId), /awaiting submission/);
-  assert.throws(() => controller.approveTask({ threadId: item.threadId }), /merge_failed/);
+  assert.throws(() => controller.approveTask({ threadId: item.threadId }), /failed/);
   const retried = controller.retryMerge(item.threadId);
   const after = store.getTask(item.threadId)!;
   assert.equal(retried.retryGeneration, 1); assert.equal(after.status, 'waiting_merge');

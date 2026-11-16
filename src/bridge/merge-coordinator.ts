@@ -867,7 +867,7 @@ export class MergeCoordinator {
     const current = this.store.getTask(threadId); if (!current?.worktree) return;
     const thread = structuredClone(current);
     thread.worktree!.validation = { path: validationPath, commit, status, result, updatedAt: new Date().toISOString() };
-    if (thread.status === 'completed' || thread.status === 'failed' || thread.status === 'review_failed') thread.finalSummary = undefined;
+    if (thread.status === 'completed' || thread.status === 'failed') thread.finalSummary = undefined;
     thread.updatedAt = new Date().toISOString(); this.store.upsertTask(thread);
   }
 
