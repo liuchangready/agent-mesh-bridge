@@ -79,6 +79,9 @@ const CONTROL_TOOLS = new Set([
   'retarget_task',
   'delete_task',
   'record_merge_request',
+  'submit_merge_resolution',
+  'request_merge_decision',
+  'retry_merge',
 ]);
 
 
@@ -535,9 +538,29 @@ export class MCPServer {
         },
       },
       {
+        name: 'request_merge_decision',
+        description: 'Ask the user to decide a merge issue and end the reviewer turn.',
+        inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, question: { type: 'string' }, background: { type: 'string' }, suggestion: { type: 'string' }, conflictFiles: { type: 'array', items: { type: 'string' } }, logPath: { type: 'string' } }, required: ['threadId', 'question'] },
+      },
+      {
+        name: 'retry_merge',
+        description: 'Restart a merge_failed task with a fresh retry budget and its existing snapshot and session.',
+        inputSchema: { type: 'object', properties: { threadId: { type: 'string' } }, required: ['threadId'] },
+      },
+      {
+        name: 'get_merge_log',
+        description: 'Read a bounded page of a recorded merge log.',
+        inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, number: { type: 'integer' }, offset: { type: 'integer' }, limit: { type: 'integer' } }, required: ['threadId', 'number'] },
+      },
+      {
+        name: 'submit_merge_resolution',
+        description: 'Submit staged changes in the retained merge resolution workspace for validation and local integration.',
+        inputSchema: { type: 'object', properties: { threadId: { type: 'string' } }, required: ['threadId'] },
+      },
+      {
         name: 'approve_task',
         description:
-          'Approve the reviewed task commit. Code changes enter waiting_merge until serialized local integration and combined validation succeed; no-change tasks complete immediately.',
+          'Approve a snapshot of the reviewed task worktree. Code changes enter waiting_merge until serialized local integration and combined validation succeed; no-change tasks complete immediately.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -742,8 +765,12 @@ export class MCPServer {
               enum: [
                 'all',
                 'active',
+                'queued',
                 'running',
                 'waiting_review',
+                'waiting_merge',
+                'wait_decision',
+                'merge_failed',
                 'review_failed',
                 'reworking',
                 'paused',
@@ -1227,6 +1254,11 @@ export class MCPServer {
   /** Execute a tool call and return result object. */
   public async handleToolCall(name: string, args: any): Promise<any> {
     this.assertReceiverMayCall(name, args);
+    const controlledTask = typeof args?.threadId === 'string' ? this.taskStore.getTask(args.threadId) : undefined;
+    if (controlledTask?.status === 'merge_failed' && name !== 'retry_merge' && name !== 'delete_task' &&
+        (CONTROL_TOOLS.has(name) || name === 'request_rework' || name === 'approve_task')) {
+      throw new Error('A merge_failed task only permits retry_merge or delete_task.');
+    }
     switch (name) {
       case 'dispatch_task':
       {
@@ -1313,6 +1345,48 @@ export class MCPServer {
         // message; that is not an active review decision anymore.
         new TaskRoleLock().releaseIfRole(args.threadId, 'reviewer');
         return result;
+      }
+
+      case 'request_merge_decision': {
+        this.assertActiveReviewerRole(args.threadId);
+        return this.reworkController.requestMergeDecision(args.threadId, args.question, args.background, args.suggestion, args.conflictFiles, args.logPath);
+      }
+
+      case 'retry_merge': return this.reworkController.retryMerge(args.threadId);
+
+      case 'get_merge_log': {
+        const thread = this.taskStore.getTask(args.threadId);
+        const event = thread?.mergeHistory?.find((entry) => entry.number === Number(args.number));
+        if (!thread || !event?.logPath) throw new Error('Merge log not found.');
+        const safeId = thread.threadId.replace(/[^A-Za-z0-9_-]/g, '_');
+        const root = thread.artifactDir || path.join(path.dirname(this.taskStore.getStoragePath()), 'merge-logs', safeId);
+        const source = event.phase === 'decision' && event.logNumber
+          ? thread.mergeHistory?.find((entry) => entry.number === event.logNumber && entry.logPath === event.logPath)
+          : event;
+        if (!source) throw new Error('Invalid merge log reference.');
+        const filename = path.basename(source.logPath!);
+        const prefix = `${safeId}_merge_`;
+        const digits = filename.startsWith(prefix) && filename.endsWith('.log') ? filename.slice(prefix.length, -4) : '';
+        const fileNumber = source.logFileNumber ?? Number(digits);
+        if (!Number.isSafeInteger(fileNumber) || fileNumber < 1 || digits !== String(fileNumber)) throw new Error('Invalid merge log path.');
+        const expected = path.join(root, 'merge_log', `${safeId}_merge_${fileNumber}.log`);
+        if (path.resolve(event.logPath) !== path.resolve(expected)) throw new Error('Invalid merge log path.');
+        if (fs.realpathSync(path.dirname(expected)) !== path.join(fs.realpathSync(root), 'merge_log')) throw new Error('Invalid merge log path.');
+        if (fs.lstatSync(expected).isSymbolicLink()) throw new Error('Invalid merge log path.');
+        const offset = Math.max(0, Math.floor(Number(args.offset) || 0));
+        const limit = Math.min(200 * 1024, Math.max(1, Math.floor(Number(args.limit) || 20 * 1024)));
+        const fd = fs.openSync(expected, 'r');
+        try {
+          const size = fs.fstatSync(fd).size;
+          const buffer = Buffer.alloc(Math.min(limit, Math.max(0, size - offset)));
+          const bytes = fs.readSync(fd, buffer, 0, buffer.length, offset);
+          return { threadId: thread.threadId, number: event.number, offset, nextOffset: offset + bytes, size, content: buffer.subarray(0, bytes).toString('utf8') };
+        } finally { fs.closeSync(fd); }
+      }
+
+      case 'submit_merge_resolution': {
+        this.assertActiveReviewerRole(args.threadId);
+        return this.reworkController.submitMergeResolution(args.threadId);
       }
 
       case 'approve_task': {

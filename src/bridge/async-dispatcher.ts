@@ -28,7 +28,7 @@ import { ActiveAgentResolver } from './active-agent-resolver';
 import { AutonomousRunner, RunResult } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
 import { TaskSupervisor } from './task-supervisor';
-import { resolveGitRepository, resolveMainWorkspaceRoot, createTaskWorktree, removeTaskWorktree, commitTaskChanges, changedFiles, currentHead } from './git-worktree';
+import { resolveGitRepository, resolveMainWorkspaceRoot, createTaskWorktree, removeTaskWorktree, changedFiles, currentHead } from './git-worktree';
 import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
 import { TaskExecutionOwner, TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 import { QueueDrainer, QueuedExecution } from './queue-drainer';
@@ -285,7 +285,7 @@ export class AsyncDispatcher {
     };
 
     const policy = concurrencyPolicy();
-    const owners = policy.enabled ? this.executionRegistry.listOwners() : [];
+    const owners = policy.enabled ? this.executionRegistry.listAgentOwners() : [];
     const globalSlotFull = policy.enabled && owners.length >= policy.maxConcurrentTasks;
     const agentSlots = policy.enabled ? owners.filter((owner) => owner.agent === targetAgent).length : 0;
     const agentSlotFull = policy.enabled && agentSlots >= policy.maxConcurrentPerAgent;
@@ -493,7 +493,7 @@ export class AsyncDispatcher {
         return;
       }
       if (policy.enabled) {
-        const owners = this.executionRegistry.listOwners();
+        const owners = this.executionRegistry.listAgentOwners();
         const agentSlots = owners.filter((owner) => owner.agent === current.targetAgent).length;
         if (owners.length >= policy.maxConcurrentTasks || agentSlots >= policy.maxConcurrentPerAgent) {
           roleLock.release(roleLease);
@@ -636,10 +636,10 @@ export class AsyncDispatcher {
       let isSuccess = !interruption && !pausedByControl && responseOk;
       if (isSuccess && isIsolatedTaskWorktree(latest.worktree)) {
         try {
-          latest.worktree.headCommit = commitTaskChanges(latest.worktree, `Agent work ${latest.threadId} round ${roundNumber}`);
-          latest.worktree.integration = { phase: latest.worktree.headCommit === latest.worktree.baseCommit ? 'no_changes' : 'ready', sourceCommit: latest.worktree.headCommit, updatedAt: new Date().toISOString() };
+          latest.worktree.headCommit = currentHead(latest.worktree.path);
+          latest.worktree.integration = { phase: 'ready', sourceCommit: latest.worktree.headCommit, updatedAt: new Date().toISOString() };
         } catch (error: any) {
-          result.error = `Could not create the task delivery commit: ${error?.message || error}`;
+          result.error = `Could not inspect the task worktree: ${error?.message || error}`;
           result.exitCode = 1;
           isSuccess = false;
         }
@@ -738,7 +738,7 @@ export class AsyncDispatcher {
   /** Describe an enabled best-effort execution cap. */
   private describeConcurrencyBlocked(targetAgent: string): string {
     const policy = concurrencyPolicy();
-    const owners = this.executionRegistry.listOwners();
+    const owners = this.executionRegistry.listAgentOwners();
     if (owners.length >= policy.maxConcurrentTasks) {
       return (
         `Queued: active execution limit reached (${owners.length}/${policy.maxConcurrentTasks}); ` +

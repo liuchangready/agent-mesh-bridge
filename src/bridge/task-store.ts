@@ -534,6 +534,7 @@ export class TaskStore extends EventEmitter {
    * Upsert a task thread.
    */
   public upsertTask(thread: DelegationThread): void {
+    const incomingMergeRevision = thread.mergeControl?.revision || 0;
     if (!thread.workspace?.id || !thread.workspace.executionPath ||
         (thread.worktree && thread.workspace.executionPath !== thread.worktree.path)) {
       throw new Error('Task requires a valid workspace binding matching its worktree');
@@ -576,6 +577,17 @@ export class TaskStore extends EventEmitter {
         }
       }
       for (const prior of authority) preferBinding(thread, prior);
+      const mergeEvents = new Map<string, NonNullable<DelegationThread['mergeHistory']>[number]>();
+      for (const source of [onDisk, inMemory, thread]) {
+        for (const event of source?.mergeHistory || []) if (!mergeEvents.has(event.id)) mergeEvents.set(event.id, event);
+      }
+      if (mergeEvents.size) thread.mergeHistory = [...mergeEvents.values()].sort((a, b) => a.number - b.number || a.at.localeCompare(b.at));
+      for (const prior of authority) {
+        if (prior.mergeControl && (!thread.mergeControl || prior.mergeControl.revision > thread.mergeControl.revision)) {
+          thread.mergeControl = structuredClone(prior.mergeControl);
+          thread.status = prior.status;
+        }
+      }
       thread.nativeSessionCompaction = mergeNativeCursors(
         mergeNativeCursors(inMemory?.nativeSessionCompaction, onDisk?.nativeSessionCompaction, {
           developer: thread.receiverSessionId,
@@ -652,7 +664,12 @@ export class TaskStore extends EventEmitter {
         }
         if (priorPhase === 'merged') thread.status = 'completed';
         else if (priorAt > nextAt) thread.status = prior.status;
+        const superseded = [...new Set([...(prior.worktree.supersededMergeResolutionPaths || []), ...(thread.worktree.supersededMergeResolutionPaths || [])])];
+        if (superseded.length) thread.worktree.supersededMergeResolutionPaths = superseded;
       }
+      const newestControl = authoritative.filter((entry) => (entry.mergeControl?.revision || 0) > incomingMergeRevision)
+        .sort((a, b) => (b.mergeControl?.revision || 0) - (a.mergeControl?.revision || 0))[0];
+      if (newestControl?.mergeControl) { thread.mergeControl = structuredClone(newestControl.mergeControl); thread.status = newestControl.status; }
       const highestKnown = Math.max(
         onDisk?.currentRound || 0,
         inMemory?.currentRound || 0,
@@ -820,6 +837,8 @@ export class TaskStore extends EventEmitter {
             t.status === 'reworking' ||
             t.status === 'queued' ||
             t.status === 'waiting_merge' ||
+            t.status === 'wait_decision' ||
+            t.status === 'merge_failed' ||
             t.status === 'paused',
         );
       } else {

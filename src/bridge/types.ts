@@ -31,11 +31,19 @@ export type ThreadStatus =
   | 'running'
   | 'waiting_review'
   | 'waiting_merge'
+  | 'wait_decision'
+  | 'merge_failed'
   | 'reworking'
   | 'paused'
   | 'review_failed'
   | 'completed'
   | 'failed';
+
+/** States in which a completed developer round can be reviewed. */
+export function isReviewerWakeEligible(thread: DelegationThread): boolean {
+  return thread.status === 'waiting_review' ||
+    (thread.status === 'waiting_merge' && ['blocked', 'conflict', 'validation_failed'].includes(thread.worktree?.integration?.phase || ''));
+}
 
 /**
  * Why a task/round stopped executing before it could finish normally.
@@ -548,6 +556,11 @@ export interface WorktreeInfo {
   taskBranch?: string;
   headCommit?: string;
   approvedCommit?: string;
+  approvedSnapshot?: { commit: string; tree: string; sourceCommit: string };
+  mergeResolutionPath?: string;
+  mergeResolutionSubmitted?: boolean;
+  mergeResolutionSourceCommit?: string;
+  supersededMergeResolutionPaths?: string[];
   integration?: {
     phase: 'ready' | 'no_changes' | 'waiting' | 'merging' | 'conflict' | 'validation_failed' | 'blocked' | 'merged';
     sourceCommit?: string;
@@ -674,6 +687,11 @@ export interface DelegationThread {
   currentRound: number; // Current round (1: initial, 2+: rework)
   createdAt: string; // ISO8601 creation timestamp
   updatedAt: string; // ISO8601 update timestamp
+  mergeHistory?: Array<{ id: string; number: number; at: string; phase: string; result: string; error?: string; logPath?: string;
+    targetRef?: string; targetOldCommit?: string; targetCommit?: string; sourceCommit?: string; candidateCommit?: string; candidateTree?: string; conflictFiles?: string[];
+    mergedCommit?: string; changedFiles?: string[]; decisionId?: string; question?: string; background?: string; suggestion?: string;
+    answer?: string; fingerprint?: string; retryGeneration?: number; consecutiveRetries?: number; errorCode?: string; exitCode?: number; attemptId?: string; logNumber?: number; logFileNumber?: number; assessment?: ResponseAssessment; interruption?: TaskInterruption }>;
+  mergeControl?: { revision: number; retryGeneration: number; failureFingerprint?: string; consecutiveRetries: number; pendingDecisionId?: string };
 
   // Native session bindings for continuous rework resume
   receiverSessionId: string; // Native session ID for target agent
@@ -984,7 +1002,7 @@ export interface ApproveTaskParams {
 
 export interface ApproveResult {
   threadId: string;
-  status: 'WAITING_MERGE' | 'COMPLETED';
+  status: 'WAITING_MERGE' | 'MERGE_FAILED' | 'COMPLETED';
   message: string;
 }
 

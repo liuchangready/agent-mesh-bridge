@@ -196,32 +196,32 @@
         },
         {
           "command": "agent-mesh-bridge.printRecentLogs",
-          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != merge_failed",
           "group": "inline"
         },
         {
           "command": "agent-mesh-bridge.approveTask",
-          "when": "view == agent-mesh-bridge.active-tasks",
+          "when": "view == agent-mesh-bridge.active-tasks && viewItem != merge_failed && viewItem != wait_decision",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.requestRework",
-          "when": "view == agent-mesh-bridge.active-tasks",
+          "when": "view == agent-mesh-bridge.active-tasks && viewItem != merge_failed && viewItem != wait_decision",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.resumeTask",
-          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != merge_failed && viewItem != wait_decision",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.pauseTask",
-          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != merge_failed && viewItem != wait_decision",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.retargetTask",
-          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != merge_failed && viewItem != wait_decision",
           "group": "1_actions"
         },
         {
@@ -231,7 +231,7 @@
         },
         {
           "command": "agent-mesh-bridge.deleteTaskForce",
-          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != merge_failed",
           "group": "1_actions"
         },
         {

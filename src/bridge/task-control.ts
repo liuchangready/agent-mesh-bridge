@@ -17,6 +17,7 @@ import { gitOutput } from './git-worktree';
 import { MeshFileLock } from './merge-coordinator';
 import { TaskRoleLock } from './task-role-lock';
 import { killPidTree } from './platform';
+import { taskValidationDir } from './round-log';
 import {
   DelegationRound,
   DelegationThread,
@@ -103,6 +104,9 @@ export class TaskControlService {
           `Use re-review / rework / retry instead.`,
       );
     }
+    if (thread.status === 'merge_failed' || thread.status === 'wait_decision') {
+      throw new Error(`Cannot pause task ${threadId} while it is ${thread.status}.`);
+    }
 
     const normalizedReason = (reason || '').trim() || 'Paused by user';
     const now = new Date().toISOString();
@@ -145,6 +149,10 @@ export class TaskControlService {
     this.cancellationRegistry.request(threadId, 'pause', normalizedReason, by);
     this.runner?.cancelThread(threadId, 'pause', normalizedReason, by);
     this.executionRegistry.killOrphanChild(threadId, true);
+    if (pausingMerge) {
+      const reviewerChild = new TaskRoleLock(this.storageDir).getOwner(threadId)?.childPid;
+      if (reviewerChild && reviewerChild !== process.pid) { try { killPidTree(reviewerChild); } catch {} }
+    }
 
     return {
       threadId,
@@ -224,6 +232,7 @@ export class TaskControlService {
       if (reviewerChild) { try { killPidTree(reviewerChild); } catch {} }
       thread.status = 'paused';
       thread.updatedAt = new Date().toISOString();
+      appendInterruption(thread, { kind: 'deleted', reason: normalizedReason, at: thread.updatedAt, by });
       thread.summary.lastOutputSnippet = `Deleting: ${normalizedReason}`;
       try { this.taskStore.upsertTask(thread); }
       catch (error) { throw new Error(`Could not persist deletion intent for ${threadId}: ${(error as Error).message}`, { cause: error }); }
@@ -243,6 +252,21 @@ export class TaskControlService {
         }
         if (latest && hasUnmergedOutput(latest) && !force) {
           throw new Error(`Refusing to delete task ${threadId}: its approved work has not been integrated locally. Wait for integration or pass force: true to discard the unmerged worktree output.`);
+        }
+        const resolutions = [...new Set([...(latest?.worktree?.supersededMergeResolutionPaths || []), latest?.worktree?.mergeResolutionPath].filter((entry): entry is string => !!entry))];
+        for (const resolution of resolutions) {
+          const resolved = path.resolve(resolution);
+          const roots = [path.resolve(this.storageDir, 'merge-worktrees')];
+          if (latest?.artifactDir) roots.push(path.resolve(taskValidationDir(latest.artifactDir)));
+          if (!roots.includes(path.dirname(resolved)) || !path.basename(resolved).startsWith(`${threadId}-`)) {
+            throw new Error(`Refusing to remove an unexpected merge resolution path: ${resolved}`);
+          }
+          const repo = latest!.worktree!.repositoryPath || latest!.worktree!.mainPath;
+          const normalized = (value: string) => process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value);
+          const registered = gitOutput(repo, ['worktree', 'list', '--porcelain']).split(/\r?\n/)
+            .some((line) => line.startsWith('worktree ') && normalized(line.slice(9)) === normalized(resolved));
+          if (registered) gitOutput(repo, ['worktree', 'remove', '--force', resolved]);
+          if (fs.existsSync(resolved)) throw new Error(`Could not remove merge resolution workspace ${resolved}.`);
         }
         this.appendTombstone(thread, normalizedReason, by, undefined, force);
         this.taskStore.deleteTask(threadId);

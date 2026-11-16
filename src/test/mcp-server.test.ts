@@ -245,7 +245,9 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'workspacePath'));
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'expectedFiles'));
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'allowNoScope'));
-    assert.strictEqual(toolNames.length, 20);
+    assert.ok(toolNames.includes('submit_merge_resolution'));
+    assert.ok(toolNames.includes('get_merge_log'));
+    assert.strictEqual(toolNames.length, 24);
   });
 
   test('list_agent_models reports the receiver and sender defaults separately', async () => {
@@ -541,6 +543,63 @@ describe('MCPServer Protocol Tests', () => {
       await call('get_round_raw_log', { threadId, round: 1, maxBytes: 10_000_000 }),
     );
     assert.ok(clamped.content.length <= 200_000);
+  });
+
+  test('get_merge_log reads bounded pages from the task-owned log', async () => {
+    const threadId = 'thread_merge_log_page'; const now = new Date().toISOString();
+    const logPath = path.join(tempDir, 'merge-logs', threadId, 'merge_log', `${threadId}_merge_1.log`);
+    fs.mkdirSync(path.dirname(logPath), { recursive: true }); fs.writeFileSync(logPath, 'abcdefghij');
+    taskStore.upsertTask({ threadId, title: 'merge log', initiatorAgent: 'codex', targetAgent: 'claude_code',
+      status: 'waiting_merge', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-abcdef12',
+      workspace: testWorkspace(tempDir), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 }, rounds: [],
+      mergeHistory: [{ id: 'one', number: 1, at: now, phase: 'conflict', result: 'failed', logPath }] });
+    const res = await mcpServer.handleRpcMessage({ jsonrpc: '2.0', id: 800, method: 'tools/call',
+      params: { name: 'get_merge_log', arguments: { threadId, number: 1, offset: 2, limit: 4 } } });
+    const page = JSON.parse(res.result.content[0].text);
+    assert.equal(page.content, 'cdef'); assert.equal(page.nextOffset, 6); assert.equal(page.size, 10);
+  });
+
+  test('get_merge_log resolves decision and legacy file numbers but rejects paths outside the task log', async () => {
+    const threadId = 'thread_merge_log_mapping'; const now = new Date().toISOString();
+    const dir = path.join(tempDir, 'merge-logs', threadId, 'merge_log'); fs.mkdirSync(dir, { recursive: true });
+    const logPath = path.join(dir, `${threadId}_merge_2.log`); fs.writeFileSync(logPath, 'abcdefghij');
+    const decisionLog = path.join(dir, `${threadId}_merge_9.log`); fs.writeFileSync(decisionLog, 'decision context');
+    const outside = path.join(tempDir, `${threadId}_merge_2.log`); fs.writeFileSync(outside, 'private');
+    taskStore.upsertTask({ threadId, title: 'merge log', initiatorAgent: 'codex', targetAgent: 'claude_code',
+      status: 'waiting_merge', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-abcdef12',
+      workspace: testWorkspace(tempDir), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 }, rounds: [],
+      mergeHistory: [
+        { id: 'legacy', number: 1, at: now, phase: 'attempt', result: 'started', logPath },
+        { id: 'decision', number: 2, at: now, phase: 'decision', result: 'requested', logPath, logNumber: 1 },
+        { id: 'outside', number: 3, at: now, phase: 'attempt', result: 'started', logPath: outside, logFileNumber: 2 },
+        { id: 'mismatch', number: 4, at: now, phase: 'attempt', result: 'started', logPath, logFileNumber: 1 },
+        { id: 'new', number: 5, at: now, phase: 'attempt', result: 'started', logPath: decisionLog, logFileNumber: 9 },
+      ] });
+    const legacy = await mcpServer.handleToolCall('get_merge_log', { threadId, number: 1, offset: 2, limit: 4 });
+    const decision = await mcpServer.handleToolCall('get_merge_log', { threadId, number: 2, offset: 2, limit: 4 });
+    assert.equal(legacy.content, 'cdef'); assert.equal(decision.content, 'cdef');
+    await assert.rejects(mcpServer.handleToolCall('get_merge_log', { threadId, number: 3 }), /Invalid merge log path/);
+    await assert.rejects(mcpServer.handleToolCall('get_merge_log', { threadId, number: 4 }), /Invalid merge log path/);
+    reworkController.requestMergeDecision(threadId, 'Which fix?', 'background', 'suggestion', [], decisionLog);
+    const question = taskStore.getTask(threadId)!.mergeHistory!.at(-1)!;
+    assert.equal(question.logNumber, 5); assert.equal(question.logFileNumber, 9);
+    const context = await mcpServer.handleToolCall('get_merge_log', { threadId, number: question.number, limit: 8 });
+    assert.equal(context.content, 'decision');
+  });
+
+  test('merge_failed rejects ordinary controls and retry_merge keeps task identity', async () => {
+    const threadId = 'thread_merge_failed_control'; const now = new Date().toISOString();
+    taskStore.upsertTask({ threadId, title: 'merge failure', initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'merge_failed',
+      currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-abcdef12', callerSessionId: 'reviewer-session',
+      workspace: testWorkspace(tempDir), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 }, rounds: [],
+      mergeControl: { revision: 1, retryGeneration: 0, consecutiveRetries: 6, failureFingerprint: 'failure' } });
+    for (const name of ['approve_task', 'request_rework', 'retry_task', 'retarget_task', 'pause_task']) {
+      await assert.rejects(() => mcpServer.handleToolCall(name, { threadId }), /only permits retry_merge or delete_task/);
+    }
+    const result = await mcpServer.handleToolCall('retry_merge', { threadId });
+    assert.equal(result.status, 'waiting_merge');
+    assert.equal(taskStore.getTask(threadId)!.receiverSessionId, 'session-abcdef12');
+    assert.equal(taskStore.getTask(threadId)!.mergeControl!.retryGeneration, 1);
   });
 
   test('get_task_token_usage reports task rollup and single-round detail', async () => {

@@ -29,7 +29,7 @@ import {
   readTextFilePaged,
   roundExecutionLogPath,
 } from './round-log';
-import { commitTaskChanges, changedFiles, currentHead } from './git-worktree';
+import { changedFiles, currentHead } from './git-worktree';
 
 /** `get_recent_logs` reads a bounded tail, not a whole multi-megabyte log. */
 const RECENT_LOG_EXCERPT_BYTES = 512 * 1024;
@@ -279,7 +279,7 @@ export class TaskSupervisor extends EventEmitter {
 
       if (isReviewerBootstrapPending(thread)) continue;
       if (policy.enabled) {
-        const owners = this.executionRegistry.listOwners();
+        const owners = this.executionRegistry.listAgentOwners();
         const agentSlots = owners.filter((owner) => owner.agent === thread.targetAgent).length;
         if (owners.length >= policy.maxConcurrentTasks || agentSlots >= policy.maxConcurrentPerAgent) {
           this.markQueued(thread, undefined, this.describeConcurrencyBlocked(thread.targetAgent, policy));
@@ -300,7 +300,7 @@ export class TaskSupervisor extends EventEmitter {
   }
 
   private describeConcurrencyBlocked(targetAgent: string, policy: ConcurrencyPolicy): string {
-    const owners = this.executionRegistry.listOwners();
+    const owners = this.executionRegistry.listAgentOwners();
     const sameAgent = owners.filter((owner) => owner.agent === targetAgent).length;
     if (owners.length >= policy.maxConcurrentTasks) {
       return `Queued: active execution limit reached (${owners.length}/${policy.maxConcurrentTasks}); waiting for a free execution record.`;
@@ -411,7 +411,7 @@ export class TaskSupervisor extends EventEmitter {
 
     const gatePolicy = concurrencyPolicy();
     if (gatePolicy.enabled) {
-      const owners = this.executionRegistry.listOwners();
+      const owners = this.executionRegistry.listAgentOwners();
       const agentSlots = owners.filter((owner) => owner.agent === fresh.targetAgent).length;
       if (owners.length >= gatePolicy.maxConcurrentTasks || agentSlots >= gatePolicy.maxConcurrentPerAgent) {
         roleLock.release(roleLease);
@@ -594,10 +594,10 @@ export class TaskSupervisor extends EventEmitter {
       let isSuccess = !interruption && !pausedByControl && responseOk;
       if (isSuccess && isIsolatedTaskWorktree(currentThread.worktree)) {
         try {
-          currentThread.worktree.headCommit = commitTaskChanges(currentThread.worktree, `Agent work ${currentThread.threadId} round ${roundNumber}`);
-          currentThread.worktree.integration = { phase: currentThread.worktree.headCommit === currentThread.worktree.baseCommit ? 'no_changes' : 'ready', sourceCommit: currentThread.worktree.headCommit, updatedAt: new Date().toISOString() };
+          currentThread.worktree.headCommit = currentHead(currentThread.worktree.path);
+          currentThread.worktree.integration = { phase: 'ready', sourceCommit: currentThread.worktree.headCommit, updatedAt: new Date().toISOString() };
         } catch (error: any) {
-          result.error = `Could not create the task delivery commit: ${error?.message || error}`;
+          result.error = `Could not inspect the task worktree: ${error?.message || error}`;
           result.exitCode = 1;
           isSuccess = false;
         }
