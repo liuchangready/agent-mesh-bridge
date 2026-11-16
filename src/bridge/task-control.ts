@@ -149,6 +149,10 @@ export class TaskControlService {
     this.cancellationRegistry.request(threadId, 'pause', normalizedReason, by);
     this.runner?.cancelThread(threadId, 'pause', normalizedReason, by);
     this.executionRegistry.killOrphanChild(threadId, true);
+    if (pausingMerge) {
+      const reviewerChild = new TaskRoleLock(this.storageDir).getOwner(threadId)?.childPid;
+      if (reviewerChild && reviewerChild !== process.pid) { try { killPidTree(reviewerChild); } catch {} }
+    }
 
     return {
       threadId,

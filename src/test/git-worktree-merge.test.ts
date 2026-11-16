@@ -1140,6 +1140,76 @@ test('pause stops combined validation and forced delete waits for it before clea
   assert.equal(gitOutput(repository, ['rev-parse', target.targetRef]), target.baseCommit);
 });
 
+test('pause and delete terminate a running Git process tree and record cancelled merge attempts', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-cancel-long-git-'));
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger');
+  initRepo(repository); const target = resolveGitRepository(repository, storage); const store = new TaskStore(storage);
+  const lock = new MeshFileLock(path.join(root, 'merge.lock')); let wakes = 0;
+  const coordinator = new MergeCoordinator(store, storage, lock, () => { wakes++; });
+  const control = new TaskControlService(store, undefined, undefined, storage, undefined, lock);
+  const childProcess = require('child_process') as typeof import('child_process');
+  const originalSpawn = childProcess.spawn; const pids: number[] = [];
+  const helper = path.join(root, 'hold-git.js'); const signal = path.join(root, 'git-running.json');
+  fs.writeFileSync(helper, `const cp=require('child_process'),fs=require('fs'); const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}); fs.writeFileSync(process.env.MESH_GIT_HOLD_SIGNAL,JSON.stringify({pid:process.pid,child:child.pid})); setInterval(()=>{},1000);`);
+  t.after(() => { (childProcess as any).spawn = originalSpawn; delete process.env.MESH_GIT_HOLD_SIGNAL; store.dispose();
+    for (const pid of pids) try { process.kill(pid, 'SIGKILL'); } catch {}
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); });
+  for (const action of ['pause', 'delete'] as const) {
+    const id = `thread_git_${action}`; const source = createTaskWorktree(target, id, storage);
+    fs.writeFileSync(path.join(source.path, 'shared.txt'), `A ${action}\nmiddle\nbeta\n`);
+    source.headCommit = commitTaskChanges(source, action); store.upsertTask(thread(id, source));
+    let cancelled = false; store.on('changed', (tasks: DelegationThread[]) => {
+      if (tasks.find((item) => item.threadId === id)?.mergeHistory?.some((entry) => entry.result === 'cancelled')) cancelled = true;
+    });
+    process.env.MESH_GIT_HOLD_SIGNAL = signal; try { fs.unlinkSync(signal); } catch {}
+    let intercepted = false;
+    (childProcess as any).spawn = (command: string, args: string[], options: any) => {
+      if (!intercepted && command === gitExe) {
+        intercepted = true;
+        return originalSpawn(command, ['-c', `alias.meshhold=!node "${helper.replace(/\\/g, '/')}"`, 'meshhold'], options);
+      }
+      return originalSpawn(command, args, options);
+    };
+    const merge = coordinator.mergeApproved(id); await waitFor(signal, 600);
+    const held = JSON.parse(fs.readFileSync(signal, 'utf8')) as { pid: number; child: number };
+    const gitPid = new TaskExecutionRegistry(storage).getOwner(id)!.childPid!; pids.push(gitPid, held.pid, held.child);
+    const deletion = action === 'delete' ? control.deleteTask(id, 'discard', 'test', true) : undefined;
+    if (action === 'pause') control.pauseTask(id, 'pause', 'test');
+    assert.equal((await merge).status, 'stale');
+    if (deletion) await deletion;
+    for (const pid of [gitPid, held.pid, held.child]) await waitForProcessExit(pid);
+    assert.equal(cancelled, true); assert.equal(wakes, 0);
+    if (action === 'pause') {
+      const saved = store.getTask(id)!; assert.equal(saved.status, 'paused');
+      assert.equal(saved.mergeControl?.consecutiveRetries, undefined);
+      assert.match(fs.readFileSync(saved.mergeHistory!.find((entry) => entry.phase === 'attempt')!.logPath!, 'utf8'), /\[cancelled\]/);
+    } else assert.equal(store.getTask(id), undefined);
+    assert.equal(git(repository, 'rev-parse', target.targetRef), target.baseCommit);
+    (childProcess as any).spawn = originalSpawn;
+  }
+});
+
+test('a merge waiting for a reviewer cannot resume after a rapid pause and resume', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-pause-merge-waiter-'));
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const target = resolveGitRepository(repository, storage); const source = createTaskWorktree(target, 'thread_waiter_pause', storage);
+  fs.writeFileSync(path.join(source.path, 'shared.txt'), 'A waiter\nmiddle\nbeta\n'); source.headCommit = commitTaskChanges(source, 'candidate');
+  const store = new TaskStore(storage); const detector = new AgentDetector(); const runner = new AutonomousRunner(detector);
+  const controller = new ReworkController(store, runner, new CallbackManager(detector, storage), detector);
+  const roles = new TaskRoleLock(storage); const role = roles.tryAcquire('thread_waiter_pause', 'reviewer')!;
+  const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));
+  const control = new TaskControlService(store, runner, undefined, storage);
+  t.after(() => { roles.release(role); controller.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); });
+  store.upsertTask(thread('thread_waiter_pause', source));
+  const oldMerge = coordinator.mergeApproved('thread_waiter_pause');
+  control.pauseTask('thread_waiter_pause', 'pause', 'test'); roles.release(role);
+  await controller.resumePausedTask('thread_waiter_pause');
+  assert.equal((await oldMerge).status, 'stale');
+  assert.equal(git(repository, 'rev-parse', target.targetRef), target.baseCommit);
+  assert.equal(store.getTask('thread_waiter_pause')!.status, 'waiting_merge');
+  assert.equal(store.getTask('thread_waiter_pause')!.mergeHistory, undefined);
+});
+
 test('delete protects running dirty output, force waits and cleans, and clean merged output deletes without force', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-delete-worktree-'));
   const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger');

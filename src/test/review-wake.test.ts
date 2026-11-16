@@ -30,6 +30,7 @@ import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { NativeSessionLock } from '../bridge/native-session-lock';
 import { ReworkController } from '../bridge/rework-controller';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
+import { TaskControlService } from '../bridge/task-control';
 
 describe('Review wake failure policy', () => {
   const now = Date.parse('2026-10-23T12:00:00.000Z');
@@ -205,6 +206,56 @@ describe('CallbackManager records stalled reviewer wakes', () => {
     const lease = new NativeSessionLock(dir).acquire('codex', sessionId);
     assert.ok(lease); new NativeSessionLock(dir).release(lease!);
     store.dispose();
+  });
+
+  test('pause and resume preserve every merge phase and wake the same dedicated reviewer after shutdown', async () => {
+    for (const phase of ['waiting', 'merging', 'conflict', 'validation_failed', 'blocked'] as const) {
+      const { dir, store, manager } = setup();
+      const detector = new AgentDetector(); const runner = new AutonomousRunner(detector);
+      const controller = new ReworkController(store, runner, manager, detector);
+      const control = new TaskControlService(store, runner, undefined, dir);
+      const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1'; const workspace = dirWorkspace();
+      fs.mkdirSync(workspace, { recursive: true });
+      const thread = makeThread({ threadId: `thread_resume_${phase}`, status: 'waiting_merge', reviewFlow: 'dedicated',
+        reviewBootstrap: { phase: 'confirmed', attempts: 1 }, reviewerSessionId: sessionId, reviewerSessionCaptured: true,
+        callerSessionId: sessionId, reviewerModel: 'test-model', mergeControl: { revision: 2, retryGeneration: 1, consecutiveRetries: 3, failureFingerprint: 'old' },
+        mergeHistory: [{ id: 'prior', number: 1, at: new Date().toISOString(), phase: 'conflict', result: 'failed' }],
+        worktree: { path: workspace, mainPath: workspace, approvedCommit: 'candidate', approvedSnapshot: { commit: 'candidate', tree: 'tree', sourceCommit: 'source' },
+          mergeResolutionPath: workspace, integration: { phase, error: 'preserve', updatedAt: new Date().toISOString() } } });
+      store.upsertTask(thread);
+      let launches = 0; let oldChildExited = phase !== 'conflict';
+      (manager as any).launchCaller = (...args: any[]) => {
+        assert.equal(oldChildExited, true); assert.equal(args[1], sessionId);
+        assert.equal(new TaskRoleLock(dir).getOwner(thread.threadId)?.role, 'reviewer');
+        launches++; args[6](process.pid); args[6](undefined); args[5](); return true;
+      };
+      if (phase === 'conflict') {
+        const roles = new TaskRoleLock(dir); const role = roles.tryAcquire(thread.threadId, 'reviewer', sessionId)!;
+        const native = new NativeSessionLock(dir); const lease = native.acquire('codex', sessionId)!;
+        const registry = new TaskExecutionRegistry(dir); const registration = registry.begin(thread.threadId, 1, 'merge-reviewer', workspace, 'reviewer');
+        const child = childProcess.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+        roles.attachChild(role, child.pid); native.attachChild(lease, child.pid); registry.attachChildPid(child.pid, registration);
+        child.once('close', () => setTimeout(() => { oldChildExited = true; registry.end(registration); native.release(lease); roles.release(role); }, 150));
+      }
+      control.pauseTask(thread.threadId, 'pause merge', 'test');
+      assert.ok(new CancellationRegistry(dir).peek(thread.threadId));
+      await controller.resumePausedTask(thread.threadId);
+      assert.equal(oldChildExited, true);
+      const needsReview = phase === 'conflict' || phase === 'validation_failed' || phase === 'blocked';
+      for (let n = 0; n < 100 && needsReview && !launches; n++) await new Promise((resolve) => setTimeout(resolve, 10));
+      const saved = store.getTask(thread.threadId)!;
+      assert.equal(new CancellationRegistry(dir).peek(thread.threadId), undefined);
+      assert.equal(saved.status, 'waiting_merge'); assert.equal(saved.interruption, undefined);
+      assert.equal(saved.interruptions?.at(-1)?.kind, 'paused'); assert.equal(JSON.stringify(saved.rounds), JSON.stringify(thread.rounds));
+      assert.equal(saved.worktree?.integration?.phase, phase); assert.deepEqual(saved.worktree?.approvedSnapshot, thread.worktree?.approvedSnapshot);
+      assert.equal(saved.worktree?.mergeResolutionPath, workspace); assert.deepEqual(saved.mergeControl, thread.mergeControl);
+      assert.deepEqual(saved.mergeHistory?.find((entry) => entry.id === 'prior'), thread.mergeHistory?.[0]);
+      assert.equal(saved.receiverSessionId, thread.receiverSessionId); assert.equal(saved.reviewerSessionId, sessionId);
+      assert.equal(launches, needsReview ? 1 : 0);
+      assert.equal(new TaskRoleLock(dir).getOwner(thread.threadId), undefined);
+      assert.equal(new TaskExecutionRegistry(dir).getOwner(thread.threadId), undefined);
+      controller.dispose(); store.dispose();
+    }
   });
 
   test('merge decision handoff releases reviewer resources and answers resume the same native session', async () => {

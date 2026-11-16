@@ -41,6 +41,8 @@ import { currentHead, changedFiles, snapshotTaskWorktree, gitOutput } from './gi
 import { MergeCoordinator, MergeResult } from './merge-coordinator';
 import { assertCanExecute } from './agent-capabilities';
 import { noteMergeFailure, resetMergeBudget } from './merge-recovery';
+import { NativeSessionLock } from './native-session-lock';
+import { CancellationRegistry } from './cancellation-registry';
 
 export class ReworkController {
   private taskStore: TaskStore;
@@ -471,14 +473,55 @@ export class ReworkController {
     if (thread.status !== 'paused') {
       throw new Error(`Cannot resume ${threadId}: task is ${thread.status}, not paused.`);
     }
-    if (thread.worktree?.approvedCommit && thread.worktree.integration?.phase === 'waiting') {
+    if ((thread.worktree?.approvedCommit || thread.worktree?.mergePending) &&
+        ['waiting', 'merging', 'conflict', 'validation_failed', 'blocked'].includes(thread.worktree?.integration?.phase || '') &&
+        [...thread.rounds].reverse().find((round) => round.type !== 'approval')?.status !== 'paused') {
       if (this.retargetService.hasOverride(overrides)) {
         throw new Error(`Cannot change the executor while resuming approved integration for ${threadId}.`);
       }
-      thread.status = 'waiting_merge';
-      thread.updatedAt = new Date().toISOString();
-      this.taskStore.upsertTask(thread);
-      return [...thread.rounds].reverse().find((round) => round.type !== 'approval') || thread.rounds[thread.rounds.length - 1];
+      const roles = new TaskRoleLock(this.storageDir);
+      const nativeLock = new NativeSessionLock(this.storageDir);
+      const sessionId = thread.reviewFlow === 'dedicated' ? thread.reviewerSessionId : thread.callerSessionId;
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        if (this.executionRegistry.getOwner(threadId) || this.mergeWorkers.has(threadId)) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          continue;
+        }
+        const role = roles.tryAcquire(threadId, 'reviewer', thread.reviewFlow === 'dedicated' ? sessionId : undefined);
+        if (!role) { await new Promise((resolve) => setTimeout(resolve, 100)); continue; }
+        let lease: ReturnType<NativeSessionLock['acquire']>;
+        try { lease = isValidSessionId(sessionId) ? nativeLock.acquire(thread.initiatorAgent, sessionId!) : undefined; }
+        catch (error) { roles.release(role); throw error; }
+        if (isValidSessionId(sessionId) && !lease) {
+          roles.release(role);
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          continue;
+        }
+        try {
+          this.taskStore.loadFromDisk();
+          const latest = this.taskStore.getTask(threadId);
+          if (!latest || latest.status !== 'paused') throw new Error(`Cannot resume ${threadId}: task changed while stopping.`);
+          this.runner.clearPendingCancellation(threadId);
+          const cancellations = new CancellationRegistry(this.storageDir);
+          cancellations.clear(threadId);
+          if (cancellations.peek(threadId)) throw new Error(`Cannot resume ${threadId}: the cancellation request could not be cleared.`);
+          latest.interruption = undefined;
+          latest.status = 'waiting_merge';
+          latest.updatedAt = new Date().toISOString();
+          this.taskStore.upsertTask(latest);
+          thread = latest;
+        } finally {
+          try { if (lease) nativeLock.release(lease); }
+          finally { roles.release(role); }
+        }
+        const round = [...thread.rounds].reverse().find((entry) => entry.type !== 'approval') || thread.rounds[thread.rounds.length - 1];
+        if (round && ['conflict', 'validation_failed', 'blocked'].includes(thread.worktree?.integration?.phase || '')) {
+          setTimeout(() => { void this.callbackManager.notifyCaller(thread!, round); }, 0).unref();
+        }
+        return round;
+      }
+      throw new Error(`Task ${threadId} is still stopping; its cancellation and paused state were retained.`);
     }
     let pausedRound =
       [...thread.rounds].reverse().find((round) => round.status === 'paused') ||

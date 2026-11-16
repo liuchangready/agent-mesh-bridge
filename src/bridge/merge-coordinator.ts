@@ -527,15 +527,19 @@ export class MergeCoordinator {
     const repoPath = worktree.deliveryTarget?.repositoryPath || worktree.repositoryPath || worktree.mainPath;
     const targetRef = worktree.deliveryTarget?.ref || worktree.targetRef!;
     const sourceCommit = worktree.approvedCommit!;
-    await this.waitForReviewerExit(thread, sourceCommit);
-    if (!this.isMergeStillAllowed(threadId, sourceCommit)) return { status: 'stale', message: 'Task was paused or deleted before integration started.' };
+    const interruptionCount = thread.interruptions?.length || 0;
+    const stillCurrent = () => this.isMergeStillAllowed(threadId, sourceCommit) &&
+      (this.store.getTask(threadId)?.interruptions?.length || 0) === interruptionCount;
+    await this.waitForReviewerExit(thread, stillCurrent);
+    if (!stillCurrent()) return { status: 'stale', message: 'Task was paused or deleted before integration started.' };
     const mergeRole = new TaskRoleLock(this.storageDir);
     let roleLease = mergeRole.tryAcquire(threadId, 'reviewer', thread.reviewFlow === 'dedicated' ? thread.reviewerSessionId : undefined);
-    while (!roleLease && this.isMergeStillAllowed(threadId, sourceCommit)) {
+    while (!roleLease && stillCurrent()) {
       await sleep(250);
-      roleLease = mergeRole.tryAcquire(threadId, 'reviewer', thread.reviewFlow === 'dedicated' ? thread.reviewerSessionId : undefined);
+      if (stillCurrent()) roleLease = mergeRole.tryAcquire(threadId, 'reviewer', thread.reviewFlow === 'dedicated' ? thread.reviewerSessionId : undefined);
     }
     if (!roleLease) return { status: 'stale', message: 'Task was paused or deleted while waiting for its role.' };
+    if (!stillCurrent()) { mergeRole.release(roleLease); return { status: 'stale', message: 'Task was paused before acquiring its role.' }; }
     let release: (() => void) | undefined;
     try { release = await this.lock.acquire(undefined, () => !this.isMergeStillAllowed(threadId, sourceCommit)); }
     catch (error) { mergeRole.release(roleLease); throw error; }
@@ -911,10 +915,10 @@ export class MergeCoordinator {
     }
   }
 
-  private async waitForReviewerExit(thread: DelegationThread, sourceCommit: string): Promise<void> {
+  private async waitForReviewerExit(thread: DelegationThread, stillCurrent: () => boolean): Promise<void> {
     const roles = new TaskRoleLock(this.storageDir);
     while (true) {
-      if (!this.isMergeStillAllowed(thread.threadId, sourceCommit)) return;
+      if (!stillCurrent()) return;
       const owner = roles.getOwner(thread.threadId);
       if (!owner || owner.role !== 'reviewer') return;
       try { process.kill(owner.childPid || owner.pid, 0); } catch { return; }
