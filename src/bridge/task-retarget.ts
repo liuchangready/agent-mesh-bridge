@@ -80,6 +80,7 @@ export class TaskRetargetService {
           `Pause the task first, switch, then resume.`,
       );
     }
+    if (thread.status === 'merge_failed' || thread.status === 'wait_decision') throw new Error(`Cannot change the executor while task is ${thread.status}.`);
     if (thread.status === 'completed') {
       throw new Error(
         `Cannot switch the executor of ${params.threadId}: the task is already completed. ` +
@@ -125,7 +126,7 @@ export class TaskRetargetService {
       .filter((round) => round.round === fresh.currentRound)
       .slice(-1)[0];
     if (
-      fresh.archivedAt || fresh.status === 'completed' || findInFlightRound(fresh) ||
+      fresh.archivedAt || fresh.status === 'completed' || fresh.status === 'merge_failed' || fresh.status === 'wait_decision' || findInFlightRound(fresh) ||
       fresh.status !== initialStatus || fresh.currentRound !== initialCurrentRound ||
       fresh.targetAgent !== initialTargetAgent || fresh.targetModel !== initialTargetModel ||
       fresh.receiverSessionId !== initialReceiverSessionId ||

@@ -80,6 +80,8 @@ const CONTROL_TOOLS = new Set([
   'delete_task',
   'record_merge_request',
   'submit_merge_resolution',
+  'request_merge_decision',
+  'retry_merge',
 ]);
 
 
@@ -536,6 +538,16 @@ export class MCPServer {
         },
       },
       {
+        name: 'request_merge_decision',
+        description: 'Ask the user to decide a merge issue and end the reviewer turn.',
+        inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, question: { type: 'string' }, background: { type: 'string' }, suggestion: { type: 'string' }, conflictFiles: { type: 'array', items: { type: 'string' } }, logPath: { type: 'string' } }, required: ['threadId', 'question'] },
+      },
+      {
+        name: 'retry_merge',
+        description: 'Restart a merge_failed task with a fresh retry budget and its existing snapshot and session.',
+        inputSchema: { type: 'object', properties: { threadId: { type: 'string' } }, required: ['threadId'] },
+      },
+      {
         name: 'get_merge_log',
         description: 'Read a bounded page of a recorded merge log.',
         inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, number: { type: 'integer' }, offset: { type: 'integer' }, limit: { type: 'integer' } }, required: ['threadId', 'number'] },
@@ -753,8 +765,12 @@ export class MCPServer {
               enum: [
                 'all',
                 'active',
+                'queued',
                 'running',
                 'waiting_review',
+                'waiting_merge',
+                'wait_decision',
+                'merge_failed',
                 'review_failed',
                 'reworking',
                 'paused',
@@ -1238,6 +1254,11 @@ export class MCPServer {
   /** Execute a tool call and return result object. */
   public async handleToolCall(name: string, args: any): Promise<any> {
     this.assertReceiverMayCall(name, args);
+    const controlledTask = typeof args?.threadId === 'string' ? this.taskStore.getTask(args.threadId) : undefined;
+    if (controlledTask?.status === 'merge_failed' && name !== 'retry_merge' && name !== 'delete_task' &&
+        (CONTROL_TOOLS.has(name) || name === 'request_rework' || name === 'approve_task')) {
+      throw new Error('A merge_failed task only permits retry_merge or delete_task.');
+    }
     switch (name) {
       case 'dispatch_task':
       {
@@ -1325,6 +1346,13 @@ export class MCPServer {
         new TaskRoleLock().releaseIfRole(args.threadId, 'reviewer');
         return result;
       }
+
+      case 'request_merge_decision': {
+        this.assertActiveReviewerRole(args.threadId);
+        return this.reworkController.requestMergeDecision(args.threadId, args.question, args.background, args.suggestion, args.conflictFiles, args.logPath);
+      }
+
+      case 'retry_merge': return this.reworkController.retryMerge(args.threadId);
 
       case 'get_merge_log': {
         const thread = this.taskStore.getTask(args.threadId);

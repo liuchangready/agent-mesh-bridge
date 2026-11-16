@@ -40,6 +40,7 @@ import { readStoredRoundUsage } from './token-usage-collector';
 import { currentHead, changedFiles, snapshotTaskWorktree, gitOutput } from './git-worktree';
 import { MergeCoordinator, MergeResult } from './merge-coordinator';
 import { assertCanExecute } from './agent-capabilities';
+import { noteMergeFailure, resetMergeBudget } from './merge-recovery';
 
 export class ReworkController {
   private taskStore: TaskStore;
@@ -144,6 +145,7 @@ export class ReworkController {
     if (thread.status === 'paused') {
       throw new Error(`Cannot request rework: task ${params.threadId} is paused; resume it first.`);
     }
+    if (thread.status === 'merge_failed' || thread.status === 'wait_decision') throw new Error(`Cannot request rework while task is ${thread.status}.`);
     this.assertDedicatedReviewerReady(thread, 'request rework');
     assertCanExecute(params.targetAgent || thread.targetAgent, 'receive rework');
     if (
@@ -652,6 +654,7 @@ export class ReworkController {
   }
 
   private assertReworkStillEligible(thread: DelegationThread, params: RequestReworkParams): void {
+    if (thread.status === 'merge_failed' || thread.status === 'wait_decision') throw new Error(`Cannot request rework while task is ${thread.status}.`);
     if (thread.archivedAt || thread.status === 'completed') {
       throw new Error(`Cannot request rework: task ${thread.threadId} became completed or archived during retarget.`);
     }
@@ -755,6 +758,7 @@ export class ReworkController {
         message: `Task ${thread.threadId} is already approved and archived; nothing to do.`,
       };
     }
+    if (thread.status === 'merge_failed' || thread.status === 'wait_decision') throw new Error(`Cannot approve while task is ${thread.status}.`);
 
     const nowIso = new Date().toISOString();
     let status: ApproveResult['status'] = 'COMPLETED';
@@ -764,6 +768,7 @@ export class ReworkController {
       try {
         snapshot = snapshotTaskWorktree(worktree);
         gitOutput(worktree.path, ['update-ref', `refs/mesh/candidates/${thread.threadId}`, snapshot.commit]);
+        if (worktree.approvedCommit !== snapshot.commit && thread.mergeControl) resetMergeBudget(thread);
         if (worktree.approvedCommit !== snapshot.commit && worktree.mergeResolutionPath) {
           worktree.supersededMergeResolutionPaths = [...new Set([...(worktree.supersededMergeResolutionPaths || []), worktree.mergeResolutionPath])];
           worktree.mergeResolutionPath = undefined;
@@ -772,24 +777,28 @@ export class ReworkController {
         }
         worktree.approvedSnapshot = snapshot;
       } catch (error) {
-        const failure = `Could not create approved snapshot: ${String(error)}`;
+        let failure = `Could not create approved snapshot: ${String(error)}`;
         const number = (thread.mergeHistory?.length || 0) + 1;
         const safeId = thread.threadId.replace(/[^A-Za-z0-9_-]/g, '_');
         const dir = path.join(thread.artifactDir || path.join(this.storageDir, 'merge-logs', safeId), 'merge_log');
-        fs.mkdirSync(dir, { recursive: true });
-        const logPath = path.join(dir, `${safeId}_merge_${number}.log`);
-        fs.writeFileSync(logPath, `${failure}\n`, 'utf8');
-        thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number, at: nowIso, phase: 'snapshot', result: 'failed', error: failure, logPath }];
+        let logPath: string | undefined;
+        try {
+          fs.mkdirSync(dir, { recursive: true });
+          logPath = path.join(dir, `${safeId}_merge_${number}.log`);
+          fs.writeFileSync(logPath, `${failure}\n`, 'utf8');
+        } catch (logError) { logPath = undefined; failure += `; could not write merge log: ${String(logError)}`; }
+        thread.status = 'waiting_merge';
+        const budget = noteMergeFailure(thread, 'snapshot', 'SNAPSHOT_FAILED', failure);
+        thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number, at: nowIso, phase: 'snapshot', result: 'failed', error: failure, logPath, ...budget }];
         worktree.approvedCommit = undefined;
         worktree.approvedSnapshot = undefined;
         worktree.mergePending = true;
         worktree.integration = { phase: 'blocked', error: failure, updatedAt: nowIso };
-        thread.status = 'waiting_merge';
         thread.updatedAt = nowIso;
         this.taskStore.upsertTask(thread);
         const reviewRound = [...thread.rounds].reverse().find((round) => round.type !== 'approval');
-        if (reviewRound) setTimeout(() => { void this.callbackManager.notifyCaller(thread, reviewRound); }, 0).unref();
-        return { threadId: thread.threadId, status: 'WAITING_MERGE', message: failure };
+        if (reviewRound && thread.status === 'waiting_merge') setTimeout(() => { void this.callbackManager.notifyCaller(thread, reviewRound); }, 0).unref();
+        return { threadId: thread.threadId, status: budget.consecutiveRetries >= 6 ? 'MERGE_FAILED' : 'WAITING_MERGE', message: failure };
       }
       if (snapshot.tree === gitOutput(worktree.path, ['rev-parse', `${worktree.baseCommit}^{tree}`])) {
         worktree.approvedCommit = undefined;
@@ -845,13 +854,69 @@ export class ReworkController {
     return this.mergeCoordinator.mergeApproved(threadId);
   }
 
+  public requestMergeDecision(threadId: string, question: string, background: string, suggestion: string, conflictFiles: string[] = [], logPath?: string): { threadId: string; status: 'wait_decision'; decisionId: string; nextAction: string; message: string } {
+    const current = this.taskStore.getTask(threadId);
+    if (!current || current.status !== 'waiting_merge' || !question?.trim()) throw new Error('A waiting merge and a non-empty question are required.');
+    const thread = structuredClone(current);
+    const decisionId = crypto.randomUUID(); const at = new Date().toISOString();
+    const files = Array.isArray(conflictFiles) && conflictFiles.length ? conflictFiles : thread.worktree?.integration?.conflictFiles || [];
+    if (logPath && !(thread.mergeHistory || []).some((entry) => entry.logPath === logPath)) throw new Error('Decision log must refer to an existing merge log.');
+    const contextLog = logPath || [...(thread.mergeHistory || [])].reverse().find((entry) => entry.logPath)?.logPath;
+    const contextLogNumber = (thread.mergeHistory || []).find((entry) => entry.logPath === contextLog)?.number;
+    thread.mergeHistory = [...(thread.mergeHistory || []), { id: decisionId, decisionId, number: (thread.mergeHistory?.length || 0) + 1, at,
+      phase: 'decision', result: 'requested', question: question.trim(), background: (background || '').trim(), suggestion: (suggestion || '').trim(), conflictFiles: files, logPath: contextLog, logNumber: contextLogNumber }];
+    const prior = thread.mergeControl;
+    thread.mergeControl = { ...prior, revision: (prior?.revision || 0) + 1, retryGeneration: prior?.retryGeneration || 0,
+      consecutiveRetries: prior?.consecutiveRetries || 0, pendingDecisionId: decisionId };
+    thread.status = 'wait_decision'; thread.updatedAt = at;
+    if (thread.reviewWake) thread.reviewWake.autoRetryAt = undefined;
+    this.taskStore.upsertTask(thread);
+    return { threadId, status: 'wait_decision', decisionId, nextAction: 'END_TURN_AND_WAIT_FOR_USER', message: 'End this reviewer turn; the user decision will wake the same session.' };
+  }
+
+  public submitMergeDecision(threadId: string, answer: string): { threadId: string; status: 'waiting_merge'; decisionId: string } {
+    const current = this.taskStore.getTask(threadId);
+    if (!current || current.status !== 'wait_decision' || !current.mergeControl?.pendingDecisionId || !answer?.trim()) throw new Error('A pending merge decision and a non-empty answer are required.');
+    const thread = structuredClone(current); const decisionId = thread.mergeControl!.pendingDecisionId!; const at = new Date().toISOString();
+    thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), decisionId, number: (thread.mergeHistory?.length || 0) + 1,
+      at, phase: 'decision', result: 'answered', answer: answer.trim() }];
+    thread.mergeControl = { ...thread.mergeControl!, revision: thread.mergeControl!.revision + 1, pendingDecisionId: undefined };
+    thread.status = 'waiting_merge'; thread.updatedAt = at;
+    if (thread.worktree?.integration && thread.worktree.integration.phase === 'waiting') thread.worktree.integration = { ...thread.worktree.integration, phase: 'blocked', updatedAt: at };
+    this.taskStore.upsertTask(thread);
+    const round = [...thread.rounds].reverse().find((entry) => entry.type !== 'approval');
+    if (round) setTimeout(() => { void this.callbackManager.notifyCaller(thread, round); }, 0).unref();
+    return { threadId, status: 'waiting_merge', decisionId };
+  }
+
+  public retryMerge(threadId: string): { threadId: string; status: 'waiting_merge'; retryGeneration: number } {
+    const current = this.taskStore.getTask(threadId);
+    if (!current || current.status !== 'merge_failed') throw new Error('Only a merge_failed task can restart its merge budget.');
+    const thread = structuredClone(current); resetMergeBudget(thread); thread.status = 'waiting_merge';
+    const at = new Date().toISOString(); thread.updatedAt = at;
+    if (thread.worktree?.integration) {
+      const phase = thread.worktree.mergeResolutionSubmitted ? 'waiting' :
+        thread.worktree.integration.phase === 'waiting' ? 'blocked' : thread.worktree.integration.phase;
+      thread.worktree.integration = { ...thread.worktree.integration, phase, updatedAt: at };
+    }
+    thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number: (thread.mergeHistory?.length || 0) + 1,
+      at, phase: 'retry_generation', result: 'started', retryGeneration: thread.mergeControl!.retryGeneration }];
+    if (thread.reviewWake) thread.reviewWake = undefined;
+    this.taskStore.upsertTask(thread);
+    if (!thread.worktree?.mergeResolutionSubmitted) {
+      const round = [...thread.rounds].reverse().find((entry) => entry.type !== 'approval');
+      if (round) setTimeout(() => { void this.callbackManager.notifyCaller(thread, round); }, 0).unref();
+    }
+    return { threadId, status: 'waiting_merge', retryGeneration: thread.mergeControl!.retryGeneration };
+  }
+
   public submitMergeResolution(threadId: string): { threadId: string; status: 'WAITING_MERGE'; message: string } {
     const thread = this.taskStore.getTask(threadId);
     const worktree = thread?.worktree;
-    if (!thread || thread.status !== 'waiting_merge' || !worktree?.approvedSnapshot || !worktree.mergeResolutionPath || !worktree.integration?.targetOldCommit) {
+    if (!thread || thread.status !== 'waiting_merge' || !worktree?.approvedCommit || !worktree.mergeResolutionPath || !worktree.integration?.targetOldCommit) {
       throw new Error('No approved merge resolution workspace is awaiting submission.');
     }
-    if ((worktree.mergeResolutionSourceCommit || worktree.integration.sourceCommit) !== worktree.approvedSnapshot.commit) {
+    if ((worktree.mergeResolutionSourceCommit || worktree.integration.sourceCommit) !== worktree.approvedCommit) {
       throw new Error('The resolution workspace belongs to a different approved candidate.');
     }
     const cwd = worktree.mergeResolutionPath;
@@ -885,8 +950,8 @@ export class ReworkController {
       if (blockedAt) this.blockedMergeRetries.delete(thread.threadId);
       if (this.mergeWorkers.has(thread.threadId)) continue;
       this.mergeWorkers.add(thread.threadId);
-      void this.mergeApproved(thread.threadId).catch((error: any) => {
-        if (this.mergeCoordinator.hasLandedCandidate(thread.threadId)) {
+      void this.mergeApproved(thread.threadId).catch(async (error: any) => {
+        if (await this.mergeCoordinator.hasLandedCandidate(thread.threadId)) {
           const latest = this.taskStore.getTask(thread.threadId);
           if (latest) this.blockedMergeRetries.set(thread.threadId, latest.updatedAt);
           console.error(`[ReworkController] Target ref is updated for ${thread.threadId}, but its durable ledger record still needs recovery: ${error?.message || error}`);
@@ -897,11 +962,14 @@ export class ReworkController {
         latest.status = 'waiting_merge';
         const failure = `Merge coordinator failed: ${error?.message || error}`;
         latest.worktree.integration = { ...latest.worktree.integration, phase: 'blocked', error: failure, updatedAt: new Date().toISOString() };
+        const budget = noteMergeFailure(latest, 'coordinator', 'COORDINATOR_ERROR', failure);
+        latest.mergeHistory = [...(latest.mergeHistory || []), { id: crypto.randomUUID(), number: (latest.mergeHistory?.length || 0) + 1,
+          at: new Date().toISOString(), phase: 'coordinator', result: 'failed', error: failure.slice(-5000), ...budget }];
         latest.summary.lastOutputSnippet = failure;
         try { this.taskStore.upsertTask(latest); }
         catch (persistError: any) { console.error(`[ReworkController] Could not persist merge failure for ${thread.threadId}: ${persistError?.message || persistError}`); }
         const reviewRound = [...(latest.rounds || [])].reverse().find((round) => round.type !== 'approval');
-        if (reviewRound) void this.callbackManager.notifyCaller(latest, reviewRound);
+        if (reviewRound && latest.status === 'waiting_merge') void this.callbackManager.notifyCaller(latest, reviewRound);
       }).finally(() => this.mergeWorkers.delete(thread.threadId));
     }
   }
@@ -949,7 +1017,7 @@ export class ReworkController {
 
     const gatePolicy = concurrencyPolicy();
     if (gatePolicy.enabled) {
-      const owners = this.executionRegistry.listOwners();
+      const owners = this.executionRegistry.listAgentOwners();
       const agentSlots = owners.filter((owner) => owner.agent === thread.targetAgent).length;
       if (owners.length >= gatePolicy.maxConcurrentTasks || agentSlots >= gatePolicy.maxConcurrentPerAgent) {
         roleLock.release(roleLease);
@@ -1169,7 +1237,7 @@ export class ReworkController {
   private isGloballyBusy(excludeThreadId: string, _workspacePath?: string): boolean {
     const policy = concurrencyPolicy();
     if (!policy.enabled) return false;
-    const owners = this.executionRegistry.listOwners().filter((owner) => owner.threadId !== excludeThreadId);
+    const owners = this.executionRegistry.listAgentOwners().filter((owner) => owner.threadId !== excludeThreadId);
     if (owners.length >= policy.maxConcurrentTasks) return true;
     const thread = this.taskStore.getTask(excludeThreadId);
     return owners.filter((owner) => owner.agent === thread?.targetAgent).length >= policy.maxConcurrentPerAgent;
@@ -1181,7 +1249,7 @@ export class ReworkController {
   }
 
   private describeConcurrencyBlocked(targetAgent: string, policy: ReturnType<typeof concurrencyPolicy>): string {
-    const owners = this.executionRegistry.listOwners();
+    const owners = this.executionRegistry.listAgentOwners();
     const sameAgent = owners.filter((owner) => owner.agent === targetAgent).length;
     if (owners.length >= policy.maxConcurrentTasks) {
       return `Queued: active execution limit reached (${owners.length}/${policy.maxConcurrentTasks}); waiting for a free execution record.`;

@@ -285,7 +285,7 @@ export class AsyncDispatcher {
     };
 
     const policy = concurrencyPolicy();
-    const owners = policy.enabled ? this.executionRegistry.listOwners() : [];
+    const owners = policy.enabled ? this.executionRegistry.listAgentOwners() : [];
     const globalSlotFull = policy.enabled && owners.length >= policy.maxConcurrentTasks;
     const agentSlots = policy.enabled ? owners.filter((owner) => owner.agent === targetAgent).length : 0;
     const agentSlotFull = policy.enabled && agentSlots >= policy.maxConcurrentPerAgent;
@@ -493,7 +493,7 @@ export class AsyncDispatcher {
         return;
       }
       if (policy.enabled) {
-        const owners = this.executionRegistry.listOwners();
+        const owners = this.executionRegistry.listAgentOwners();
         const agentSlots = owners.filter((owner) => owner.agent === current.targetAgent).length;
         if (owners.length >= policy.maxConcurrentTasks || agentSlots >= policy.maxConcurrentPerAgent) {
           roleLock.release(roleLease);
@@ -738,7 +738,7 @@ export class AsyncDispatcher {
   /** Describe an enabled best-effort execution cap. */
   private describeConcurrencyBlocked(targetAgent: string): string {
     const policy = concurrencyPolicy();
-    const owners = this.executionRegistry.listOwners();
+    const owners = this.executionRegistry.listAgentOwners();
     if (owners.length >= policy.maxConcurrentTasks) {
       return (
         `Queued: active execution limit reached (${owners.length}/${policy.maxConcurrentTasks}); ` +

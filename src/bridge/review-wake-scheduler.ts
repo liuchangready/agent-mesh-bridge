@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import * as crypto from 'crypto';
 import type { TaskStore } from './task-store';
 import type { CallbackManager } from './callback-manager';
 import {
@@ -19,7 +20,10 @@ import {
   ReviewFailure,
   ReviewWakeState,
   latestCompletedWorkRound,
+  isReviewerWakeEligible,
+  appendInterruption,
 } from './types';
+import { noteMergeFailure } from './merge-recovery';
 import { TaskRoleLock } from './task-role-lock';
 import { callerSessionKey } from './caller-wake-queue';
 
@@ -169,6 +173,25 @@ export class ReviewWakeScheduler extends EventEmitter {
       if (!state) continue;
 
       try {
+        if (thread.status === 'waiting_merge') {
+          if (!state.autoRetryAt || state.gaveUp || Date.parse(state.autoRetryAt) > now) continue;
+          const quota = this.rateLimitOf(thread);
+          const reset = quota?.resetsAt ? Date.parse(quota.resetsAt) : NaN;
+          if (Number.isFinite(reset) && reset > now) {
+            this.persist(thread, planAutoRetry({ ...state, quotaResetsAt: quota!.resetsAt, autoRetryAttempts: 0 }, now));
+            continue;
+          }
+          const round = this.reviewRound(thread);
+          if (!round) continue;
+          const accepted = await Promise.resolve(this.callbackManager.notifyCaller(thread, round));
+          const latest = this.taskStore.getTask(thread.threadId);
+          if (latest?.status === 'waiting_merge' && latest.reviewWake?.lastAttemptAt === state.lastAttemptAt) {
+            latest.reviewWake = { ...state, autoRetryAt: accepted ? undefined : new Date(now + 60_000).toISOString() };
+            this.taskStore.upsertTask(latest);
+          }
+          if (accepted) launched++;
+          continue;
+        }
         // The record only describes the review of one round. After a rework the
         // task briefly returns to `waiting_review` for a NEW round, and the old
         // failure must not leak into it (nor burn its retry budget).
@@ -253,6 +276,28 @@ export class ReviewWakeScheduler extends EventEmitter {
     const stalled: DelegationThread[] = [];
     for (const thread of tasks) {
       try {
+        if (thread.status === 'waiting_merge' && isReviewerWakeEligible(thread)) {
+          if (this.isReviewerActive(thread.threadId)) continue;
+          const history = thread.mergeHistory || [];
+          const started = [...history].reverse().find(event => event.phase === 'reviewer' && event.result === 'started' && event.attemptId);
+          if (!started || history.some(event => event.phase === 'reviewer' && event.attemptId === started.attemptId && event.result !== 'started')) continue;
+          const startedAt = Date.parse(started.at);
+          if (!Number.isFinite(startedAt) || now - startedAt < this.stallTimeoutMs) continue;
+          const reason = 'Reviewer process disappeared before reporting completion';
+          const interruption = { kind: 'watchdog' as const, reason, at: new Date(now).toISOString(), by: 'watchdog' };
+          appendInterruption(thread, interruption);
+          const budget = noteMergeFailure(thread, 'reviewer', 'WATCHDOG', reason);
+          const state = buildReviewWakeState({ round: thread.currentRound || 1, agent: thread.initiatorAgent, kind: 'timeout', error: reason, now });
+          if (budget.consecutiveRetries >= 6) { state.autoRetryAt = undefined; state.gaveUp = true; }
+          thread.reviewWake = state;
+          thread.mergeHistory = [...history, { id: crypto.randomUUID(), attemptId: started.attemptId,
+            number: history.length + 1, at: interruption.at, phase: 'reviewer', result: 'failed', error: reason,
+            errorCode: 'WATCHDOG', interruption, ...budget }];
+          thread.updatedAt = interruption.at;
+          this.taskStore.upsertTask(thread);
+          stalled.push(thread);
+          continue;
+        }
         if (thread.status !== 'waiting_review') continue;
         if (this.isReviewerActive(thread.threadId)) continue;
         const state = thread.reviewWake;
@@ -392,7 +437,7 @@ export class ReviewWakeScheduler extends EventEmitter {
         .getAllTasks()
         .filter(
           (t) =>
-            t.status === 'waiting_review' &&
+            isReviewerWakeEligible(t) &&
             !!t.reviewWake &&
             t.reviewWake.gaveUp !== true &&
             // A review parked on a dependency is not stalled: its wake is

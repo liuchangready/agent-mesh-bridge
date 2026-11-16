@@ -63,6 +63,9 @@ function safeThreadId(threadId: string): string {
 }
 
 export class TaskExecutionRegistry {
+  public listAgentOwners(): TaskExecutionOwner[] {
+    return this.listOwners().filter((owner) => owner.agent !== 'merge-git' && owner.agent !== 'merge-validation' && owner.agent !== 'merge-reviewer');
+  }
   private readonly dir: string;
   private readonly staleAfterMs: number;
   private readonly orphanGraceMs: number;

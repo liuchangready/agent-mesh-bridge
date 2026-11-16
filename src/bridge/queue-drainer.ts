@@ -70,7 +70,7 @@ export class QueueDrainer {
         deferred = true;
         continue;
       }
-      const owners = this.executionRegistry.listOwners();
+      const owners = this.executionRegistry.listAgentOwners();
       const activeByAgent = new Map<string, number>();
       for (const owner of owners) {
         if (owner.agent) activeByAgent.set(owner.agent, (activeByAgent.get(owner.agent) || 0) + 1);

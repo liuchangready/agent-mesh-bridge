@@ -279,7 +279,7 @@ export class TaskSupervisor extends EventEmitter {
 
       if (isReviewerBootstrapPending(thread)) continue;
       if (policy.enabled) {
-        const owners = this.executionRegistry.listOwners();
+        const owners = this.executionRegistry.listAgentOwners();
         const agentSlots = owners.filter((owner) => owner.agent === thread.targetAgent).length;
         if (owners.length >= policy.maxConcurrentTasks || agentSlots >= policy.maxConcurrentPerAgent) {
           this.markQueued(thread, undefined, this.describeConcurrencyBlocked(thread.targetAgent, policy));
@@ -300,7 +300,7 @@ export class TaskSupervisor extends EventEmitter {
   }
 
   private describeConcurrencyBlocked(targetAgent: string, policy: ConcurrencyPolicy): string {
-    const owners = this.executionRegistry.listOwners();
+    const owners = this.executionRegistry.listAgentOwners();
     const sameAgent = owners.filter((owner) => owner.agent === targetAgent).length;
     if (owners.length >= policy.maxConcurrentTasks) {
       return `Queued: active execution limit reached (${owners.length}/${policy.maxConcurrentTasks}); waiting for a free execution record.`;
@@ -411,7 +411,7 @@ export class TaskSupervisor extends EventEmitter {
 
     const gatePolicy = concurrencyPolicy();
     if (gatePolicy.enabled) {
-      const owners = this.executionRegistry.listOwners();
+      const owners = this.executionRegistry.listAgentOwners();
       const agentSlots = owners.filter((owner) => owner.agent === fresh.targetAgent).length;
       if (owners.length >= gatePolicy.maxConcurrentTasks || agentSlots >= gatePolicy.maxConcurrentPerAgent) {
         roleLock.release(roleLease);

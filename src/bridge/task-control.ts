@@ -104,6 +104,9 @@ export class TaskControlService {
           `Use re-review / rework / retry instead.`,
       );
     }
+    if (thread.status === 'merge_failed' || thread.status === 'wait_decision') {
+      throw new Error(`Cannot pause task ${threadId} while it is ${thread.status}.`);
+    }
 
     const normalizedReason = (reason || '').trim() || 'Paused by user';
     const now = new Date().toISOString();
@@ -225,6 +228,7 @@ export class TaskControlService {
       if (reviewerChild) { try { killPidTree(reviewerChild); } catch {} }
       thread.status = 'paused';
       thread.updatedAt = new Date().toISOString();
+      appendInterruption(thread, { kind: 'deleted', reason: normalizedReason, at: thread.updatedAt, by });
       thread.summary.lastOutputSnippet = `Deleting: ${normalizedReason}`;
       try { this.taskStore.upsertTask(thread); }
       catch (error) { throw new Error(`Could not persist deletion intent for ${threadId}: ${(error as Error).message}`, { cause: error }); }

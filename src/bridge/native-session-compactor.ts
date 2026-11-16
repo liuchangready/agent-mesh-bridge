@@ -291,7 +291,7 @@ export class NativeSessionCompactor {
           registration: registry.begin(
             threadId,
             currentRound?.round || thread!.currentRound || 1,
-            agent,
+            role === 'reviewer' && thread!.status === 'waiting_merge' ? 'merge-reviewer' : agent,
             getTaskExecutionPath(thread!),
             'maintenance',
           ),

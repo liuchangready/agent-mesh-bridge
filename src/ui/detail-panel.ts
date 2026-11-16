@@ -86,6 +86,10 @@ export class TaskDetailPanel {
           case 'retryMerge':
             await this.handleRetryMerge();
             break;
+          case 'submitMergeDecision':
+            try { this.reworkController.submitMergeDecision(this.currentThreadId, String(message.answer || '')); this.update(); }
+            catch (error: any) { vscode.window.showErrorMessage(`Decision failed: ${error.message}`); }
+            break;
           case 'pauseTask':
             await vscode.commands.executeCommand('agent-mesh-bridge.pauseTask', this.currentThreadId);
             this.update();
@@ -170,11 +174,12 @@ export class TaskDetailPanel {
 
   private async handleApprove(remarks?: string) {
     try {
-      this.reworkController.approveTask({
+      const result = this.reworkController.approveTask({
         threadId: this.currentThreadId,
         remarks: remarks || 'Approved via Detail Panel',
       });
-      vscode.window.showInformationMessage(`Task ${this.currentThreadId} approved successfully.`);
+      if (result.status === 'MERGE_FAILED' || result.message.startsWith('Could not create approved snapshot:')) vscode.window.showWarningMessage(result.message);
+      else vscode.window.showInformationMessage(`Task ${this.currentThreadId} approved successfully.`);
       this.update();
     } catch (err: any) {
       vscode.window.showErrorMessage(`Approval failed: ${err.message}`);
@@ -183,6 +188,11 @@ export class TaskDetailPanel {
 
   private async handleRetryMerge() {
     try {
+      if (this.taskStore.getTask(this.currentThreadId)?.status === 'merge_failed') {
+        this.reworkController.retryMerge(this.currentThreadId);
+        this.update();
+        return;
+      }
       const result = await this.reworkController.mergeApproved(this.currentThreadId);
       if (result.status === 'merged') vscode.window.showInformationMessage(`Task ${this.currentThreadId} merged into its pinned local target.`);
       else vscode.window.showWarningMessage(result.message);
@@ -431,6 +441,8 @@ export class TaskDetailPanel {
       reworking: '#f59e0b',
       waiting_review: '#3b82f6',
       waiting_merge: '#8b5cf6',
+      wait_decision: '#eab308',
+      merge_failed: '#ef4444',
       paused: '#f97316',
       completed: '#10b981',
       failed: '#ef4444',
@@ -819,7 +831,8 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
     }
   </style>
 </head>
-<body>
+<body class="${thread.status === 'merge_failed' ? 'merge-failed' : ''}">
+  <style>.merge-failed .timeline button { display: none; }</style>
   <div class="header">
     <div class="title-row">
       <h2 class="title">[${escapeHtml(thread.initiatorAgent)} -> ${escapeHtml(thread.targetAgent)}] ${escapeHtml(thread.title)}</h2>
@@ -1115,7 +1128,8 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
       : ''
   }
 
-  <div class="action-bar">
+  ${thread.status === 'merge_failed' ? `<div class="action-bar"><button onclick="retryMerge()">重试合并</button><button onclick="deleteTask()">删除任务</button></div>` : ''}
+  <div class="action-bar" ${thread.status === 'merge_failed' ? 'style="display:none"' : ''}>
     ${(thread.status === 'failed' || thread.rounds.some((r) => r.status === 'failed')) ? `<button class="retry-btn" style="background: #dc2626; color: white;" onclick="retryFailedRound()">🔄 重试失败轮次 (Retry Failed)</button>` : ''}
     ${thread.status === 'waiting_review' && thread.reviewWake && thread.reviewWake.round === (thread.currentRound || 1) ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（唤醒失败）</button>` : ''}
     ${thread.status === 'review_failed' ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（检视失败）</button>` : ''}
@@ -1128,7 +1142,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
     <button class="secondary" onclick="refresh()">⟳ Refresh</button>
   </div>
 
-  <div class="live-logs-box" style="margin-top: 16px; margin-bottom: 24px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; padding: 16px;">
+  <div class="live-logs-box" style="${thread.status === 'merge_failed' ? 'display:none;' : ''}margin-top: 16px; margin-bottom: 24px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; padding: 16px;">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px; flex-wrap:wrap; gap:8px;">
       <div style="font-weight:600; font-size:14px; display:flex; align-items:center; gap:8px;">
         ${thread.status === 'running' || thread.status === 'reworking' ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;"></span>` : ''}
@@ -1152,14 +1166,20 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
     <div class="meta-item"><strong>#${event.number} ${escapeHtml(event.phase)} · ${escapeHtml(event.result)}</strong> · ${escapeHtml(event.at)}
       ${event.targetOldCommit ? `<div>Target: ${escapeHtml(event.targetRef || '')} @ ${escapeHtml(event.targetOldCommit)}</div>` : ''}
       ${event.error ? `<pre class="code-block">${escapeHtml(event.error)}</pre>` : ''}
+      ${event.question ? `<div style="white-space:pre-wrap">问题: ${escapeHtml(event.question)}</div>` : ''}
+      ${event.background ? `<div style="white-space:pre-wrap">背景: ${escapeHtml(event.background)}</div>` : ''}
+      ${event.suggestion ? `<div style="white-space:pre-wrap">建议: ${escapeHtml(event.suggestion)}</div>` : ''}
+      ${event.answer ? `<div style="white-space:pre-wrap">决定: ${escapeHtml(event.answer)}</div>` : ''}
       ${event.conflictFiles?.length ? `<div>Conflicts: ${event.conflictFiles.map(escapeHtml).join(', ')}</div>` : ''}
-      ${event.logPath ? `<div>Log: ${escapeHtml(event.logPath)} · get_merge_log #${event.number}</div>` : ''}
+      ${event.logPath ? `<div>Log: ${escapeHtml(event.logPath)} · get_merge_log #${event.logNumber || event.number}</div>` : ''}
       ${event.changedFiles?.length ? `<pre class="code-block">${escapeHtml(event.changedFiles.join('\n'))}</pre>` : ''}
       ${event.mergedCommit ? `<div>Revert by creating a new commit: <code>git revert -m 1 ${escapeHtml(event.mergedCommit)}</code></div>` : ''}
     </div>`).join('')}</div>` : ''}
 
+  ${thread.status === 'wait_decision' ? `<div class="rework-box"><h3>提交合并决定</h3><textarea id="mergeDecision" placeholder="输入您的决定"></textarea><button onclick="submitMergeDecision()">提交决定并唤醒 Reviewer</button></div>` : ''}
+
   ${
-    thread.status !== 'completed'
+    thread.status !== 'completed' && thread.status !== 'merge_failed' && thread.status !== 'wait_decision'
       ? `
   <div class="rework-box">
     <h3>Manual Rework Intervention</h3>
@@ -1183,6 +1203,11 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
 
     function retryMerge() {
       vscode.postMessage({ command: 'retryMerge' });
+    }
+
+    function submitMergeDecision() {
+      const answer = document.getElementById('mergeDecision').value;
+      if (answer && answer.trim()) vscode.postMessage({ command: 'submitMergeDecision', answer: answer });
     }
 
     function pauseTask() {

@@ -495,7 +495,7 @@ export class ReviewerBootstrapService {
       }
 
       if (policy.enabled) {
-        const owners = this.deps.executionRegistry.listOwners();
+        const owners = this.deps.executionRegistry.listAgentOwners();
         if (owners.length >= policy.maxConcurrentTasks) continue;
         const initiatorSlots = owners.filter(
           (owner) => owner.agent === candidate.initiatorAgent,

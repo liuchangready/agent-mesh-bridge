@@ -74,6 +74,14 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
         iconName = 'git-merge';
         statusLabel = 'Waiting for verified integration';
         break;
+      case 'wait_decision':
+        iconName = 'question';
+        statusLabel = 'Waiting for user decision';
+        break;
+      case 'merge_failed':
+        iconName = 'error';
+        statusLabel = 'Merge failed; retry or delete';
+        break;
       case 'waiting_review':
         iconName = 'eye';
         statusLabel = `In-Review (${roundText})`;
@@ -177,7 +185,11 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     item.description = description;
     item.iconPath = new vscode.ThemeIcon(iconName);
     item.contextValue =
-      thread.status === 'waiting_merge'
+      thread.status === 'merge_failed'
+        ? 'merge_failed'
+        : thread.status === 'wait_decision'
+        ? 'wait_decision'
+        : thread.status === 'waiting_merge'
         ? 'waiting_merge'
         : thread.status === 'waiting_review'
         ? // A healthy review needs no manual wake: only a recorded wake failure

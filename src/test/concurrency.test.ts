@@ -258,6 +258,16 @@ describe('AsyncDispatcher - independent task admission', () => {
     assert.match(second.message, /limit reached/i);
   });
 
+  test('merge process registrations do not consume a configured agent slot', async () => {
+    saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 1, maxConcurrentPerAgent: 1 } });
+    const registration = registry.begin('independent_merge', 1, 'merge-git', workspace);
+    try {
+      const dispatched = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Agent during merge', prompt: 'work', workspaceRoot: workspace });
+      assert.strictEqual(dispatched.status, 'DISPATCHED', dispatched.message);
+      await waitFor(() => started.includes('Agent during merge'));
+    } finally { registry.end(registration); }
+  });
+
   test('a per-agent cap skips only that agent and still starts a different agent candidate', async () => {
     saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 3, maxConcurrentPerAgent: 1 } });
     const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Codex active', prompt: 'a', workspaceRoot: workspace });

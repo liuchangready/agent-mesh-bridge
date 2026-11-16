@@ -247,7 +247,7 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'allowNoScope'));
     assert.ok(toolNames.includes('submit_merge_resolution'));
     assert.ok(toolNames.includes('get_merge_log'));
-    assert.strictEqual(toolNames.length, 22);
+    assert.strictEqual(toolNames.length, 24);
   });
 
   test('list_agent_models reports the receiver and sender defaults separately', async () => {
@@ -557,6 +557,21 @@ describe('MCPServer Protocol Tests', () => {
       params: { name: 'get_merge_log', arguments: { threadId, number: 1, offset: 2, limit: 4 } } });
     const page = JSON.parse(res.result.content[0].text);
     assert.equal(page.content, 'cdef'); assert.equal(page.nextOffset, 6); assert.equal(page.size, 10);
+  });
+
+  test('merge_failed rejects ordinary controls and retry_merge keeps task identity', async () => {
+    const threadId = 'thread_merge_failed_control'; const now = new Date().toISOString();
+    taskStore.upsertTask({ threadId, title: 'merge failure', initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'merge_failed',
+      currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-abcdef12', callerSessionId: 'reviewer-session',
+      workspace: testWorkspace(tempDir), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 }, rounds: [],
+      mergeControl: { revision: 1, retryGeneration: 0, consecutiveRetries: 6, failureFingerprint: 'failure' } });
+    for (const name of ['approve_task', 'request_rework', 'retry_task', 'retarget_task', 'pause_task']) {
+      await assert.rejects(() => mcpServer.handleToolCall(name, { threadId }), /only permits retry_merge or delete_task/);
+    }
+    const result = await mcpServer.handleToolCall('retry_merge', { threadId });
+    assert.equal(result.status, 'waiting_merge');
+    assert.equal(taskStore.getTask(threadId)!.receiverSessionId, 'session-abcdef12');
+    assert.equal(taskStore.getTask(threadId)!.mergeControl!.retryGeneration, 1);
   });
 
   test('get_task_token_usage reports task rollup and single-round detail', async () => {
