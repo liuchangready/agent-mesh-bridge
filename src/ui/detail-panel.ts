@@ -1,4 +1,5 @@
 import { getTaskExecutionPath } from '../bridge/types';
+import * as fs from 'fs';
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { TaskStore } from '../bridge/task-store';
@@ -120,6 +121,9 @@ export class TaskDetailPanel {
             break;
           case 'openReviewerLog':
             await this.handleOpenReviewerLog(Number(message.round));
+            break;
+          case 'openMergeLog':
+            await this.handleOpenMergeLog(Number(message.number));
             break;
           case 'printRecentLogs':
             await vscode.commands.executeCommand(
@@ -384,6 +388,41 @@ export class TaskDetailPanel {
       await vscode.window.showTextDocument(document, { preview: true });
     } catch (err) {
       vscode.window.showErrorMessage(`无法打开 reviewer 日志：${String(err)}`);
+    }
+  }
+
+  /** Open one task-owned merge log from the merge timeline. */
+  private async handleOpenMergeLog(number: number): Promise<void> {
+    const thread = this.taskStore.getTask(this.currentThreadId);
+    const event = thread?.mergeHistory?.find((entry) => entry.number === number);
+    if (!thread || !event?.logPath) {
+      vscode.window.showWarningMessage('This merge event has no recorded log.');
+      return;
+    }
+
+    try {
+      const safeId = thread.threadId.replace(/[^A-Za-z0-9_-]/g, '_');
+      const root = thread.artifactDir || path.join(path.dirname(this.taskStore.getStoragePath()), 'merge-logs', safeId);
+      const source = event.phase === 'decision' && event.logNumber
+        ? thread.mergeHistory?.find((entry) => entry.number === event.logNumber && entry.logPath === event.logPath)
+        : event;
+      if (!source?.logPath) throw new Error('Invalid merge log reference.');
+
+      const filename = path.basename(source.logPath);
+      const prefix = `${safeId}_merge_`;
+      const digits = filename.startsWith(prefix) && filename.endsWith('.log') ? filename.slice(prefix.length, -4) : '';
+      const fileNumber = source.logFileNumber ?? Number(digits);
+      if (!Number.isSafeInteger(fileNumber) || fileNumber < 1 || digits !== String(fileNumber)) throw new Error('Invalid merge log path.');
+
+      const dir = path.join(root, 'merge_log');
+      const expected = path.join(dir, `${safeId}_merge_${fileNumber}.log`);
+      if (path.resolve(event.logPath) !== path.resolve(expected) || fs.realpathSync(path.dirname(expected)) !== path.join(fs.realpathSync(root), 'merge_log') || fs.lstatSync(expected).isSymbolicLink()) {
+        throw new Error('Invalid merge log path.');
+      }
+      const document = await vscode.workspace.openTextDocument(vscode.Uri.file(expected));
+      await vscode.window.showTextDocument(document, { preview: true });
+    } catch (error) {
+      vscode.window.showErrorMessage(`Could not open merge log: ${String(error)}`);
     }
   }
 
@@ -1186,7 +1225,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
       ${event.suggestion ? `<div style="white-space:pre-wrap">建议: ${escapeHtml(event.suggestion)}</div>` : ''}
       ${event.answer ? `<div style="white-space:pre-wrap">决定: ${escapeHtml(event.answer)}</div>` : ''}
       ${event.conflictFiles?.length ? `<div>Conflicts: ${event.conflictFiles.map(escapeHtml).join(', ')}</div>` : ''}
-      ${event.logPath ? `<div>Log: ${escapeHtml(event.logPath)} · get_merge_log #${event.logNumber || event.number}</div>` : ''}
+      ${event.logPath ? `<div>Log: ${escapeHtml(event.logPath)} · <button class="secondary" style="padding:3px 8px;font-size:12px" onclick="openMergeLog(${event.number})">Open merge log</button> · get_merge_log #${event.logNumber || event.number}</div>` : ''}
       ${event.changedFiles?.length ? `<pre class="code-block">${escapeHtml(event.changedFiles.join('\n'))}</pre>` : ''}
       ${event.mergedCommit ? `<div>Revert by creating a new commit: <code>git revert -m 1 ${escapeHtml(event.mergedCommit)}</code></div>` : ''}
     </div>`).join('')}</div>` : ''}
@@ -1255,6 +1294,9 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
 
     function openReviewerLog(round) {
       vscode.postMessage({ command: 'openReviewerLog', round: round });
+    }
+    function openMergeLog(number) {
+      vscode.postMessage({ command: 'openMergeLog', number: number });
     }
 
     function copyLogs() {
