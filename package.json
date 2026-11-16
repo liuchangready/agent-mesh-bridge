@@ -63,6 +63,9 @@
       ]
     },
     "commands": [
+      { "command": "agent-mesh-bridge.readTaskTemplates", "title": "Read Task Templates" },
+      { "command": "agent-mesh-bridge.createTaskTemplate", "title": "Create Task Template" },
+      { "command": "agent-mesh-bridge.editTaskTemplate", "title": "Edit Task Template" },
       { "command": "agent-mesh-bridge.selectWorkspace", "title": "Agent Bridge: Select Default Workspace" },
       { "command": "agent-mesh-bridge.clearWorkspace", "title": "Agent Bridge: Clear Default Workspace" },
       { "command": "agent-mesh-bridge.filterWorkspaces", "title": "Agent Bridge: Filter Tasks by Workspace" },
@@ -174,6 +177,9 @@
         }
       ],
       "view/item/context": [
+        { "command": "agent-mesh-bridge.readTaskTemplates", "when": "viewItem == workspace_group", "group": "2_templates" },
+        { "command": "agent-mesh-bridge.createTaskTemplate", "when": "viewItem == workspace_group", "group": "2_templates" },
+        { "command": "agent-mesh-bridge.editTaskTemplate", "when": "viewItem == workspace_group", "group": "2_templates" },
         {
           "command": "agent-mesh-bridge.clearAgentExhaustion",
           "when": "view == agent-mesh-bridge.agent-nodes",

@@ -375,6 +375,7 @@ export function buildReviewerBootstrapPrompt(thread: DelegationThread, token?: s
     '',
     'Your ONLY action in this turn: call the MCP tool `dispatch_task` exactly once, with these arguments:',
     credential,
+    ...(thread.taskTemplate ? ['', '[Task template reviewer instructions]', thread.taskTemplate.reviewerInstructions] : []),
     '',
     'The bridge validates that token against the pending task and fills in the brief itself. Do NOT pass',
     'title or prompt, do NOT explore the repository, do NOT modify files, and do NOT start any',

@@ -1,3 +1,4 @@
+import { appendTemplateInstructions } from './task-templates';
 import { getTaskExecutionPath } from './types';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -520,7 +521,7 @@ export class TaskSupervisor extends EventEmitter {
       try {
         result = await this.runner.execute({
           agent: thread.targetAgent,
-          prompt: isRework ? appendCompactionProtocol(round.prompt, roundNumber) : round.prompt,
+          prompt: appendTemplateInstructions(isRework ? appendCompactionProtocol(round.prompt, roundNumber) : round.prompt, thread.taskTemplate, 'worker'),
           isRework,
           receiverSessionId: thread.receiverSessionId,
           title: thread.title,

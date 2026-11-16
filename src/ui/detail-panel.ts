@@ -957,6 +957,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
             })()
           : ''
       }
+      ${thread.taskTemplate ? `<div class="meta-item" style="grid-column:1/-1;"><div class="meta-label">Task template</div><div class="meta-val">${escapeHtml(thread.taskTemplate.label)} 璺?${escapeHtml(thread.taskTemplate.version)}<br/>${escapeHtml(thread.taskTemplate.summary)}<details><summary>Worker instructions</summary><pre style="white-space:pre-wrap">${escapeHtml(thread.taskTemplate.workerInstructions)}</pre></details><details><summary>Reviewer instructions</summary><pre style="white-space:pre-wrap">${escapeHtml(thread.taskTemplate.reviewerInstructions)}</pre></details></div></div>` : ''}
       <div class="meta-item">
         <div class="meta-label">Workspace</div>
         <div class="meta-val">${escapeHtml(getTaskExecutionPath(thread))}</div>

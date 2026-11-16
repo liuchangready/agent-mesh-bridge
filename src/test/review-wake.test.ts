@@ -132,6 +132,14 @@ describe('CallbackManager records stalled reviewer wakes', () => {
     return path.join(os.tmpdir(), 'agent-bridge-review-wake-ws');
   };
 
+  test('review callback injects only reviewer template instructions', async () => {
+    const {store, manager} = setup(); let prompt = '';
+    const thread = makeThread({threadId:'thread_review_template',taskTemplate:{id:'t',version:'1',label:'T',summary:'S',workerInstructions:'WORKER SECRET',reviewerInstructions:'REVIEWER SNAPSHOT',sourceFileName:'t.md',selectedAt:'now'}});
+    store.upsertTask(thread);
+    (manager as any).launchCaller = (_t: any, _s: any, text: string, _r: any, _k: any, release: () => void) => { prompt=text; release(); return true; };
+    try { assert.equal(await manager.notifyCaller(thread,thread.rounds[0]),true); assert.equal(prompt.split('REVIEWER SNAPSHOT').length-1,1); assert.ok(!prompt.includes('WORKER SECRET')); } finally { store.dispose(); }
+  });
+
   test('a 429 that still exits 0 is a failed review, not a delivered one', () => {
     const { store, manager, tracker } = setup();
     const thread = makeThread();

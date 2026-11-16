@@ -42,6 +42,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
 
     return Promise.resolve(groupWorkspaceTasks(tasks).map((threads) => {
       const group = new TaskTreeItem(threads[0].workspace.nameAtDispatch, vscode.TreeItemCollapsibleState.Expanded);
+      group.workspaceId = threads[0].workspace.id;
       group.tooltip = threads[0].workspace.rootPath;
       group.iconPath = new vscode.ThemeIcon('folder');
       group.contextValue = 'workspace_group';
@@ -278,6 +279,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
 }
 
 export class TaskTreeItem extends vscode.TreeItem {
+  public workspaceId?: string;
   public subItems?: TaskTreeItem[];
   public thread?: DelegationThread;
 

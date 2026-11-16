@@ -323,6 +323,7 @@ export class CallbackManager extends EventEmitter {
     const wakeMessage = thread.status === 'waiting_merge'
       ? `The approved task could not be integrated: ${thread.worktree?.integration?.error || 'unknown error'}. Resolution workspace: ${thread.worktree?.mergeResolutionPath || 'not available'}. Worker assessment: ${JSON.stringify(reviewRound.assessment || null)}. Interruptions: ${JSON.stringify(thread.interruptions || [])}. Recent merge decisions and recovery: ${JSON.stringify((thread.mergeHistory || []).slice(-8))}. Inspect get_thread_details, get_merge_log and get_round_raw_log for task ${thread.threadId}. Preserve the existing thread and reviewer session; use standard Git to resolve and stage changes, then call submit_merge_resolution. Request rework only if the candidate itself needs changes; request_merge_decision when a user decision is needed. Treat STREAM_GAP_EXCEEDED as a warning, defer quota failures, and investigate authentication, permission, CLI startup, environment, Git and validation failures.`
       : promptMessage;
+    const reviewWakeMessage = thread.taskTemplate ? `${wakeMessage}\n\n[Task template reviewer instructions]\n${thread.taskTemplate.reviewerInstructions}` : wakeMessage;
     const mergeWakeId = thread.status === 'waiting_merge' ? crypto.randomUUID() : undefined;
     let released = false;
     let sessionLeaseReleased = !reviewerSessionLease;
@@ -344,8 +345,8 @@ export class CallbackManager extends EventEmitter {
       thread,
       callerSessionId,
       reviewerPreparation?.recoveryPrefix
-        ? `<bridge_recovery_document version="${reviewerPreparation.recoveryVersion}">\n${reviewerPreparation.recoveryPrefix}\n</bridge_recovery_document>\n\n${wakeMessage}`
-        : wakeMessage,
+        ? `<bridge_recovery_document version="${reviewerPreparation.recoveryVersion}">\n${reviewerPreparation.recoveryPrefix}\n</bridge_recovery_document>\n\n${reviewWakeMessage}`
+        : reviewWakeMessage,
       reviewRound,
       'review',
       release,
@@ -542,7 +543,8 @@ export class CallbackManager extends EventEmitter {
         this.drainNextWake(callerSessionId);
       }
     };
-    const launched = this.launchCaller(thread, callerSessionId, promptMessage, round, 'failure', release, (childPid) => {
+    const failureMessage = thread.taskTemplate ? `${promptMessage}\n\n[Task template reviewer instructions]\n${thread.taskTemplate.reviewerInstructions}` : promptMessage;
+    const launched = this.launchCaller(thread, callerSessionId, failureMessage, round, 'failure', release, (childPid) => {
       if (childPid) {
         nativeLock.attachChild(sessionLease, childPid);
         if (!roleLock.attachChild(roleLease, childPid)) throw new Error('Could not bind failure-wake child PID to the task role.');

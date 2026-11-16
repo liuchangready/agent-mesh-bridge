@@ -151,6 +151,35 @@ describe('MCPServer Protocol Tests', () => {
     } finally { window.dispose(); }
   });
 
+  test('linked workspace ID, root and bound context list the dispatch workspace', async () => {
+    const main = process.cwd();
+    const linked = path.join(tempDir, 'linked');
+    const git = spawnSync(gitExe, ['worktree', 'add', '-b', 'linked-test', linked], { cwd: main, encoding: 'utf8', windowsHide: true });
+    assert.equal(git.status, 0, git.stderr);
+    const registry = new WorkspaceRegistry(tempDir);
+    const linkedId = registry.register(linked).id;
+    const mainId = registry.register(main).id;
+    const byId = await mcpServer.handleToolCall('list_task_templates', { workspaceId: linkedId });
+    const byRoot = await mcpServer.handleToolCall('list_task_templates', { workspaceRoot: linked });
+    (mcpServer as any).workspaceContext = { id: linkedId };
+    const inherited = await mcpServer.handleToolCall('list_task_templates', {});
+    assert.equal(byId.workspaceId, mainId);
+    assert.equal(byRoot.workspaceId, mainId);
+    assert.equal(inherited.workspaceId, mainId);
+    assert.equal(fs.existsSync(path.join(linked, '.agent_bridge')), false);
+    const count = taskStore.listTasks(1000, 'all').length;
+    await assert.rejects(mcpServer.handleToolCall('dispatch_task', { workspaceId: linkedId, targetAgent: 'claude_code', initiatorAgent: 'codex', title: 'invalid template', prompt: 'work', templateId: 'missing' }), /TASK_TEMPLATE_INVALID_OR_NOT_FOUND/);
+    assert.equal(taskStore.listTasks(1000, 'all').length, count);
+    const template = byId.templates.find((t: any) => t.id === 'programming');
+    assert.ok(template);
+    assert.equal(template.workerInstructions, undefined);
+    const realDispatch = dispatcher.dispatchTask.bind(dispatcher);
+    dispatcher.dispatchTask = params => realDispatch({ ...params, reviewFlow: 'dedicated' });
+    const result = await mcpServer.handleToolCall('dispatch_task', { workspaceId: linkedId, targetAgent: 'claude_code', initiatorAgent: 'codex', title: 'linked template', prompt: 'work', templateId: template.id });
+    assert.equal(result.workspace.id, mainId);
+    assert.equal(taskStore.getTask(result.threadId)?.taskTemplate?.id, template.id);
+  });
+
   test('explicit cross-workspace dispatch keeps caller window on first and later calls', async () => {
     const rootA = process.cwd();
     const rootB = path.join(tempDir, 'repo-b'); fs.mkdirSync(rootB); initGitRepo(rootB);
@@ -247,7 +276,8 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'allowNoScope'));
     assert.ok(toolNames.includes('submit_merge_resolution'));
     assert.ok(toolNames.includes('get_merge_log'));
-    assert.strictEqual(toolNames.length, 24);
+    assert.ok(toolNames.includes('list_task_templates'));
+    assert.strictEqual(toolNames.length, 25);
   });
 
   test('list_agent_models reports the receiver and sender defaults separately', async () => {
@@ -855,6 +885,8 @@ describe('MCPServer Protocol Tests', () => {
       // The model should not even see new-work tools.
       const toolNames = mcpServer.getToolDefinitions().map((tool: any) => tool.name);
       assert.ok(!toolNames.includes('dispatch_task'));
+      assert.ok(!toolNames.includes('list_task_templates'));
+      await assert.rejects(mcpServer.handleToolCall('list_task_templates', {}), /receiver/i);
       assert.ok(!toolNames.includes('invoke_agent'));
       assert.ok(toolNames.includes('request_rework'));
       assert.ok(toolNames.includes('approve_task'));

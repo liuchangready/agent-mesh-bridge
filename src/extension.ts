@@ -5,6 +5,8 @@ import * as path from 'path';
 import * as os from 'os';
 import { TaskStore } from './bridge/task-store';
 import { WorkspaceRegistry, WindowWorkspace, physicalDirectory } from './bridge/workspace';
+import { registerTemplateCommands } from './ui/template-commands';
+import { resolveTemplateWorkspaceRoot } from './bridge/git-worktree';
 import { AgentDetector } from './bridge/agent-detector';
 import { ActiveAgentResolver, applyConfiguredAgentDefault } from './bridge/active-agent-resolver';
 import { AutonomousRunner } from './bridge/autonomous-runner';
@@ -818,6 +820,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // 6. Register Commands
   context.subscriptions.push(
+    ...registerTemplateCommands(workspaceRegistry, vscode),
     vscode.commands.registerCommand('agent-mesh-bridge.refreshAgentStatus', async () => {
       await agentNodesProvider.refresh(true);
       await statusBar.update();
