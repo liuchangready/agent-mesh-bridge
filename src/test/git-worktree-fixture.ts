@@ -11,6 +11,8 @@ process.env.MESH_GIT_PATH = gitExe;
 const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-merge-home-'));
 process.env.USERPROFILE = isolatedHome;
 process.env.HOME = isolatedHome;
+const repositoryTemplate = path.join(isolatedHome, 'repository-template');
+let templateReady = false;
 
 export function git(cwd: string, ...args: string[]): string {
   const result = spawnSync(gitExe, args, { cwd, encoding: 'utf8', windowsHide: true });
@@ -31,6 +33,16 @@ export function assertSameExistingPath(actual: string, expected: string): void {
 }
 
 export function initRepo(root: string): void {
+  if (!templateReady) {
+    createRepositoryTemplate();
+    templateReady = true;
+  }
+  // Copy ordinary files, including .git, so refs, config and objects stay independent.
+  fs.cpSync(repositoryTemplate, root, { recursive: true });
+}
+
+function createRepositoryTemplate(): void {
+  const root = repositoryTemplate;
   fs.mkdirSync(root, { recursive: true });
   git(root, 'init', '-b', 'feature/caller');
   git(root, 'config', 'user.name', 'Mesh Test');
