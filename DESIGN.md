@@ -85,7 +85,7 @@ flowchart TD
    - 适配 Windows/macOS/Linux 跨平台进程拉起；
    - 注入各 Agent 专属的免交互与权限旁路标志（`--dangerously-skip-permissions` 等）；
    - 关闭 `stdin` 并配置 `CI=1` 环境变量；
-   - 内置输出静默看门狗与最大超时保护。
+   - 输出流质量 assessment 评估、stream 间隔测量与扣除挂起；移除独立静默 kill 看门狗，由控制器统一管理活动时间预算。
 5. **`CallbackManager`（回调唤醒引擎）**：
    - 监听任务各轮次完成状态；
    - 根据发起方类型调用各 Agent 原生唤醒信道（`codex queue`、`claude --resume`、`agy --conversation`、`dsh headless --session-id`），触发 A 的下一轮推理。
@@ -106,6 +106,14 @@ flowchart TD
    - Persist source/target/candidate SHA and transaction phase for crash recovery. Conflicts and validation failures return to review; a dirty checked-out target is preserved and remains in blocked `waiting_merge` until an explicit retry.
    - `mergeRequest` 仅表示远端交付。未集成的成果不能自动归档、容量淘汰或普通删除；force 才可明确丢弃。旧任务不自动迁移。
    - **统一任务数据目录**：新任务的所有 bridge 侧产物固定放在 `<taskDataRoot>/<threadId>/`，其中 `worktree/` 是 Git worktree，`worker_log/` / `reviewer_log/` 保存轮次日志与压缩归档，`Archive/` 保存终态 tar.gz + JSON，`bootstrap/` 保存一次性 reviewer 凭证，`validation/` 保存合并验证临时 worktree，`model-overlays/` 保存桥接生成的 DSH 单次运行模型 patch。绝对路径在创建时写入 `thread.artifactDir` / `taskDataDir`，后续轮次只读该值，不重新解析全局设置；`agentMeshBridge.taskDataRoot` 为空时默认 `<bridge home>/tasks`，相对路径相对 bridge home 解析。旧 ledger 条目继续使用已记录的 `worktree.path`；旧日志目录仅从已存在的 `bridge-policy.json` 读取兼容，不迁移。
+10. **`ExecutionController`（统一生命周期与执行控制器）**：
+    - 统一管控 `develop`、`review`（含专用 reviewer bootstrap）与 `merge`（含有界合并修复）三个阶段的执行生命周期；
+    - 管理单任务单调累计活动时间预算（默认 120 分钟），通过 `HostSuspensionGuard` 扣除主机休眠/挂起，输出流不予延长预算；
+    - 作为唯一执行启动与停止观察入口，通过进程真实身份探测（`pid + birthId`）与 10 秒退出确认，防止 PID 复用误判；
+    - 统一处理结果分类与安全重试策略：明确临时错误（transient）在预算内最多额外自动重试 2 次（5s / 30s 退避），已知配额重置自动入队等待；未知超时与不确定状态直接进入终态 `failed`；
+    - 结合 `TaskStore.transitionExecution`，在任务短写锁下提供 CAS 版本比对校验与原子文件写入，防陈旧覆盖；
+    - 支持跨阶段的 `wait_decision` 状态及恢复，保留既有消耗预算。
+
 ### 2.1 运行时三条硬准则
 
 1. **拆分任务不因权限停摆**：所有被派发的轮次必须携带各端 `skip-danger` 参数；Codex 的 `--ask-for-approval` 是全局参数，必须位于 `exec` 之前；DSH 注入 `DSH_PERMISSION_MODE=danger-full-access`，使其 `approval` 策略变为 `never`。

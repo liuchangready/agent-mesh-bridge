@@ -46,6 +46,7 @@ import { assertCanExecute } from './agent-capabilities';
 import { createMergeLog, noteMergeFailure, resetMergeBudget } from './merge-recovery';
 import { NativeSessionLock } from './native-session-lock';
 import { CancellationRegistry } from './cancellation-registry';
+import { ExecutionController } from './execution-controller';
 
 export class ReworkController {
   private taskStore: TaskStore;
@@ -97,6 +98,10 @@ export class ReworkController {
       // Recover transactions already on disk once all controller services exist.
       this.resumePendingMerges();
     }
+  }
+
+  public getMergeCoordinator(): MergeCoordinator {
+    return this.mergeCoordinator;
   }
 
   /** Answer model-switch confirmations raised by an executor switch. */
@@ -242,6 +247,14 @@ export class ReworkController {
     // another agent has no resumable session and starts a fresh one.
     const resumesNativeSession = shouldResumeNativeSession(thread, reworkRound);
 
+    const originalReviewRound = thread.currentRound;
+    const expectedOperationId = thread.execution?.operationId;
+    const expectedGeneration = thread.execution?.generation;
+    const expectedRunId = thread.execution?.run?.id;
+    const expectedReviewerSession = thread.reviewFlow === 'dedicated'
+      ? thread.reviewerSessionId
+      : (thread.reviewerSessionId || thread.callerSessionId);
+
     thread.currentRound = nextRound;
     clearTaskFailure(thread);
     thread.status = 'running';
@@ -276,10 +289,114 @@ export class ReworkController {
       : `Reworking in same session (Round ${nextRound})...`;
 
     // Persist immediately
-    this.taskStore.upsertTask(thread);
-    // If TaskSupervisor is actively running (e.g. in VS Code extension host),
-    // let it supervise execution persistently to prevent child processes from being killed when ephemeral MCP CLI exits.
-    if (TaskSupervisor.isSupervisorActive()) {
+    let finalHasActiveRun = false;
+    if (thread.execution) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        this.taskStore.loadFromDisk();
+        const freshTask = this.taskStore.getTask(thread.threadId);
+        if (!freshTask) {
+          throw new Error(`Task thread not found: ${thread.threadId}`);
+        }
+        const currentRev = freshTask.execution?.revision ?? 0;
+        try {
+          await this.taskStore.transitionExecution(thread.threadId, currentRev, (t) => {
+            if (t.execution) {
+              if (expectedOperationId && t.execution.operationId !== expectedOperationId) {
+                throw new Error(
+                  `Cannot request rework: execution operation changed concurrently (expected ${expectedOperationId}, found ${t.execution.operationId})`,
+                );
+              }
+              if (expectedGeneration !== undefined && t.execution.generation !== expectedGeneration) {
+                throw new Error(
+                  `Cannot request rework: execution generation changed concurrently (expected ${expectedGeneration}, found ${t.execution.generation})`,
+                );
+              }
+              if (expectedRunId && t.execution.run?.id !== expectedRunId) {
+                throw new Error(
+                  `Cannot request rework: execution run changed concurrently (expected ${expectedRunId}, found ${t.execution.run?.id})`,
+                );
+              }
+              if (!expectedRunId && t.execution.run) {
+                throw new Error(
+                  `Cannot request rework: a new execution run (${t.execution.run.id}) started concurrently`,
+                );
+              }
+            }
+
+            if (
+              t.status === 'completed' ||
+              t.status === 'paused' ||
+              (t.status === 'failed' && t.failure?.stage === 'merge') ||
+              t.status === 'wait_decision'
+            ) {
+              throw new Error(`Cannot request rework while task is ${t.status}`);
+            }
+            if (t.currentRound !== originalReviewRound) {
+              throw new Error(
+                `Cannot request rework: task round advanced concurrently (expected round ${originalReviewRound}, found ${t.currentRound})`,
+              );
+            }
+            if (expectedReviewerSession && t.reviewerSessionId && t.reviewerSessionId !== expectedReviewerSession) {
+              throw new Error(
+                `Cannot request rework: reviewer session changed concurrently (expected ${expectedReviewerSession}, found ${t.reviewerSessionId})`,
+              );
+            }
+
+            const currentHasActiveRun = Boolean(t.execution?.run);
+            finalHasActiveRun = currentHasActiveRun;
+
+            t.currentRound = nextRound;
+            clearTaskFailure(t);
+            t.status = 'running';
+            t.interruption = undefined;
+            t.callerSessionId = thread.callerSessionId;
+            t.receiverSessionId = thread.receiverSessionId;
+            t.targetAgent = thread.targetAgent;
+            t.targetModel = thread.targetModel;
+            t.retargets = thread.retargets;
+
+            const existingRoundIdx = t.rounds.findIndex((r) => r.round === nextRound);
+            if (existingRoundIdx >= 0) {
+              t.rounds[existingRoundIdx] = reworkRound;
+            } else {
+              t.rounds.push(reworkRound);
+            }
+
+            t.summary = {
+              ...t.summary,
+              lastPromptSnippet: (params.feedback || '').slice(0, 100),
+              lastOutputSnippet: retarget && retarget.toAgent !== retarget.fromAgent
+                ? `Reworking on ${t.targetAgent} with a fresh session (Round ${nextRound})...`
+                : `Reworking in same session (Round ${nextRound})...`,
+            };
+
+            if (t.execution) {
+              t.execution.round = nextRound;
+              if (!currentHasActiveRun) {
+                t.execution.phase = 'develop';
+                t.execution.run = undefined;
+                t.execution.queue = undefined;
+              }
+            }
+          });
+          break;
+        } catch (err: any) {
+          if (err?.message?.includes('revision mismatch') && attempt < 2) {
+            continue;
+          }
+          throw err;
+        }
+      }
+
+    } else {
+      this.taskStore.upsertTask(thread);
+    }
+
+    if (thread.execution && ExecutionController.getInstance()) {
+      if (!finalHasActiveRun) {
+        void ExecutionController.getInstance()!.startExecution(thread.threadId, 'develop');
+      }
+    } else if (TaskSupervisor.isSupervisorActive()) {
       console.log(
         `[ReworkController] Active TaskSupervisor detected. Delegating Round ${nextRound} execution to supervisor.`,
       );
@@ -748,9 +865,9 @@ export class ReworkController {
     if (!thread) {
       throw new Error(`Task thread not found: ${params.threadId}`);
     }
-    if (thread.status !== 'waiting_review') {
+    if (thread.status !== 'waiting_review' && thread.status !== 'reviewing') {
       throw new Error(
-        `Cannot block review: thread ${params.threadId} is "${thread.status}", not "waiting_review".`,
+        `Cannot block review: thread ${params.threadId} is "${thread.status}", not "waiting_review" or "reviewing".`,
       );
     }
     const inFlight = findInFlightRound(thread);
@@ -874,8 +991,17 @@ export class ReworkController {
     }
     thread.updatedAt = nowIso;
 
+    const originalReviewRound = thread.currentRound;
+    const expectedOperationId = thread.execution?.operationId;
+    const expectedGeneration = thread.execution?.generation;
+    const expectedRunId = thread.execution?.run?.id;
+    const expectedReviewerSession = thread.reviewFlow === 'dedicated'
+      ? thread.reviewerSessionId
+      : (thread.reviewerSessionId || thread.callerSessionId);
+
+    let approvalRound: DelegationRound | undefined;
     if (params.remarks) {
-      const approvalRound: DelegationRound = {
+      approvalRound = {
         // Monotonic numbering keeps approval entries from colliding with a
         // round number that a retry already reused.
         round: nextRoundNumber(thread),
@@ -890,6 +1016,119 @@ export class ReworkController {
       thread.currentRound = approvalRound.round;
       thread.summary.lastPromptSnippet = params.remarks.slice(0, 100);
       thread.summary.lastOutputSnippet = 'Approved';
+    }
+
+    if (thread.execution) {
+      let finalHasActiveRun = false;
+      const doTransition = async () => {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          this.taskStore.loadFromDisk();
+          const freshTask = this.taskStore.getTask(thread.threadId);
+          if (!freshTask) {
+            throw new Error(`Task thread not found: ${thread.threadId}`);
+          }
+          const currentRev = freshTask.execution?.revision ?? 0;
+          try {
+            return await this.taskStore.transitionExecution(thread.threadId, currentRev, (t) => {
+              if (t.execution) {
+                if (expectedOperationId && t.execution.operationId !== expectedOperationId) {
+                  throw new Error(
+                    `Cannot approve task: execution operation changed concurrently (expected ${expectedOperationId}, found ${t.execution.operationId})`,
+                  );
+                }
+                if (expectedGeneration !== undefined && t.execution.generation !== expectedGeneration) {
+                  throw new Error(
+                    `Cannot approve task: execution generation changed concurrently (expected ${expectedGeneration}, found ${t.execution.generation})`,
+                  );
+                }
+                if (expectedRunId && t.execution.run?.id !== expectedRunId) {
+                  throw new Error(
+                    `Cannot approve task: execution run changed concurrently (expected ${expectedRunId}, found ${t.execution.run?.id})`,
+                  );
+                }
+                if (!expectedRunId && t.execution.run) {
+                  throw new Error(
+                    `Cannot approve task: a new execution run (${t.execution.run.id}) started concurrently`,
+                  );
+                }
+              }
+
+              if (
+                t.status === 'completed' ||
+                t.status === 'paused' ||
+                (t.status === 'failed' && t.failure?.stage === 'merge') ||
+                t.status === 'wait_decision'
+              ) {
+                throw new Error(`Cannot approve task while task is ${t.status}`);
+              }
+              if (t.currentRound !== originalReviewRound && (!approvalRound || t.currentRound !== approvalRound.round)) {
+                throw new Error(
+                  `Cannot approve task: task round advanced concurrently (expected round ${originalReviewRound}, found ${t.currentRound})`,
+                );
+              }
+              if (expectedReviewerSession && t.reviewerSessionId && t.reviewerSessionId !== expectedReviewerSession) {
+                throw new Error(
+                  `Cannot approve task: reviewer session changed concurrently (expected ${expectedReviewerSession}, found ${t.reviewerSessionId})`,
+                );
+              }
+
+              const currentHasActiveRun = Boolean(t.execution?.run);
+              finalHasActiveRun = currentHasActiveRun;
+
+              clearTaskFailure(t);
+              t.worktree = thread.worktree;
+              t.status = thread.status;
+              t.mergeControl = thread.mergeControl;
+              t.mergeHistory = thread.mergeHistory;
+              if (approvalRound) {
+                const existingIdx = t.rounds.findIndex((r) => r.round === approvalRound!.round);
+                if (existingIdx >= 0) {
+                  t.rounds[existingIdx] = approvalRound;
+                } else {
+                  t.rounds.push(approvalRound);
+                }
+                t.currentRound = approvalRound.round;
+                t.summary = {
+                  ...t.summary,
+                  lastPromptSnippet: (params.remarks || '').slice(0, 100),
+                  lastOutputSnippet: 'Approved',
+                };
+              }
+              if (t.execution) {
+                if (!currentHasActiveRun) {
+                  t.execution.run = undefined;
+                  t.execution.queue = undefined;
+                  if (status === 'WAITING_MERGE') {
+                    t.execution.phase = 'merge';
+                  }
+                }
+              }
+            });
+          } catch (err: any) {
+            if (err?.message?.includes('revision mismatch') && attempt < 2) {
+              continue;
+            }
+            throw err;
+          }
+        }
+        throw new Error(`Failed to transition task ${thread.threadId} after retries`);
+      };
+      const execPromise = doTransition().then(() => {
+        if (!finalHasActiveRun && ExecutionController.getInstance() && status === 'WAITING_MERGE') {
+          void ExecutionController.getInstance()!.startExecution(thread.threadId, 'merge');
+        }
+        if (status === 'COMPLETED') {
+          try { archiveCompletedTaskLogs(thread, path.dirname(this.taskStore.getStoragePath())); } catch {}
+        }
+        return {
+          threadId: thread.threadId,
+          status,
+          message: status === 'WAITING_MERGE'
+            ? `Task ${thread.threadId} is approved at ${thread.worktree?.approvedCommit}; local integration and combined validation will run asynchronously.`
+            : `Task ${thread.threadId} successfully approved and archived.`,
+        };
+      });
+      return execPromise as any;
     }
 
     this.taskStore.upsertTask(thread);
@@ -910,9 +1149,26 @@ export class ReworkController {
     return this.mergeCoordinator.mergeApproved(threadId);
   }
 
-  public requestMergeDecision(threadId: string, question: string, background: string, suggestion: string, conflictFiles: string[] = [], logPath?: string): { threadId: string; status: 'wait_decision'; decisionId: string; nextAction: string; message: string } {
+  public async requestMergeDecision(threadId: string, question: string, background: string, suggestion: string, conflictFiles: string[] = [], logPath?: string): Promise<{ threadId: string; status: 'wait_decision'; decisionId: string; nextAction: string; message: string }> {
     const current = this.taskStore.getTask(threadId);
-    if (!current || current.status !== 'waiting_merge' || !question?.trim()) throw new Error('A waiting merge and a non-empty question are required.');
+    if (!current || (current.status !== 'waiting_merge' && current.status !== 'merging') || !question?.trim()) throw new Error('A waiting merge and a non-empty question are required.');
+    if (current.execution && ExecutionController.getInstance()) {
+      const decision = await ExecutionController.getInstance()!.requestTaskDecision(threadId, {
+        question: question.trim(),
+        background: (background || '').trim(),
+        suggestion: (suggestion || '').trim(),
+        resumePoint: 'retry_merge',
+        conflictFiles,
+        logPath,
+      });
+      return {
+        threadId,
+        status: 'wait_decision',
+        decisionId: decision.id,
+        nextAction: 'END_TURN_AND_WAIT_FOR_USER',
+        message: 'End this reviewer turn; the user decision will wake the same session.',
+      };
+    }
     if (current.worktree?.integration?.stashRecoveryPending) throw new Error('Cannot request a merge decision while stash metadata recovery is pending.');
     const thread = structuredClone(current);
     const decisionId = crypto.randomUUID(); const at = new Date().toISOString();
@@ -934,7 +1190,13 @@ export class ReworkController {
 
   public submitMergeDecision(threadId: string, answer: string): { threadId: string; status: 'waiting_merge'; decisionId: string } {
     const current = this.taskStore.getTask(threadId);
-    if (!current || current.status !== 'wait_decision' || !current.mergeControl?.pendingDecisionId || !answer?.trim()) throw new Error('A pending merge decision and a non-empty answer are required.');
+    if (!current || current.status !== 'wait_decision' || !answer?.trim()) throw new Error('A pending merge decision and a non-empty answer are required.');
+    if (current.execution && ExecutionController.getInstance()) {
+      const decisionId = current.decision?.id || current.mergeControl?.pendingDecisionId || '';
+      void ExecutionController.getInstance()!.submitTaskDecision(threadId, decisionId, answer);
+      return { threadId, status: 'waiting_merge', decisionId };
+    }
+    if (!current.mergeControl?.pendingDecisionId) throw new Error('A pending merge decision and a non-empty answer are required.');
     const thread = structuredClone(current); const decisionId = thread.mergeControl!.pendingDecisionId!; const at = new Date().toISOString();
     thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), decisionId, number: (thread.mergeHistory?.length || 0) + 1,
       at, phase: 'decision', result: 'answered', answer: answer.trim() }];
@@ -950,6 +1212,10 @@ export class ReworkController {
   public retryMerge(threadId: string): { threadId: string; status: 'waiting_merge'; retryGeneration: number } {
     const current = this.taskStore.getTask(threadId);
     if (!current || current.archivedAt || current.status !== 'failed' || current.failure?.stage !== 'merge') throw new Error('Only a merge failure can restart its merge budget.');
+    if (current.execution && ExecutionController.getInstance()) {
+      void ExecutionController.getInstance()!.retryOperation(threadId);
+      return { threadId, status: 'waiting_merge', retryGeneration: (current.execution.generation || 1) + 1 };
+    }
     const thread = structuredClone(current); resetMergeBudget(thread); clearTaskFailure(thread); thread.status = 'waiting_merge';
     const at = new Date().toISOString(); thread.updatedAt = at;
     if (thread.worktree?.integration) {
@@ -1002,7 +1268,7 @@ export class ReworkController {
   public resumePendingMerges(): void {
     this.taskStore.loadFromDisk();
     for (const thread of this.taskStore.getAllTasks()) {
-      if (thread.status !== 'waiting_merge') continue;
+      if (thread.status !== 'waiting_merge' || thread.execution) continue;
       if (['blocked', 'conflict', 'validation_failed'].includes(thread.worktree?.integration?.phase || '')) continue;
       const blockedAt = this.blockedMergeRetries.get(thread.threadId);
       if (blockedAt && blockedAt === thread.updatedAt) continue;

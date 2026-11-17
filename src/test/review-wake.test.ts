@@ -277,10 +277,10 @@ describe('CallbackManager records stalled reviewer wakes', () => {
       worktree: { path: workspace, mainPath: workspace, integration: { phase: 'blocked', error: 'need decision', updatedAt: new Date().toISOString() } } });
     store.upsertTask(thread);
     const sessions: string[] = [];
-    (manager as any).launchCaller = (...args: any[]) => {
+    (manager as any).launchCaller = async (...args: any[]) => {
       sessions.push(args[1]); const release = args[5]; const onPid = args[6];
       onPid(process.pid);
-      if (sessions.length === 1) controller.requestMergeDecision(thread.threadId, 'Choose?', 'background', 'A');
+      if (sessions.length === 1) await controller.requestMergeDecision(thread.threadId, 'Choose?', 'background', 'A');
       onPid(undefined); release(); return true;
     };
     assert.equal(await manager.notifyCaller(thread, thread.rounds[0]), true);

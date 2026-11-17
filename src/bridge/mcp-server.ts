@@ -11,6 +11,7 @@ import { ActiveAgentResolver } from './active-agent-resolver';
 import { AutonomousRunner } from './autonomous-runner';
 import { TaskSupervisor } from './task-supervisor';
 import { TaskControlService } from './task-control';
+import { ExecutionController } from './execution-controller';
 import { CallerPollGuard, progressSignature } from './caller-poll-guard';
 import { TaskRoleLock } from './task-role-lock';
 import { TaskExecutionRegistry } from './task-execution-registry';
@@ -84,6 +85,7 @@ const CONTROL_TOOLS = new Set([
   'record_merge_request',
   'submit_merge_resolution',
   'request_merge_decision',
+  'submit_task_decision',
   'retry_merge',
 ]);
 
@@ -547,6 +549,39 @@ export class MCPServer {
         name: 'request_merge_decision',
         description: 'Ask the user to decide a merge issue and end the reviewer turn.',
         inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, question: { type: 'string' }, background: { type: 'string' }, suggestion: { type: 'string' }, conflictFiles: { type: 'array', items: { type: 'string' } }, logPath: { type: 'string' } }, required: ['threadId', 'question'] },
+      },
+      {
+        name: 'request_task_decision',
+        description: 'Ask the user to make a decision on develop, review, or merge and wait.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            threadId: { type: 'string' },
+            question: { type: 'string' },
+            background: { type: 'string' },
+            suggestion: { type: 'string' },
+            resumePoint: {
+              type: 'string',
+              enum: ['continue_develop', 'continue_review', 'retry_merge', 'continue_merge_resolution'],
+            },
+            conflictFiles: { type: 'array', items: { type: 'string' } },
+            logPath: { type: 'string' },
+          },
+          required: ['threadId', 'question', 'resumePoint'],
+        },
+      },
+      {
+        name: 'submit_task_decision',
+        description: 'Submit an answer to a pending task decision and immediately resume execution.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            threadId: { type: 'string' },
+            decisionId: { type: 'string' },
+            answer: { type: 'string' },
+          },
+          required: ['threadId', 'decisionId', 'answer'],
+        },
       },
       {
         name: 'retry_merge',
@@ -1369,10 +1404,59 @@ export class MCPServer {
 
       case 'request_merge_decision': {
         this.assertActiveReviewerRole(args.threadId);
-        return this.reworkController.requestMergeDecision(args.threadId, args.question, args.background, args.suggestion, args.conflictFiles, args.logPath);
+        return await this.reworkController.requestMergeDecision(args.threadId, args.question, args.background, args.suggestion, args.conflictFiles, args.logPath);
       }
 
-      case 'retry_merge': return this.reworkController.retryMerge(args.threadId);
+      case 'request_task_decision': {
+        const callerAgent = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
+        const thread = this.taskStore.getTask(args.threadId);
+        if (!thread) throw new Error(`Task thread not found: ${args.threadId}`);
+        const isReceiver = process.env.MESH_TASK_RECEIVER === '1';
+        if (isReceiver && process.env.MESH_TASK_THREAD_ID && process.env.MESH_TASK_THREAD_ID !== args.threadId) {
+          throw new Error(`Receiver process for thread ${process.env.MESH_TASK_THREAD_ID} cannot request decisions for thread ${args.threadId}`);
+        }
+        const isDeveloper = Boolean(
+          isReceiver &&
+          (process.env.MESH_TASK_THREAD_ID === args.threadId || thread.targetAgent === callerAgent)
+        );
+        if (!isDeveloper) {
+          this.assertActiveReviewerRole(args.threadId);
+        }
+        if (ExecutionController.getInstance()) {
+          const resumePoint = args.resumePoint || (isDeveloper ? 'continue_develop' : 'continue_review');
+          const decision = await ExecutionController.getInstance()!.requestTaskDecision(args.threadId, {
+            question: args.question,
+            background: args.background,
+            suggestion: args.suggestion,
+            resumePoint,
+            conflictFiles: args.conflictFiles,
+            logPath: args.logPath,
+          });
+          return {
+            threadId: args.threadId,
+            status: 'wait_decision',
+            decisionId: decision.id,
+            nextAction: 'END_TURN_AND_WAIT_FOR_USER',
+            message: 'Decision requested. End this turn; user answer will wake the task.',
+          };
+        }
+        return await this.reworkController.requestMergeDecision(args.threadId, args.question, args.background, args.suggestion, args.conflictFiles, args.logPath);
+      }
+
+      case 'submit_task_decision': {
+        if (ExecutionController.getInstance()) {
+          const updated = await ExecutionController.getInstance()!.submitTaskDecision(args.threadId, args.decisionId, args.answer, 'agent');
+          return {
+            threadId: args.threadId,
+            status: updated.status,
+            decisionId: args.decisionId,
+            message: `Decision answered. Resumed ${updated.status}.`,
+          };
+        }
+        return await this.reworkController.submitMergeDecision(args.threadId, args.answer);
+      }
+
+      case 'retry_merge': return await this.reworkController.retryMerge(args.threadId);
 
       case 'get_merge_log': {
         const thread = this.taskStore.getTask(args.threadId);
@@ -1411,7 +1495,7 @@ export class MCPServer {
 
       case 'approve_task': {
         this.assertActiveReviewerRole(args.threadId);
-        const result = this.reworkController.approveTask({
+        const result = await this.reworkController.approveTask({
           threadId: args.threadId,
           remarks: args.remarks,
         });
@@ -1421,10 +1505,19 @@ export class MCPServer {
       }
 
       case 'pause_task': {
-        return this.taskControl.pauseTask(args.threadId, args.reason, 'agent');
+        return await this.taskControl.pauseTask(args.threadId, args.reason, 'agent');
       }
 
       case 'resume_task': {
+        const thread = this.taskStore.getTask(args.threadId);
+        if (thread?.execution && ExecutionController.getInstance()) {
+          const resumed = await ExecutionController.getInstance()!.resumeOperation(args.threadId);
+          return {
+            threadId: args.threadId,
+            status: resumed.status,
+            message: `Task ${args.threadId} resumed (${resumed.status}).`,
+          };
+        }
         return this.reworkController.resumePausedTask(args.threadId, {
           targetAgent: args.targetAgent,
           model: args.model,
@@ -1442,12 +1535,21 @@ export class MCPServer {
       }
 
       case 'retry_task': {
+        let thread = this.taskStore.getTask(args.threadId);
+        if (thread?.execution && ExecutionController.getInstance()) {
+          const retried = await ExecutionController.getInstance()!.retryOperation(args.threadId);
+          return {
+            threadId: args.threadId,
+            status: 'RETRYING',
+            message: `Task ${args.threadId} retried with new generation.`,
+          };
+        }
         const retried = await this.reworkController.retryFailedRound(args.threadId, {
           targetAgent: args.targetAgent,
           model: args.model,
           modelRequestedByUser: args.modelRequestedByUser === true,
         });
-        const thread = this.taskStore.getTask(args.threadId);
+        thread = this.taskStore.getTask(args.threadId);
         const routed =
           thread && (args.targetAgent || args.model)
             ? ` Now executing on ${thread.targetAgent}${thread.targetModel ? ` (${thread.targetModel})` : ''}.`

@@ -315,6 +315,7 @@ export interface RunOptions {
   cwd?: string;
   timeoutMs?: number; // Overall process timeout, default 2 hours (120 mins)
   silenceTimeoutMs?: number; // Silence watchdog timeout, default 10 minutes
+  sessionLease?: NativeSessionLease;
   /**
    * How to treat an output gap that exceeds the threshold while the process
    * still exited 0 with a real final answer. Default `warn`: keep the round
@@ -830,7 +831,7 @@ export class AutonomousRunner {
             return this.buildInterruptedResult(pending);
           }
           try {
-            prepared = await compactor.prepareBeforeResume(taskThreadId, nativeRole, options.model, nativeRole === 'reviewer' && options.taskRound === 0);
+            prepared = await compactor.prepareBeforeResume(taskThreadId, nativeRole, options.model, nativeRole === 'reviewer' && options.taskRound === 0, options.sessionLease);
             break;
           } catch (error: any) {
             if (!String(error?.message || error).includes('already owned by another Bridge process')) throw error;
@@ -876,7 +877,9 @@ export class AutonomousRunner {
               : current.status === 'queued' || current.status === 'waiting_review');
             if (cancel || !current || current.archivedAt || currentAgent !== boundAgent ||
                 currentModel !== options.model || !allowedStatus || (currentCaptured && currentSession !== sessionId)) {
-              sessionLock.release(nativeLease);
+              if (!options.sessionLease) {
+                sessionLock.release(nativeLease);
+              }
               nativeLease = undefined;
               throw new Error('Task binding or state changed before the first native session id could be published.');
             }
@@ -1109,7 +1112,7 @@ export class AutonomousRunner {
         return result;
       }
     } finally {
-      if (nativeLease && this.taskStore) {
+      if (nativeLease && this.taskStore && !options.sessionLease) {
         const lock = new NativeSessionLock(path.dirname(this.taskStore.getStoragePath()));
         let released = false;
         for (let attempt = 0; attempt < 2 && !released; attempt++) {
@@ -1613,56 +1616,9 @@ export class AutonomousRunner {
         cancellationPoll.unref?.();
       }
 
-      // Silence Watchdog. Silence is measured on the suspension-adjusted clock:
-      // a host that slept for an hour was never going to produce output, so the
-      // round must not be killed the moment the machine wakes up.
-      const silenceInterval = setInterval(() => {
-        if (isSettled) {
-          clearInterval(silenceInterval);
-          return;
-        }
-        suspension.sync();
-        const nowMono = monotonicNowMs();
-        const silentDuration = Math.max(
-          0,
-          nowMono - lastActivityMono - suspension.suspendedWithin(lastActivityMono, nowMono),
-        );
-        // A round parked on a declared background task is not hung: the agent
-        // said it is waiting and the child pipeline is the work being paid for.
-        // It gets its own bounded budget instead of the normal silence threshold
-        // (a wedged child still cannot park the round forever).
-        //
-        // The budget is measured on the park itself, NOT on the general silence
-        // duration, because a normal threshold may already have been exceeded
-        // before the agent announced the wait.
-        const parkedFor =
-          backgroundWaitStartedMono === undefined
-            ? undefined
-            : Math.max(
-                0,
-                nowMono -
-                  backgroundWaitStartedMono -
-                  suspension.suspendedWithin(backgroundWaitStartedMono, nowMono),
-              );
-        const exceeded =
-          parkedFor !== undefined
-            ? parkedFor > BACKGROUND_WAIT_BUDGET_MS
-            : silentDuration > silenceTimeoutMs;
-        if (exceeded) {
-          clearInterval(silenceInterval);
-          watchdogTriggered = true;
-          console.warn(
-            parkedFor !== undefined
-              ? `[AutonomousRunner] Watchdog triggered: ${options.agent} parked on a background task for ` +
-                  `${Math.round(parkedFor / 1000)}s, beyond the ${Math.round(BACKGROUND_WAIT_BUDGET_MS / 1000)}s budget. Terminating.`
-              : `[AutonomousRunner] Watchdog triggered: Process ${options.agent} silent for ` +
-                  `${Math.round(silentDuration / 1000)}s (threshold ${Math.round(silenceTimeoutMs / 1000)}s). Terminating.`,
-          );
-          try {
-            this.killProcess(child);
-          } catch {}
-        }
-      }, 5000);
+      // Silence Watchdog: under unified execution lifecycle, active silence termination is
+      // removed in favor of unified budget and STREAM_GAP_EXCEEDED warning assessment.
+      const silenceInterval: NodeJS.Timeout | null = null;
 
       // Overall timeout, counted in ACTIVE runtime: time the host spent asleep
       // does not consume the task's execution budget.
@@ -1786,7 +1742,7 @@ export class AutonomousRunner {
           return;
         }
         isSettled = true;
-        clearInterval(silenceInterval);
+        if (silenceInterval) clearInterval(silenceInterval);
         clearInterval(maxTimer);
         const cancellation = takeCancellation();
         const durationMs = Date.now() - startTime;
@@ -1826,7 +1782,7 @@ export class AutonomousRunner {
         // Pick up a suspension window that ended right at exit time (e.g. the
         // machine was asleep when the child's last output arrived).
         suspension.sync();
-        clearInterval(silenceInterval);
+        if (silenceInterval) clearInterval(silenceInterval);
         clearInterval(maxTimer);
         // A provider error printed without a trailing newline still has to be
         // recognised; the process is gone, so record it instead of aborting.

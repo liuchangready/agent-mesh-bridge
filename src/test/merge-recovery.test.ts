@@ -57,13 +57,13 @@ test('merge decisions append immutable question and answer records and wake the 
   t.after(() => { controller.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
   store.upsertTask(task(root));
   const stale = structuredClone(store.getTask('thread_merge_decision')!);
-  const first = controller.requestMergeDecision('thread_merge_decision', 'Which fix?', 'context', 'choose A', ['a.txt']);
+  const first = await controller.requestMergeDecision('thread_merge_decision', 'Which fix?', 'context', 'choose A', ['a.txt']);
   assert.equal(store.getTask(first.threadId)!.status, 'wait_decision');
   stale.updatedAt = new Date(Date.now() + 60_000).toISOString(); store.upsertTask(stale);
   assert.equal(store.getTask(first.threadId)!.status, 'wait_decision');
   const savedQuestion = JSON.stringify(store.getTask(first.threadId)!.mergeHistory![0]);
   controller.submitMergeDecision(first.threadId, 'Use A\nand retain B');
-  const second = controller.requestMergeDecision(first.threadId, 'Which test?', 'more context', 'run integration');
+  const second = await controller.requestMergeDecision(first.threadId, 'Which test?', 'more context', 'run integration');
   controller.submitMergeDecision(first.threadId, 'Run it');
   await new Promise((resolve) => setTimeout(resolve, 25));
   const stored = store.getTask(first.threadId)!;
@@ -103,7 +103,7 @@ test('pending stash metadata recovery survives stale writes and pause/resume wit
   assert.equal(store.getTask(thread.threadId)!.worktree!.approvedCommit, 'candidate');
   await assert.rejects(() => controller.requestRework({ threadId: thread.threadId, feedback: 'change it' }), /stash metadata recovery/i);
   assert.throws(() => controller.approveTask({ threadId: thread.threadId }), /stash metadata recovery/i);
-  assert.throws(() => controller.requestMergeDecision(thread.threadId, 'Choose?', '', ''), /stash metadata recovery/i);
+  await assert.rejects(() => controller.requestMergeDecision(thread.threadId, 'Choose?', '', ''), /stash metadata recovery/i);
   const control = new TaskControlService(store, undefined, undefined, root);
   assert.equal(control.pauseTask(thread.threadId, 'pause', 'test').status, 'PAUSED');
   await controller.resumePausedTask(thread.threadId);

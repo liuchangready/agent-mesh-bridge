@@ -25,6 +25,7 @@ import { ConcurrencyPolicy, concurrencyPolicy } from './bridge-policy';
 import { TaskRoleLock } from './task-role-lock';
 import { appendCompactionProtocol, compactRoundBestEffort } from './context-compactor';
 import { readStoredRoundUsage } from './token-usage-collector';
+import { ExecutionController } from './execution-controller';
 import {
   findLatestExecutionLog,
   readTextFilePaged,
@@ -154,6 +155,7 @@ export class TaskSupervisor extends EventEmitter {
 
     updateLock();
     this.heartbeatInterval = setInterval(updateLock, 5000);
+    this.heartbeatInterval.unref?.();
   }
 
   private startWatching(): void {
@@ -166,11 +168,12 @@ export class TaskSupervisor extends EventEmitter {
     this.pollInterval = setInterval(() => {
       this.checkPendingTasks();
     }, 3000);
+    this.pollInterval.unref?.();
 
     // Initial check on startup
     setTimeout(() => {
       this.checkPendingTasks();
-    }, 1000);
+    }, 1000).unref?.();
   }
 
   /**
@@ -269,6 +272,16 @@ export class TaskSupervisor extends EventEmitter {
       .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 
     for (const thread of candidates) {
+      if (thread.execution && ExecutionController.getInstance()) {
+        if (thread.execution.queue?.notBefore) {
+          const notBeforeTime = Date.parse(thread.execution.queue.notBefore);
+          if (Number.isFinite(notBeforeTime) && Date.now() < notBeforeTime) {
+            continue;
+          }
+        }
+        void ExecutionController.getInstance()!.startExecution(thread.threadId, thread.execution.phase);
+        continue;
+      }
       this.normalizeRoundIntegrity(thread);
       const round = findInFlightRound(thread);
       if (!round || !round.prompt) continue;

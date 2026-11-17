@@ -8,7 +8,7 @@
 
 - **项目名称**：`agent-mesh-bridge` (VSCode 插件)
 - **核心目标**：在 VSCode 宿主内无缝打通 **Google Antigravity (`agy`)**、**OpenAI Codex (`codex`)**、**Anthropic Claude Code (`claude`)**、**DeepSeek Harness (`dsh`)**，构建对等多 Agent 协作网格。
-- **二十三大核心设计铁律**：
+- **二十四大核心设计铁律**：
   1. **默认选路原则**：无显式指定 target 时，默认自动选路至 VSCode 当前使用的前台 Agent。
   2. **全向对等互派**：四端 Agent 均可作为发件人向其他 Agent 派发任务；但**接收方不得二次转发**（见第 9 条）。
   3. **接收方原生留痕**：执行必须携带原生会话参数（`--session-id` / `--conversation` / `--session-id <dsh>`），确保在接收方原生历史可查。
@@ -19,7 +19,7 @@
   8. **Concurrent Git isolation**: Every new code task gets a unique `mesh/task/<threadId>` branch/worktree. Pin the real local delivery target at dispatch: explicit `targetBranch`, otherwise the source checkout branch. Child tasks inherit it. Start at the target branch commit; never use uncommitted checkout changes as task input. Under the global merge lock, merge against the latest target, validate, and CAS-update the real ref. Sync a checked-out target only when clean; preserve dirty user files and block delivery.
   9. **接收方禁止转发（当前策略）**：被派发的 Agent（receiver）只执行当前任务并回传结果，**不得**调用 `dispatch_task` / `invoke_agent` 把工作再转给其他 Agent，也不得驱动自己任务的 review 闭环。接收方进程由 `MESH_TASK_RECEIVER=1` 标记，MCP server 会隐藏并拒绝转发类工具。
   10. **权限旁路不可失效**：拆分/派发出去的任务必须真正无人值守。Codex 的 `--ask-for-approval` 是**全局参数，必须放在 `exec` 之前**；DSH 必须注入 `DSH_PERMISSION_MODE=danger-full-access`（否则 headless 默认 `workspace-write` + `approval: ask`，任务会卡在无人应答的权限询问上）。
-  11. **可暂停、可删除、可追溯**：运行中的任务必须可以暂停（终止 Agent 进程并保留当前轮次以便恢复）、可以删除（先终止进程，再移除账本条目）；暂停、停止、看门狗、超时等非正常结束必须在 `thread.interruption` / `round.interruption` 中记录 `{ kind, reason, at, by }`，且保留 `interruptions[]` 历史。
+  11. **可暂停、可删除、可追溯**：运行中的任务必须可以暂停（终止 Agent 进程并保留当前轮次以便恢复）、可以删除（先终止进程，再移除账本条目）；暂停、停止、超时等非正常结束必须在 `thread.interruption` / `round.interruption` 中记录 `{ kind, reason, at, by }`，且保留 `interruptions[]` 历史。运行生命周期由统一执行控制器分配 120 分钟单调活动时间预算管理，移除独立静默杀进程看门狗。
   12. **单任务单一角色（硬不变量）**：同一 `threadId` 在任一时刻只能有一个活跃角色——`reviewer`（下发/检视）或 `developer`（开发/返修）。角色链严格为 reviewer → developer → reviewer → …；不得同时存在两个检视进程，也不得在 reviewer 未交接时启动 developer。
       - 角色锁存于 `~/.agent-mesh-bridge/roles/<threadId>.json`，带心跳与僵尸回收。
       - reviewer 在 `request_rework` / `approve_task` 成功时视为完成交接并释放角色；developer 轮次结束后、唤醒 reviewer 前释放 developer 角色。
@@ -33,10 +33,10 @@
       - 任务已 `completed` 仍允许记录 MR；MR 记录不影响任务级队列推进，但必须在调用者本轮结束前完成。
 
   15. **响应成功必须双条件（硬不变量）**：Agent 响应是否成功不能只看退出码，必须同时满足：
-      - **错误码**：进程退出码为 `0`；非 0 记录 `NONZERO_EXIT`，暂停/超时/看门狗记录对应中断码。
+      - **错误码**：进程退出码为 `0`；非 0 记录 `NONZERO_EXIT`，暂停/超时记录对应中断码。
       - **流质量**：stdout 中必须提取到**实际最终输出**，且输出流连续（有 chunk，且最长间隔不超过 `silenceTimeoutMs`）；没有实际输出记 `EMPTY_OUTPUT`。
-      - **间隔必须扣除主机挂起**：间隔用**单调时钟**测量（免疫 NTP/改表跳变），并由 `HostSuspensionGuard` 心跳识别 `sleep`/`hibernate`/Modern Standby/宿主被冻结的窗口，从 `maxGapMs` 中扣除；被扣除的原始墙钟间隔留在 `rawMaxGapMs`，扣除量留在 `excludedSuspensionMs`、窗口数留在 `suspensionCount`。静默看门狗与总超时同样按「扣除挂起后的活跃时间」判定，机器睡多久都不算 agent 的静默、也不消耗任务预算。
-      - **长间隔默认降级为 warning**：`exitCode === 0` 且提取到实际输出时，扣除挂起后仍超阈值的间隔记 `STREAM_GAP_EXCEEDED` 警告（`assessment.warnings[]`，`success` 仍为 `true`，`stream.continuous = false`、`stream.gapExceeded = true`），不得据此外抛失败、丢弃已完成的工作或重跑整轮；`STREAM_STALLED` 只在显式 `streamGapPolicy: 'fail'` 时使用。
+      - **间隔必须扣除主机挂起**：间隔用**单调时钟**测量（免疫 NTP/改表跳变），并由 `HostSuspensionGuard` 心跳识别 `sleep`/`hibernate`/Modern Standby/宿主被冻结的窗口，从 `maxGapMs` 中扣除；被扣除的原始墙钟间隔留在 `rawMaxGapMs`，扣除量留在 `excludedSuspensionMs`、窗口数留在 `suspensionCount`。超时与活动预算同样按「扣除挂起后的活跃时间」判定，机器睡多久都不算 agent 的静默、也不消耗任务预算。
+      - **长间隔默认降级为 warning**：`exitCode === 0` 且提取到实际输出时，扣除挂起后仍超阈值的间隔记 `STREAM_GAP_EXCEEDED` 警告（`assessment.warnings[]`，`success` 仍为 `true`，`stream.continuous = false`、`stream.gapExceeded = true`），不得据此外抛失败、丢弃已完成的工作或重跑整轮；移除独立静默 kill 机制，由控制器统一管理活动时间。
       - `RunResult.assessment` 必须持久化到 `round.assessment`，字段包括 `success`、`errorCode`、`exitCode`、`warnings[]`、`stream.{chunkCount, stdoutBytes, stderrBytes, firstOutputAtMs, lastOutputAtMs, maxGapMs, rawMaxGapMs, excludedSuspensionMs, suspensionCount, gapThresholdMs, hasActualOutput, continuous, gapExceeded}`。
       - 任何 `exitCode === 0` 但不能提取实际输出（例如只有 JSON status/metadata）的轮次必须判定为 `failed`，不得进入 `waiting_review`，更不得唤醒 reviewer。
 
@@ -109,6 +109,14 @@
       - **归档**：默认保留最新 20 个任务（设置 `agentMeshBridge.archive.keepRecentTasks`），超出且已终态的任务由 `TaskArchiveService` 自动归档。归档在生成 `<threadId>_archive.tar.gz` 存入 `Archive/` 归档后，清空 `rounds`、会话 id，并清理 `worker_log` 与 `reviewer_log` 中的活动散落日志，同时保留终态摘要与 `Archive/` 中的压缩包，并尽力清理 native 会话。
       - **删除**：`delete_task` 才彻底丢弃任务全部信息——先取消进程/释放租约，移除账本条目，再清理 `worker_log/`、`reviewer_log/`、`Archive/`、bootstrap 文件与 native 会话（含专用 reviewer 会话），写入墓碑；`callerSessionId`（legacy 用户会话）永不清理。
       - 归档任务对 `get_thread_details` 返回 `archived: true` 与空 `rounds`，并指向 `get_task_summary`；不得让已归档任务重新出现在活动队列或恢复出旧轮次。
+
+  24. **开发检视与合并的统一执行生命周期 (UNIFIED_EXECUTION_LIFECYCLE)**：
+      - **统一控制器**：develop、review（含专用 Reviewer bootstrap）、merge（含有界 Reviewer 合并修复）统一经过 `ExecutionController` 执行控制器管理，共用持久化当前运行记录（`thread.execution`）、进程身份探测（`pid + birthId`）、活动时间预算（默认 120 分钟单调时钟，扣除主机挂起，输出日志不续期）、结果分类和自动重试计数。
+      - **状态流转**：规范为 `queued / running / reviewing / merging / wait_decision / paused / completed / failed`。阶段交接时若互斥资源空闲直接拉起目标阶段，实际受阻时才置入 `queued`。
+      - **CAS与短写锁**：更新运行记录、生命周期与决定唯一入口为 `TaskStore.transitionExecution(threadId, expectedRevision, change)`，在按任务短 OS 写锁内重读新鲜记录、校验版本、原子写入；并发回调携带身份重读提交，避免陈旧写入。
+      - **重试策略**：可安全重试的明确临时错误（transient）在预算内最多额外自动重试 2 次（退避 5s / 30s）；已知配额进入 `queued(quota)` 并不消耗重试次数；未知恢复时间、超时、无裁决、空输出或宿主崩溃后不确定工作直接进入明确 `failed`，不反复重放。手动 retry 重置重试次数并开启新 generation；resume 保留既有已消耗预算。
+      - **消除静默看门狗与嵌套重试**：移除独立静默 kill 看门狗和多套心跳过期回收，流质量 assessment 双条件与长间隔 warning 继续保留；执行器、Reviewer 与合并不再各自嵌套重试。
+      - **跨阶段决定等待**：支持开发、检视、合入阶段的 `wait_decision`，记录明确的 `resumePoint`，用户决策提交后立即恢复对应阶段并保留预算。
 
 详细架构设计见 [DESIGN.md](DESIGN.md)。
 

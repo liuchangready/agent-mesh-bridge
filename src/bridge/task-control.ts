@@ -16,6 +16,7 @@ import { changedFiles, currentHead } from './git-worktree';
 import { gitOutput } from './git-worktree';
 import { MeshFileLock } from './merge-coordinator';
 import { TaskRoleLock } from './task-role-lock';
+import { ExecutionController } from './execution-controller';
 import { killPidTree } from './platform';
 import { taskValidationDir } from './round-log';
 import {
@@ -93,7 +94,7 @@ export class TaskControlService {
         `Cannot pause task ${threadId}: it already failed. Use resume/retry instead.`,
       );
     }
-    if (thread.status === 'waiting_review') {
+    if (thread.status === 'waiting_review' && !thread.execution) {
       throw new Error(
         `Cannot pause task ${threadId}: it is waiting for the caller's review, not executing.`,
       );
@@ -103,6 +104,20 @@ export class TaskControlService {
     }
 
     const normalizedReason = (reason || '').trim() || 'Paused by user';
+    if (thread.execution && ExecutionController.getInstance()) {
+      void ExecutionController.getInstance()!.pauseExecution(threadId, normalizedReason, by);
+      this.cancellationRegistry.request(threadId, 'pause', normalizedReason, by);
+      this.runner?.cancelThread(threadId, 'pause', normalizedReason, by);
+      this.executionRegistry.killOrphanChild(threadId, true);
+      return {
+        threadId,
+        status: 'PAUSED',
+        reason: normalizedReason,
+        message:
+          `Task ${threadId} paused. Interruption reason: ${normalizedReason}. ` +
+          `The round is preserved and can be resumed later.`,
+      };
+    }
     const now = new Date().toISOString();
     const interruption: TaskInterruption = {
       kind: 'paused',
@@ -217,6 +232,8 @@ export class TaskControlService {
       thread.status === 'queued' ||
       thread.status === 'paused' ||
       thread.status === 'waiting_merge' ||
+      thread.status === 'reviewing' ||
+      thread.status === 'merging' ||
       !!findInFlightRound(thread) ||
       !!new TaskRoleLock(this.storageDir).getOwner(threadId)?.childPid ||
       this.executionRegistry.listOwners().some((owner) => owner.threadId === threadId && !!owner.childPid);

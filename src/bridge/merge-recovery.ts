@@ -31,9 +31,12 @@ export function noteMergeFailure(thread: DelegationThread, phase: string, code: 
   const previous = thread.mergeControl;
   const fingerprint = failureFingerprint(phase, code, summary, items);
   const retryGeneration = previous?.retryGeneration || 0;
-  const consecutiveRetries = previous?.failureFingerprint === fingerprint ? previous.consecutiveRetries + 1 : 0;
+  // Under unified execution lifecycle, failure fingerprints are diagnostic and do NOT reset retry budgets.
+  const consecutiveRetries = thread.execution
+    ? (previous?.consecutiveRetries || 0) + 1
+    : (previous?.failureFingerprint === fingerprint ? previous.consecutiveRetries + 1 : 0);
   thread.mergeControl = { ...previous, revision: (previous?.revision || 0) + 1, retryGeneration, failureFingerprint: fingerprint, consecutiveRetries };
-  if (consecutiveRetries >= 6 && !(thread.status === 'failed' && thread.failure?.stage === 'merge')) {
+  if (!thread.execution && consecutiveRetries >= 6 && !(thread.status === 'failed' && thread.failure?.stage === 'merge')) {
     enterTaskFailure(thread, { stage: 'merge', reason: summary.trim() || code, code, at: new Date().toISOString(), round: thread.currentRound });
   }
   return { fingerprint, retryGeneration, consecutiveRetries };

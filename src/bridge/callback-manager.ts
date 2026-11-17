@@ -39,6 +39,12 @@ import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-executi
 import { CancellationRegistry } from './cancellation-registry';
 import { noteMergeFailure } from './merge-recovery';
 import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
+import {
+  buildReviewerBootstrapPrompt,
+  clearReviewerBootstrapToken,
+  readReviewerBootstrapToken,
+  recordReviewerBootstrapHostPid,
+} from './reviewer-bootstrap';
 
 /**
  * How many times one task may wake its caller about failures.
@@ -299,33 +305,7 @@ export class CallbackManager extends EventEmitter {
 
     this.emit('taskCompleted', { thread, round: reviewRound });
 
-    const preview = reviewRound.output
-      ? reviewRound.output.slice(0, 200).replace(/[\r\n]+/g, ' ')
-      : reviewRound.error
-        ? `Error: ${reviewRound.error.slice(0, 150)}`
-        : 'Completed';
-
-    // Callee token line: only when something was actually measured. A missing
-    // measurement must not be rendered as "0 tokens".
-    const tokenLine = (() => {
-      const usage = reviewRound.tokenUsage;
-      if (!usage || !usage.available) return '';
-      const tilde = usage.source === 'estimated' || usage.partial ? '~' : '';
-      const cumulative = aggregateThreadTokenUsage(thread.rounds || []);
-      const cumulativeTilde = cumulative.isPartialOrEstimated ? '~' : '';
-      return (
-        `\n📊 Callee Token: Round ${reviewRound.round} ${tilde}${formatTokenCount(usage.totalTokens)}` +
-        ` (输入 ${formatTokenCount(usage.promptTokens)} · 输出 ${formatTokenCount(usage.outputTokens)} · 缓存 ${formatTokenCount(usage.cacheReadTokens)})` +
-        ` · 任务累计 ${cumulativeTilde}${formatTokenCount(cumulative.totalTokens)}`
-      );
-    })();
-
-    const promptMessage = `[Agent Mesh Bridge 自动化闭环验收指令] 任务【${thread.title}】第 ${reviewRound.round} 轮已由 ${thread.targetAgent} 执行完成。\n结果摘要: ${preview}${tokenLine}\n\n本任务已有中间文档链保存在任务账本（历轮指令 / 开发报告 / 返修意见）。get_thread_details(threadId="${thread.threadId}") 默认返回有界视图：最新轮完整，较早轮次可能是「提纯胶囊」卡片；需要逐字核对某一历史轮时用 get_round_raw_log(threadId="${thread.threadId}", round=<轮号>)，不要为此读取整段历史。必须沿用同一 threadId 与当前 callerSessionId 继续，禁止新建任务、另起会话或转派给其他 Agent。\n\n请作为任务下发方立即执行自动化检视闭环（判据只看**本任务自身范围**）：\n1. 审查本任务范围的代码与产出，并在当前工作区实际运行相关测试验证；\n2. 本任务范围内存在编译报错、测试未通过或功能缺陷：立即调用 request_rework(threadId="${thread.threadId}", feedback="具体报错与修复要求")；\n3. 本任务范围已通过、只是同批其他任务/依赖尚未交付：**不要**再发一轮 rework 空转，改用 request_rework(threadId="${thread.threadId}", feedback="阻塞说明", blocked=true, waitingForThreadId="<被依赖的 threadId>") 挂起；桥接不占用轮次，并在依赖到达 completed/failed 时自动唤醒你；\n4. 本任务范围通过即调用 approve_task(threadId="${thread.threadId}", remarks="本任务范围的验收结论与测试结果")。**不要用同批其他任务的 skip/失败否决本任务**——批次门禁属于收口阶段，由你在第 5 步统一处理；\n5. 验收通过后，由你作为调用者统一收口一个 MR：汇总该任务及同一批尚未推送的改动，只创建一个 MR，使用仓库既有远端与 gh/glab/等价 CLI 推送到远端；然后调用 mcp 工具 record_merge_request(threadId="${thread.threadId}", url="MR URL", branch="源分支", commit="提交 SHA", remote="origin", status="synced", summary="MR 摘要") 记录 MR 信息。不要每个子任务各推一次，不要新建任务/会话；开发者(receiver)不负责提交/推送。\n注意：上一轮没有任何文件改动时，本轮若再提交几乎相同的 rework 指令会被桥接拒绝（REWORK_NOOP_LOOP），只能 approve_task 或 blocked=true。\n请注意：请直接调用上述 MCP 工具完成闭环，请勿仅输出文本结论。`;
-
-    const wakeMessage = thread.status === 'waiting_merge'
-      ? `The approved task could not be integrated: ${thread.worktree?.integration?.error || 'unknown error'}. Resolution workspace: ${thread.worktree?.mergeResolutionPath || 'not available'}. Worker assessment: ${JSON.stringify(reviewRound.assessment || null)}. Interruptions: ${JSON.stringify(thread.interruptions || [])}. Recent merge decisions and recovery: ${JSON.stringify((thread.mergeHistory || []).slice(-8))}. Inspect get_thread_details, get_merge_log and get_round_raw_log for task ${thread.threadId}. Preserve the existing thread and reviewer session; use standard Git to resolve and stage changes, then call submit_merge_resolution. Request rework only if the candidate itself needs changes; request_merge_decision when a user decision is needed. Treat STREAM_GAP_EXCEEDED as a warning, defer quota failures, and investigate authentication, permission, CLI startup, environment, Git and validation failures.`
-      : promptMessage;
-    const reviewWakeMessage = thread.taskTemplate ? `${wakeMessage}\n\n[Task template reviewer instructions]\n${thread.taskTemplate.reviewerInstructions}` : wakeMessage;
+    const reviewWakeMessage = this.buildReviewWakeMessage(thread, reviewRound);
     const mergeWakeId = thread.status === 'waiting_merge' ? crypto.randomUUID() : undefined;
     let released = false;
     let sessionLeaseReleased = !reviewerSessionLease;
@@ -619,6 +599,337 @@ export class CallbackManager extends EventEmitter {
     return callerSessionId && isValidSessionId(callerSessionId) ? callerSessionId : undefined;
   }
 
+  public buildReviewWakeMessage(thread: DelegationThread, reviewRound: DelegationRound): string {
+    const preview = reviewRound.output
+      ? reviewRound.output.slice(0, 200).replace(/[\r\n]+/g, ' ')
+      : reviewRound.error
+        ? `Error: ${reviewRound.error.slice(0, 150)}`
+        : 'Completed';
+
+    const tokenLine = (() => {
+      const usage = reviewRound.tokenUsage;
+      if (!usage || !usage.available) return '';
+      const tilde = usage.source === 'estimated' || usage.partial ? '~' : '';
+      const cumulative = aggregateThreadTokenUsage(thread.rounds || []);
+      const cumulativeTilde = cumulative.isPartialOrEstimated ? '~' : '';
+      return (
+        `\n📊 Callee Token: Round ${reviewRound.round} ${tilde}${formatTokenCount(usage.totalTokens)}` +
+        ` (输入 ${formatTokenCount(usage.promptTokens)} · 输出 ${formatTokenCount(usage.outputTokens)} · 缓存 ${formatTokenCount(usage.cacheReadTokens)})` +
+        ` · 任务累计 ${cumulativeTilde}${formatTokenCount(cumulative.totalTokens)}`
+      );
+    })();
+
+    const promptMessage = `[Agent Mesh Bridge 自动化闭环验收指令] 任务【${thread.title}】第 ${reviewRound.round} 轮已由 ${thread.targetAgent} 执行完成。\n结果摘要: ${preview}${tokenLine}\n\n本任务已有中间文档链保存在任务账本（历轮指令 / 开发报告 / 返修意见）。get_thread_details(threadId="${thread.threadId}") 默认返回有界视图：最新轮完整，较早轮次可能是「提纯胶囊」卡片；需要逐字核对某一历史轮时用 get_round_raw_log(threadId="${thread.threadId}", round=<轮号>)，不要为此读取整段历史。必须沿用同一 threadId 与当前 callerSessionId 继续，禁止新建任务、另起会话或转派给其他 Agent。\n\n请作为任务下发方立即执行自动化检视闭环（判据只看**本任务自身范围**）：\n1. 审查本任务范围的代码与产出，并在当前工作区实际运行相关测试验证；\n2. 本任务范围内存在编译报错、测试未通过或功能缺陷：立即调用 request_rework(threadId="${thread.threadId}", feedback="具体报错与修复要求")；\n3. 本任务范围已通过、只是同批其他任务/依赖尚未交付：**不要**再发一轮 rework 空转，改用 request_rework(threadId="${thread.threadId}", feedback="阻塞说明", blocked=true, waitingForThreadId="<被依赖的 threadId>") 挂起；桥接不占用轮次，并在依赖到达 completed/failed 时自动唤醒你；\n4. 本任务范围通过即调用 approve_task(threadId="${thread.threadId}", remarks="本任务范围的验收结论与测试结果")。**不要用同批其他任务的 skip/失败否决本任务**——批次门禁属于收口阶段，由你在第 5 步统一处理；\n5. 验收通过后，由你作为调用者统一收口一个 MR：汇总该任务及同一批尚未推送的改动，只创建一个 MR，使用仓库既有远端与 gh/glab/等价 CLI 推送到远端；然后调用 mcp 工具 record_merge_request(threadId="${thread.threadId}", url="MR URL", branch="源分支", commit="提交 SHA", remote="origin", status="synced", summary="MR 摘要") 记录 MR 信息。不要每个子任务各推一次，不要新建任务/会话；开发者(receiver)不负责提交/推送。\n注意：上一轮没有任何文件改动时，本轮若再提交几乎相同的 rework 指令会被桥接拒绝（REWORK_NOOP_LOOP），只能 approve_task 或 blocked=true。\n请注意：请直接调用上述 MCP 工具完成闭环，请勿仅输出文本结论。`;
+
+    const wakeMessage = thread.status === 'waiting_merge'
+      ? `The approved task could not be integrated: ${thread.worktree?.integration?.error || 'unknown error'}. Resolution workspace: ${thread.worktree?.mergeResolutionPath || 'not available'}. Worker assessment: ${JSON.stringify(reviewRound.assessment || null)}. Interruptions: ${JSON.stringify(thread.interruptions || [])}. Recent merge decisions and recovery: ${JSON.stringify((thread.mergeHistory || []).slice(-8))}. Inspect get_thread_details, get_merge_log and get_round_raw_log for task ${thread.threadId}. Preserve the existing thread and reviewer session; use standard Git to resolve and stage changes, then call submit_merge_resolution. Request rework only if the candidate itself needs changes; request_merge_decision when a user decision is needed. Treat STREAM_GAP_EXCEEDED as a warning, defer quota failures, and investigate authentication, permission, CLI startup, environment, Git and validation failures.`
+      : promptMessage;
+    return thread.taskTemplate ? `${wakeMessage}\n\n[Task template reviewer instructions]\n${thread.taskTemplate.reviewerInstructions}` : wakeMessage;
+  }
+
+  public async launchReviewerBootstrap(
+    thread: DelegationThread,
+    onChildPid?: (pid: number) => void,
+  ): Promise<{ confirmed: boolean; error?: string; transient?: boolean }> {
+    assertCanExecute(thread.initiatorAgent, 'bootstrap as a reviewer', 'initiator');
+    const store = this.taskStore;
+    const root = this.storageDir || (store ? path.dirname(store.getStoragePath()) : undefined);
+    const tokenRecord = root ? readReviewerBootstrapToken(thread.threadId, root, thread.artifactDir) : undefined;
+    if (!tokenRecord) {
+      return { confirmed: false, error: 'Reviewer bootstrap token is missing.' };
+    }
+
+    const resumeReviewerSession = thread.reviewerSessionCaptured === true && !!thread.reviewerSessionId;
+    const preassigned = resumeReviewerSession ? thread.reviewerSessionId! : crypto.randomUUID();
+    const prompt = buildReviewerBootstrapPrompt(thread, tokenRecord.token);
+    const runner = this.runner || new AutonomousRunner(this.detector);
+
+    const result = await runner.execute({
+      agent: thread.initiatorAgent,
+      prompt,
+      isRework: resumeReviewerSession,
+      receiverSessionId: preassigned,
+      title: `Reviewer bootstrap: ${thread.title}`,
+      cwd: getTaskExecutionPath(thread),
+      taskThreadId: thread.threadId,
+      artifactDir: thread.artifactDir,
+      taskRound: 0,
+      nativeSessionRole: 'reviewer',
+      model: thread.reviewerModel,
+      role: 'bootstrap',
+      markAsReceiver: false,
+      maxRetries: 0,
+      extraEnv: {
+        MESH_REVIEW_BOOTSTRAP: '1',
+        MESH_REVIEW_BOOTSTRAP_TOKEN: tokenRecord.token,
+        MESH_REVIEW_THREAD_ID: thread.threadId,
+        MESH_CALLER_AGENT: thread.initiatorAgent,
+      },
+      onChildPid: (pid) => {
+        if (pid && root) recordReviewerBootstrapHostPid(thread.threadId, pid, root, thread.artifactDir);
+        if (pid) onChildPid?.(pid);
+      },
+    });
+
+    if (store) store.loadFromDisk();
+    const fresh = store?.getTask(thread.threadId);
+    if (fresh?.reviewBootstrap?.phase === 'confirmed') {
+      const sessionId =
+        result.actualSessionId ||
+        (thread.initiatorAgent === 'claude_code' ? preassigned : undefined) ||
+        (resumeReviewerSession ? preassigned : undefined);
+      if (sessionId && store) {
+        fresh.reviewerSessionId = sessionId;
+        fresh.reviewerSessionCaptured = true;
+        fresh.callerSessionId = sessionId;
+        fresh.reviewBootstrap = {
+          ...fresh.reviewBootstrap,
+          phase: 'confirmed',
+          reviewerSessionId: sessionId,
+        };
+        if (root) clearReviewerBootstrapToken(fresh.threadId, root, fresh.artifactDir);
+        store.upsertTask(fresh);
+      }
+      return { confirmed: true };
+    }
+
+    const detail = result.error || `Reviewer process exited with code ${result.exitCode} without confirming bootstrap`;
+    const isTransient = runner.isTransientError(result);
+    return { confirmed: false, error: detail, transient: isTransient };
+  }
+
+  public launchCaller(
+    thread: DelegationThread,
+    round: DelegationRound,
+    onChildPid?: (pid: number) => void,
+  ): Promise<{ success: boolean; error?: string; exitCode?: number }>;
+  public launchCaller(
+    thread: DelegationThread,
+    callerSessionId: string,
+    promptMessage: string,
+    round: DelegationRound,
+    wakeKind: 'review' | 'failure',
+    release: () => void,
+    onChildPid?: (pid: number | undefined) => void,
+    recoveryVersion?: string,
+    mergeWakeId?: string,
+    roleToken?: string,
+  ): boolean;
+  public launchCaller(
+    thread: DelegationThread,
+    callerSessionIdOrRound: string | DelegationRound,
+    promptMessageOrOnChildPid?: string | ((pid: number) => void),
+    roundParam?: DelegationRound,
+    wakeKind?: 'review' | 'failure',
+    release?: () => void,
+    onChildPid?: (pid: number | undefined) => void,
+    recoveryVersion?: string,
+    mergeWakeId?: string,
+    roleToken?: string,
+  ): boolean | Promise<{ success: boolean; error?: string; exitCode?: number }> {
+    if (typeof callerSessionIdOrRound !== 'string') {
+      const round = callerSessionIdOrRound;
+      const childPidCb = typeof promptMessageOrOnChildPid === 'function' ? promptMessageOrOnChildPid : undefined;
+      return this.launchCallerAsync(thread, round, childPidCb);
+    }
+    const callerSessionId = callerSessionIdOrRound;
+    const promptMessage = promptMessageOrOnChildPid as string;
+    const round = roundParam!;
+    return this.launchCallerSync(thread, callerSessionId, promptMessage, round, wakeKind!, release!, onChildPid, recoveryVersion, mergeWakeId, roleToken);
+  }
+
+  private launchCallerAsync(
+    thread: DelegationThread,
+    round: DelegationRound,
+    onChildPid?: (pid: number) => void,
+  ): Promise<{ success: boolean; error?: string; exitCode?: number }> {
+    assertCanExecute(thread.initiatorAgent, 'resume as a reviewer', 'initiator');
+    const callerSessionId = this.resolveCallerSession(thread);
+    if (!callerSessionId) {
+      return Promise.resolve({ success: false, error: `No caller session ID found for task ${thread.threadId}` });
+    }
+
+    const initiator = thread.initiatorAgent;
+    const cwd = thread.status === 'waiting_merge' && thread.worktree?.mergeResolutionPath || getTaskExecutionPath(thread);
+    const senderModel = thread.reviewFlow === 'dedicated' ? thread.reviewerModel : resolveConfiguredModel(initiator, undefined, 'initiator');
+    const modelFlagArgs = senderModel ? ['--model', senderModel] : [];
+    const codexModelArgs = senderModel ? ['-c', `model="${senderModel}"`] : [];
+
+    const wakeMessage = this.buildReviewWakeMessage(thread, round);
+
+    const callbackEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      CI: '1',
+      NON_INTERACTIVE: 'true',
+    };
+    if (initiator === 'deepseek_harness') {
+      callbackEnv.DSH_PERMISSION_MODE = 'danger-full-access';
+    }
+    delete callbackEnv[MESH_TASK_RECEIVER_ENV];
+    delete callbackEnv[MESH_TASK_THREAD_ENV];
+    delete callbackEnv[MESH_TASK_ROUND_ENV];
+    delete callbackEnv.MESH_REVIEW_BOOTSTRAP;
+    delete callbackEnv.MESH_REVIEW_BOOTSTRAP_TOKEN;
+    delete callbackEnv.MESH_REVIEW_THREAD_ID;
+    if (thread.reviewFlow === 'dedicated') {
+      callbackEnv.MESH_REVIEW_SESSION_ID = callerSessionId;
+      callbackEnv.MESH_REVIEW_THREAD_ID = thread.threadId;
+    }
+
+    const logDir = this.storageDir || (this.taskStore ? path.dirname(this.taskStore.getStoragePath()) : undefined);
+    if (logDir) {
+      try {
+        fs.mkdirSync(logDir, { recursive: true });
+        const logPath = path.join(logDir, 'callbacks.log');
+        const banner = `\n--- [${new Date().toISOString()}] Waking up ${initiator} (thread: ${thread.threadId}, round: ${round.round}, session: ${callerSessionId}, senderModel: ${senderModel || 'agent default'}) ---\n`;
+        fs.appendFileSync(logPath, banner, 'utf8');
+      } catch {}
+    }
+
+    const reviewerLog = createReviewerLogWriter(
+      thread.threadId,
+      round.round,
+      {
+        agent: initiator,
+        sessionId: callerSessionId,
+        kind: 'review',
+        note: `${thread.title} | receiver=${thread.targetAgent} | roundType=${round.type} | senderModel=${senderModel || 'agent default'}`,
+      },
+      { artifactDir: thread.artifactDir },
+    );
+
+    return new Promise<{ success: boolean; error?: string; exitCode?: number }>((resolve) => {
+      let command = defaultBinary(initiator);
+      let args: string[] = [];
+      let extraEnv: NodeJS.ProcessEnv = {};
+      let useShell = false;
+      let sendStdinPrompt = false;
+
+      if (initiator === 'antigravity') {
+        command = this.detector.resolveExecutable('antigravity') || defaultBinary('agy');
+        args = [
+          '--conversation',
+          callerSessionId,
+          '-p',
+          wakeMessage,
+          '--dangerously-skip-permissions',
+          '--mode',
+          'accept-edits',
+          ...modelFlagArgs,
+        ];
+      } else if (initiator === 'claude_code') {
+        const claudePath = this.detector.resolveExecutable('claude_code') || defaultBinary('claude');
+        args = [
+          '--resume',
+          callerSessionId,
+          '-p',
+          '--dangerously-skip-permissions',
+          ...modelFlagArgs,
+        ];
+        sendStdinPrompt = true;
+        if (needsShellWrapper(claudePath)) {
+          command = 'cmd.exe';
+          args = ['/c', claudePath, ...args];
+        } else {
+          command = claudePath;
+        }
+      } else if (initiator === 'codex') {
+        const codexPath = this.detector.resolveExecutable('codex') || defaultBinary('codex');
+        const support = cachedCodexResumeSupport(codexPath);
+        const resumeId = codexResumeArgument(callerSessionId, support);
+        command = codexPath;
+        args = [
+          ...(support?.noDaemon ? ['--no-daemon'] : []),
+          ...codexModelArgs,
+          '--ask-for-approval',
+          'never',
+          'exec',
+          'resume',
+          resumeId,
+          wakeMessage,
+          '--dangerously-bypass-approvals-and-sandbox',
+          '--dangerously-bypass-hook-trust',
+          '--skip-git-repo-check',
+        ];
+      } else if (initiator === 'deepseek_harness') {
+        const launcher = this.detector.resolveExecutable('deepseek_harness') || defaultBinary('dsh');
+        const built = buildDshHeadlessCommand(launcher, {
+          prompt: wakeMessage,
+          sessionId: callerSessionId,
+          json: false,
+          modelOverlayPath: senderModel ? writeDshModelOverlay(senderModel, thread.artifactDir) : undefined,
+        });
+        if (built) {
+          command = built.command;
+          args = built.args;
+          useShell = Boolean(built.useShell);
+          if (built.env) extraEnv = built.env;
+        } else {
+          command = launcher;
+          args = ['--session-id', callerSessionId, '-p', wakeMessage];
+        }
+      } else {
+        args = [...modelFlagArgs, '--conversation', callerSessionId, '-p', wakeMessage];
+      }
+
+      let child: child_process.ChildProcess;
+      try {
+        child = child_process.spawn(command, args, {
+          cwd,
+          windowsHide: true,
+          shell: useShell,
+          stdio: [sendStdinPrompt ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+          env: { ...callbackEnv, ...extraEnv },
+        });
+      } catch (err: any) {
+        reviewerLog.writeOutcome({ error: err.message });
+        reviewerLog.close();
+        resolve({ success: false, error: err.message, exitCode: -1 });
+        return;
+      }
+
+      if (sendStdinPrompt && child.stdin) {
+        child.stdin.on('error', () => {});
+        try { child.stdin.write(wakeMessage, 'utf8'); } catch {}
+        try { child.stdin.end(); } catch {}
+      }
+
+      if (child.pid) {
+        onChildPid?.(child.pid);
+      }
+
+      let stdoutOutput = '';
+      let stderrOutput = '';
+      child.stdout?.on('data', (chunk: Buffer) => {
+        const text = chunk.toString('utf8');
+        stdoutOutput = (stdoutOutput + text).slice(-65536);
+        reviewerLog.write(text);
+      });
+
+      child.stderr?.on('data', (chunk: Buffer) => {
+        const text = chunk.toString('utf8');
+        stderrOutput = (stderrOutput + text).slice(-65536);
+        reviewerLog.write(text);
+      });
+
+      child.once('error', (err) => {
+        reviewerLog.writeOutcome({ error: err.message });
+        reviewerLog.close();
+        resolve({ success: false, error: err.message, exitCode: -1 });
+      });
+
+      child.once('close', (code) => {
+        reviewerLog.writeOutcome({ exitCode: code ?? undefined });
+        reviewerLog.close();
+        resolve({
+          success: code === 0,
+          exitCode: code ?? undefined,
+          error: code === 0 ? undefined : stderrOutput || stdoutOutput || `Reviewer process exited with code ${code}`,
+        });
+      });
+    });
+  }
+
   /**
    * Spawns the caller's CLI in its own native session, detached, with bridge
    * receiver markers stripped so the caller keeps full control-plane tools.
@@ -626,7 +937,7 @@ export class CallbackManager extends EventEmitter {
    * @param release - called when the child fails to start or exits non-zero, so
    *   the caller can drop whatever lease it took for this wake-up.
    */
-  private launchCaller(
+  private launchCallerSync(
     thread: DelegationThread,
     callerSessionId: string,
     promptMessage: string,
