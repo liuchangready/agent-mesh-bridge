@@ -92,7 +92,7 @@ describe('CallerPollGuard', () => {
 
     const progressed = makeThread();
     progressed.rounds[0].status = 'completed';
-    progressed.status = 'waiting_review';
+    progressed.status = 'reviewing';
     const res = guard.check(thread.threadId, progressSignature(progressed));
     assert.strictEqual(res.verdict, 'allow');
     assert.strictEqual(res.reads, 1);

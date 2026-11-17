@@ -11,6 +11,7 @@ import { ActiveAgentResolver } from './active-agent-resolver';
 import { AutonomousRunner } from './autonomous-runner';
 import { TaskSupervisor } from './task-supervisor';
 import { TaskControlService } from './task-control';
+import { ExecutionController } from './execution-controller';
 import { CallerPollGuard, progressSignature } from './caller-poll-guard';
 import { TaskRoleLock } from './task-role-lock';
 import { TaskExecutionRegistry } from './task-execution-registry';
@@ -52,7 +53,9 @@ import {
 } from './reviewer-log';
 import { aggregateThreadTokenUsage } from './token-usage-collector';
 import { assertCanExecute } from './agent-capabilities';
-import { WorkspaceRegistry, readWindow, matchingWindows, physicalDirectory } from './workspace';
+import { WorkspaceRegistry, WorkspaceResolver, readWindow, matchingWindows, physicalDirectory } from './workspace';
+import { listTaskTemplates } from './task-templates';
+import { resolveTemplateWorkspaceRoot } from './git-worktree';
 
 /** Older non-compacted rounds are excerpted to this many characters. */
 const DETAIL_HISTORY_OUTPUT_MAX_CHARS = 4_000;
@@ -64,6 +67,7 @@ const DETAIL_HISTORY_OUTPUT_MAX_CHARS = 4_000;
  */
 const FORWARDING_TOOLS = new Set([
   'dispatch_task',
+  'list_task_templates',
   'submit_mesh_task',
   'invoke_agent',
   'invoke_antigravity',
@@ -81,6 +85,8 @@ const CONTROL_TOOLS = new Set([
   'record_merge_request',
   'submit_merge_resolution',
   'request_merge_decision',
+  'submit_merge_decision',
+  'submit_task_decision',
   'retry_merge',
 ]);
 
@@ -340,7 +346,7 @@ export class MCPServer {
         roundsWithReviewerLog: [],
         message:
           'No reviewer log exists for this task yet: the bridge only records one while it wakes the caller ' +
-          '(waiting_review), and rounds reviewed before this artifact existed have none. ' +
+          '(reviewing), and rounds reviewed before this artifact existed have none. ' +
           'The reviewer verdict itself is still on the round ledger (approval remarks / next round feedback).',
       };
     }
@@ -391,7 +397,7 @@ export class MCPServer {
       returnedBytes: Buffer.byteLength(page.content, 'utf8'),
       reviewerAgent: task.initiatorAgent,
       /** True while the caller is still reviewing this round. */
-      live: task.status === 'waiting_review' && round === (task.currentRound || latest),
+      live: task.status === 'reviewing' && round === (task.currentRound || latest),
       roundsWithReviewerLog: withLogs,
       hint: page.truncated
         ? `Paged: continue with offsetBytes=${page.nextOffset}.`
@@ -404,9 +410,11 @@ export class MCPServer {
    */
   public getToolDefinitions() {
     const tools = [
+      { name: 'list_task_templates', description: 'Before each ordinary dispatch, list workspace template summaries and select a suitable templateId, or omit it if none fits. Reviewer bootstrap must only confirm dispatch and must not call this tool.', inputSchema: { type: 'object', properties: { workspaceId: { type: 'string' }, workspaceRoot: { type: 'string' } } } },
       {
         name: 'dispatch_task',
         description:
+          'Before ordinary dispatch call list_task_templates for this workspace and select a suitable templateId, or omit it if none fits. Reviewer bootstrap must only confirm dispatch. ' +
           'Asynchronously delegate a new task to another agent (Codex, Claude Code, Antigravity, DeepSeek Harness) without blocking the current turn. ' +
           'After this call returns you MUST end your turn immediately and wait for the callback: the bridge wakes your native session when the round finishes, whether it succeeds or fails. ' +
           'Do NOT poll `get_thread_details` / `get_recent_logs` / `list_recent_tasks` to watch the task — that keeps the user paying for a turn that has nothing left to do, and repeated reads at unchanged progress are answered with a short `repeatPoll` stub instead of the details. ' +
@@ -448,6 +456,7 @@ export class MCPServer {
               description: 'Absolute local workspace root directory.',
             },
             workspaceId: { type: 'string', description: 'Registered Bridge workspace ID.' },
+            templateId: { type: 'string', description: 'Optional template selected from list_task_templates.' },
             targetBranch: {
               type: 'string',
               description: 'Existing local branch to merge the approved task into. Defaults to the source checkout branch and is pinned for this task.',
@@ -539,12 +548,50 @@ export class MCPServer {
       },
       {
         name: 'request_merge_decision',
-        description: 'Ask the user to decide a merge issue and end the reviewer turn.',
+        description: 'Ask the user to decide an issue during review or merge review and end the reviewer turn.',
         inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, question: { type: 'string' }, background: { type: 'string' }, suggestion: { type: 'string' }, conflictFiles: { type: 'array', items: { type: 'string' } }, logPath: { type: 'string' } }, required: ['threadId', 'question'] },
       },
       {
+        name: 'submit_merge_decision',
+        description: 'Answer a pending review or merge decision and resume the same reviewer session.',
+        inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, answer: { type: 'string' } }, required: ['threadId', 'answer'] },
+      },
+      {
+        name: 'request_task_decision',
+        description: 'Ask the user to make a decision on develop, review, or merge and wait.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            threadId: { type: 'string' },
+            question: { type: 'string' },
+            background: { type: 'string' },
+            suggestion: { type: 'string' },
+            resumePoint: {
+              type: 'string',
+              enum: ['continue_develop', 'continue_review', 'retry_merge', 'continue_merge_resolution'],
+            },
+            conflictFiles: { type: 'array', items: { type: 'string' } },
+            logPath: { type: 'string' },
+          },
+          required: ['threadId', 'question', 'resumePoint'],
+        },
+      },
+      {
+        name: 'submit_task_decision',
+        description: 'Submit an answer to a pending task decision and immediately resume execution.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            threadId: { type: 'string' },
+            decisionId: { type: 'string' },
+            answer: { type: 'string' },
+          },
+          required: ['threadId', 'decisionId', 'answer'],
+        },
+      },
+      {
         name: 'retry_merge',
-        description: 'Restart a merge_failed task with a fresh retry budget and its existing snapshot and session.',
+        description: 'Restart a failed task at the merge stage with a fresh retry budget and its existing snapshot and session.',
         inputSchema: { type: 'object', properties: { threadId: { type: 'string' } }, required: ['threadId'] },
       },
       {
@@ -560,7 +607,7 @@ export class MCPServer {
       {
         name: 'approve_task',
         description:
-          'Approve a snapshot of the reviewed task worktree. Code changes enter waiting_merge until serialized local integration and combined validation succeed; no-change tasks complete immediately.',
+          'Approve a snapshot of the reviewed task worktree. Code changes queue for serialized local integration and validation; no-change tasks complete immediately.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -579,7 +626,7 @@ export class MCPServer {
       {
         name: 'pause_task',
         description:
-          'Pause a queued/running/reworking task. The current agent process is stopped, the round is preserved as paused, and the interruption reason is recorded.',
+          'Pause a queued/running task. The current agent process is stopped, the round is preserved as paused, and the interruption reason is recorded.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -658,7 +705,7 @@ export class MCPServer {
       {
         name: 'retarget_task',
         description:
-          'Move an existing task to another executor: another agent and/or another model, keeping the same thread, round history and isolated worktree. Works on queued, paused, failed and waiting_review tasks; refuses while a round is in flight (pause first) and on completed tasks. Switching the agent starts a fresh native session because the previous agent\'s session cannot be resumed. Model policy: omitted model keeps the current one (or uses the new agent\'s configured default); a non-default model requires modelRequestedByUser: true and the user\'s click consent in VS Code.',
+          'Move an existing task to another executor: another agent and/or another model, keeping the same thread, round history and isolated worktree. Works on queued, paused, failed and reviewing tasks; refuses while a round is in flight (pause first) and on completed tasks. Switching the agent starts a fresh native session because the previous agent\'s session cannot be resumed. Model policy: omitted model keeps the current one (or uses the new agent\'s configured default); a non-default model requires modelRequestedByUser: true and the user\'s click consent in VS Code.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -767,17 +814,19 @@ export class MCPServer {
                 'active',
                 'queued',
                 'running',
+                'reworking',
+                'reviewing',
+                'merging',
                 'waiting_review',
                 'waiting_merge',
                 'wait_decision',
                 'merge_failed',
                 'review_failed',
-                'reworking',
                 'paused',
                 'completed',
                 'failed',
               ],
-              description: 'Filter by lifecycle status.',
+              description: 'Filter by lifecycle status. review_failed and merge_failed are deprecated input aliases for failed at the corresponding stage; reworking is an alias for running rework.',
             },
           },
         },
@@ -1255,11 +1304,24 @@ export class MCPServer {
   public async handleToolCall(name: string, args: any): Promise<any> {
     this.assertReceiverMayCall(name, args);
     const controlledTask = typeof args?.threadId === 'string' ? this.taskStore.getTask(args.threadId) : undefined;
-    if (controlledTask?.status === 'merge_failed' && name !== 'retry_merge' && name !== 'delete_task' &&
+    if (controlledTask?.status === 'failed' && controlledTask.failure?.stage === 'merge' && name !== 'retry_merge' && name !== 'delete_task' &&
         (CONTROL_TOOLS.has(name) || name === 'request_rework' || name === 'approve_task')) {
-      throw new Error('A merge_failed task only permits retry_merge or delete_task.');
+      throw new Error('A failed merge only permits retry_merge or delete_task.');
     }
     switch (name) {
+      case 'list_task_templates': {
+        const explicit = !!(args.workspaceId || args.workspaceRoot);
+        let context = this.workspaceContext;
+        try { context = await this.resolveClientWorkspaceContext(); } catch (e: any) { if (!explicit || !String(e?.message).includes('WORKSPACE_AMBIGUOUS')) throw e; }
+        const storage = path.dirname(this.taskStore.getStoragePath());
+        const window = context?.origin && readWindow(storage, context.origin);
+        const id = args.workspaceId || (!args.workspaceRoot ? window?.defaultWorkspaceId || context?.id : undefined);
+        const registry = new WorkspaceRegistry(storage);
+        const requested = new WorkspaceResolver(registry).resolve(id, args.workspaceRoot);
+        const workspace = registry.register(resolveTemplateWorkspaceRoot(requested.rootPath));
+        const result = listTaskTemplates(workspace.rootPath);
+        return { workspaceId: workspace.id, templates: result.templates.map(({id, label, summary, version}) => ({id, label, summary, version})), diagnostics: result.diagnostics };
+      }
       case 'dispatch_task':
       {
         // Dedicated reviewer bootstrap: this process is the fresh reviewer
@@ -1297,6 +1359,7 @@ export class MCPServer {
             inheritedWorkspaceId ? resolvedContext?.source || 'explicit' : 'explicit',
           workspaceOrigin: windowContext ? resolvedContext?.origin : undefined,
           suppressWorkspaceOriginInference: true,
+          templateId: args.templateId,
           targetBranch: args.targetBranch,
           model: args.model,
           modelRequestedByUser: args.modelRequestedByUser === true,
@@ -1349,10 +1412,61 @@ export class MCPServer {
 
       case 'request_merge_decision': {
         this.assertActiveReviewerRole(args.threadId);
-        return this.reworkController.requestMergeDecision(args.threadId, args.question, args.background, args.suggestion, args.conflictFiles, args.logPath);
+        return await this.reworkController.requestMergeDecision(args.threadId, args.question, args.background, args.suggestion, args.conflictFiles, args.logPath);
       }
 
-      case 'retry_merge': return this.reworkController.retryMerge(args.threadId);
+      case 'submit_merge_decision': return this.reworkController.submitMergeDecision(args.threadId, args.answer);
+
+      case 'request_task_decision': {
+        const callerAgent = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
+        const thread = this.taskStore.getTask(args.threadId);
+        if (!thread) throw new Error(`Task thread not found: ${args.threadId}`);
+        const isReceiver = process.env.MESH_TASK_RECEIVER === '1';
+        if (isReceiver && process.env.MESH_TASK_THREAD_ID && process.env.MESH_TASK_THREAD_ID !== args.threadId) {
+          throw new Error(`Receiver process for thread ${process.env.MESH_TASK_THREAD_ID} cannot request decisions for thread ${args.threadId}`);
+        }
+        const isDeveloper = Boolean(
+          isReceiver &&
+          (process.env.MESH_TASK_THREAD_ID === args.threadId || thread.targetAgent === callerAgent)
+        );
+        if (!isDeveloper) {
+          this.assertActiveReviewerRole(args.threadId);
+        }
+        if (ExecutionController.getInstance()) {
+          const resumePoint = args.resumePoint || (isDeveloper ? 'continue_develop' : 'continue_review');
+          const decision = await ExecutionController.getInstance()!.requestTaskDecision(args.threadId, {
+            question: args.question,
+            background: args.background,
+            suggestion: args.suggestion,
+            resumePoint,
+            conflictFiles: args.conflictFiles,
+            logPath: args.logPath,
+          });
+          return {
+            threadId: args.threadId,
+            status: 'wait_decision',
+            decisionId: decision.id,
+            nextAction: 'END_TURN_AND_WAIT_FOR_USER',
+            message: 'Decision requested. End this turn; user answer will wake the task.',
+          };
+        }
+        return await this.reworkController.requestMergeDecision(args.threadId, args.question, args.background, args.suggestion, args.conflictFiles, args.logPath);
+      }
+
+      case 'submit_task_decision': {
+        if (ExecutionController.getInstance()) {
+          const updated = await ExecutionController.getInstance()!.submitTaskDecision(args.threadId, args.decisionId, args.answer, 'agent');
+          return {
+            threadId: args.threadId,
+            status: updated.status,
+            decisionId: args.decisionId,
+            message: `Decision answered. Resumed ${updated.status}.`,
+          };
+        }
+        return await this.reworkController.submitMergeDecision(args.threadId, args.answer);
+      }
+
+      case 'retry_merge': return await this.reworkController.retryMerge(args.threadId);
 
       case 'get_merge_log': {
         const thread = this.taskStore.getTask(args.threadId);
@@ -1391,7 +1505,7 @@ export class MCPServer {
 
       case 'approve_task': {
         this.assertActiveReviewerRole(args.threadId);
-        const result = this.reworkController.approveTask({
+        const result = await this.reworkController.approveTask({
           threadId: args.threadId,
           remarks: args.remarks,
         });
@@ -1401,10 +1515,19 @@ export class MCPServer {
       }
 
       case 'pause_task': {
-        return this.taskControl.pauseTask(args.threadId, args.reason, 'agent');
+        return await this.taskControl.pauseTask(args.threadId, args.reason, 'agent');
       }
 
       case 'resume_task': {
+        const thread = this.taskStore.getTask(args.threadId);
+        if (thread?.execution && ExecutionController.getInstance()) {
+          const resumed = await ExecutionController.getInstance()!.resumeOperation(args.threadId);
+          return {
+            threadId: args.threadId,
+            status: resumed.status,
+            message: `Task ${args.threadId} resumed (${resumed.status}).`,
+          };
+        }
         return this.reworkController.resumePausedTask(args.threadId, {
           targetAgent: args.targetAgent,
           model: args.model,
@@ -1422,12 +1545,21 @@ export class MCPServer {
       }
 
       case 'retry_task': {
+        let thread = this.taskStore.getTask(args.threadId);
+        if (thread?.execution && ExecutionController.getInstance()) {
+          const retried = await ExecutionController.getInstance()!.retryOperation(args.threadId);
+          return {
+            threadId: args.threadId,
+            status: 'RETRYING',
+            message: `Task ${args.threadId} retried with new generation.`,
+          };
+        }
         const retried = await this.reworkController.retryFailedRound(args.threadId, {
           targetAgent: args.targetAgent,
           model: args.model,
           modelRequestedByUser: args.modelRequestedByUser === true,
         });
-        const thread = this.taskStore.getTask(args.threadId);
+        thread = this.taskStore.getTask(args.threadId);
         const routed =
           thread && (args.targetAgent || args.model)
             ? ` Now executing on ${thread.targetAgent}${thread.targetModel ? ` (${thread.targetModel})` : ''}.`
@@ -1504,6 +1636,7 @@ export class MCPServer {
         // the derived token rollup so a list can be compared by cost.
         return tasks.map((task) => ({
           ...task,
+          taskTemplate: task.taskTemplate && { id: task.taskTemplate.id, version: task.taskTemplate.version, label: task.taskTemplate.label, summary: task.taskTemplate.summary },
           modelRouting: getModelRouting(task),
           archived: !!task.archivedAt,
           finalSummary: task.finalSummary?.summary || null,
@@ -1634,13 +1767,15 @@ export class MCPServer {
         if (!task) {
           throw new Error(`Thread not found: ${args.threadId}`);
         }
-        const summary =
-          task.finalSummary ||
-          (isTerminalThreadStatus(task.status) ? buildFinalSummary(task) : undefined);
+        const summary = isTerminalThreadStatus(task.status)
+          ? task.finalSummary || (task.archivedAt ? undefined : buildFinalSummary(task))
+          : undefined;
         return {
           threadId: task.threadId,
           title: task.title,
           status: task.status,
+          failureStage: task.failure?.stage,
+          failureRevision: task.failureRevision,
           archived: !!task.archivedAt,
           ...(task.archivedAt ? { archivedAt: task.archivedAt } : {}),
           createdAt: task.createdAt,
@@ -1658,7 +1793,7 @@ export class MCPServer {
             : {
                 hint:
                   'The task is still running (or was created before summaries existed); ' +
-                  'the read-only digest is written once it reaches completed/failed/review_failed.',
+                  'the read-only digest is written once it reaches completed/failed.',
               }),
         };
       }

@@ -1,4 +1,4 @@
-﻿# 文件夹级 Bridge Workspace
+# 文件夹级 Bridge Workspace
 
 > 状态：实现进行中；尚未完成验收。此文记录当前实现与未完成边界。
 
@@ -12,6 +12,8 @@ Bridge 工作空间以本地绝对目录为根；`physicalDirectory` 验证目�
 
 ## 窗口及查询
 
+默认 workspace 的 ID 与选择来源通过 VS Code `workspaceState` 保存；手动选择、清除以及首次成功派发的采纳都会更新该状态。同一 VS Code 工作区重载或重启时先校验注册记录与目录可用性，再恢复选择并发布新的窗口心跳。窗口实例 ID 和 generation 仍重新生成，不恢复旧连接凭证。不同 VS Code 工作区分别保存选择，不使用全局默认或从历史任务猜测；旧版从未保存的选择需要重新选择一次。
+
 每个扩展宿主拥有随机实例 ID 和 generation、心跳文件和独立默认值。选择或清除默认空间的命令只影响本窗口；任务树过滤与派发默认独立。MCP 连接的调用窗口来源与任务目标分开解析：即使首次调用显式选择另一空间，也先按连接 roots 解析调用窗口，目标目录不得覆盖该来源。支持 MCP roots 的客户端可在初始化后提供根目录，只有一个根且只匹配一个存活窗口时才关联；来源存在歧义时仍可显式派发，但不记录任何窗口 origin，省略目标的调用则返回歧义。未能确定调用窗口的 MCP 派发不从目标目录猜测窗口。派发持久化并确认成功后，宿主只从该实例激活后创建、origin 匹配的任务中采纳首个默认，已有默认不被覆盖。不得根据调用者 PID 或 MCP clientInfo 推断窗口。
 
 `dispatch_task` 使用 `workspaceRoot` 或 `workspaceId`，省略时仅使用已绑定连接上下文；未解析到空间时报 `WORKSPACE_REQUIRED`。`workspacePath` 不再接受。`list_workspaces` 列举注册表及账本派生数量；`list_recent_tasks` 可按 workspace ID 或已绑定窗口当前默认过滤，先过滤再限制数量。任务树按空间分组，可选择全部、当前或指定空间；Agent 视图显示当前窗口默认根目录。
@@ -20,7 +22,7 @@ Bridge 工作空间以本地绝对目录为根；`physicalDirectory` 验证目�
 
 ## 上线步骤
 
-停止旧版派发及所有宿主，处理所有旧版未终态任务，包括 queued、running、reworking、paused、waiting_review、waiting_merge 和 bootstrap pending；备份需要保留的结果及旧账本，并在新版本启用前将全部旧任务记录移出其活动账本。新模型不迁移或兼容旧任务，不应以调用者实时账本作为测试数据。确保 Node 20+、依赖和 Git 可用，针对隔离测试主目录运行编译及完整测试。部署后重新选择窗口默认空间；旧任务数据不应作为新模型的输入。
+停止旧版派发及所有宿主，处理所有旧版未终态任务，包括 queued、running、reworking、paused、reviewing、merging 和 bootstrap pending；备份需要保留的结果及旧账本，并在新版本启用前将全部旧任务记录移出其活动账本。新模型不迁移或兼容旧任务，不应以调用者实时账本作为测试数据。确保 Node 20+、依赖和 Git 可用，针对隔离测试主目录运行编译及完整测试。部署后重新选择窗口默认空间；旧任务数据不应作为新模型的输入。
 
 ## 尚待完成
 

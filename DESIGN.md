@@ -76,7 +76,7 @@ flowchart TD
 2. **`AsyncTaskDispatcher`（异步派发引擎）**：
    - 负责解析 A 的下发意向，生成全局唯一 `threadId` 与接收方原生 `receiverSessionId`；
    - 立即向发起方返回 `DISPATCHED` / `QUEUED` 确认报文，断开长连接等待，允许 A 结束当前 Turn；
-   - 只有显式启用的并发限额阻止启动时返回 `QUEUED`；调度器跳过该候选并继续扫描其他任务。paused / waiting_review / blocked / bootstrap pending 仅阻挡自身后续 developer 轮次。
+   - 只有显式启用的并发限额阻止启动时返回 `QUEUED`；调度器跳过该候选并继续扫描其他任务。paused / reviewing / blocked / bootstrap pending 仅阻挡自身后续 developer 轮次。
 3. **`MultiTurnReworkController`（多轮返修控制器）**：
    - 维系 `threadId` ↔ `receiverSessionId` 强绑定；
    - 处理 A 的 `request_rework` 指令，递增轮次并在接收方原有原生会话中触发续聊命令；
@@ -85,7 +85,7 @@ flowchart TD
    - 适配 Windows/macOS/Linux 跨平台进程拉起；
    - 注入各 Agent 专属的免交互与权限旁路标志（`--dangerously-skip-permissions` 等）；
    - 关闭 `stdin` 并配置 `CI=1` 环境变量；
-   - 内置输出静默看门狗与最大超时保护。
+   - 输出流质量 assessment 评估、stream 间隔测量与扣除挂起；移除独立静默 kill 看门狗，由控制器统一管理活动时间预算。
 5. **`CallbackManager`（回调唤醒引擎）**：
    - 监听任务各轮次完成状态；
    - 根据发起方类型调用各 Agent 原生唤醒信道（`codex queue`、`claude --resume`、`agy --conversation`、`dsh headless --session-id`），触发 A 的下一轮推理。
@@ -99,13 +99,21 @@ flowchart TD
    - `pause_task` / `delete_task` 先发 cancellation，再按 thread 登记杀掉该任务的孤儿进程；不影响其他 thread。
 8. **`QueueDrainer`（回退候选扫描器）**：
    - 无常驻 supervisor 时扫描所有 ready 候选；因角色、bootstrap 或限额阻塞的候选不阻止扫描后续任务；
-   - paused / waiting_review / blocked / bootstrap pending 只跳过自身，不形成全局或 workspace 队头。
+   - paused / reviewing / blocked / bootstrap pending 只跳过自身，不形成全局或 workspace 队头。
 9. **Git worktree and local delivery**: Each new task records an isolated task branch/worktree and pins the real local delivery target (`targetBranch` if explicit, otherwise the source checkout branch), repository identity/path, and base/head/approved commits. Child tasks inherit the target and start from its current committed SHA, never parent unapproved changes. Under the global lock, merge against the latest target, run compile/test, then CAS-update the target ref. A checked-out target is synchronized only when clean; preserve dirty files and block delivery otherwise. Retain validation path/commit/cleanup metadata. Legacy tasks without `deliveryTarget` keep the old `targetRef` meaning.
    - Approval binds to the clean `approvedCommit`. After reviewer exit, the bridge takes the mesh-wide lock before reading the real target SHA.
    - The lock covers the temporary three-way merge, real compile/test, target ref CAS update and ledger persistence. It does not cover development, individual tests, review, or remote push.
-   - Persist source/target/candidate SHA and transaction phase for crash recovery. Conflicts and validation failures return to review; a dirty checked-out target is preserved and remains in blocked `waiting_merge` until an explicit retry.
+   - Persist source/target/candidate SHA and transaction phase for crash recovery. Approved tasks enter `queued` with `queuePhase: merge`; only the global lock holder enters `merging`. Conflicts, validation failures and dirty target checkouts return to `reviewing`, preserving the checkout and merge context.
    - `mergeRequest` 仅表示远端交付。未集成的成果不能自动归档、容量淘汰或普通删除；force 才可明确丢弃。旧任务不自动迁移。
    - **统一任务数据目录**：新任务的所有 bridge 侧产物固定放在 `<taskDataRoot>/<threadId>/`，其中 `worktree/` 是 Git worktree，`worker_log/` / `reviewer_log/` 保存轮次日志与压缩归档，`Archive/` 保存终态 tar.gz + JSON，`bootstrap/` 保存一次性 reviewer 凭证，`validation/` 保存合并验证临时 worktree，`model-overlays/` 保存桥接生成的 DSH 单次运行模型 patch。绝对路径在创建时写入 `thread.artifactDir` / `taskDataDir`，后续轮次只读该值，不重新解析全局设置；`agentMeshBridge.taskDataRoot` 为空时默认 `<bridge home>/tasks`，相对路径相对 bridge home 解析。旧 ledger 条目继续使用已记录的 `worktree.path`；旧日志目录仅从已存在的 `bridge-policy.json` 读取兼容，不迁移。
+10. **`ExecutionController`（统一生命周期与执行控制器）**：
+    - 统一管控 `develop`、`review`（含专用 reviewer bootstrap）与 `merge`（含有界合并修复）三个阶段的执行生命周期；
+    - 管理单任务单调累计活动时间预算（默认 120 分钟），通过 `HostSuspensionGuard` 扣除主机休眠/挂起，输出流不予延长预算；
+    - 作为唯一执行启动与停止观察入口，通过进程真实身份探测（`pid + birthId`）与 10 秒退出确认，防止 PID 复用误判；
+    - 统一处理结果分类与安全重试策略：明确临时错误（transient）在预算内最多额外自动重试 2 次（5s / 30s 退避），已知配额重置自动入队等待；未知超时与不确定状态直接进入终态 `failed`；
+    - 结合 `TaskStore.transitionExecution`，在任务短写锁下提供 CAS 版本比对校验与原子文件写入，防陈旧覆盖；
+    - 支持跨阶段的 `wait_decision` 状态及恢复，保留既有消耗预算。
+
 ### 2.1 运行时三条硬准则
 
 1. **拆分任务不因权限停摆**：所有被派发的轮次必须携带各端 `skip-danger` 参数；Codex 的 `--ask-for-approval` 是全局参数，必须位于 `exec` 之前；DSH 注入 `DSH_PERMISSION_MODE=danger-full-access`，使其 `approval` 策略变为 `never`。
@@ -121,9 +129,9 @@ flowchart TD
 
 角色锁写入 `~/.agent-mesh-bridge/roles/<threadId>.json`（5s 心跳、30s 僵尸回收）。规则：
 
-1. `CallbackManager.notifyCaller()` 必须先校验 `waiting_review`、无在飞轮次，并取得 `reviewer` 锁；重复唤醒直接拒绝，不再拉起第二个检视进程。
+1. `CallbackManager.notifyCaller()` 必须先校验 `reviewing`、无在飞轮次，并取得 `reviewer` 锁；重复唤醒直接拒绝，不再拉起第二个检视进程。
 2. developer 轮次必须先取得 `developer` 锁；若 reviewer 仍持有，则任务进入 `queued`，等交接后由 supervisor/queue-drainer 启动。
-3. developer 轮次结束、状态落为 `waiting_review` 后，先释放 developer 锁，再唤醒 reviewer，避免双向等待死锁。
+3. developer 轮次结束、状态落为 `reviewing` 后，先释放 developer 锁，再唤醒 reviewer，避免双向等待死锁。
 4. reviewer 在 `request_rework` / `approve_task` 成功时视为完成决策并释放 reviewer 锁（`TaskRoleLock.releaseIfRole`）；其 CLI 进程继续打印最终文本不构成新的活跃检视。
 5. **中断恢复不是新建任务**：只能沿用原 `threadId`、原 `receiverSessionId` / `callerSessionId`，并以账本中的历轮 `prompt`（设计/返修指令）、`output`（开发/返修报告）、review feedback 作为中间文档链继续；禁止新建任务、另起会话或把同一任务拆成新的 reviewer/developer 任务。
 
@@ -167,7 +175,7 @@ interface ResponseAssessment {
 }
 ```
 
-`exitCode === 0` 但没有实际输出（例如只有 status 事件）时，轮次必须判为 `failed`，不得进入 `waiting_review`，也不得唤醒 reviewer。
+`exitCode === 0` 但没有实际输出（例如只有 status 事件）时，轮次必须判为 `failed`，不得进入 `reviewing`，也不得唤醒 reviewer。
 
 已适配的最终答案来源：
 
@@ -223,8 +231,8 @@ New tasks pin the real local delivery branch selected at dispatch (`targetBranch
 
 终态与保留边界（`AGENTS.md` 第 23 条）：
 
-- `completed` / `failed` / `review_failed` 时生成确定性 `finalSummary`，`get_task_summary` 可读；归档只保留摘要与轻量元数据。
-- 检视失败（`reviewWake.gaveUp`：自动重试耗尽或挂起在不可观测依赖上）转成终态 `review_failed`，`thread.reviewFailure` 记录 `{ kind, reason, at, round, by }` 并释放队列槽；重新检视会 `reopenFailedReview()` 回到 `waiting_review` 并保留失败记录。
+- `completed` / `failed` 时生成确定性 `finalSummary`，`get_task_summary` 可读；归档只保留摘要与轻量元数据。
+- 检视失败（`reviewWake.gaveUp`：自动重试耗尽或挂起在不可观测依赖上）转成终态 `failed` (failure.stage=review)，`thread.reviewFailure` 记录 `{ kind, reason, at, round, by }` 并释放队列槽；重新检视会 `reopenFailedReview()` 回到 `reviewing` 并保留失败记录。
 - 默认保留最新 20 个任务，超出的终态任务自动归档：清空 rounds、会话 id、bootstrap/wake 状态，删除 bridge 日志与 native 会话；`mergePending` worktree 任务不自动归档。
 - `delete_task` 是彻底清除：账本条目、bridge 日志、bootstrap token、native 会话全部删除；legacy 请求方会话永不清理。
 
@@ -296,7 +304,8 @@ sequenceDiagram
 
 ```typescript
 export type AgentId = 'antigravity' | 'claude_code' | 'codex' | 'deepseek_harness';
-export type ThreadStatus = 'queued' | 'running' | 'waiting_review' | 'reworking' | 'paused' | 'review_failed' | 'completed' | 'failed';
+export type ThreadStatus = 'queued' | 'running' | 'reviewing' | 'merging' | 'wait_decision' | 'paused' | 'completed' | 'failed';
+
 export type RoundStatus = 'running' | 'paused' | 'completed' | 'failed';
 export type InterruptionKind = 'paused' | 'stopped' | 'deleted' | 'timeout' | 'watchdog' | 'error';
 
@@ -355,6 +364,10 @@ export interface DelegationRound {
   interruption?: TaskInterruption; // 该轮被暂停/中断的原因
 }
 ```
+
+`failed` carries `failure.stage` (`bootstrap`, `execution`, `review`, or `merge`) and a monotonic `failureRevision`. Legacy ledger statuses and the deprecated `review_failed` / `merge_failed` filter inputs are normalized on read. Only `retry_merge` can restart a merge failure; unmerged results remain protected from archival and capacity eviction. See [FAILED_STATE_UNIFICATION_DESIGN.md](docs/FAILED_STATE_UNIFICATION_DESIGN.md).
+
+开发、检视、合并共用运行记录、活动时间预算和自动重试策略的后续方案见 [统一执行设计](docs/UNIFIED_EXECUTION_LIFECYCLE_DESIGN.md)。该文为待实现设计，不改变本节已实现行为。
 
 ### 4.2 1000 条容量控制与磁盘持久化规则
 
@@ -436,7 +449,7 @@ export interface DelegationRound {
 - **功能**：检索最近的委派任务列表（上限 1000 条）。
 - **参数**：
   - `limit` (number, 可选): 默认 20，最大 1000
-  - `statusFilter` (string, 可选): `'all' | 'active' | 'running' | 'waiting_review' | 'review_failed' | 'reworking' | 'paused' | 'completed' | 'failed'`
+  - `statusFilter` (string, 可选): `'all' | 'active' | 'queued' | 'running' | 'reviewing' | 'merging' | 'wait_decision' | 'paused' | 'completed' | 'failed'`。旧输入别名 `'reworking'` 筛选运行中的返修，`'review_failed'` / `'merge_failed'` 分别筛选失败的检视 / 合并阶段；返回状态均为新值。
 - **返回值**：包含 `threadId, title, initiatorAgent, targetAgent, status, currentRound, summary` 的对象数组。
 
 ### 5. `get_thread_details`（查看单条任务完整交互历史）

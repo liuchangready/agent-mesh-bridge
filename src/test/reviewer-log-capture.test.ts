@@ -54,7 +54,7 @@ const makeThread = (): DelegationThread => ({
   title: 'Capture reviewer stream',
   initiatorAgent: 'codex',
   targetAgent: 'claude_code',
-  status: 'waiting_review',
+  status: 'reviewing',
   currentRound: 1,
   createdAt: '2026-10-20T03:17:38.487Z',
   updatedAt: '2026-10-20T04:39:07.796Z',

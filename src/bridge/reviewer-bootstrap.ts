@@ -28,6 +28,7 @@ import { concurrencyPolicy } from './bridge-policy';
 import { TaskExecutionRegistry } from './task-execution-registry';
 import { TaskRoleLock } from './task-role-lock';
 import { TaskStore } from './task-store';
+import { ExecutionController } from './execution-controller';
 import { bootstrapDir } from './task-summary';
 import { reviewerBootstrapLogPath } from './reviewer-log';
 import { taskBootstrapDir, bridgeHomeDir } from './round-log';
@@ -375,6 +376,7 @@ export function buildReviewerBootstrapPrompt(thread: DelegationThread, token?: s
     '',
     'Your ONLY action in this turn: call the MCP tool `dispatch_task` exactly once, with these arguments:',
     credential,
+    ...(thread.taskTemplate ? ['', '[Task template reviewer instructions]', thread.taskTemplate.reviewerInstructions] : []),
     '',
     'The bridge validates that token against the pending task and fills in the brief itself. Do NOT pass',
     'title or prompt, do NOT explore the repository, do NOT modify files, and do NOT start any',
@@ -475,6 +477,10 @@ export class ReviewerBootstrapService {
 
     for (const candidate of pending) {
       if (candidate.reviewBootstrap?.phase === 'failed') continue;
+      if (candidate.execution && ExecutionController.getInstance()) {
+        void ExecutionController.getInstance()!.startExecution(candidate.threadId, 'review', { purpose: 'bootstrap' });
+        continue;
+      }
       if (this.launching.has(candidate.threadId)) continue;
       // An active same-task bootstrap must be left to its owning process. Check
       // this before the retry budget so another extension host cannot mark a
@@ -740,7 +746,9 @@ export class ReviewerBootstrapService {
     const fresh = this.deps.taskStore.getTask(thread.threadId);
     const root = this.deps.storageDir || path.dirname(this.deps.taskStore.getStoragePath());
     const cancellation = new CancellationRegistry(root).peek(thread.threadId);
-    if (!fresh || fresh.status === 'paused' || cancellation?.action === 'pause' || cancellation?.action === 'delete') {
+    if (!fresh || fresh.archivedAt || fresh.status !== 'queued' ||
+        (fresh.failureRevision || 0) !== (thread.failureRevision || 0) ||
+        cancellation?.action === 'pause' || cancellation?.action === 'delete') {
       return;
     }
     const at = new Date().toISOString();
@@ -751,6 +759,8 @@ export class ReviewerBootstrapService {
       retryAfter: undefined,
     };
     fresh.status = 'failed';
+    fresh.failureRevision = (fresh.failureRevision || 0) + 1;
+    fresh.failure = { stage: 'bootstrap', reason: detail.trim() || 'Reviewer bootstrap failed', at, round: fresh.currentRound };
     fresh.summary.lastOutputSnippet = `[Reviewer bootstrap failed] ${detail.slice(0, 140)}`;
     const round = fresh.rounds && fresh.rounds.length > 0
       ? fresh.rounds[fresh.rounds.length - 1]

@@ -11,7 +11,7 @@ import { ReworkController } from '../bridge/rework-controller';
 import { readReviewerBootstrapToken, writeReviewerBootstrapToken } from '../bridge/reviewer-bootstrap';
 import { TaskStore } from '../bridge/task-store';
 import { TaskSupervisor } from '../bridge/task-supervisor';
-import { DelegationRound, DelegationThread, isReviewerBootstrapPending } from '../bridge/types';
+import { DelegationRound, DelegationThread, isReviewerBootstrapPending, clearTaskFailure } from '../bridge/types';
 
 const now = '2026-11-05T00:00:00.000Z';
 const reviewerSessionId = 'reviewer-session-0123';
@@ -113,6 +113,7 @@ test('failed bootstrap retry rejects before retarget or ledger mutation', async 
       controller.retryFailedRound(failed.threadId, { targetAgent: 'antigravity' }),
       /dedicated reviewer bootstrap is failed/i,
     );
+    assert.throws(() => controller.approveTask({ threadId: failed.threadId }), /bootstrap/i);
 
     assert.deepEqual(persisted(store.getTask(failed.threadId)), before);
   });
@@ -135,14 +136,14 @@ test('completed and archived tasks cannot be retried or have output cleared', as
 test('waiting review cannot retry an older failure behind a newer successful round', async () => {
   await withController(async ({ store, controller }) => {
     const waiting = task({
-      status: 'waiting_review',
+      status: 'reviewing',
       currentRound: 3,
       rounds: [round(1, 'failed', 'initial'), round(2, 'completed'), round(3, 'completed')],
     });
     store.upsertTask(waiting);
     const before = persisted(store.getTask(waiting.threadId));
 
-    await assert.rejects(controller.retryFailedRound(waiting.threadId), /while it is waiting_review/i);
+    await assert.rejects(controller.retryFailedRound(waiting.threadId), /while it is reviewing/i);
 
     assert.deepEqual(persisted(store.getTask(waiting.threadId)), before);
   });
@@ -187,6 +188,7 @@ test('retry does not revive a task completed during executor approval', async ()
     const retrying = controller.retryFailedRound(failed.threadId, { targetAgent: 'antigravity' });
     await approvalStarted;
     const completed = store.getTask(failed.threadId)!;
+    clearTaskFailure(completed);
     completed.status = 'completed';
     store.upsertTask(completed);
     finishRetarget();
@@ -201,7 +203,7 @@ test('retry does not revive a task completed during executor approval', async ()
 
 test('dedicated rework cannot rebind reviewer session from params or detector', async () => {
   await withController(async ({ store, controller }) => {
-    const ready = task({ status: 'waiting_review', currentRound: 1, rounds: [round(1, 'completed', 'initial')] });
+    const ready = task({ status: 'reviewing', currentRound: 1, rounds: [round(1, 'completed', 'initial')] });
     store.upsertTask(ready);
     const before = persisted(store.getTask(ready.threadId));
 

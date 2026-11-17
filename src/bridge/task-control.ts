@@ -16,6 +16,7 @@ import { changedFiles, currentHead } from './git-worktree';
 import { gitOutput } from './git-worktree';
 import { MeshFileLock } from './merge-coordinator';
 import { TaskRoleLock } from './task-role-lock';
+import { ExecutionController } from './execution-controller';
 import { killPidTree } from './platform';
 import { taskValidationDir } from './round-log';
 import {
@@ -25,6 +26,7 @@ import {
   appendInterruption,
   findInFlightRound,
   isMergePending,
+  isMergeReview,
   isIsolatedTaskWorktree,
 } from './types';
 
@@ -75,7 +77,7 @@ export class TaskControlService {
   }
 
   /**
-   * Pause a queued/running/reworking task. The current round is marked
+   * Pause a queued/running task. The current round is marked
    * `paused` and keeps the original prompt so it can be resumed later.
    */
   public pauseTask(threadId: string, reason: string, by: string = 'user'): TaskControlResult {
@@ -93,22 +95,30 @@ export class TaskControlService {
         `Cannot pause task ${threadId}: it already failed. Use resume/retry instead.`,
       );
     }
-    if (thread.status === 'waiting_review') {
+    if (thread.status === 'reviewing' && !thread.execution && !isMergeReview(thread)) {
       throw new Error(
         `Cannot pause task ${threadId}: it is waiting for the caller's review, not executing.`,
       );
     }
-    if (thread.status === 'review_failed') {
-      throw new Error(
-        `Cannot pause task ${threadId}: its review already failed (terminal). ` +
-          `Use re-review / rework / retry instead.`,
-      );
-    }
-    if (thread.status === 'merge_failed' || thread.status === 'wait_decision') {
+    if (thread.status === 'wait_decision') {
       throw new Error(`Cannot pause task ${threadId} while it is ${thread.status}.`);
     }
 
     const normalizedReason = (reason || '').trim() || 'Paused by user';
+    if (thread.execution && ExecutionController.getInstance()) {
+      void ExecutionController.getInstance()!.pauseExecution(threadId, normalizedReason, by);
+      this.cancellationRegistry.request(threadId, 'pause', normalizedReason, by);
+      this.runner?.cancelThread(threadId, 'pause', normalizedReason, by);
+      this.executionRegistry.killOrphanChild(threadId, true);
+      return {
+        threadId,
+        status: 'PAUSED',
+        reason: normalizedReason,
+        message:
+          `Task ${threadId} paused. Interruption reason: ${normalizedReason}. ` +
+          `The round is preserved and can be resumed later.`,
+      };
+    }
     const now = new Date().toISOString();
     const interruption: TaskInterruption = {
       kind: 'paused',
@@ -118,7 +128,7 @@ export class TaskControlService {
     };
 
     const round = this.resolveCurrentRound(thread);
-    const pausingMerge = thread.status === 'waiting_merge';
+    const pausingMerge = thread.status === 'merging' || (thread.status === 'queued' && thread.queuePhase === 'merge') || isMergeReview(thread);
     if (thread.status === 'paused') {
       // Idempotent, but still publish cancellation and stop this task's child.
       this.cancellationRegistry.request(threadId, 'pause', normalizedReason, by);
@@ -182,6 +192,10 @@ export class TaskControlService {
       throw new Error(`Task thread not found: ${threadId}`);
     }
 
+    if (thread.worktree?.integration?.stashRecoveryLockHeld) {
+      throw new Error(`Cannot delete ${threadId} while stash metadata recovery is pending; retry the recovery first.`);
+    }
+
     const hasUnmergedOutput = (candidate: DelegationThread): boolean => !!candidate.worktree && (() => {
       try {
         const worktree = candidate.worktree!;
@@ -216,10 +230,9 @@ export class TaskControlService {
     const normalizedReason = (reason || '').trim() || 'Deleted by user';
     const active =
       thread.status === 'running' ||
-      thread.status === 'reworking' ||
       thread.status === 'queued' ||
       thread.status === 'paused' ||
-      thread.status === 'waiting_merge' ||
+      thread.status === 'merging' ||
       !!findInFlightRound(thread) ||
       !!new TaskRoleLock(this.storageDir).getOwner(threadId)?.childPid ||
       this.executionRegistry.listOwners().some((owner) => owner.threadId === threadId && !!owner.childPid);
@@ -246,6 +259,7 @@ export class TaskControlService {
       try {
         this.taskStore.loadFromDisk();
         const latest = this.taskStore.getTask(threadId);
+        if (latest?.worktree?.integration?.stashRecoveryLockHeld) throw new Error(`Cannot delete ${threadId} while a stash recovery lock is held; retry the recovery first.`);
         if (latest?.status === 'completed' && latest.worktree?.integration?.phase === 'merged') {
           thread.status = latest.status;
           thread.worktree = latest.worktree;

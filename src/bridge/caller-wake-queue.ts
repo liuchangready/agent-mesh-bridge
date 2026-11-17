@@ -39,6 +39,7 @@ export interface WakeRequest {
   threadId: string;
   round: number;
   kind: WakeKind;
+  failureRevision?: number;
   enqueuedAt: number;
 }
 

@@ -29,20 +29,121 @@ export type ModelResolutionSource =
 export type ThreadStatus =
   | 'queued'
   | 'running'
-  | 'waiting_review'
-  | 'waiting_merge'
+  | 'reviewing'
+  | 'merging'
   | 'wait_decision'
-  | 'merge_failed'
-  | 'reworking'
   | 'paused'
-  | 'review_failed'
   | 'completed'
   | 'failed';
 
+export type ExecutionPhase = 'develop' | 'review' | 'merge';
+
+export interface ProcessIdentity {
+  pid: number;
+  birthId?: string;
+}
+
+export interface ExecutionControl {
+  version: 1;
+  revision: number;
+  operationId: string;
+  phase: ExecutionPhase;
+  round: number;
+  purpose?: 'bootstrap' | 'merge_resolution';
+  generation: number;
+  attempt: number;
+  autoRetriesUsed: number;
+  queue?: {
+    reason: 'role' | 'session' | 'merge_lock' |
+      'capacity' | 'backoff' | 'quota';
+    notBefore?: string;
+  };
+  run?: {
+    id: string;
+    owner: ProcessIdentity;
+    child?: ProcessIdentity;
+    step: string;
+    state: 'starting' | 'active' | 'stopping';
+    startedAt: string;
+  };
+  budget: {
+    limitMs: number;
+    spentActiveMs: number;
+    maxAutoRetries: number;
+  };
+  lastOutcome?: {
+    code: string;
+    reason: string;
+    at: string;
+    evidencePath?: string;
+  };
+}
+
+export type TaskDecisionResumePoint =
+  | 'continue_develop'
+  | 'continue_review'
+  | 'retry_merge'
+  | 'continue_merge_resolution';
+
+export interface TaskDecisionRecord {
+  id: string;
+  operationId: string;
+  generation: number;
+  phase: ExecutionPhase;
+  round: number;
+  question: string;
+  background?: string;
+  suggestion?: string;
+  resumePoint: TaskDecisionResumePoint;
+  createdAt: string;
+  answer?: string;
+  answeredAt?: string;
+  answeredBy?: string;
+  conflictFiles?: string[];
+  logPath?: string;
+}
+
+export type NextAction =
+  | { kind: 'advance'; phase?: ExecutionPhase }
+  | { kind: 'retry'; notBefore: string; reason?: string }
+  | { kind: 'decision'; requestId: string }
+  | { kind: 'failed'; code: string; reason?: string; stage?: FailureStage }
+  | { kind: 'paused' };
+
+export type FailureStage = 'bootstrap' | 'execution' | 'review' | 'merge';
+export interface TaskFailure {
+  stage: FailureStage;
+  reason: string;
+  at: string;
+  round?: number;
+  by?: string;
+  code?: string;
+}
+
+export function enterTaskFailure(thread: DelegationThread, failure: TaskFailure): void {
+  failure = { ...failure, reason: failure.reason.trim() || 'Task failed; no reason was recorded' };
+  if (thread.status === 'failed' && thread.failure && thread.failure.stage === failure.stage &&
+      thread.failure.reason === failure.reason && thread.failure.round === failure.round && thread.failure.code === failure.code) return;
+  thread.failureRevision = (thread.failureRevision || 0) + 1;
+  thread.status = 'failed';
+  thread.failure = failure;
+}
+
+export function clearTaskFailure(thread: DelegationThread): void {
+  if (thread.status === 'failed') {
+    thread.failureRevision = (thread.failureRevision || 0) + 1;
+    thread.failure = undefined;
+  }
+}
+
 /** States in which a completed developer round can be reviewed. */
 export function isReviewerWakeEligible(thread: DelegationThread): boolean {
-  return thread.status === 'waiting_review' ||
-    (thread.status === 'waiting_merge' && ['blocked', 'conflict', 'validation_failed'].includes(thread.worktree?.integration?.phase || ''));
+  return thread.status === 'reviewing';
+}
+
+export function isMergeReview(thread: DelegationThread): boolean {
+  return thread.status === 'reviewing' && !!(thread.worktree?.mergePending || thread.worktree?.approvedCommit) &&
+    ['blocked', 'conflict', 'validation_failed'].includes(thread.worktree.integration?.phase || '');
 }
 
 /**
@@ -505,7 +606,9 @@ export interface ReviewerBootstrapState {
  * `get_task_summary` can answer after the rounds/logs/native sessions are gone.
  */
 export interface TaskFinalSummary {
-  kind: 'completed' | 'failed' | 'review_failed';
+  kind: 'completed' | 'failed';
+  failureStage?: FailureStage;
+  failureRevision?: number;
   at: string;
   title: string;
   /** Reviewer's approval remarks (completed) or the terminal error (failed). */
@@ -530,6 +633,7 @@ export interface TaskFinalSummary {
     taskBranch?: string; taskPath?: string; approvedCommit?: string;
     targetBranch?: string; targetRef?: string; targetRepositoryPath?: string; targetPath?: string; targetCommit?: string;
     mergeState?: string; blockedReason?: string;
+    stashRestore?: { status: string; sha?: string; error?: string };
     validationPath?: string; validationCommit?: string; validationStatus?: string; validationResult?: string;
   };
 }
@@ -569,6 +673,9 @@ export interface WorktreeInfo {
     targetPath?: string;
     candidateCommit?: string;
     mergedCommit?: string;
+    stashRecoveryPending?: boolean;
+    stashRecoveryLockHeld?: boolean;
+    stashRestore?: { status: string; sha?: string; error?: string };
     error?: string;
     conflictFiles?: string[];
     updatedAt: string;
@@ -592,12 +699,12 @@ export function isIsolatedTaskWorktree(worktree?: WorktreeInfo): worktree is Wor
  * The receiver round finishing does not imply the review happened: the wake
  * spawns the caller's CLI, and that process can die (quota, expired session,
  * provider outage) before it calls `approve_task` / `request_rework`. Without a
- * record, the task would sit in `waiting_review` forever with no trace of why.
+ * record, the task would sit in `reviewing` forever with no trace of why.
  * This is that trace, plus the plan for the automatic retry.
  */
 export interface ReviewWakeState {
   /** How the stall was detected. */
-  kind?: 'wake_failed' | 'timeout';
+  kind?: 'wake_failed' | 'timeout' | 'pending';
   /** Round the reviewer still has to inspect. */
   round: number;
   /** Failed wake attempts since the last recorded review handoff. */
@@ -644,7 +751,7 @@ export interface ReviewBlockInfo {
  * reviewer ever produced a verdict (the wake died, the retry budget ran out, or
  * the review was parked on a dependency nothing in the mesh can observe). It is
  * kept separate from `failed` because the delivered work may be perfectly good —
- * only the review is missing — and separate from `waiting_review` because no
+ * only the review is missing — and separate from `reviewing` because no
  * reviewer is working and nothing will ever move it without human action.
  *
  * Terminal semantics (identical to `failed` for scheduling): the task releases
@@ -679,19 +786,26 @@ export function getTaskExecutionPath(thread: DelegationThread): string {
 }
 
 export interface DelegationThread {
+  failure?: TaskFailure;
+  failureRevision?: number;
+  execution?: ExecutionControl;
+  decision?: TaskDecisionRecord;
+  decisions?: TaskDecisionRecord[];
+  taskTemplate?: import('./task-templates').TaskTemplate;
   threadId: string; // e.g. "thread_20261016_163000_a7f9"
   title: string; // Brief title, e.g. "Fix TCP cursor drift"
   initiatorAgent: AgentId; // Initiator (Caller A)
   targetAgent: AgentId; // Receiver (Target B)
   status: ThreadStatus; // Lifecycle status; each task has its own isolated Git worktree.
+  queuePhase?: 'development' | 'merge'; // Missing means development for existing ledgers.
   currentRound: number; // Current round (1: initial, 2+: rework)
   createdAt: string; // ISO8601 creation timestamp
   updatedAt: string; // ISO8601 update timestamp
   mergeHistory?: Array<{ id: string; number: number; at: string; phase: string; result: string; error?: string; logPath?: string;
     targetRef?: string; targetOldCommit?: string; targetCommit?: string; sourceCommit?: string; candidateCommit?: string; candidateTree?: string; conflictFiles?: string[];
     mergedCommit?: string; changedFiles?: string[]; decisionId?: string; question?: string; background?: string; suggestion?: string;
-    answer?: string; fingerprint?: string; retryGeneration?: number; consecutiveRetries?: number; errorCode?: string; exitCode?: number; attemptId?: string; logNumber?: number; logFileNumber?: number; assessment?: ResponseAssessment; interruption?: TaskInterruption }>;
-  mergeControl?: { revision: number; retryGeneration: number; failureFingerprint?: string; consecutiveRetries: number; pendingDecisionId?: string };
+    answer?: string; decisionStage?: 'review' | 'merge'; fingerprint?: string; retryGeneration?: number; consecutiveRetries?: number; errorCode?: string; exitCode?: number; attemptId?: string; logNumber?: number; logFileNumber?: number; assessment?: ResponseAssessment; interruption?: TaskInterruption }>;
+  mergeControl?: { revision: number; retryGeneration: number; failureFingerprint?: string; consecutiveRetries: number; pendingDecisionId?: string; decisionStage?: 'review' | 'merge' };
 
   // Native session bindings for continuous rework resume
   receiverSessionId: string; // Native session ID for target agent
@@ -815,7 +929,7 @@ export interface DelegationThread {
    * with no code change: a full execution slot and a new ledger round every few
    * minutes, forever, until the sibling landed.
    *
-   * With this flag the task stays `waiting_review` (so the queue invariants are
+   * With this flag the task stays `reviewing` (so the queue invariants are
    * unchanged) but the watchdog and the wake path leave it alone; it is woken
    * again the moment `waitingForThreadId` reaches a terminal state.
    */
@@ -848,6 +962,7 @@ export interface DelegationThread {
 }
 
 export interface DispatchTaskParams {
+  templateId?: string;
   targetAgent?: TargetAgentSelection;
   title: string;
   prompt: string;
@@ -1002,7 +1117,7 @@ export interface ApproveTaskParams {
 
 export interface ApproveResult {
   threadId: string;
-  status: 'WAITING_MERGE' | 'MERGE_FAILED' | 'COMPLETED';
+  status: 'QUEUED' | 'REVIEWING' | 'MERGE_FAILED' | 'COMPLETED';
   message: string;
 }
 
@@ -1168,7 +1283,7 @@ export function shouldResumeNativeSession(
  * Task-level queue occupancy.
  *
  * A task occupies the one global task slot until it reaches a terminal state:
- * `completed`, `failed` or `review_failed`. `waiting_review` and `paused` are
+ * `completed`, `failed` or `review_failed`. `reviewing` and `paused` are
  * still unfinished tasks and MUST block every other task, not just developer
  * rounds. `failed` and `review_failed` are terminal for queue purposes so old
  * failures cannot block the mesh forever; retrying/re-reviewing either one
@@ -1177,8 +1292,7 @@ export function shouldResumeNativeSession(
 export function isTaskUnfinished(thread: DelegationThread): boolean {
   return (
     thread.status !== 'completed' &&
-    thread.status !== 'failed' &&
-    thread.status !== 'review_failed'
+    thread.status !== 'failed'
   );
 }
 
@@ -1240,10 +1354,7 @@ export function findQueueHead(tasks: DelegationThread[]): DelegationThread | und
 export function isMergePending(thread: DelegationThread): boolean {
   const state = thread?.worktree?.integration?.phase;
   if (!thread?.worktree || state === 'merged' || state === 'no_changes') return false;
-  return thread.status === 'waiting_merge' || thread.worktree.approvedCommit !== undefined ||
-    (!!thread.worktree.baseCommit && !!thread.worktree.path && !['completed', 'review_failed', 'archived'].includes(thread.status)) ||
-    state === 'ready' || state === 'waiting' || state === 'merging' || state === 'conflict' || state === 'validation_failed' ||
-    thread.status === 'completed';
+  return true;
 }
 
 /**
@@ -1254,7 +1365,8 @@ export function isMergePending(thread: DelegationThread): boolean {
  */
 export function pendingMerges(tasks: DelegationThread[]): DelegationThread[] {
   return (tasks || [])
-    .filter((task) => !!task && isMergePending(task))
+    .filter((task) => !!task && isMergePending(task) &&
+      !(task.status === 'running' && !task.worktree?.integration && !task.worktree?.approvedCommit))
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 }
 

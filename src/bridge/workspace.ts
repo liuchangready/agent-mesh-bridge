@@ -33,16 +33,35 @@ export interface WindowWorkspaceContext {
   expiresAt: number;
 }
 
+interface WorkspaceSelectionState {
+  get<T>(key: string): T | undefined;
+  update(key: string, value: unknown): PromiseLike<void>;
+}
+
+const WORKSPACE_SELECTION_KEY = 'agentMeshBridge.workspace.default';
+
 /** Window records are written only by their owning extension host. */
 export class WindowWorkspace {
   readonly context: WindowWorkspaceContext;
   private readonly file: string;
-  constructor(storageDir: string, roots: string[]) {
+  constructor(storageDir: string, roots: string[], private readonly state?: WorkspaceSelectionState) {
     const dir = path.join(storageDir, 'window-contexts');
     fs.mkdirSync(dir, { recursive: true });
     this.context = { hostInstanceId: crypto.randomUUID(), generation: crypto.randomUUID(),
       folderRoots: roots.map(physicalDirectory), expiresAt: 0 };
     this.file = path.join(dir, `${this.context.hostInstanceId}.json`);
+    const saved = state?.get<{ id: string; source: 'manual' | 'first-dispatch' }>(WORKSPACE_SELECTION_KEY);
+    if (saved) {
+      try {
+        const workspace = new WorkspaceRegistry(storageDir).get(saved.id);
+        if (!workspace) throw new Error('Saved workspace is no longer registered');
+        physicalDirectory(workspace.rootPath);
+        this.context.defaultWorkspaceId = workspace.id;
+        this.context.defaultSource = saved.source === 'first-dispatch' ? 'first-dispatch' : 'manual';
+      } catch (error) {
+        console.warn('[Agent Mesh Bridge] Saved workspace could not be restored:', error);
+      }
+    }
     this.publish();
   }
   publish(): void {
@@ -51,16 +70,18 @@ export class WindowWorkspace {
     fs.writeFileSync(temp, JSON.stringify(this.context));
     fs.renameSync(temp, this.file);
   }
-  setDefault(id?: string, source: 'manual' | 'first-dispatch' = 'manual'): void {
+  async setDefault(id?: string, source: 'manual' | 'first-dispatch' = 'manual'): Promise<void> {
     this.context.defaultWorkspaceId = id;
     this.context.defaultSource = id ? source : undefined;
     this.publish();
+    try { await this.state?.update(WORKSPACE_SELECTION_KEY, id ? { id, source } : undefined); }
+    catch (error) { console.warn('[Agent Mesh Bridge] Workspace selection could not be saved:', error); }
   }
   adopt(binding: TaskWorkspaceBinding): boolean {
     if (this.context.defaultWorkspaceId || !binding.dispatchAccepted ||
       binding.origin?.hostInstanceId !== this.context.hostInstanceId ||
       binding.origin.generation !== this.context.generation) return false;
-    this.setDefault(binding.id, 'first-dispatch');
+    void this.setDefault(binding.id, 'first-dispatch');
     return true;
   }
   dispose(): void { try { fs.unlinkSync(this.file); } catch {} }

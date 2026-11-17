@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { TaskStore } from '../bridge/task-store';
-import { DelegationThread, describeModelRouting, getModelRouting } from '../bridge/types';
+import { DelegationThread, describeModelRouting, getModelRouting, findInFlightRound } from '../bridge/types';
+import { formatTaskTreeStatus } from './task-status-formatter';
 import { aggregateThreadTokenUsage, formatTokenCount } from '../bridge/token-usage-collector';
 import { groupWorkspaceTasks } from '../bridge/workspace';
 
@@ -42,6 +43,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
 
     return Promise.resolve(groupWorkspaceTasks(tasks).map((threads) => {
       const group = new TaskTreeItem(threads[0].workspace.nameAtDispatch, vscode.TreeItemCollapsibleState.Expanded);
+      group.workspaceId = threads[0].workspace.id;
       group.tooltip = threads[0].workspace.rootPath;
       group.iconPath = new vscode.ThemeIcon('folder');
       group.contextValue = 'workspace_group';
@@ -56,53 +58,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     const label = `[${fromAbbr} ➔ ${toAbbr}] ${thread.title}`;
 
     const roundText = `Round ${thread.currentRound || 1}`;
-    let iconName = 'symbol-misc';
-    let statusLabel = thread.status.toUpperCase();
-
-    switch (thread.status) {
-      case 'queued':
-        iconName = 'clock';
-        statusLabel = `Queued (排队中)`;
-        break;
-      case 'running':
-      case 'reworking':
-        iconName = 'sync~spin';
-        statusLabel =
-          thread.status === 'reworking' ? `Reworking (${roundText})` : `Running (${roundText})`;
-        break;
-      case 'waiting_merge':
-        iconName = 'git-merge';
-        statusLabel = 'Waiting for verified integration';
-        break;
-      case 'wait_decision':
-        iconName = 'question';
-        statusLabel = 'Waiting for user decision';
-        break;
-      case 'merge_failed':
-        iconName = 'error';
-        statusLabel = 'Merge failed; retry or delete';
-        break;
-      case 'waiting_review':
-        iconName = 'eye';
-        statusLabel = `In-Review (${roundText})`;
-        break;
-      case 'review_failed':
-        iconName = 'warning';
-        statusLabel = `Review Failed · 检视失败 (${roundText})`;
-        break;
-      case 'paused':
-        iconName = 'debug-pause';
-        statusLabel = `Paused (已暂停)`;
-        break;
-      case 'completed':
-        iconName = 'check';
-        statusLabel = `Completed (${roundText})`;
-        break;
-      case 'failed':
-        iconName = 'error';
-        statusLabel = `Failed (${roundText})`;
-        break;
-    }
+    let { iconName, statusLabel } = formatTaskTreeStatus(thread);
 
     const durationSec = Math.round((thread.summary.totalDurationMs || 0) / 1000);
     const durationText =
@@ -130,13 +86,15 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     // (429 / expired session), and nothing else can move this task. The record is
     // per-round, so a rework that is still being reviewed shows nothing.
     const reviewWake =
-      thread.status === 'waiting_review' &&
+      thread.status === 'reviewing' &&
       thread.reviewWake &&
       thread.reviewWake.round === (thread.currentRound || 1)
         ? thread.reviewWake
         : undefined;
     const reviewBadge = reviewWake
-      ? reviewWake.gaveUp
+      ? reviewWake.kind === 'pending'
+        ? ' · Review wake pending'
+        : reviewWake.gaveUp
         ? ' · ⚠️检视唤醒失败(需手动)'
         : reviewWake.quotaExhausted
           ? ` · ⚠️配额不足${
@@ -154,7 +112,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     // state visible while allowing unrelated tasks to run; only explicitly configured limits
     // or an explicitly configured concurrency limit can delay them.
     const reviewBlocked =
-      thread.status === 'waiting_review' && thread.reviewBlocked ? thread.reviewBlocked : undefined;
+      thread.status === 'reviewing' && thread.reviewBlocked ? thread.reviewBlocked : undefined;
     if (reviewBlocked) {
       statusLabel = `Parked Review · 已挂起 (${roundText})`;
     }
@@ -167,8 +125,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     // A failed review is terminal (it released the queue slot). Show WHY on the
     // row: without the reason the user only sees that nobody reviewed.
     const reviewFailureBadge =
-      thread.status === 'review_failed'
-        ? ` · 🚫${(thread.reviewFailure?.reason || '未记录原因').slice(0, 60)}`
+      thread.status === 'failed' && thread.failure?.stage === 'review'
+        ? ` · 🚫${(thread.failure?.reason || '未记录原因').slice(0, 60)}`
         : '';
 
     // Derived from the rounds (never a stored aggregate): cheap, and cannot go
@@ -185,26 +143,28 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     item.description = description;
     item.iconPath = new vscode.ThemeIcon(iconName);
     item.contextValue =
-      thread.status === 'merge_failed'
-        ? 'merge_failed'
+      thread.status === 'failed' && thread.failure?.stage === 'merge'
+        ? 'failed_merge'
         : thread.status === 'wait_decision'
         ? 'wait_decision'
-        : thread.status === 'waiting_merge'
-        ? 'waiting_merge'
-        : thread.status === 'waiting_review'
+        : thread.status === 'merging'
+        ? 'merging'
+        : thread.status === 'reviewing'
         ? // A healthy review needs no manual wake: only a recorded wake failure
           // exposes the "re-review" action (see the menu `when` clause). A
           // parked review gets its own value so the user can release the park.
-          reviewWake
-          ? 'waiting_review_stalled'
+          reviewWake && reviewWake.kind !== 'pending'
+          ? 'reviewing_stalled'
           : reviewBlocked
-            ? 'waiting_review_blocked'
-            : 'waiting_review'
+            ? 'reviewing_blocked'
+            : 'reviewing'
         : thread.status === 'paused'
           ? 'paused_task'
-          : thread.status === 'review_failed'
-            ? 'review_failed'
-            : 'task_item';
+          : thread.status === 'failed' && thread.failure?.stage === 'review'
+            ? 'failed_review'
+            : thread.status === 'failed'
+              ? (thread.failure?.stage === 'bootstrap' ? 'failed_bootstrap' : 'failed_execution')
+              : 'task_item';
 
     // Click command
     item.command = {
@@ -278,6 +238,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
 }
 
 export class TaskTreeItem extends vscode.TreeItem {
+  public workspaceId?: string;
   public subItems?: TaskTreeItem[];
   public thread?: DelegationThread;
 

@@ -1,4 +1,5 @@
 import { getTaskExecutionPath } from './types';
+import { resolveTaskTemplate, appendTemplateInstructions } from './task-templates';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -17,7 +18,9 @@ import {
   isValidSessionId,
   isUserInterruption,
   shouldResumeNativeSession,
+  ExecutionPhase,
 } from './types';
+import { ExecutionController } from './execution-controller';
 import { readBridgePolicy } from './bridge-policy';
 import { roundExecutionLogPath } from './round-log';
 import { ensureTaskDataDir, removeTaskDataDir } from './task-data-dir';
@@ -147,6 +150,7 @@ export class AsyncDispatcher {
         physicalDirectory(requestedWorkspace.rootPath) !== repositoryPath) {
       throw new Error('WORKSPACE_MISMATCH');
     }
+    const taskTemplate = params.templateId !== undefined ? resolveTaskTemplate(selected.rootPath, params.templateId) : undefined;
     const windowContext = params.workspaceOrigin
       ? readWindow(this.storageDir, params.workspaceOrigin)
       : params.suppressWorkspaceOriginInference ? undefined : findUniqueWindow(this.storageDir, selected.rootPath);
@@ -244,6 +248,7 @@ export class AsyncDispatcher {
       throw error;
     }
     const tempCandidate: DelegationThread = {
+      taskTemplate,
       threadId,
       title: params.title || 'Untitled Delegation Task',
       initiatorAgent,
@@ -284,6 +289,26 @@ export class AsyncDispatcher {
       rounds: [round1],
     };
 
+    const initialPhase: ExecutionPhase = reviewFlow === 'dedicated' ? 'review' : 'develop';
+    const initialPurpose = reviewFlow === 'dedicated' ? 'bootstrap' : undefined;
+    tempCandidate.execution = {
+      version: 1,
+      revision: 1,
+      operationId: `${initialPhase}_1_${Date.now()}`,
+      phase: initialPhase,
+      round: 1,
+      purpose: initialPurpose,
+      generation: 1,
+      attempt: 0,
+      autoRetriesUsed: 0,
+      budget: {
+        limitMs: 120 * 60 * 1000,
+        spentActiveMs: 0,
+        maxAutoRetries: 2,
+      },
+      queue: undefined,
+    };
+
     const policy = concurrencyPolicy();
     const owners = policy.enabled ? this.executionRegistry.listAgentOwners() : [];
     const globalSlotFull = policy.enabled && owners.length >= policy.maxConcurrentTasks;
@@ -306,6 +331,9 @@ export class AsyncDispatcher {
     if (isQueued) {
       tempCandidate.status = 'queued';
       tempCandidate.summary.lastOutputSnippet = queueDetail;
+      if (tempCandidate.execution) {
+        tempCandidate.execution.queue = { reason: 'capacity' };
+      }
     }
 
     const thread = tempCandidate;
@@ -334,6 +362,10 @@ export class AsyncDispatcher {
       }, this.storageDir, taskDirs.artifactDir);
       if (!tokenWritten) {
         thread.status = 'failed';
+        thread.failureRevision = (thread.failureRevision || 0) + 1;
+        thread.failure = { stage: 'bootstrap', reason: 'token write failed', at: nowIso, round: thread.currentRound };
+        const placeholder = thread.rounds.find(r => r.round === thread.currentRound);
+        if (placeholder) { placeholder.status = 'failed'; placeholder.error = 'token write failed'; }
         thread.reviewBootstrap = { phase: 'failed', attempts: 0, lastError: 'token write failed' };
         thread.summary.lastOutputSnippet = '[Reviewer bootstrap failed] could not write the dispatch token';
         this.taskStore.upsertTask(thread);
@@ -343,6 +375,9 @@ export class AsyncDispatcher {
       }
       thread.workspace.dispatchAccepted = true;
       this.taskStore.upsertTask(thread);
+      if (ExecutionController.getInstance()) {
+        void ExecutionController.getInstance()!.startExecution(threadId, 'review', { purpose: 'bootstrap' });
+      }
       const routing = getModelRouting(thread);
       const reviewerLine =
         `Dedicated reviewer ${initiatorAgent}` +
@@ -371,9 +406,11 @@ export class AsyncDispatcher {
 
     thread.workspace.dispatchAccepted = true;
     this.taskStore.upsertTask(thread);
-    // If TaskSupervisor is actively running (e.g. in VS Code extension host),
-    // let it supervise execution persistently to prevent child processes from being killed when ephemeral MCP CLI exits.
-    if (TaskSupervisor.isSupervisorActive()) {
+    if (ExecutionController.getInstance()) {
+      if (!isQueued) {
+        void ExecutionController.getInstance()!.startExecution(threadId, 'develop');
+      }
+    } else if (TaskSupervisor.isSupervisorActive()) {
       console.log(
         `[AsyncDispatcher] Active TaskSupervisor detected. Delegating Thread ${threadId} (status: ${thread.status}) execution to supervisor.`,
       );
@@ -476,11 +513,12 @@ export class AsyncDispatcher {
       const current = stored;
       const currentRound = current.rounds.filter((round) => round.round === roundNumber).slice(-1)[0];
       const terminal =
+        current.queuePhase === 'merge' ||
+        current.status === 'merging' || current.status === 'wait_decision' ||
         current.status === 'completed' ||
         current.status === 'failed' ||
-        current.status === 'review_failed' ||
         current.status === 'paused' ||
-        current.status === 'waiting_review';
+        current.status === 'reviewing';
       if (
         terminal ||
         current.targetAgent !== thread.targetAgent ||
@@ -512,14 +550,14 @@ export class AsyncDispatcher {
         );
       } catch (error: any) {
         roleLock.release(roleLease);
-        current.status = 'failed';
         currentRound.status = 'failed';
         currentRound.error = `Could not register task execution: ${error?.message || error}`;
         current.updatedAt = new Date().toISOString();
+        enterTaskFailure(current, { stage: 'execution', reason: currentRound.error, at: current.updatedAt, round: currentRound.round });
         this.taskStore.upsertTask(current);
         return;
       }
-      current.status = isRework ? 'reworking' : 'running';
+      current.status = 'running';
       current.summary.lastOutputSnippet = 'Executing in background...';
       this.taskStore.upsertTask(current);
       thread = current;
@@ -528,6 +566,8 @@ export class AsyncDispatcher {
         `[AsyncDispatcher] Starting background execution: ${thread.threadId} (Round ${roundNumber}) on ${thread.targetAgent}`,
       );
 
+      const startedFailureRevision = thread.failureRevision || 0;
+      const startedRoundTimestamp = thread.rounds.filter(r => r.round === roundNumber).slice(-1)[0]?.timestamp;
       let streamedOutput = '';
       const startTime = Date.now();
       let streamTimer: NodeJS.Timeout | null = null;
@@ -542,7 +582,7 @@ export class AsyncDispatcher {
           output: cleanSnippet,
           durationMs: elapsedMs,
           status: 'running',
-        });
+        }, undefined, undefined, undefined, undefined, { failureRevision: startedFailureRevision, roundTimestamp: startedRoundTimestamp });
       }, this.streamSyncIntervalMs);
 
       const logFilePath = roundExecutionLogPath(
@@ -565,7 +605,7 @@ export class AsyncDispatcher {
       try {
         result = await this.runner.execute({
           agent: thread.targetAgent,
-          prompt: isRework ? appendCompactionProtocol(prompt, roundNumber) : prompt,
+          prompt: appendTemplateInstructions(isRework ? appendCompactionProtocol(prompt, roundNumber) : prompt, thread.taskTemplate, 'worker'),
           isRework,
           receiverSessionId: thread.receiverSessionId,
           title: thread.title,
@@ -625,6 +665,11 @@ export class AsyncDispatcher {
         return;
       }
 
+      const liveRound = latest.rounds.filter(r => r.round === roundNumber).slice(-1)[0];
+      if (latest.archivedAt || (latest.failureRevision || 0) !== startedFailureRevision ||
+          latest.currentRound !== roundNumber || !liveRound || liveRound.timestamp !== startedRoundTimestamp ||
+          roleLock.getOwner(thread.threadId)?.token !== roleLease.token) return;
+
       // A pause may have landed after the child exited but before this handler
       // ran; the control plane's state wins over a "successful" result.
       const pausedByControl = latest.status === 'paused';
@@ -654,7 +699,7 @@ export class AsyncDispatcher {
         } catch {}
       }
       const finalRoundStatus = isPaused ? 'paused' : isSuccess ? 'completed' : 'failed';
-      const finalThreadStatus = isPaused ? 'paused' : isSuccess ? 'waiting_review' : 'failed';
+      const finalThreadStatus = isPaused ? 'paused' : isSuccess ? 'reviewing' : 'failed';
 
       const nativeSessionId = result.actualSessionId || latest.receiverSessionId;
       if (result.actualSessionId && result.actualSessionId !== latest.receiverSessionId) {
@@ -687,6 +732,7 @@ export class AsyncDispatcher {
         nativeSessionId,
         undefined,
         interruption,
+        { failureRevision: startedFailureRevision, roundTimestamp: startedRoundTimestamp },
       );
 
       if (updatedThread && this.taskStore.getTask(updatedThread.threadId)) {
@@ -766,7 +812,8 @@ export class AsyncDispatcher {
     const freshRound = fresh ? findInFlightRound(fresh) : undefined;
     if (
       !fresh ||
-      (fresh.status !== 'queued' && fresh.status !== 'running' && fresh.status !== 'reworking') ||
+      fresh.queuePhase === 'merge' ||
+      (fresh.status !== 'queued' && fresh.status !== 'running') ||
       fresh.targetAgent !== thread.targetAgent ||
       fresh.reviewBlocked ||
       isReviewerBootstrapPending(fresh) ||
@@ -796,3 +843,4 @@ export class AsyncDispatcher {
     return `thread_${ymd}_${hms}_${rand}`;
   }
 }
+import { enterTaskFailure } from './types';

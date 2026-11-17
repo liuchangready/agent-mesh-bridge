@@ -63,6 +63,9 @@
       ]
     },
     "commands": [
+      { "command": "agent-mesh-bridge.readTaskTemplates", "title": "Read Task Templates" },
+      { "command": "agent-mesh-bridge.createTaskTemplate", "title": "Create Task Template" },
+      { "command": "agent-mesh-bridge.editTaskTemplate", "title": "Edit Task Template" },
       { "command": "agent-mesh-bridge.selectWorkspace", "title": "Agent Bridge: Select Default Workspace" },
       { "command": "agent-mesh-bridge.clearWorkspace", "title": "Agent Bridge: Clear Default Workspace" },
       { "command": "agent-mesh-bridge.filterWorkspaces", "title": "Agent Bridge: Filter Tasks by Workspace" },
@@ -174,6 +177,9 @@
         }
       ],
       "view/item/context": [
+        { "command": "agent-mesh-bridge.readTaskTemplates", "when": "viewItem == workspace_group", "group": "2_templates" },
+        { "command": "agent-mesh-bridge.createTaskTemplate", "when": "viewItem == workspace_group", "group": "2_templates" },
+        { "command": "agent-mesh-bridge.editTaskTemplate", "when": "viewItem == workspace_group", "group": "2_templates" },
         {
           "command": "agent-mesh-bridge.clearAgentExhaustion",
           "when": "view == agent-mesh-bridge.agent-nodes",
@@ -196,32 +202,32 @@
         },
         {
           "command": "agent-mesh-bridge.printRecentLogs",
-          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != merge_failed",
+          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge",
           "group": "inline"
         },
         {
           "command": "agent-mesh-bridge.approveTask",
-          "when": "view == agent-mesh-bridge.active-tasks && viewItem != merge_failed && viewItem != wait_decision",
+          "when": "view == agent-mesh-bridge.active-tasks && viewItem != failed_merge && viewItem != wait_decision",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.requestRework",
-          "when": "view == agent-mesh-bridge.active-tasks && viewItem != merge_failed && viewItem != wait_decision",
+          "when": "view == agent-mesh-bridge.active-tasks && viewItem != failed_merge && viewItem != wait_decision",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.resumeTask",
-          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != merge_failed && viewItem != wait_decision",
+          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge && viewItem != failed_bootstrap && viewItem != wait_decision",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.pauseTask",
-          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != merge_failed && viewItem != wait_decision",
+          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge && viewItem != failed_review && viewItem != failed_execution && viewItem != failed_bootstrap && viewItem != wait_decision",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.retargetTask",
-          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != merge_failed && viewItem != wait_decision",
+          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge && viewItem != wait_decision",
           "group": "1_actions"
         },
         {
@@ -231,12 +237,12 @@
         },
         {
           "command": "agent-mesh-bridge.deleteTaskForce",
-          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != merge_failed",
+          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.wakeUpCaller",
-          "when": "(viewItem == waiting_review_stalled || viewItem == waiting_review_blocked || viewItem == review_failed) && (view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks)",
+          "when": "(viewItem == reviewing_stalled || viewItem == reviewing_blocked || viewItem == failed_review) && (view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks)",
           "group": "1_actions"
         }
       ]
@@ -364,7 +370,7 @@
           "type": "number",
           "default": 10,
           "minimum": 1,
-          "markdownDescription": "How long a task may stay in `waiting_review` with **no live reviewer process** before the bridge treats the review as stalled: it records the failure (so the task shows \"检视卡住\" and exposes **Re-Review**) and schedules an automatic re-wake. Raise this if your reviewer's test runs routinely take longer than 10 minutes. When the automatic retry budget is exhausted, or the review is parked on a dependency the bridge cannot observe, the task becomes the terminal `review_failed` status (which releases its queue slot) with the concrete reason shown in the task tree and detail panel."
+          "markdownDescription": "How long a task may stay in `reviewing` with **no live reviewer process** before the bridge treats the review as stalled: it records the failure (so the task shows \"检视卡住\" and exposes **Re-Review**) and schedules an automatic re-wake. Raise this if your reviewer's test runs routinely take longer than 10 minutes. When the automatic retry budget is exhausted, or the review is parked on a dependency the bridge cannot observe, the task becomes the terminal `failed` status with review stage (which releases its queue slot) with the concrete reason shown in the task tree and detail panel."
         },
         "agentMeshBridge.antigravityPath": {
           "type": "string",
@@ -433,7 +439,7 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "test": "node --test out/test/**/*.test.js",
+    "test": "node scripts/test.cjs",
     "package": "npx @vscode/vsce package --no-dependencies --allow-missing-repository",
     "smoke:extension-host": "npm run package && node scripts/extension-host-smoke.cjs",
     "lint": "eslint .",

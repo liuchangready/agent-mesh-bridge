@@ -12,6 +12,9 @@ import {
   TokenUsageComponent,
   appendInterruption,
   isMergePending,
+  isMergeReview,
+  findInFlightRound,
+  enterTaskFailure,
 } from './types';
 import {
   archiveCompletedTaskLogs,
@@ -19,11 +22,13 @@ import {
   buildFinalSummary,
   ensureFinalSummary,
   isTerminalThreadStatus,
+  canArchiveTask,
   removeTaskArtifacts,
 } from './task-summary';
 import { cleanupThreadNativeSessions, collectThreadSessionRefs } from './native-session-cleanup';
 import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
 import { removeTaskDataDir } from './task-data-dir';
+import { MeshFileLock } from './mesh-file-lock';
 
 export const MAX_STORED_TASKS = 1000;
 
@@ -32,6 +37,7 @@ function canEvictForCapacity(task: DelegationThread): boolean {
     return !task.worktree || task.worktree.integration?.phase === 'merged' || task.worktree.integration?.phase === 'no_changes';
   }
   if (task.status !== 'failed') return false;
+  if (task.failure?.stage === 'merge' || task.failure?.stage === 'review') return false;
   const worktree = task.worktree;
   return !worktree || (
     !worktree.approvedCommit &&
@@ -40,8 +46,57 @@ function canEvictForCapacity(task: DelegationThread): boolean {
     worktree.integration?.phase !== 'merging' &&
     worktree.integration?.phase !== 'conflict' &&
     worktree.integration?.phase !== 'validation_failed' &&
-    (!worktree.headCommit || worktree.headCommit === worktree.baseCommit)
+    !!worktree.headCommit && !!worktree.baseCommit && worktree.headCommit === worktree.baseCommit
   );
+}
+
+/**
+ * Normalize legacy thread status in-place.
+ * Historical ledgers may carry `status: 'reworking'`; normalize it to `'running'`
+ * on read while preserving all rounds, sessions, worktree, token usage, and interruptions.
+ */
+export function normalizeThread(thread: DelegationThread): DelegationThread {
+  if (!thread) return thread;
+  const oldStatus = thread.status as string;
+  if (oldStatus === 'waiting_review') thread.status = 'reviewing';
+  if (oldStatus === 'waiting_merge') {
+    const phase = thread.worktree?.integration?.phase;
+    if (phase === 'waiting' || phase === 'ready' || !phase) {
+      thread.status = 'queued';
+      thread.queuePhase = 'merge';
+    } else if (['blocked', 'conflict', 'validation_failed'].includes(phase)) {
+      thread.status = 'reviewing';
+      if (thread.worktree) thread.worktree.mergePending = true;
+    } else {
+      thread.status = 'merging';
+    }
+  }
+  if (oldStatus === 'reworking') {
+    thread.status = 'running';
+  }
+  if (thread.status !== 'queued' && thread.status !== 'paused') thread.queuePhase = undefined;
+  // Controller records already carry explicit failure and execution identities.
+  if (thread.execution) return thread;
+  if (oldStatus === 'review_failed' || oldStatus === 'merge_failed' || oldStatus === 'failed') {
+    const validStage = thread.failure?.stage && ['bootstrap', 'execution', 'review', 'merge'].includes(thread.failure.stage)
+      ? thread.failure.stage : undefined;
+    const stage = oldStatus === 'review_failed' ? 'review' : oldStatus === 'merge_failed' ? 'merge' :
+      validStage || (thread.reviewBootstrap?.phase === 'failed' ? 'bootstrap' : 'execution');
+    const work = [...(thread.rounds || [])].reverse().find(r => r.type !== 'approval');
+    const merge = [...(thread.mergeHistory || [])].reverse().find(e => e.result === 'failed');
+    const reason = oldStatus === 'review_failed' ? thread.reviewFailure?.reason : oldStatus === 'merge_failed' ? merge?.error :
+      thread.failure?.reason || (stage === 'bootstrap' ? thread.reviewBootstrap?.lastError : stage === 'review' ? thread.reviewFailure?.reason :
+        stage === 'merge' ? merge?.error : work?.error || work?.interruption?.reason);
+    thread.status = 'failed';
+    thread.failure = { ...(oldStatus === 'failed' ? thread.failure : undefined), stage,
+      reason: reason?.trim() || '旧任务失败，原因未记录',
+      at: (oldStatus === 'failed' && thread.failure?.at) || (stage === 'review' ? thread.reviewFailure?.at : stage === 'merge' ? merge?.at : undefined) || thread.updatedAt || thread.createdAt };
+  }
+  if ((thread.finalSummary?.kind as string) === 'review_failed' && thread.finalSummary) {
+    thread.finalSummary.kind = 'failed';
+    thread.finalSummary.failureStage = 'review';
+  }
+  return thread;
 }
 
 /**
@@ -360,7 +415,7 @@ export class TaskStore extends EventEmitter {
         const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
         if (parsed && parsed.threadId && parsed.workspace?.id && parsed.workspace?.executionPath &&
             (!parsed.worktree || parsed.worktree.path === parsed.workspace.executionPath)) {
-          this.tasks.set(parsed.threadId, parsed as DelegationThread);
+          this.tasks.set(parsed.threadId, normalizeThread(parsed as DelegationThread));
           this.knownMtimes.set(name, mtime);
         } else {
           this.tasks.delete(name.slice(0, -'.json'.length));
@@ -498,11 +553,13 @@ export class TaskStore extends EventEmitter {
           this.ensureUpToDate();
           this.emit('changed', Array.from(this.tasks.values()));
         }, 300);
+        this.watchDebounceTimer.unref?.();
       };
       this.ensureThreadsDir();
-      fs.watchFile(this.threadsDir, { interval: 1000 }, (curr, prev) => {
+      const watcher = fs.watchFile(this.threadsDir, { interval: 1000 }, (curr, prev) => {
         if (curr.mtimeMs !== prev.mtimeMs) onChange();
       });
+      (watcher as any)?.unref?.();
       this.isWatching = true;
     } catch (err) {
       console.warn(`[TaskStore] Failed to setup watchFile:`, err);
@@ -531,9 +588,65 @@ export class TaskStore extends EventEmitter {
   }
 
   /**
+   * Sole gateway for protected execution control, lifecycle, and decision transitions.
+   * Runs inside a short OS file lock, reads fresh state from disk, validates expected revision,
+   * applies change, increments revision, and atomically writes.
+   */
+  public async transitionExecution(
+    threadId: string,
+    expectedRevision: number,
+    change: (thread: DelegationThread) => void,
+  ): Promise<DelegationThread> {
+    const lockDir = path.join(this.storageDir, 'execution-locks');
+    fs.mkdirSync(lockDir, { recursive: true });
+    const lockFile = path.join(lockDir, `${threadId.replace(/[^A-Za-z0-9_-]/g, '_')}.lock`);
+    const lock = new MeshFileLock(lockFile);
+    const release = await lock.acquire(undefined, undefined, 15_000);
+    if (!release) {
+      throw new Error(`Timed out acquiring task execution lock for ${threadId}: ${lockFile}`);
+    }
+    try {
+      this.ensureUpToDate();
+      let thread = this.tasks.get(threadId);
+      const file = this.threadFilePath(threadId);
+      if (fs.existsSync(file)) {
+        try {
+          thread = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+        } catch (err) {
+          throw new Error(`Corrupted task file on disk for ${threadId}: ${(err as Error)?.message || err}`);
+        }
+      }
+      if (!thread) {
+        throw new Error(`Task thread not found: ${threadId}`);
+      }
+      const currentRev = thread.execution?.revision ?? 0;
+      if (currentRev !== expectedRevision) {
+        throw new Error(
+          `Execution revision mismatch for task ${threadId}: expected revision ${expectedRevision}, but found ${currentRev}`,
+        );
+      }
+      change(thread);
+      if (thread.execution) {
+        thread.execution.revision = currentRev + 1;
+      }
+      thread.updatedAt = new Date().toISOString();
+      ensureFinalSummary(thread);
+      this.persistThread(thread);
+      this.tasks.set(thread.threadId, thread);
+      this.writeAggregate();
+      this.emit('changed', Array.from(this.tasks.values()));
+      return thread;
+    } finally {
+      release();
+      lock.dispose();
+    }
+  }
+
+  /**
    * Upsert a task thread.
    */
   public upsertTask(thread: DelegationThread): void {
+    if (thread) normalizeThread(thread);
     const incomingMergeRevision = thread.mergeControl?.revision || 0;
     if (!thread.workspace?.id || !thread.workspace.executionPath ||
         (thread.worktree && thread.workspace.executionPath !== thread.worktree.path)) {
@@ -554,9 +667,13 @@ export class TaskStore extends EventEmitter {
     let onDisk: DelegationThread | undefined;
     try {
       const file = this.threadFilePath(thread.threadId);
-      if (fs.existsSync(file)) onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (fs.existsSync(file)) onDisk = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
     } catch {}
     const inMemory = this.tasks.get(thread.threadId);
+    if (onDisk?.archivedAt && !thread.archivedAt) {
+      this.tasks.set(thread.threadId, onDisk);
+      return;
+    }
     if ((onDisk || inMemory) && onDisk !== thread) {
       const authority = [inMemory, onDisk].filter(Boolean) as DelegationThread[];
       for (const prior of authority) {
@@ -577,6 +694,7 @@ export class TaskStore extends EventEmitter {
         }
       }
       for (const prior of authority) preferBinding(thread, prior);
+      thread.taskTemplate = structuredClone(onDisk?.taskTemplate || inMemory?.taskTemplate || thread.taskTemplate);
       const mergeEvents = new Map<string, NonNullable<DelegationThread['mergeHistory']>[number]>();
       for (const source of [onDisk, inMemory, thread]) {
         for (const event of source?.mergeHistory || []) if (!mergeEvents.has(event.id)) mergeEvents.set(event.id, event);
@@ -586,6 +704,30 @@ export class TaskStore extends EventEmitter {
         if (prior.mergeControl && (!thread.mergeControl || prior.mergeControl.revision > thread.mergeControl.revision)) {
           thread.mergeControl = structuredClone(prior.mergeControl);
           thread.status = prior.status;
+        }
+        if (prior.execution && (!thread.execution || prior.execution.revision > thread.execution.revision)) {
+          // Ordinary stale upsertTask must not overwrite protected execution, lifecycle status, decisions, or failure!
+          thread.execution = structuredClone(prior.execution);
+          thread.status = prior.status;
+          if (prior.failure) thread.failure = structuredClone(prior.failure);
+          if (prior.decision) thread.decision = structuredClone(prior.decision);
+          if (prior.decisions?.length) thread.decisions = structuredClone(prior.decisions);
+        }
+        if (prior.decision && (!thread.decision || prior.decision.id !== thread.decision.id)) {
+          if (!thread.decision || prior.status === 'wait_decision') {
+            thread.decision = structuredClone(prior.decision);
+          }
+        }
+        if (prior.decisions?.length) {
+          const existingIds = new Set((thread.decisions || []).map((d) => d.id));
+          const mergedDecisions = [...(thread.decisions || [])];
+          for (const d of prior.decisions) {
+            if (!existingIds.has(d.id)) {
+              mergedDecisions.push(structuredClone(d));
+              existingIds.add(d.id);
+            }
+          }
+          thread.decisions = mergedDecisions;
         }
       }
       thread.nativeSessionCompaction = mergeNativeCursors(
@@ -641,6 +783,13 @@ export class TaskStore extends EventEmitter {
         };
         const priorPhase = prior.worktree.integration?.phase;
         const incomingPhase = thread.worktree.integration?.phase;
+        if (prior.worktree.integration?.stashRecoveryPending && !thread.worktree.integration?.stashRecoveryPending &&
+            !(incomingPhase === 'merged' && thread.worktree.integration?.stashRecoveryPending === false)) {
+          const validation = thread.worktree.validation;
+          thread.worktree = { ...thread.worktree, ...prior.worktree, validation: validation || prior.worktree.validation };
+          thread.status = prior.status;
+          continue;
+        }
         if (incomingPhase === 'merged') {
           // Local integration is monotonic even when a stale writer carries a
           // later wall-clock timestamp (for example after clock skew).
@@ -670,6 +819,16 @@ export class TaskStore extends EventEmitter {
       const newestControl = authoritative.filter((entry) => (entry.mergeControl?.revision || 0) > incomingMergeRevision)
         .sort((a, b) => (b.mergeControl?.revision || 0) - (a.mergeControl?.revision || 0))[0];
       if (newestControl?.mergeControl) { thread.mergeControl = structuredClone(newestControl.mergeControl); thread.status = newestControl.status; }
+      const persisted = onDisk || inMemory;
+      if (!thread.execution && persisted && ((persisted.failureRevision || 0) > (thread.failureRevision || 0) ||
+          ((persisted.failureRevision || 0) === (thread.failureRevision || 0) &&
+           ((persisted.status !== thread.status && (persisted.status === 'failed' || thread.status === 'failed')) ||
+            (persisted.status === 'failed' && JSON.stringify(persisted.failure) !== JSON.stringify(thread.failure)))))) {
+        thread.failureRevision = persisted.failureRevision;
+        thread.failure = persisted.failure;
+        thread.status = persisted.status;
+      }
+      if (thread.worktree?.integration?.phase === 'merged') { thread.status = 'completed'; thread.failure = undefined; }
       const highestKnown = Math.max(
         onDisk?.currentRound || 0,
         inMemory?.currentRound || 0,
@@ -713,10 +872,17 @@ export class TaskStore extends EventEmitter {
     receiverSessionId?: string,
     callerSessionId?: string,
     interruption?: TaskInterruption,
+    expected?: { failureRevision: number; roundTimestamp?: string },
   ): DelegationThread | undefined {
     this.ensureUpToDate();
     const thread = this.tasks.get(threadId);
     if (!thread) return undefined;
+    if (expected) {
+      const round = [...thread.rounds].reverse().find(r => r.round === roundNumber);
+      if (thread.archivedAt || (thread.failureRevision || 0) !== expected.failureRevision ||
+          thread.currentRound !== roundNumber || !round || round.timestamp !== expected.roundTimestamp ||
+          (thread.status !== 'running' && thread.status !== 'paused')) return undefined;
+    }
 
     if (receiverSessionId) {
       thread.receiverSessionId = receiverSessionId;
@@ -788,10 +954,16 @@ export class TaskStore extends EventEmitter {
 
     if (newThreadStatus) {
       // Only transition thread status if this round is the latest round or newer,
-      // or if explicitly closing task
+      // or if explicitly closing task. Tasks with execution records manage lifecycle
+      // strictly through transitionExecution.
       const isLatest = !thread.currentRound || roundNumber >= thread.currentRound;
-      if (isLatest || newThreadStatus === 'completed' || newThreadStatus === 'failed') {
-        thread.status = newThreadStatus;
+      if (isLatest) {
+        if (newThreadStatus === 'failed') {
+          enterTaskFailure(thread, { stage: 'execution', reason: roundUpdate.error || interruption?.reason || 'Execution failed',
+            at: new Date().toISOString(), round: roundNumber, code: roundUpdate.assessment?.errorCode });
+        } else {
+          thread.status = newThreadStatus;
+        }
       }
     }
 
@@ -833,14 +1005,23 @@ export class TaskStore extends EventEmitter {
         all = all.filter(
           (t) =>
             t.status === 'running' ||
-            t.status === 'waiting_review' ||
-            t.status === 'reworking' ||
+            t.status === 'reviewing' ||
             t.status === 'queued' ||
-            t.status === 'waiting_merge' ||
+            t.status === 'merging' ||
             t.status === 'wait_decision' ||
-            t.status === 'merge_failed' ||
+            (t.status === 'failed' && t.failure?.stage === 'merge') ||
             t.status === 'paused',
         );
+      } else if (statusFilter === 'review_failed' || statusFilter === 'merge_failed') {
+        const stage = statusFilter === 'review_failed' ? 'review' : 'merge';
+        all = all.filter(t => t.status === 'failed' && t.failure?.stage === stage);
+      } else if (statusFilter === 'reworking') {
+        // Compatibility alias: match tasks normalized to 'running' whose in-flight round is rework
+        all = all.filter((t) => t.status === 'running' && findInFlightRound(t)?.type === 'rework');
+      } else if (statusFilter === 'waiting_review') {
+        all = all.filter((t) => t.status === 'reviewing');
+      } else if (statusFilter === 'waiting_merge') {
+        all = all.filter((t) => t.status === 'merging' || (t.status === 'queued' && t.queuePhase === 'merge') || isMergeReview(t));
       } else {
         all = all.filter((t) => t.status === statusFilter);
       }
@@ -904,7 +1085,7 @@ export class TaskStore extends EventEmitter {
     this.ensureUpToDate();
     const source = this.tasks.get(threadId);
     const thread = source && JSON.parse(JSON.stringify(source)) as DelegationThread;
-    if (!thread || thread.archivedAt || !isTerminalThreadStatus(thread.status)) return undefined;
+    if (!thread || !canArchiveTask(thread)) return undefined;
     // Do not discard the source until a complete archive and archived ledger row are durable.
     const nativeLock = new NativeSessionLock(this.storageDir);
     const leases: NativeSessionLease[] = [];

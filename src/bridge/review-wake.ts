@@ -4,16 +4,18 @@ import {
   RateLimitInfo,
   ReviewFailure,
   ReviewWakeState,
+  enterTaskFailure,
+  clearTaskFailure,
 } from './types';
 
 /**
  * Reviewer wake-up failures and their automatic recovery.
  *
- * A delegated round ending in `waiting_review` only means the *receiver* is
+ * A delegated round ending in `reviewing` only means the *receiver* is
  * done. The reviewer (the caller agent) is woken by spawning its CLI in its own
  * native session; that process can fail before it ever calls `approve_task` /
  * `request_rework` — the common case being a 429 or an exhausted quota. The
- * thread would then stay `waiting_review` forever and, because `waiting_review`
+ * thread would then stay `reviewing` forever and, because `reviewing`
  * is an unfinished task, it would keep blocking its workspace queue.
  *
  * This module keeps the decision inputs pure (no timers, no IO) so both the
@@ -30,11 +32,11 @@ export const REVIEW_WAKE_RESET_GRACE_MS = 20_000;
 export const REVIEW_WAKE_MIN_DELAY_MS = 30_000;
 
 /**
- * How long a task may sit in `waiting_review` with no live reviewer process
+ * How long a task may sit in `reviewing` with no live reviewer process
  * before the review is declared stalled.
  *
  * Every wake takes the `reviewer` role lock for the lifetime of the caller
- * process, so "waiting_review + no live lock + older than this" means the review
+ * process, so "reviewing + no live lock + older than this" means the review
  * died without reporting anything (extension host crash, silent CLI exit, or a
  * caller session that no longer exists). Ten minutes is well past the usual
  * 30-60s review, and the user can raise it in the settings.
@@ -186,6 +188,8 @@ export function describeReviewWake(state: ReviewWakeState): string {
         ? `配额不足，预计 ${state.quotaResetsAtFormatted} 恢复`
         : '配额不足',
     );
+  } else if (state.kind === 'pending') {
+    parts.push('Review wake is pending');
   } else if (state.kind === 'timeout') {
     parts.push('检视卡住（无活跃检视进程）');
   } else {
@@ -242,14 +246,14 @@ export interface ReviewFailureInput {
  * waiting for a reviewer either — a stale wake failure must not overwrite that.
  */
 export function applyReviewFailure(thread: DelegationThread, input: ReviewFailureInput): boolean {
-  if (thread.status !== 'waiting_review') return false;
+  if (thread.status !== 'reviewing') return false;
   const now = new Date().toISOString();
   const reason =
     String(input.reason || '')
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 500) || 'review ended without a verdict';
-  thread.status = 'review_failed';
+  enterTaskFailure(thread, { stage: 'review', reason, at: now, round: input.round ?? (thread.currentRound || 1), by: input.by });
   thread.reviewFailure = {
     kind: input.kind,
     reason,
@@ -270,13 +274,14 @@ export function applyReviewFailure(thread: DelegationThread, input: ReviewFailur
  * Re-open a failed review so a reviewer can be woken again.
  *
  * Used by the explicit re-review path (manual wake / queued wake replay) and by
- * `request_rework`-style recovery: the task goes back to `waiting_review` (thus
+ * `request_rework`-style recovery: the task goes back to `reviewing` (thus
  * re-occupies its queue slot) and the failed wake plan is dropped. The failure
  * record is deliberately KEPT as audit history.
  */
 export function reopenFailedReview(thread: DelegationThread): boolean {
-  if (thread.status !== 'review_failed') return false;
-  thread.status = 'waiting_review';
+  if (thread.status !== 'failed' || thread.failure?.stage !== 'review' || thread.archivedAt) return false;
+  clearTaskFailure(thread);
+  thread.status = 'reviewing';
   thread.reviewWake = undefined;
   thread.updatedAt = new Date().toISOString();
   return true;

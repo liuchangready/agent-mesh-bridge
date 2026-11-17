@@ -41,6 +41,7 @@ const { AutonomousRunner } = require(path.join(outBridgeDir, 'autonomous-runner'
 const { CallbackManager } = require(path.join(outBridgeDir, 'callback-manager'));
 const { AsyncDispatcher } = require(path.join(outBridgeDir, 'async-dispatcher'));
 const { ReworkController } = require(path.join(outBridgeDir, 'rework-controller'));
+const { ExecutionController } = require(path.join(outBridgeDir, 'execution-controller'));
 const { MCPServer } = require(path.join(outBridgeDir, 'mcp-server'));
 
 try {
@@ -52,6 +53,12 @@ try {
   callbackManager.setTaskStore(taskStore);
   const dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector);
   const reworkController = new ReworkController(taskStore, runner, callbackManager, detector);
+  const executionController = new ExecutionController(
+    taskStore,
+    runner,
+    callbackManager,
+    reworkController.getMergeCoordinator ? reworkController.getMergeCoordinator() : undefined,
+  );
 
   const server = new MCPServer(dispatcher, reworkController, taskStore, detector, resolver, runner);
 

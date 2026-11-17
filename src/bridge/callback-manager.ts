@@ -1,4 +1,4 @@
-import { getTaskExecutionPath, isReviewerWakeEligible } from './types';
+import { getTaskExecutionPath, isReviewerWakeEligible, isMergeReview } from './types';
 import * as child_process from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -39,6 +39,12 @@ import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-executi
 import { CancellationRegistry } from './cancellation-registry';
 import { noteMergeFailure } from './merge-recovery';
 import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
+import {
+  buildReviewerBootstrapPrompt,
+  clearReviewerBootstrapToken,
+  readReviewerBootstrapToken,
+  recordReviewerBootstrapHostPid,
+} from './reviewer-bootstrap';
 
 /**
  * How many times one task may wake its caller about failures.
@@ -55,10 +61,12 @@ export class CallbackManager extends EventEmitter {
   private runner?: AutonomousRunner;
   private wakeQueue: CallerWakeQueue;
   private taskStore?: TaskStore;
+  private readonly storageDir?: string;
 
   constructor(detector: AgentDetector, storageDir?: string) {
     super();
     this.detector = detector;
+    this.storageDir = storageDir;
     this.wakeQueue = new CallerWakeQueue(storageDir);
   }
 
@@ -105,14 +113,14 @@ export class CallbackManager extends EventEmitter {
     }
     const thread = this.taskStore.getTask(next.threadId);
     const round = thread?.rounds?.find((r) => r.round === next.round);
-    if (!thread || !round) {
+    if (!thread || thread.archivedAt || !round || (thread.failureRevision || 0) !== (next.failureRevision || 0)) {
       console.warn(
         `[CallbackManager] Dropping queued wake for ${next.threadId} round ${next.round}: it no longer exists.`,
       );
       return;
     }
     if (next.kind === 'review') {
-      if (!isReviewerWakeEligible(thread) && thread.status !== 'review_failed') {
+      if (!isReviewerWakeEligible(thread)) {
         console.log(
           `[CallbackManager] Dropping queued review wake for ${next.threadId}: status is now "${thread.status}".`,
         );
@@ -121,7 +129,7 @@ export class CallbackManager extends EventEmitter {
       void this.notifyCaller(thread, round);
       return;
     }
-    if (thread.status !== 'failed') {
+    if (thread.status !== 'failed' || thread.failure?.stage !== 'execution') {
       console.log(
         `[CallbackManager] Dropping queued failure wake for ${next.threadId}: status is now "${thread.status}".`,
       );
@@ -155,7 +163,6 @@ export class CallbackManager extends EventEmitter {
     if (
       inFlight ||
       thread.status === 'running' ||
-      thread.status === 'reworking' ||
       thread.status === 'queued'
     ) {
       console.warn(
@@ -168,7 +175,7 @@ export class CallbackManager extends EventEmitter {
     // there, only the verdict is missing. Waking the reviewer again turns the
     // task back into a live review (and re-occupies its queue slot) on the same
     // round and native session; the recorded failure stays as audit history.
-    if (thread.status === 'review_failed') {
+    if (thread.status === 'failed' && thread.failure?.stage === 'review') {
       reopenFailedReview(thread);
       try {
         this.taskStore?.upsertTask(thread);
@@ -177,7 +184,7 @@ export class CallbackManager extends EventEmitter {
     if (!isReviewerWakeEligible(thread)) {
       console.warn(
         `[CallbackManager] Refusing to wake reviewer for ${thread.threadId}: ` +
-          `task status is "${thread.status}", not "waiting_review".`,
+          `task status is "${thread.status}", not "reviewing".`,
       );
       return false;
     }
@@ -193,6 +200,7 @@ export class CallbackManager extends EventEmitter {
       threadId: thread.threadId,
       round: reviewRound.round,
       kind: 'review',
+      failureRevision: thread.failureRevision || 0,
       enqueuedAt: Date.now(),
     };
     if (!this.wakeQueue.tryAcquire(callerSessionId)) {
@@ -259,8 +267,8 @@ export class CallbackManager extends EventEmitter {
         executionRegistration = executionRegistry.begin(
           thread.threadId,
           reviewRound.round,
-          thread.status === 'waiting_merge' ? 'merge-reviewer' : thread.initiatorAgent,
-          thread.status === 'waiting_merge' && thread.worktree?.mergeResolutionPath || getTaskExecutionPath(thread),
+          isMergeReview(thread) ? 'merge-reviewer' : thread.initiatorAgent,
+          isMergeReview(thread) && thread.worktree?.mergeResolutionPath || getTaskExecutionPath(thread),
           'reviewer',
         );
         ownsExecutionRegistration = true;
@@ -297,33 +305,8 @@ export class CallbackManager extends EventEmitter {
 
     this.emit('taskCompleted', { thread, round: reviewRound });
 
-    const preview = reviewRound.output
-      ? reviewRound.output.slice(0, 200).replace(/[\r\n]+/g, ' ')
-      : reviewRound.error
-        ? `Error: ${reviewRound.error.slice(0, 150)}`
-        : 'Completed';
-
-    // Callee token line: only when something was actually measured. A missing
-    // measurement must not be rendered as "0 tokens".
-    const tokenLine = (() => {
-      const usage = reviewRound.tokenUsage;
-      if (!usage || !usage.available) return '';
-      const tilde = usage.source === 'estimated' || usage.partial ? '~' : '';
-      const cumulative = aggregateThreadTokenUsage(thread.rounds || []);
-      const cumulativeTilde = cumulative.isPartialOrEstimated ? '~' : '';
-      return (
-        `\n📊 Callee Token: Round ${reviewRound.round} ${tilde}${formatTokenCount(usage.totalTokens)}` +
-        ` (输入 ${formatTokenCount(usage.promptTokens)} · 输出 ${formatTokenCount(usage.outputTokens)} · 缓存 ${formatTokenCount(usage.cacheReadTokens)})` +
-        ` · 任务累计 ${cumulativeTilde}${formatTokenCount(cumulative.totalTokens)}`
-      );
-    })();
-
-    const promptMessage = `[Agent Mesh Bridge 自动化闭环验收指令] 任务【${thread.title}】第 ${reviewRound.round} 轮已由 ${thread.targetAgent} 执行完成。\n结果摘要: ${preview}${tokenLine}\n\n本任务已有中间文档链保存在任务账本（历轮指令 / 开发报告 / 返修意见）。get_thread_details(threadId="${thread.threadId}") 默认返回有界视图：最新轮完整，较早轮次可能是「提纯胶囊」卡片；需要逐字核对某一历史轮时用 get_round_raw_log(threadId="${thread.threadId}", round=<轮号>)，不要为此读取整段历史。必须沿用同一 threadId 与当前 callerSessionId 继续，禁止新建任务、另起会话或转派给其他 Agent。\n\n请作为任务下发方立即执行自动化检视闭环（判据只看**本任务自身范围**）：\n1. 审查本任务范围的代码与产出，并在当前工作区实际运行相关测试验证；\n2. 本任务范围内存在编译报错、测试未通过或功能缺陷：立即调用 request_rework(threadId="${thread.threadId}", feedback="具体报错与修复要求")；\n3. 本任务范围已通过、只是同批其他任务/依赖尚未交付：**不要**再发一轮 rework 空转，改用 request_rework(threadId="${thread.threadId}", feedback="阻塞说明", blocked=true, waitingForThreadId="<被依赖的 threadId>") 挂起；桥接不占用轮次，并在依赖到达 completed/failed 时自动唤醒你；\n4. 本任务范围通过即调用 approve_task(threadId="${thread.threadId}", remarks="本任务范围的验收结论与测试结果")。**不要用同批其他任务的 skip/失败否决本任务**——批次门禁属于收口阶段，由你在第 5 步统一处理；\n5. 验收通过后，由你作为调用者统一收口一个 MR：汇总该任务及同一批尚未推送的改动，只创建一个 MR，使用仓库既有远端与 gh/glab/等价 CLI 推送到远端；然后调用 mcp 工具 record_merge_request(threadId="${thread.threadId}", url="MR URL", branch="源分支", commit="提交 SHA", remote="origin", status="synced", summary="MR 摘要") 记录 MR 信息。不要每个子任务各推一次，不要新建任务/会话；开发者(receiver)不负责提交/推送。\n注意：上一轮没有任何文件改动时，本轮若再提交几乎相同的 rework 指令会被桥接拒绝（REWORK_NOOP_LOOP），只能 approve_task 或 blocked=true。\n请注意：请直接调用上述 MCP 工具完成闭环，请勿仅输出文本结论。`;
-
-    const wakeMessage = thread.status === 'waiting_merge'
-      ? `The approved task could not be integrated: ${thread.worktree?.integration?.error || 'unknown error'}. Resolution workspace: ${thread.worktree?.mergeResolutionPath || 'not available'}. Worker assessment: ${JSON.stringify(reviewRound.assessment || null)}. Interruptions: ${JSON.stringify(thread.interruptions || [])}. Recent merge decisions and recovery: ${JSON.stringify((thread.mergeHistory || []).slice(-8))}. Inspect get_thread_details, get_merge_log and get_round_raw_log for task ${thread.threadId}. Preserve the existing thread and reviewer session; use standard Git to resolve and stage changes, then call submit_merge_resolution. Request rework only if the candidate itself needs changes; request_merge_decision when a user decision is needed. Treat STREAM_GAP_EXCEEDED as a warning, defer quota failures, and investigate authentication, permission, CLI startup, environment, Git and validation failures.`
-      : promptMessage;
-    const mergeWakeId = thread.status === 'waiting_merge' ? crypto.randomUUID() : undefined;
+    const reviewWakeMessage = this.buildReviewWakeMessage(thread, reviewRound);
+    const mergeWakeId = isMergeReview(thread) ? crypto.randomUUID() : undefined;
     let released = false;
     let sessionLeaseReleased = !reviewerSessionLease;
     const release = () => {
@@ -344,8 +327,8 @@ export class CallbackManager extends EventEmitter {
       thread,
       callerSessionId,
       reviewerPreparation?.recoveryPrefix
-        ? `<bridge_recovery_document version="${reviewerPreparation.recoveryVersion}">\n${reviewerPreparation.recoveryPrefix}\n</bridge_recovery_document>\n\n${wakeMessage}`
-        : wakeMessage,
+        ? `<bridge_recovery_document version="${reviewerPreparation.recoveryVersion}">\n${reviewerPreparation.recoveryPrefix}\n</bridge_recovery_document>\n\n${reviewWakeMessage}`
+        : reviewWakeMessage,
       reviewRound,
       'review',
       release,
@@ -365,7 +348,7 @@ export class CallbackManager extends EventEmitter {
         if (!roleLock.attachChild(roleLease, childPid) && childPid) throw new Error('Could not bind reviewer child PID to the task role.');
         if (childPid && mergeWakeId && this.taskStore) {
           const current = this.taskStore.getTask(thread.threadId);
-          if (!current || current.status !== 'waiting_merge' || !isReviewerWakeEligible(current)) throw new Error('Merge review state changed before reviewer launch.');
+          if (!current || !isMergeReview(current) || !isReviewerWakeEligible(current)) throw new Error('Merge review state changed before reviewer launch.');
           const updated = structuredClone(current);
           updated.mergeHistory = [...(updated.mergeHistory || []), { id: mergeWakeId, attemptId: mergeWakeId, number: (updated.mergeHistory?.length || 0) + 1,
             at: new Date().toISOString(), phase: 'reviewer', result: 'started', retryGeneration: updated.mergeControl?.retryGeneration || 0 }];
@@ -379,6 +362,7 @@ export class CallbackManager extends EventEmitter {
       },
       reviewerPreparation?.recoveryVersion,
       mergeWakeId,
+      roleLease.token,
     );
     if (!launched) {
       release();
@@ -403,7 +387,7 @@ export class CallbackManager extends EventEmitter {
     roundNumber: number,
     result?: { error?: string; exitCode?: number; assessment?: { errorCode?: string; reason?: string } },
   ): Promise<boolean> {
-    if (thread.status !== 'failed') {
+    if (thread.status !== 'failed' || thread.failure?.stage !== 'execution') {
       // Paused/stopped tasks are user decisions, not failures to triage.
       return false;
     }
@@ -477,6 +461,7 @@ export class CallbackManager extends EventEmitter {
         threadId: thread.threadId,
         round: roundNumber,
         kind: 'failure',
+        failureRevision: thread.failureRevision || 0,
         enqueuedAt: Date.now(),
       });
     }
@@ -489,7 +474,7 @@ export class CallbackManager extends EventEmitter {
     if (!roleLease || !sessionLease) {
       if (roleLease) roleLock.release(roleLease);
       this.wakeQueue.release(callerSessionId);
-      return this.deferWake(callerSessionId, { threadId: thread.threadId, round: roundNumber, kind: 'failure', enqueuedAt: Date.now() });
+      return this.deferWake(callerSessionId, { threadId: thread.threadId, round: roundNumber, kind: 'failure', failureRevision: thread.failureRevision || 0, enqueuedAt: Date.now() });
     }
     const executionRegistry = new TaskExecutionRegistry(storageRoot);
     let executionRegistration: TaskExecutionRegistration;
@@ -510,7 +495,7 @@ export class CallbackManager extends EventEmitter {
       this.taskStore.loadFromDisk();
       const fresh = this.taskStore.getTask(thread.threadId);
       const freshSession = fresh?.reviewFlow === 'dedicated' ? fresh.reviewerSessionId : fresh?.callerSessionId;
-      if (!fresh || fresh.archivedAt || fresh.status !== 'failed' || freshSession !== callerSessionId ||
+      if (!fresh || fresh.archivedAt || fresh.status !== 'failed' || fresh.failure?.stage !== 'execution' || freshSession !== callerSessionId ||
           roleLock.getOwner(thread.threadId)?.token !== roleLease.token ||
           new CancellationRegistry(storageRoot).peek(thread.threadId)) {
         nativeLock.release(sessionLease); roleLock.release(roleLease);
@@ -542,7 +527,8 @@ export class CallbackManager extends EventEmitter {
         this.drainNextWake(callerSessionId);
       }
     };
-    const launched = this.launchCaller(thread, callerSessionId, promptMessage, round, 'failure', release, (childPid) => {
+    const failureMessage = thread.taskTemplate ? `${promptMessage}\n\n[Task template reviewer instructions]\n${thread.taskTemplate.reviewerInstructions}` : promptMessage;
+    const launched = this.launchCaller(thread, callerSessionId, failureMessage, round, 'failure', release, (childPid) => {
       if (childPid) {
         nativeLock.attachChild(sessionLease, childPid);
         if (!roleLock.attachChild(roleLease, childPid)) throw new Error('Could not bind failure-wake child PID to the task role.');
@@ -613,14 +599,114 @@ export class CallbackManager extends EventEmitter {
     return callerSessionId && isValidSessionId(callerSessionId) ? callerSessionId : undefined;
   }
 
-  /**
-   * Spawns the caller's CLI in its own native session, detached, with bridge
-   * receiver markers stripped so the caller keeps full control-plane tools.
-   *
-   * @param release - called when the child fails to start or exits non-zero, so
-   *   the caller can drop whatever lease it took for this wake-up.
-   */
-  private launchCaller(
+  public buildReviewWakeMessage(thread: DelegationThread, reviewRound: DelegationRound): string {
+    const preview = reviewRound.output
+      ? reviewRound.output.slice(0, 200).replace(/[\r\n]+/g, ' ')
+      : reviewRound.error
+        ? `Error: ${reviewRound.error.slice(0, 150)}`
+        : 'Completed';
+
+    const tokenLine = (() => {
+      const usage = reviewRound.tokenUsage;
+      if (!usage || !usage.available) return '';
+      const tilde = usage.source === 'estimated' || usage.partial ? '~' : '';
+      const cumulative = aggregateThreadTokenUsage(thread.rounds || []);
+      const cumulativeTilde = cumulative.isPartialOrEstimated ? '~' : '';
+      return (
+        `\n📊 Callee Token: Round ${reviewRound.round} ${tilde}${formatTokenCount(usage.totalTokens)}` +
+        ` (输入 ${formatTokenCount(usage.promptTokens)} · 输出 ${formatTokenCount(usage.outputTokens)} · 缓存 ${formatTokenCount(usage.cacheReadTokens)})` +
+        ` · 任务累计 ${cumulativeTilde}${formatTokenCount(cumulative.totalTokens)}`
+      );
+    })();
+
+    const promptMessage = `[Agent Mesh Bridge 自动化闭环验收指令] 任务【${thread.title}】第 ${reviewRound.round} 轮已由 ${thread.targetAgent} 执行完成。\n结果摘要: ${preview}${tokenLine}\n\n本任务已有中间文档链保存在任务账本（历轮指令 / 开发报告 / 返修意见）。get_thread_details(threadId="${thread.threadId}") 默认返回有界视图：最新轮完整，较早轮次可能是「提纯胶囊」卡片；需要逐字核对某一历史轮时用 get_round_raw_log(threadId="${thread.threadId}", round=<轮号>)，不要为此读取整段历史。必须沿用同一 threadId 与当前 callerSessionId 继续，禁止新建任务、另起会话或转派给其他 Agent。\n\n请作为任务下发方立即执行自动化检视闭环（判据只看**本任务自身范围**）：\n1. 审查本任务范围的代码与产出，并在当前工作区实际运行相关测试验证；\n2. 本任务范围内存在编译报错、测试未通过或功能缺陷：立即调用 request_rework(threadId="${thread.threadId}", feedback="具体报错与修复要求")；\n3. 本任务范围已通过、只是同批其他任务/依赖尚未交付：**不要**再发一轮 rework 空转，改用 request_rework(threadId="${thread.threadId}", feedback="阻塞说明", blocked=true, waitingForThreadId="<被依赖的 threadId>") 挂起；桥接不占用轮次，并在依赖到达 completed/failed 时自动唤醒你；\n4. 本任务范围通过即调用 approve_task(threadId="${thread.threadId}", remarks="本任务范围的验收结论与测试结果")。**不要用同批其他任务的 skip/失败否决本任务**——批次门禁属于收口阶段，由你在第 5 步统一处理；\n5. 验收通过后，由你作为调用者统一收口一个 MR：汇总该任务及同一批尚未推送的改动，只创建一个 MR，使用仓库既有远端与 gh/glab/等价 CLI 推送到远端；然后调用 mcp 工具 record_merge_request(threadId="${thread.threadId}", url="MR URL", branch="源分支", commit="提交 SHA", remote="origin", status="synced", summary="MR 摘要") 记录 MR 信息。不要每个子任务各推一次，不要新建任务/会话；开发者(receiver)不负责提交/推送。\n注意：上一轮没有任何文件改动时，本轮若再提交几乎相同的 rework 指令会被桥接拒绝（REWORK_NOOP_LOOP），只能 approve_task 或 blocked=true。\n请注意：请直接调用上述 MCP 工具完成闭环，请勿仅输出文本结论。`;
+
+    const wakeMessage = isMergeReview(thread)
+      ? `The approved task could not be integrated: ${thread.worktree?.integration?.error || 'unknown error'}. Resolution workspace: ${thread.worktree?.mergeResolutionPath || 'not available'}. Worker assessment: ${JSON.stringify(reviewRound.assessment || null)}. Interruptions: ${JSON.stringify(thread.interruptions || [])}. Recent merge decisions and recovery: ${JSON.stringify((thread.mergeHistory || []).slice(-8))}. Inspect get_thread_details, get_merge_log and get_round_raw_log for task ${thread.threadId}. Preserve the existing thread and reviewer session; use standard Git to resolve and stage changes, then call submit_merge_resolution. Request rework only if the candidate itself needs changes; request_merge_decision when a user decision is needed. Treat STREAM_GAP_EXCEEDED as a warning, defer quota failures, and investigate authentication, permission, CLI startup, environment, Git and validation failures.`
+      : promptMessage;
+    const answer = [...(thread.mergeHistory || [])].reverse().find(entry => entry.phase === 'decision' && entry.result === 'answered');
+    const question = answer && (thread.mergeHistory || []).find(entry => entry.decisionId === answer.decisionId && entry.result === 'requested');
+    const decisionMessage = answer ? `\n\nUser decision for ${question?.question || 'the pending question'}: ${answer.answer || ''}` : '';
+    return (thread.taskTemplate ? `${wakeMessage}\n\n[Task template reviewer instructions]\n${thread.taskTemplate.reviewerInstructions}` : wakeMessage) + decisionMessage;
+  }
+
+  public async launchReviewerBootstrap(
+    thread: DelegationThread,
+    onChildPid?: (pid: number) => void,
+  ): Promise<{ confirmed: boolean; error?: string; transient?: boolean }> {
+    assertCanExecute(thread.initiatorAgent, 'bootstrap as a reviewer', 'initiator');
+    const store = this.taskStore;
+    const root = this.storageDir || (store ? path.dirname(store.getStoragePath()) : undefined);
+    const tokenRecord = root ? readReviewerBootstrapToken(thread.threadId, root, thread.artifactDir) : undefined;
+    if (!tokenRecord) {
+      return { confirmed: false, error: 'Reviewer bootstrap token is missing.' };
+    }
+
+    const resumeReviewerSession = thread.reviewerSessionCaptured === true && !!thread.reviewerSessionId;
+    const preassigned = resumeReviewerSession ? thread.reviewerSessionId! : crypto.randomUUID();
+    const prompt = buildReviewerBootstrapPrompt(thread, tokenRecord.token);
+    const runner = this.runner || new AutonomousRunner(this.detector);
+
+    const result = await runner.execute({
+      agent: thread.initiatorAgent,
+      prompt,
+      isRework: resumeReviewerSession,
+      receiverSessionId: preassigned,
+      title: `Reviewer bootstrap: ${thread.title}`,
+      cwd: getTaskExecutionPath(thread),
+      taskThreadId: thread.threadId,
+      artifactDir: thread.artifactDir,
+      taskRound: 0,
+      nativeSessionRole: 'reviewer',
+      model: thread.reviewerModel,
+      role: 'bootstrap',
+      markAsReceiver: false,
+      maxRetries: 0,
+      extraEnv: {
+        MESH_REVIEW_BOOTSTRAP: '1',
+        MESH_REVIEW_BOOTSTRAP_TOKEN: tokenRecord.token,
+        MESH_REVIEW_THREAD_ID: thread.threadId,
+        MESH_CALLER_AGENT: thread.initiatorAgent,
+      },
+      onChildPid: (pid) => {
+        if (pid && root) recordReviewerBootstrapHostPid(thread.threadId, pid, root, thread.artifactDir);
+        if (pid) onChildPid?.(pid);
+      },
+    });
+
+    if (store) store.loadFromDisk();
+    const fresh = store?.getTask(thread.threadId);
+    if (fresh?.reviewBootstrap?.phase === 'confirmed') {
+      const sessionId =
+        result.actualSessionId ||
+        (thread.initiatorAgent === 'claude_code' ? preassigned : undefined) ||
+        (resumeReviewerSession ? preassigned : undefined);
+      if (sessionId && store) {
+        fresh.reviewerSessionId = sessionId;
+        fresh.reviewerSessionCaptured = true;
+        fresh.callerSessionId = sessionId;
+        fresh.reviewBootstrap = {
+          ...fresh.reviewBootstrap,
+          phase: 'confirmed',
+          reviewerSessionId: sessionId,
+        };
+        if (root) clearReviewerBootstrapToken(fresh.threadId, root, fresh.artifactDir);
+        store.upsertTask(fresh);
+      }
+      return { confirmed: true };
+    }
+
+    const detail = result.error || `Reviewer process exited with code ${result.exitCode} without confirming bootstrap`;
+    const isTransient = runner.isTransientError(result);
+    return { confirmed: false, error: detail, transient: isTransient };
+  }
+
+  public launchCaller(
+    thread: DelegationThread,
+    round: DelegationRound,
+    onChildPid?: (pid: number) => void,
+  ): Promise<{ success: boolean; error?: string; exitCode?: number }>;
+  public launchCaller(
     thread: DelegationThread,
     callerSessionId: string,
     promptMessage: string,
@@ -630,10 +716,246 @@ export class CallbackManager extends EventEmitter {
     onChildPid?: (pid: number | undefined) => void,
     recoveryVersion?: string,
     mergeWakeId?: string,
+    roleToken?: string,
+  ): boolean;
+  public launchCaller(
+    thread: DelegationThread,
+    callerSessionIdOrRound: string | DelegationRound,
+    promptMessageOrOnChildPid?: string | ((pid: number) => void),
+    roundParam?: DelegationRound,
+    wakeKind?: 'review' | 'failure',
+    release?: () => void,
+    onChildPid?: (pid: number | undefined) => void,
+    recoveryVersion?: string,
+    mergeWakeId?: string,
+    roleToken?: string,
+  ): boolean | Promise<{ success: boolean; error?: string; exitCode?: number }> {
+    if (typeof callerSessionIdOrRound !== 'string') {
+      const round = callerSessionIdOrRound;
+      const childPidCb = typeof promptMessageOrOnChildPid === 'function' ? promptMessageOrOnChildPid : undefined;
+      return this.launchCallerAsync(thread, round, childPidCb);
+    }
+    const callerSessionId = callerSessionIdOrRound;
+    const promptMessage = promptMessageOrOnChildPid as string;
+    const round = roundParam!;
+    return this.launchCallerSync(thread, callerSessionId, promptMessage, round, wakeKind!, release!, onChildPid, recoveryVersion, mergeWakeId, roleToken);
+  }
+
+  private launchCallerAsync(
+    thread: DelegationThread,
+    round: DelegationRound,
+    onChildPid?: (pid: number) => void,
+  ): Promise<{ success: boolean; error?: string; exitCode?: number }> {
+    assertCanExecute(thread.initiatorAgent, 'resume as a reviewer', 'initiator');
+    const callerSessionId = this.resolveCallerSession(thread);
+    if (!callerSessionId) {
+      return Promise.resolve({ success: false, error: `No caller session ID found for task ${thread.threadId}` });
+    }
+
+    const initiator = thread.initiatorAgent;
+    const cwd = isMergeReview(thread) && thread.worktree?.mergeResolutionPath || getTaskExecutionPath(thread);
+    const senderModel = thread.reviewFlow === 'dedicated' ? thread.reviewerModel : resolveConfiguredModel(initiator, undefined, 'initiator');
+    const modelFlagArgs = senderModel ? ['--model', senderModel] : [];
+    const codexModelArgs = senderModel ? ['-c', `model="${senderModel}"`] : [];
+
+    const wakeMessage = this.buildReviewWakeMessage(thread, round);
+
+    const callbackEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      CI: '1',
+      NON_INTERACTIVE: 'true',
+    };
+    if (initiator === 'deepseek_harness') {
+      callbackEnv.DSH_PERMISSION_MODE = 'danger-full-access';
+    }
+    delete callbackEnv[MESH_TASK_RECEIVER_ENV];
+    delete callbackEnv[MESH_TASK_THREAD_ENV];
+    delete callbackEnv[MESH_TASK_ROUND_ENV];
+    delete callbackEnv.MESH_REVIEW_BOOTSTRAP;
+    delete callbackEnv.MESH_REVIEW_BOOTSTRAP_TOKEN;
+    delete callbackEnv.MESH_REVIEW_THREAD_ID;
+    if (thread.reviewFlow === 'dedicated') {
+      callbackEnv.MESH_REVIEW_SESSION_ID = callerSessionId;
+      callbackEnv.MESH_REVIEW_THREAD_ID = thread.threadId;
+    }
+
+    const logDir = this.storageDir || (this.taskStore ? path.dirname(this.taskStore.getStoragePath()) : undefined);
+    if (logDir) {
+      try {
+        fs.mkdirSync(logDir, { recursive: true });
+        const logPath = path.join(logDir, 'callbacks.log');
+        const banner = `\n--- [${new Date().toISOString()}] Waking up ${initiator} (thread: ${thread.threadId}, round: ${round.round}, session: ${callerSessionId}, senderModel: ${senderModel || 'agent default'}) ---\n`;
+        fs.appendFileSync(logPath, banner, 'utf8');
+      } catch {}
+    }
+
+    const reviewerLog = createReviewerLogWriter(
+      thread.threadId,
+      round.round,
+      {
+        agent: initiator,
+        sessionId: callerSessionId,
+        kind: 'review',
+        note: `${thread.title} | receiver=${thread.targetAgent} | roundType=${round.type} | senderModel=${senderModel || 'agent default'}`,
+      },
+      { artifactDir: thread.artifactDir },
+    );
+
+    return new Promise<{ success: boolean; error?: string; exitCode?: number }>((resolve) => {
+      let command = defaultBinary(initiator);
+      let args: string[] = [];
+      let extraEnv: NodeJS.ProcessEnv = {};
+      let useShell = false;
+      let sendStdinPrompt = false;
+
+      if (initiator === 'antigravity') {
+        command = this.detector.resolveExecutable('antigravity') || defaultBinary('agy');
+        args = [
+          '--conversation',
+          callerSessionId,
+          '-p',
+          wakeMessage,
+          '--dangerously-skip-permissions',
+          '--mode',
+          'accept-edits',
+          ...modelFlagArgs,
+        ];
+      } else if (initiator === 'claude_code') {
+        const claudePath = this.detector.resolveExecutable('claude_code') || defaultBinary('claude');
+        args = [
+          '--resume',
+          callerSessionId,
+          '-p',
+          '--dangerously-skip-permissions',
+          ...modelFlagArgs,
+        ];
+        sendStdinPrompt = true;
+        if (needsShellWrapper(claudePath)) {
+          command = 'cmd.exe';
+          args = ['/c', claudePath, ...args];
+        } else {
+          command = claudePath;
+        }
+      } else if (initiator === 'codex') {
+        const codexPath = this.detector.resolveExecutable('codex') || defaultBinary('codex');
+        const support = cachedCodexResumeSupport(codexPath);
+        const resumeId = codexResumeArgument(callerSessionId, support);
+        command = codexPath;
+        args = [
+          ...(support?.noDaemon ? ['--no-daemon'] : []),
+          ...codexModelArgs,
+          '--ask-for-approval',
+          'never',
+          'exec',
+          'resume',
+          resumeId,
+          wakeMessage,
+          '--dangerously-bypass-approvals-and-sandbox',
+          '--dangerously-bypass-hook-trust',
+          '--skip-git-repo-check',
+        ];
+      } else if (initiator === 'deepseek_harness') {
+        const launcher = this.detector.resolveExecutable('deepseek_harness') || defaultBinary('dsh');
+        const built = buildDshHeadlessCommand(launcher, {
+          prompt: wakeMessage,
+          sessionId: callerSessionId,
+          json: false,
+          modelOverlayPath: senderModel ? writeDshModelOverlay(senderModel, thread.artifactDir) : undefined,
+        });
+        if (built) {
+          command = built.command;
+          args = built.args;
+          useShell = Boolean(built.useShell);
+          if (built.env) extraEnv = built.env;
+        } else {
+          command = launcher;
+          args = ['--session-id', callerSessionId, '-p', wakeMessage];
+        }
+      } else {
+        args = [...modelFlagArgs, '--conversation', callerSessionId, '-p', wakeMessage];
+      }
+
+      let child: child_process.ChildProcess;
+      try {
+        child = child_process.spawn(command, args, {
+          cwd,
+          windowsHide: true,
+          shell: useShell,
+          stdio: [sendStdinPrompt ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+          env: { ...callbackEnv, ...extraEnv },
+        });
+      } catch (err: any) {
+        reviewerLog.writeOutcome({ error: err.message });
+        reviewerLog.close();
+        resolve({ success: false, error: err.message, exitCode: -1 });
+        return;
+      }
+
+      if (sendStdinPrompt && child.stdin) {
+        child.stdin.on('error', () => {});
+        try { child.stdin.write(wakeMessage, 'utf8'); } catch {}
+        try { child.stdin.end(); } catch {}
+      }
+
+      if (child.pid) {
+        onChildPid?.(child.pid);
+      }
+
+      let stdoutOutput = '';
+      let stderrOutput = '';
+      child.stdout?.on('data', (chunk: Buffer) => {
+        const text = chunk.toString('utf8');
+        stdoutOutput = (stdoutOutput + text).slice(-65536);
+        reviewerLog.write(text);
+      });
+
+      child.stderr?.on('data', (chunk: Buffer) => {
+        const text = chunk.toString('utf8');
+        stderrOutput = (stderrOutput + text).slice(-65536);
+        reviewerLog.write(text);
+      });
+
+      child.once('error', (err) => {
+        reviewerLog.writeOutcome({ error: err.message });
+        reviewerLog.close();
+        resolve({ success: false, error: err.message, exitCode: -1 });
+      });
+
+      child.once('close', (code) => {
+        reviewerLog.writeOutcome({ exitCode: code ?? undefined });
+        reviewerLog.close();
+        resolve({
+          success: code === 0,
+          exitCode: code ?? undefined,
+          error: code === 0 ? undefined : stderrOutput || stdoutOutput || `Reviewer process exited with code ${code}`,
+        });
+      });
+    });
+  }
+
+  /**
+   * Spawns the caller's CLI in its own native session, detached, with bridge
+   * receiver markers stripped so the caller keeps full control-plane tools.
+   *
+   * @param release - called when the child fails to start or exits non-zero, so
+   *   the caller can drop whatever lease it took for this wake-up.
+   */
+  private launchCallerSync(
+    thread: DelegationThread,
+    callerSessionId: string,
+    promptMessage: string,
+    round: DelegationRound,
+    wakeKind: 'review' | 'failure',
+    release: () => void,
+    onChildPid?: (pid: number | undefined) => void,
+    recoveryVersion?: string,
+    mergeWakeId?: string,
+    roleToken?: string,
   ): boolean {
     assertCanExecute(thread.initiatorAgent, 'resume as a reviewer', 'initiator');
+    const startedThread = structuredClone(thread);
     const initiator = thread.initiatorAgent;
-    const cwd = thread.status === 'waiting_merge' && thread.worktree?.mergeResolutionPath || getTaskExecutionPath(thread);
+    const cwd = isMergeReview(thread) && thread.worktree?.mergeResolutionPath || getTaskExecutionPath(thread);
     // Wake the caller on its SENDER-side default model, which is configured
     // separately from the receiver-side default: the same agent can dispatch a
     // task to itself and execute it with a different model. An empty sender
@@ -705,7 +1027,7 @@ export class CallbackManager extends EventEmitter {
     // anything: a 429 / exhausted quota kills it before its first tool call.
     // Tee a bounded tail of its output (still written verbatim to
     // callbacks.log) so a failed wake can be classified and retried instead of
-    // leaving the task parked in `waiting_review` forever.
+    // leaving the task parked in `reviewing` forever.
     const capture = new WakeOutputCapture();
     const stdoutCapture = new WakeOutputCapture(); const stderrCapture = new WakeOutputCapture();
     const suspension = new HostSuspensionGuard();
@@ -733,7 +1055,7 @@ export class CallbackManager extends EventEmitter {
     const attachErrorLogging = (child: child_process.ChildProcess) => {
       suspension.start();
       let interruption: TaskInterruption | undefined;
-      const watchdog = thread.status === 'waiting_merge' && wakeKind === 'review' ? setInterval(() => {
+      const watchdog = isMergeReview(thread) && wakeKind === 'review' ? setInterval(() => {
         suspension.sync(); const now = monotonicNowMs();
         const elapsed = now - startedAt - suspension.totalSuspendedMs();
         const silent = now - previousOutput - suspension.suspendedWithin(previousOutput, now);
@@ -758,23 +1080,25 @@ export class CallbackManager extends EventEmitter {
         try { reviewerLog.writeOutcome(outcome); reviewerLog.close(); }
         catch (error: any) { console.error(`[CallbackManager] Reviewer log finalization failed for ${thread.threadId}: ${error?.message || error}`); }
         suspension.sync(); suspension.stop();
-        const assessment = wakeKind === 'review' && thread.status === 'waiting_merge'
+        const assessment = wakeKind === 'review' && isMergeReview(thread)
           ? (this.runner || new AutonomousRunner(this.detector)).evaluateResponse({ exitCode: outcome.exitCode ?? -1,
               stdout: stdoutCapture.text(), stderr: stderrCapture.text(), chunkCount, stdoutBytes, stderrBytes,
               firstOutputAtMs, lastOutputAtMs, maxGapMs, rawMaxGapMs, excludedSuspensionMs, suspensionCount: suspension.suspensionCount,
               gapThresholdMs: 10 * 60_000, interruption }) : undefined;
         try {
-          const state = this.finalizeWake(thread, round, callerSessionId, {
+          const root = this.taskStore ? path.dirname(this.taskStore.getStoragePath()) : this.storageDir;
+          const stillOwnsRole = !roleToken || new TaskRoleLock(root).getOwner(thread.threadId)?.token === roleToken;
+          const state = stillOwnsRole ? this.finalizeWake(startedThread, round, callerSessionId, {
             ...outcome,
             output: capture.text(),
             assessment,
             interruption,
             attemptId: mergeWakeId,
-          }, wakeKind);
+          }, wakeKind) : undefined;
           if (outcome.exitCode === 0 && (!assessment || assessment.success) && wakeKind === 'review' && thread.reviewFlow === 'dedicated' && this.taskStore) {
             this.taskStore.loadFromDisk();
             const current = this.taskStore.getTask(thread.threadId);
-            if (current && !isReviewerWakeEligible(current) && current.status !== 'failed' && current.status !== 'review_failed') {
+            if (current && !isReviewerWakeEligible(current) && current.status !== 'failed') {
               const cursor = current.nativeSessionCompaction?.reviewer;
               new NativeSessionCompactor(this.taskStore, this.detector).recordBusinessSuccess(
                 thread.threadId,
@@ -1005,7 +1329,7 @@ export class CallbackManager extends EventEmitter {
    * "Success" requires the caller process to exit cleanly AND print no
    * quota/rate-limit signal: several CLIs exit 0 after printing "429" or
    * "insufficient quota", and treating that as a delivered review is exactly how
-   * a task ends up parked in `waiting_review` with nobody looking at it.
+   * a task ends up parked in `reviewing` with nobody looking at it.
    *
    * On failure the state is written to the thread so the tree/detail panel can
    * show "检视唤醒失败" with a one-click re-review, and so the scheduler knows
@@ -1037,14 +1361,14 @@ export class CallbackManager extends EventEmitter {
         const current = this.taskStore.getTask(thread.threadId);
         // Deleted and archived tasks must never be resurrected from this
         // callback's stale in-memory copy.
-        if (!current || current.archivedAt) return undefined;
+        if (!current || current.archivedAt || (current.failureRevision || 0) !== (thread.failureRevision || 0)) return undefined;
         target = current;
       } catch {
         return undefined;
       }
     }
 
-    const mergeWake = thread.status === 'waiting_merge' && isReviewerWakeEligible(thread);
+    const mergeWake = isMergeReview(thread) && isReviewerWakeEligible(thread);
     if (mergeWake && target.status === 'wait_decision' && outcome.assessment && !outcome.assessment.success) {
       const reason = outcome.assessment.reason || outcome.assessment.errorCode;
       if (outcome.interruption) appendInterruption(target, outcome.interruption);
@@ -1054,18 +1378,20 @@ export class CallbackManager extends EventEmitter {
       target.updatedAt = new Date().toISOString(); this.taskStore?.upsertTask(target);
       return undefined;
     }
-    if (mergeWake && target.status === 'waiting_merge' && !isReviewerWakeEligible(target) && outcome.assessment && !outcome.assessment.success && target.worktree?.integration) {
+    if (mergeWake && target.status === 'queued' && target.queuePhase === 'merge' && outcome.assessment && !outcome.assessment.success && target.worktree?.integration) {
       const priorAt = Date.parse(target.worktree.integration.updatedAt || '') || 0;
+      target.status = 'reviewing';
+      target.queuePhase = undefined;
       target.worktree.integration = { ...target.worktree.integration, phase: 'blocked', error: `Reviewer ${outcome.assessment.errorCode}: ${outcome.assessment.reason || 'response failed'}`, updatedAt: new Date(Math.max(Date.now(), priorAt + 1)).toISOString() };
     }
-    if (mergeWake && outcome.attemptId && (target.status !== 'waiting_merge' || !isReviewerWakeEligible(target))) {
+    if (mergeWake && outcome.attemptId && (!isMergeReview(target) || !isReviewerWakeEligible(target))) {
       const result = target.status === 'paused' ? 'cancelled' : 'completed';
       target.mergeHistory = [...(target.mergeHistory || []), { id: crypto.randomUUID(), attemptId: outcome.attemptId,
         number: (target.mergeHistory?.length || 0) + 1, at: new Date().toISOString(), phase: 'reviewer', result,
         assessment: outcome.assessment, interruption: outcome.interruption }];
       this.taskStore?.upsertTask(target);
     }
-    if (target.status === 'completed' || (target.status === 'waiting_merge' && (!mergeWake || !isReviewerWakeEligible(target)))) {
+    if (target.status === 'completed' || (isMergeReview(target) && (!mergeWake || !isReviewerWakeEligible(target)))) {
       if (target.reviewWake?.round === round.round) {
         target.reviewWake = undefined;
         target.updatedAt = new Date().toISOString();
@@ -1077,7 +1403,7 @@ export class CallbackManager extends EventEmitter {
     }
 
     // Paused/failed/deleted/review_failed tasks no longer own a review slot.
-    if (target.status !== 'waiting_review' && !(mergeWake && isReviewerWakeEligible(target))) return undefined;
+    if (target.status !== 'reviewing' && !(mergeWake && isReviewerWakeEligible(target))) return undefined;
 
     const handedOff =
       (target.rounds || []).some((candidate) => candidate.round > round.round && candidate.type !== 'approval') ||
@@ -1132,23 +1458,23 @@ export class CallbackManager extends EventEmitter {
         /spawn.*(?:enoent|not found)|failed to launch/i.test(outcome.error || '') ? 'CLI_START_FAILED' :
           (outcome.assessment?.errorCode || (outcome.exitCode === undefined ? 'CLI_START_FAILED' : `EXIT_${outcome.exitCode}`));
       const budget = noteMergeFailure(target, 'reviewer', code, reason);
-      if (target.status === 'merge_failed' || code === 'AUTH_OR_PERMISSION') { state.autoRetryAt = undefined; state.gaveUp = true; }
+      if ((target.status === 'failed' && target.failure?.stage === 'merge') || code === 'AUTH_OR_PERMISSION') { state.autoRetryAt = undefined; state.gaveUp = true; }
       const number = (target.mergeHistory?.length || 0) + 1;
       target.mergeHistory = [...(target.mergeHistory || []), {
         id: crypto.randomUUID(), number, at: target.updatedAt, phase: 'reviewer', result: 'failed', attemptId: outcome.attemptId, error: state.lastError, errorCode: code, exitCode: outcome.exitCode, assessment: outcome.assessment, interruption: outcome.interruption, ...budget,
       }];
-      if (code === 'AUTH_OR_PERMISSION' && target.status === 'waiting_merge') {
+      if (code === 'AUTH_OR_PERMISSION' && isMergeReview(target)) {
         const decisionId = crypto.randomUUID();
         target.mergeHistory.push({ id: decisionId, decisionId, number: number + 1, at: target.updatedAt, phase: 'decision', result: 'requested',
-          question: 'How should the reviewer proceed after the authentication or permission failure?', background: reason,
+          decisionStage: 'merge', question: 'How should the reviewer proceed after the authentication or permission failure?', background: reason,
           suggestion: 'Restore the required credentials or permissions, then submit a decision.' });
-        target.mergeControl = { ...target.mergeControl!, revision: target.mergeControl!.revision + 1, pendingDecisionId: decisionId };
+        target.mergeControl = { ...target.mergeControl!, revision: target.mergeControl!.revision + 1, pendingDecisionId: decisionId, decisionStage: 'merge' };
         target.status = 'wait_decision';
       }
     } else if (state.gaveUp) {
       // The retry budget is spent: no reviewer will ever be woken again on its
       // own. Surface that as a terminal `review_failed` (releasing the queue
-      // slot) with the concrete cause, rather than a silent `waiting_review`.
+      // slot) with the concrete cause, rather than a silent `reviewing`.
       applyReviewFailure(target, {
         kind: 'retries_exhausted',
         reason: `检视唤醒自动重试已耗尽（${state.attempts} 次失败）：${state.lastError}`,

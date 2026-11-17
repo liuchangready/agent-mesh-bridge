@@ -2,6 +2,7 @@ import { TaskExecutionRegistry } from './task-execution-registry';
 import { TaskStore } from './task-store';
 import { concurrencyPolicy } from './bridge-policy';
 import { DelegationRound, DelegationThread, findInFlightRound, isReviewerBootstrapPending } from './types';
+import { ExecutionController } from './execution-controller';
 
 export interface QueuedExecution {
   thread: DelegationThread;
@@ -51,13 +52,17 @@ export class QueueDrainer {
     const policy = concurrencyPolicy();
     this.taskStore.loadFromDisk();
     const allTasks = this.taskStore.getAllTasks();
+
+    if (ExecutionController.getInstance()) {
+      await ExecutionController.getInstance()!.scanAndDrain();
+    }
     const candidates = allTasks
       .filter((thread) => {
-        if (!thread || !thread.threadId || thread.status === 'paused' || thread.status === 'waiting_review') {
+        if (!thread || !thread.threadId || thread.execution || thread.status === 'paused' || thread.status === 'reviewing') {
           return false;
         }
-        if (thread.reviewBlocked || isReviewerBootstrapPending(thread)) return false;
-        return thread.status === 'queued' || thread.status === 'running' || thread.status === 'reworking';
+        if (thread.queuePhase === 'merge' || thread.reviewBlocked || isReviewerBootstrapPending(thread)) return false;
+        return thread.status === 'queued' || thread.status === 'running';
       })
       .map((thread) => ({ thread, round: findInFlightRound(thread) }))
       .filter((target): target is QueuedExecution => Boolean(target.round?.prompt))

@@ -83,6 +83,62 @@ test('execution path must agree with the isolated worktree', () => {
   assert.equal(getTaskExecutionPath(thread), '/two');
 });
 
+function selectionState() {
+  const values = new Map<string, unknown>();
+  return {
+    get<T>(key: string): T | undefined { return values.get(key) as T | undefined; },
+    async update(key: string, value: unknown): Promise<void> {
+      if (value === undefined) values.delete(key); else values.set(key, structuredClone(value));
+    },
+  };
+}
+
+test('workspace selection survives a new host while clear and first-dispatch choices persist', async (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-window-reload-'));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const workspace = new WorkspaceRegistry(temp).register(temp, 'user');
+  const state = selectionState();
+  const original = new WindowWorkspace(temp, [temp], state);
+  await original.setDefault(workspace.id);
+  original.dispose();
+  const restored = new WindowWorkspace(temp, [temp], state);
+  assert.notEqual(restored.context.hostInstanceId, original.context.hostInstanceId);
+  assert.notEqual(restored.context.generation, original.context.generation);
+  assert.equal(restored.context.defaultWorkspaceId, workspace.id);
+  assert.equal(restored.context.defaultSource, 'manual');
+  assert.equal(findUniqueWindow(temp, physicalDirectory(temp))?.defaultWorkspaceId, workspace.id);
+  assert.equal(restored.adopt({ ...testWorkspace(temp), dispatchAccepted: true, origin: original.context }), false);
+  await restored.setDefault(undefined);
+  restored.dispose();
+  const cleared = new WindowWorkspace(temp, [temp], state);
+  assert.equal(cleared.context.defaultWorkspaceId, undefined);
+  const binding = { ...testWorkspace(temp), id: workspace.id, dispatchAccepted: true, origin: cleared.context };
+  assert.equal(cleared.adopt(binding), true);
+  cleared.dispose();
+  const adopted = new WindowWorkspace(temp, [temp], state);
+  assert.equal(adopted.context.defaultWorkspaceId, workspace.id);
+  assert.equal(adopted.context.defaultSource, 'first-dispatch');
+  adopted.dispose();
+});
+
+test('workspace state stays isolated and missing saved directories do not break startup', async (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-window-state-'));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const root = path.join(temp, 'project'); fs.mkdirSync(root);
+  const workspace = new WorkspaceRegistry(temp).register(root, 'user');
+  const firstState = selectionState(), secondState = selectionState();
+  const first = new WindowWorkspace(temp, [root], firstState);
+  await first.setDefault(workspace.id);
+  first.dispose();
+  const other = new WindowWorkspace(temp, [root], secondState);
+  assert.equal(other.context.defaultWorkspaceId, undefined);
+  other.dispose();
+  fs.rmdirSync(root);
+  const unavailable = new WindowWorkspace(temp, [], firstState);
+  assert.equal(unavailable.context.defaultWorkspaceId, undefined);
+  unavailable.dispose();
+});
+
 test('ledger refuses a missing or changed binding and filters before limiting', () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-ws-store-'));
   const store = new TaskStore(temp);

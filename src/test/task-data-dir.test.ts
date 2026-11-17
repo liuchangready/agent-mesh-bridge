@@ -415,11 +415,11 @@ test('dispatch pins the absolute task directory and writes its round log there',
     reviewFlow: 'legacy',
   });
   const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline && store.getTask(result.threadId)?.status !== 'waiting_review') {
+  while (Date.now() < deadline && store.getTask(result.threadId)?.status !== 'reviewing') {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   const thread = store.getTask(result.threadId)!;
-  assert.strictEqual(thread.status, 'waiting_review');
+  assert.strictEqual(thread.status, 'reviewing');
   assert.strictEqual(thread.artifactDir, path.join(storage, 'tasks', result.threadId));
   assert.strictEqual(thread.taskDataDir, thread.artifactDir);
   assert.strictEqual(path.resolve(thread.worktree!.path), path.join(thread.artifactDir!, 'worktree'));

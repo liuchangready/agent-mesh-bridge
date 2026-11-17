@@ -5,6 +5,8 @@ import * as path from 'path';
 import * as os from 'os';
 import { TaskStore } from './bridge/task-store';
 import { WorkspaceRegistry, WindowWorkspace, physicalDirectory } from './bridge/workspace';
+import { registerTemplateCommands } from './ui/template-commands';
+import { resolveTemplateWorkspaceRoot } from './bridge/git-worktree';
 import { AgentDetector } from './bridge/agent-detector';
 import { ActiveAgentResolver, applyConfiguredAgentDefault } from './bridge/active-agent-resolver';
 import { AutonomousRunner } from './bridge/autonomous-runner';
@@ -13,6 +15,7 @@ import { ReviewWakeScheduler } from './bridge/review-wake-scheduler';
 import { reopenFailedReview } from './bridge/review-wake';
 import { AsyncDispatcher } from './bridge/async-dispatcher';
 import { ReworkController } from './bridge/rework-controller';
+import { ExecutionController } from './bridge/execution-controller';
 import { ConfigSyncService } from './config/config-sync';
 import { StatusBarController } from './ui/status-bar';
 import { TaskTreeProvider, TaskTreeItem } from './ui/task-tree-provider';
@@ -283,7 +286,7 @@ export function activate(context: vscode.ExtensionContext) {
     if (folder.uri.scheme !== 'file') return [];
     try { return [physicalDirectory(folder.uri.fsPath)]; } catch { return []; }
   });
-  const windowWorkspace = new WindowWorkspace(workspaceStorage, currentWindowRoots());
+  const windowWorkspace = new WindowWorkspace(workspaceStorage, currentWindowRoots(), context.workspaceState);
   const knownWorkspaceTasks = new Set(taskStore.getAllTasks().map((task) => task.threadId));
   const windowHeartbeat = setInterval(() => {
     try { windowWorkspace.publish(); } catch (error) { console.warn('[Agent Mesh Bridge] Workspace heartbeat failed:', error); }
@@ -414,7 +417,7 @@ export function activate(context: vscode.ExtensionContext) {
   callbackManager.setTaskStore(taskStore);
 
   // A reviewer wake can die before it reviews anything (429 / exhausted quota).
-  // The thread then stays `waiting_review` and blocks its workspace queue, so the
+  // The thread then stays `reviewing` and blocks its workspace queue, so the
   // scheduling plan lives in the ledger (`thread.reviewWake`) and this scheduler
   // re-wakes the SAME caller session once the provider's quota is back.
   //
@@ -447,10 +450,10 @@ export function activate(context: vscode.ExtensionContext) {
       .map((t) => `【${t.title}】`)
       .join('、');
     const more = threads.length > 5 ? ` 等 ${threads.length} 个任务` : '';
-    const terminalFailures = threads.filter((t) => t.status === 'review_failed').length;
+    const terminalFailures = threads.filter((t) => t.status === 'failed' && t.failure?.stage === 'review').length;
     const tail =
       terminalFailures > 0
-        ? `已记录为“检视失败”(review_failed, 终态) 并释放队列槽；需手动重新检视或下发返修。`
+        ? `已记录为“检视失败”(failed/review，终态) 并释放队列槽；需手动重新检视或下发返修。`
         : '已记录为检视卡住并安排自动重新检视。';
     vscode.window
       .showWarningMessage(`⚠️ [Agent Bridge] 检视未完成：${names}${more}${tail}`, '查看首个任务 (Details)')
@@ -483,6 +486,16 @@ export function activate(context: vscode.ExtensionContext) {
     true,
   );
   context.subscriptions.push({ dispose: () => reworkController.dispose() });
+  const executionController = new ExecutionController(
+    taskStore,
+    runner,
+    callbackManager,
+    reworkController.getMergeCoordinator(),
+    undefined,
+    undefined,
+    executionRegistry,
+  );
+  context.subscriptions.push({ dispose: () => executionController.dispose() });
   const taskControl = new TaskControlService(taskStore, runner);
   const configSync = new ConfigSyncService(undefined, dshProvider);
   configSync.setAgentMcpEnv(agentMcpEnvFor(dshProvider));
@@ -635,10 +648,10 @@ export function activate(context: vscode.ExtensionContext) {
     for (const t of taskList) {
       const blocked = t.reviewBlocked;
       if (!blocked?.waitingForThreadId) continue;
-      if (t.status !== 'waiting_review') continue;
+      if (t.status !== 'reviewing') continue;
       const dependency = byThreadId.get(blocked.waitingForThreadId);
       if (!dependency) continue;
-      if (dependency.status !== 'completed' && dependency.status !== 'failed' && dependency.status !== 'review_failed') continue;
+      if (dependency.status !== 'completed' && dependency.status !== 'failed') continue;
 
       const reviewRound = [...(t.rounds || [])]
         .reverse()
@@ -761,7 +774,7 @@ export function activate(context: vscode.ExtensionContext) {
     const title = thread ? thread.title : threadId;
     const worktree = thread?.worktree;
     const mergeGate = !!thread && isMergePending(thread);
-    const running = !!thread && (thread.status === 'running' || thread.status === 'reworking' || thread.status === 'waiting_merge');
+    const running = !!thread && (thread.status === 'running' || thread.status === 'merging');
 
     const details = [
       force ? `确定要【强制删除】任务【${title}】吗？` : `确定要永久删除任务【${title}】吗？`,
@@ -818,6 +831,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // 6. Register Commands
   context.subscriptions.push(
+    ...registerTemplateCommands(workspaceRegistry, vscode),
     vscode.commands.registerCommand('agent-mesh-bridge.refreshAgentStatus', async () => {
       await agentNodesProvider.refresh(true);
       await statusBar.update();
@@ -868,11 +882,11 @@ export function activate(context: vscode.ExtensionContext) {
         if (!folders?.length || folders[0].scheme !== 'file') return;
         id = workspaceRegistry.register(folders[0].fsPath, 'user').id;
       }
-      windowWorkspace.setDefault(id);
+      await windowWorkspace.setDefault(id);
       activeTreeProvider.refresh(); recentTreeProvider.refresh(); void agentNodesProvider.refresh(false);
     }),
-    vscode.commands.registerCommand('agent-mesh-bridge.clearWorkspace', () => {
-      windowWorkspace.setDefault(undefined);
+    vscode.commands.registerCommand('agent-mesh-bridge.clearWorkspace', async () => {
+      await windowWorkspace.setDefault(undefined);
       activeTreeProvider.refresh(); recentTreeProvider.refresh(); void agentNodesProvider.refresh(false);
     }),
     vscode.commands.registerCommand('agent-mesh-bridge.filterWorkspaces', async () => {
@@ -1298,7 +1312,7 @@ export function activate(context: vscode.ExtensionContext) {
           thread.rounds.find((r) => r.round === thread.currentRound && r.status === 'running') ||
           runningRounds[runningRounds.length - 1];
 
-        // If currently in running/reworking and has a round waiting to execute
+        // If currently running and has a round waiting to execute
         if (targetRound && targetRound.prompt) {
           supervisor.executeThreadRound(thread, targetRound);
           vscode.window.showInformationMessage(
@@ -1432,14 +1446,14 @@ export function activate(context: vscode.ExtensionContext) {
         // `reviewWake` first made that impossible: a lost wake could only be
         // fixed by editing the ledger by hand. A terminal `review_failed` task is
         // precisely a review that needs another chance, so it re-opens here.
-        if (thread.status === 'review_failed') {
+        if (thread.status === 'failed' && thread.failure?.stage === 'review') {
           reopenFailedReview(thread);
           taskStore.upsertTask(thread);
           vscode.window.showInformationMessage(
             `【${thread.title}】上次检视失败（${thread.reviewFailure?.reason || '原因未记录'}），正在重新打开检视并唤醒下发者。`,
           );
         }
-        if (thread.status !== 'waiting_review') {
+        if (thread.status !== 'reviewing') {
           vscode.window.showWarningMessage(
             `任务【${thread.title}】当前状态为 ${thread.status}；只有处于“等待检视”的任务才能重新检视。`,
           );

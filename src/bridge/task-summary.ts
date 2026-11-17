@@ -43,7 +43,7 @@ export const DEFAULT_ARCHIVE_KEEP_RECENT = 20;
 const SUMMARY_MAX_CHARS = 1200;
 
 export function isTerminalThreadStatus(status: ThreadStatus): boolean {
-  return status === 'completed' || status === 'failed' || status === 'review_failed';
+  return status === 'completed' || status === 'failed';
 }
 
 /** Strip ANSI/JSON noise and collapse whitespace so the digest stays readable. */
@@ -96,15 +96,11 @@ export function buildFinalSummary(
   mergeRequest?: MergeRequestInfo,
 ): TaskFinalSummary {
   const terminal: TaskFinalSummary['kind'] =
-    thread.status === 'completed'
-      ? 'completed'
-      : thread.status === 'review_failed'
-        ? 'review_failed'
-        : 'failed';
+    thread.status === 'completed' ? 'completed' : 'failed';
   const work = lastWorkRound(thread);
   const approval = approvalRemarks(thread);
   const reviewFailure = thread.reviewFailure;
-  const error = work?.error || work?.interruption?.reason || reviewFailure?.reason;
+  const error = thread.failure?.reason || work?.error || work?.interruption?.reason || reviewFailure?.reason;
   const output = work?.output;
   const tokens = aggregateThreadTokenUsage(thread.rounds || []);
   const nativeOperations = (thread.rounds || []).flatMap((round) => round.nativeSessionCompactions || []);
@@ -117,8 +113,8 @@ export function buildFinalSummary(
   const headline =
     terminal === 'completed'
       ? `审阅通过${approval ? `：${approval}` : '。'}`
-      : terminal === 'review_failed'
-        ? `检视失败${reviewFailure?.reason ? `：${reviewFailure.reason}` : '：未取得检视结论。'}`
+      : thread.failure?.stage === 'review'
+        ? `检视失败${error ? `：${error}` : '：未取得检视结论。'}`
         : `任务失败${error ? `：${error}` : '。'}`;
   const detail = terminal === 'completed' ? output : output || error;
   const summary = cleanSummaryText(
@@ -132,6 +128,7 @@ export function buildFinalSummary(
 
   return {
     kind: terminal,
+    ...(terminal === 'failed' ? { failureStage: thread.failure?.stage, failureRevision: thread.failureRevision || 0 } : {}),
     at: new Date().toISOString(),
     title: thread.title,
     verdict: terminal === 'completed' ? approval : error,
@@ -161,6 +158,7 @@ export function buildFinalSummary(
       targetPath: thread.worktree.integration?.targetPath || thread.worktree.deliveryTarget?.checkoutPath,
       targetCommit: thread.worktree.integration?.targetCommit || thread.worktree.integration?.targetOldCommit || thread.worktree.deliveryTarget?.baseCommit,
       mergeState: thread.worktree.integration?.phase, blockedReason: thread.worktree.integration?.error,
+      stashRestore: thread.worktree.integration?.stashRestore,
       validationPath: thread.worktree.validation?.path, validationCommit: thread.worktree.validation?.commit,
       validationStatus: thread.worktree.validation?.status, validationResult: thread.worktree.validation?.result,
     } } : {}),
@@ -169,8 +167,11 @@ export function buildFinalSummary(
 
 /** Fill `finalSummary` on a terminal task; returns true when it changed. */
 export function ensureFinalSummary(thread: DelegationThread): boolean {
-  if (!isTerminalThreadStatus(thread.status)) return false;
-  if (thread.finalSummary && thread.finalSummary.kind === thread.status) return false;
+  if (!isTerminalThreadStatus(thread.status)) { thread.finalSummary = undefined; return false; }
+  if (thread.archivedAt && thread.finalSummary) return false;
+  if (thread.finalSummary && thread.finalSummary.kind === thread.status &&
+      (thread.status !== 'failed' || (thread.finalSummary.failureStage === thread.failure?.stage &&
+        (thread.finalSummary.failureRevision || 0) === (thread.failureRevision || 0)))) return false;
   thread.finalSummary = buildFinalSummary(thread);
   return true;
 }
@@ -180,7 +181,7 @@ export function ensureFinalSummary(thread: DelegationThread): boolean {
  * Returns true when the thread was modified.
  */
 export function archiveThreadData(thread: DelegationThread, now = new Date()): boolean {
-  if (thread.archivedAt || !isTerminalThreadStatus(thread.status)) return false;
+  if (!canArchiveTask(thread)) return false;
   ensureFinalSummary(thread);
   const digest = thread.finalSummary;
   if (!digest) return false;
@@ -205,6 +206,13 @@ export function archiveThreadData(thread: DelegationThread, now = new Date()): b
   // The digest owns the conversation content now; stop duplicating it.
   thread.modelNotice = undefined;
   return true;
+}
+
+export function canArchiveTask(thread: DelegationThread): boolean {
+  if (thread.archivedAt || !isTerminalThreadStatus(thread.status)) return false;
+  if (thread.status === 'failed' && thread.failure?.stage === 'merge') return false;
+  if (thread.worktree && !['merged', 'no_changes'].includes(thread.worktree.integration?.phase || '')) return false;
+  return !isMergePending(thread);
 }
 
 /** Directory holding the one-shot reviewer bootstrap tokens. */
@@ -557,7 +565,7 @@ export function selectTasksToArchive(
     .slice(keep)
     .filter(
       (thread) =>
-        isTerminalThreadStatus(thread.status) &&
+        canArchiveTask(thread) &&
         // A worktree task whose output is not locally integrated still owns the only
         // surviving diff context; archiving it would discard the evidence.
         !isMergePending(thread),

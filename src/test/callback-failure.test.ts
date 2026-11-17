@@ -47,6 +47,8 @@ describe('CallbackManager failure wake-ups', () => {
     targetAgent: 'deepseek_harness',
     status: 'failed',
     currentRound: 2,
+    failure: { stage: 'execution', reason: 'dsh: TRANSPORT: Connection error.', at: '2026-10-20T04:39:07.796Z', round: 2 },
+    failureRevision: 1,
     createdAt: '2026-10-20T03:17:38.487Z',
     updatedAt: '2026-10-20T04:39:07.796Z',
     receiverSessionId: 'session-8b5dc091-3d68-43d9-bd08-05b383c4b972',
@@ -95,6 +97,13 @@ describe('CallbackManager failure wake-ups', () => {
     assert.match(captured!.prompt, /不要.*原样/s);
     assert.match(captured!.prompt, /Connection error/);
     assert.match(captured!.prompt, /session-8b5dc091/);
+  });
+
+  test('failure callback sends only reviewer template instructions', async () => {
+    const manager = new CallbackManager(new AgentDetector()); let prompt = '';
+    (manager as any).launchCaller = (_t: any, _s: any, text: string, _r: any, _k: any, release: () => void) => { prompt = text; release(); return true; };
+    const thread = makeThread({taskTemplate: {id:'t',version:'1',label:'T',summary:'S',workerInstructions:'WORKER SECRET',reviewerInstructions:'REVIEWER SNAPSHOT',sourceFileName:'t.md',selectedAt:'now'}});
+    assert.equal(await manager.notifyCallerOfFailure(thread,2),true); assert.equal(prompt.split('REVIEWER SNAPSHOT').length-1,1); assert.ok(!prompt.includes('WORKER SECRET'));
   });
 
   test('does not wake the caller twice for the same failed round', async () => {

@@ -154,7 +154,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       const result = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
         targetAgent: agent, title: 'Existing session', prompt: 'do the work', reviewFlow: 'legacy',
       });
-      await waitForStatus(result.threadId, 'waiting_review');
+      await waitForStatus(result.threadId, 'reviewing');
       const thread = taskStore.getTask(result.threadId)!;
       assert.strictEqual(thread.receiverSessionCaptured, true);
       thread.status = 'running';
@@ -368,7 +368,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       modelRequestedByUser: true,
       initiatorModel: 'gpt-6.1-sol',
     });
-    await waitForStatus(res.threadId, 'waiting_review');
+    await waitForStatus(res.threadId, 'reviewing');
 
     const stored = taskStore.getTask(res.threadId)!;
     assert.strictEqual(stored.targetModel, 'gpt-6-sol');
@@ -401,7 +401,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
         callerSessionId: 'caller-session-two-ends',
         initiatorAgent: 'antigravity',
       });
-      await waitForStatus(res.threadId, 'waiting_review');
+      await waitForStatus(res.threadId, 'reviewing');
 
       const stored = taskStore.getTask(res.threadId)!;
       assert.strictEqual(stored.targetModel, 'gpt-6-flash', 'receiver uses its own default');
@@ -440,7 +440,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       prompt: 'Implement the parser',
       model: 'gpt-6-luna',
     });
-    await waitForStatus(res.threadId, 'waiting_review');
+    await waitForStatus(res.threadId, 'reviewing');
 
     const stored = taskStore.getTask(res.threadId)!;
     // No configured default in this isolated home, so nothing is pinned.
@@ -522,7 +522,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       prompt: 'do the work',
       initiatorAgent: 'codex',
     });
-    await waitForStatus(dispatchRes.threadId, 'waiting_review');
+    await waitForStatus(dispatchRes.threadId, 'reviewing');
 
     await assert.rejects(
       () =>
@@ -537,7 +537,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     // Rejected before a new round exists: still one round, still in review.
     const thread = taskStore.getTask(dispatchRes.threadId)!;
     assert.strictEqual(thread.rounds.length, 1);
-    assert.strictEqual(thread.status, 'waiting_review');
+    assert.strictEqual(thread.status, 'reviewing');
     assert.strictEqual(thread.targetAgent, 'claude_code');
   });
 
@@ -551,7 +551,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     const originalSessionId = dispatchRes.receiverSessionId;
     assert.ok(originalSessionId);
 
-    await waitForStatus(dispatchRes.threadId, 'waiting_review');
+    await waitForStatus(dispatchRes.threadId, 'reviewing');
 
     const reworkRes = await reworkController.requestRework({
       threadId: dispatchRes.threadId,
@@ -566,7 +566,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     const thread = taskStore.getTask(dispatchRes.threadId);
     assert.ok(thread);
     assert.strictEqual(thread.currentRound, 2);
-    assert.strictEqual(thread.status, 'reworking');
+    assert.strictEqual(thread.status, 'running');
     assert.strictEqual(thread.receiverSessionId, originalSessionId);
     assert.strictEqual(thread.rounds.length, 2);
     assert.strictEqual(thread.rounds[1].type, 'rework');
@@ -596,7 +596,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       prompt: 'Implement the flow',
     });
     const originalSessionId = dispatchRes.receiverSessionId;
-    await waitForStatus(dispatchRes.threadId, 'waiting_review');
+    await waitForStatus(dispatchRes.threadId, 'reviewing');
 
     const reworkRes = await reworkController.requestRework({
       threadId: dispatchRes.threadId,
@@ -610,7 +610,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.notStrictEqual(reworkRes.receiverSessionId, originalSessionId);
     assert.ok(reworkRes.retarget, 'the switch must be recorded on the rework result');
 
-    await waitForStatus(dispatchRes.threadId, 'waiting_review');
+    await waitForStatus(dispatchRes.threadId, 'reviewing');
 
     const thread = taskStore.getTask(dispatchRes.threadId)!;
     assert.strictEqual(thread.targetAgent, 'codex');
@@ -628,9 +628,9 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     });
 
     // A thread may only be approved once nothing is in flight.
-    await waitForStatus(dispatchRes.threadId, 'waiting_review');
+    await waitForStatus(dispatchRes.threadId, 'reviewing');
 
-    const approveRes = reworkController.approveTask({
+    const approveRes = await reworkController.approveTask({
       threadId: dispatchRes.threadId,
       remarks: 'All lint checks passed.',
     });
@@ -656,7 +656,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.notStrictEqual(thread1.callerSessionId, 'claude_code');
 
     // 2. Requesting rework with invalid callerSessionId "antigravity"
-    await waitForStatus(dispatchRes.threadId, 'waiting_review');
+    await waitForStatus(dispatchRes.threadId, 'reviewing');
     await reworkController.requestRework({
       threadId: dispatchRes.threadId,
       feedback: 'Fix something',
@@ -668,7 +668,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.notStrictEqual(thread2.callerSessionId, 'antigravity');
 
     // 3. Requesting rework with a valid UUID
-    await waitForStatus(dispatchRes.threadId, 'waiting_review');
+    await waitForStatus(dispatchRes.threadId, 'reviewing');
     const validUuid = '12345678-abcd-ef01-2345-6789abcdef01';
     await reworkController.requestRework({
       threadId: dispatchRes.threadId,
@@ -681,6 +681,33 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.strictEqual(thread3.callerSessionId, validUuid);
   });
 
+  test('supervisor injects worker snapshot without changing round prompt', async () => {
+    const now = new Date().toISOString(); let actual = '';
+    const thread: DelegationThread = {threadId:'thread_template_supervisor',title:'Supervisor',initiatorAgent:'codex',targetAgent:'claude_code',status:'running',currentRound:1,createdAt:now,updatedAt:now,receiverSessionId:'5c562220-839a-47d5-92c6-e61561e66f07',workspace:testWorkspace(process.cwd()),summary:{lastPromptSnippet:'',lastOutputSnippet:'',totalDurationMs:0},rounds:[{round:1,type:'initial',prompt:'ORIGINAL',status:'running',durationMs:0,timestamp:now}],taskTemplate:{id:'t',version:'1',label:'T',summary:'S',workerInstructions:'WORKER SNAPSHOT',reviewerInstructions:'REVIEWER SECRET',sourceFileName:'t.md',selectedAt:now}};
+    taskStore.upsertTask(thread); runner.execute = async params => { actual=params.prompt; return {exitCode:1,stdout:'',stderr:'failure',extractedOutput:'',durationMs:1}; };
+    const supervisor = new TaskSupervisor(taskStore,runner,callbackManager,detector,new TaskExecutionRegistry(tempDir));
+    try { await supervisor.executeThreadRound(thread, thread.rounds[0]); } finally { supervisor.dispose(); }
+    assert.equal(actual.split('WORKER SNAPSHOT').length-1,1); assert.ok(!actual.includes('REVIEWER SECRET')); assert.equal(taskStore.getTask(thread.threadId)!.rounds[0].prompt,'ORIGINAL');
+  });
+
+  test('dispatcher rework and retry use the original worker template snapshot', async () => {
+    const templates = require('../bridge/task-templates') as typeof import('../bridge/task-templates');
+    const file = templates.createTaskTemplate(process.cwd(), 'snapshot', 'Snapshot', 'Test');
+    let content = fs.readFileSync(file, 'utf8').replace('Describe the work, deliverables and evidence.', 'WORKER SNAPSHOT').replace('Describe independent checks, acceptance and rework requirements.', 'REVIEWER SNAPSHOT'); fs.writeFileSync(file, content);
+    const prompts: string[] = [];
+    runner.execute = async (params) => { prompts.push(params.prompt); return { exitCode: 0, stdout: 'done', stderr: '', extractedOutput: 'done', durationMs: 1 }; };
+    const result = await dispatcher.dispatchTask({workspaceRoot: process.cwd(), targetAgent:'claude_code', initiatorAgent:'codex', title:'Snapshot', prompt:'initial task', templateId:'snapshot', reviewFlow:'legacy'});
+    await waitForStatus(result.threadId, 'reviewing');
+    fs.writeFileSync(file, content.replace('WORKER SNAPSHOT', 'changed')); fs.unlinkSync(file);
+    await reworkController.requestRework({threadId:result.threadId, feedback:'fix issue'}); await waitForStatus(result.threadId,'reviewing');
+    taskStore.updateRound(result.threadId, 2, { status:'failed', error:'retry' }, 'failed');
+    await reworkController.retryFailedRound(result.threadId); await waitForStatus(result.threadId,'reviewing');
+    taskStore.updateRound(result.threadId, 2, {status:'paused'}, 'paused');
+    await reworkController.resumePausedTask(result.threadId); await waitForStatus(result.threadId, 'reviewing');
+    assert.equal(prompts.length,4); for (const prompt of prompts) { assert.equal(prompt.split('WORKER SNAPSHOT').length - 1,1); assert.ok(!prompt.includes('REVIEWER SNAPSHOT')); assert.ok(!prompt.includes('changed')); }
+    const thread = taskStore.getTask(result.threadId)!; assert.equal(thread.rounds[0].prompt,'initial task'); assert.equal(thread.rounds[1].prompt,'fix issue');
+  });
+
   test('should retry failed round preserving original round number and prompt', async () => {
     const dispatchRes = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
       targetAgent: 'codex',
@@ -689,12 +716,12 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     });
 
     // Request rework (round 1 must be finished first)
-    await waitForStatus(dispatchRes.threadId, 'waiting_review');
+    await waitForStatus(dispatchRes.threadId, 'reviewing');
     await reworkController.requestRework({
       threadId: dispatchRes.threadId,
       feedback: 'Handle comments in JSON',
     });
-    await waitForStatus(dispatchRes.threadId, 'waiting_review');
+    await waitForStatus(dispatchRes.threadId, 'reviewing');
 
     const thread = taskStore.getTask(dispatchRes.threadId);
     assert.ok(thread);
@@ -721,7 +748,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
 
     const recoveredThread = taskStore.getTask(dispatchRes.threadId);
     assert.ok(recoveredThread);
-    assert.strictEqual(recoveredThread.status, 'reworking');
+    assert.strictEqual(recoveredThread.status, 'running');
     assert.strictEqual(recoveredThread.rounds.length, 2); // No duplicate round created!
     assert.strictEqual(recoveredThread.rounds[1].status, 'running');
   });

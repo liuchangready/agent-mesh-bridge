@@ -357,8 +357,8 @@ test('paused and waiting-review tasks do not serialize independent reviewer boot
   const dir = makeTempDir('bridge-bootstrap-independent-');
   const store = new TaskStore(dir);
   const workspace = makeTempDir('bridge-bootstrap-shared-ws-');
-  const parked = makeDedicatedThread('thread_waiting_review', {
-    status: 'waiting_review',
+  const parked = makeDedicatedThread('thread_reviewing', {
+    status: 'reviewing',
     workspace: testWorkspace(workspace),
   });
   parked.reviewFlow = 'legacy';
@@ -405,7 +405,7 @@ test('paused and waiting-review tasks do not serialize independent reviewer boot
   service.stop();
 
   assert.deepStrictEqual(calls.slice().sort(), targets.map((task) => task.threadId).sort());
-  assert.strictEqual(store.getTask(parked.threadId)?.status, 'waiting_review');
+  assert.strictEqual(store.getTask(parked.threadId)?.status, 'reviewing');
   for (const task of targets) {
     const stored = store.getTask(task.threadId)!;
     assert.strictEqual(stored.reviewBootstrap?.phase, 'confirmed');
@@ -425,7 +425,7 @@ test('concurrency: a running task in another workspace does not block a pending 
   const store = new TaskStore(dir);
   const otherWorkspace = makeTempDir('bridge-bootstrap-other-ws-');
   const older = makeDedicatedThread('thread_other_ws', {
-    status: 'reworking',
+    status: 'running',
     createdAt: '2026-10-31T23:00:00.000Z',
     workspace: testWorkspace(otherWorkspace),
   });
@@ -624,4 +624,12 @@ test('bootstrap attempts are capped so a permanently racy host still terminates'
 
   store.dispose();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('bootstrap includes only the reviewer template snapshot', () => {
+  const template = { id: 't', version: '1', label: 'T', summary: 'S', workerInstructions: 'WORKER SECRET', reviewerInstructions: 'REVIEWER REQUIREMENT', sourceFileName: 't.md', selectedAt: 'now' };
+  const prompt = buildReviewerBootstrapPrompt(makeDedicatedThread('thread_template_bootstrap', { taskTemplate: template }), 'token');
+  assert.ok(prompt.includes(template.reviewerInstructions)); assert.ok(!prompt.includes(template.workerInstructions));
+  assert.equal(prompt.split(template.reviewerInstructions).length - 1, 1);
+  assert.ok(!buildReviewerBootstrapPrompt(makeDedicatedThread('thread_legacy'), 'token').includes(template.reviewerInstructions));
 });

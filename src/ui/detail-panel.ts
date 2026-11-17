@@ -1,9 +1,10 @@
 import { getTaskExecutionPath } from '../bridge/types';
+import * as fs from 'fs';
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { TaskStore } from '../bridge/task-store';
 import { ReworkController } from '../bridge/rework-controller';
-import { DelegationThread } from '../bridge/types';
+import { DelegationThread, findInFlightRound } from '../bridge/types';
 import { TaskSupervisor } from '../bridge/task-supervisor';
 import {
   findExistingExecutionLog,
@@ -62,11 +63,11 @@ export class TaskDetailPanel {
     });
 
     // The reviewer runs outside the ledger, so `changed` never fires while it
-    // works. Tick once every 30s during `waiting_review` so the Reviewer Output
+    // works. Tick once every 30s during `reviewing` so the Reviewer Output
     // block follows the live log instead of freezing on the first chunk.
     const reviewerTick = setInterval(() => {
       const thread = this.taskStore.getTask(this.currentThreadId);
-      if (thread?.status === 'waiting_review') this.update();
+      if (thread?.status === 'reviewing') this.update();
     }, 30_000);
     this.disposables.push({ dispose: () => clearInterval(reviewerTick) });
 
@@ -121,6 +122,9 @@ export class TaskDetailPanel {
           case 'openReviewerLog':
             await this.handleOpenReviewerLog(Number(message.round));
             break;
+          case 'openMergeLog':
+            await this.handleOpenMergeLog(Number(message.number));
+            break;
           case 'printRecentLogs':
             await vscode.commands.executeCommand(
               'agent-mesh-bridge.printRecentLogs',
@@ -174,7 +178,7 @@ export class TaskDetailPanel {
 
   private async handleApprove(remarks?: string) {
     try {
-      const result = this.reworkController.approveTask({
+      const result = await this.reworkController.approveTask({
         threadId: this.currentThreadId,
         remarks: remarks || 'Approved via Detail Panel',
       });
@@ -188,13 +192,14 @@ export class TaskDetailPanel {
 
   private async handleRetryMerge() {
     try {
-      if (this.taskStore.getTask(this.currentThreadId)?.status === 'merge_failed') {
+      if ((() => { const task = this.taskStore.getTask(this.currentThreadId); return task?.status === 'failed' && task.failure?.stage === 'merge'; })()) {
         this.reworkController.retryMerge(this.currentThreadId);
         this.update();
         return;
       }
       const result = await this.reworkController.mergeApproved(this.currentThreadId);
-      if (result.status === 'merged') vscode.window.showInformationMessage(`Task ${this.currentThreadId} merged into its pinned local target.`);
+      if (result.status === 'merged' && this.taskStore.getTask(this.currentThreadId)?.worktree?.integration?.stashRecoveryPending) vscode.window.showWarningMessage(result.message);
+      else if (result.status === 'merged') vscode.window.showInformationMessage(`Task ${this.currentThreadId} merged into its pinned local target.`);
       else vscode.window.showWarningMessage(result.message);
     } catch (err: any) { vscode.window.showErrorMessage(`Merge retry failed: ${err.message}`); }
     this.update();
@@ -234,14 +239,14 @@ export class TaskDetailPanel {
       return;
     }
 
-    if (thread.status === 'running' || thread.status === 'reworking') {
+    if (thread.status === 'running') {
       vscode.window.showInformationMessage(
         `任务当前正在由 ${thread.targetAgent} 自主执行中（Round ${thread.currentRound || 1}），无需重复触发。`,
       );
       return;
     }
 
-    if (thread.status === 'waiting_review') {
+    if (thread.status === 'reviewing') {
       const choice = await vscode.window.showWarningMessage(
         `任务当前处于“等待检视”状态：下发方 (${thread.initiatorAgent}) 正在后台独立执行自动化测试与审查（通常耗时 30~60 秒）。确定要打断并提前下发新的返修要求吗？`,
         { modal: true },
@@ -387,6 +392,41 @@ export class TaskDetailPanel {
     }
   }
 
+  /** Open one task-owned merge log from the merge timeline. */
+  private async handleOpenMergeLog(number: number): Promise<void> {
+    const thread = this.taskStore.getTask(this.currentThreadId);
+    const event = thread?.mergeHistory?.find((entry) => entry.number === number);
+    if (!thread || !event?.logPath) {
+      vscode.window.showWarningMessage('This merge event has no recorded log.');
+      return;
+    }
+
+    try {
+      const safeId = thread.threadId.replace(/[^A-Za-z0-9_-]/g, '_');
+      const root = thread.artifactDir || path.join(path.dirname(this.taskStore.getStoragePath()), 'merge-logs', safeId);
+      const source = event.phase === 'decision' && event.logNumber
+        ? thread.mergeHistory?.find((entry) => entry.number === event.logNumber && entry.logPath === event.logPath)
+        : event;
+      if (!source?.logPath) throw new Error('Invalid merge log reference.');
+
+      const filename = path.basename(source.logPath);
+      const prefix = `${safeId}_merge_`;
+      const digits = filename.startsWith(prefix) && filename.endsWith('.log') ? filename.slice(prefix.length, -4) : '';
+      const fileNumber = source.logFileNumber ?? Number(digits);
+      if (!Number.isSafeInteger(fileNumber) || fileNumber < 1 || digits !== String(fileNumber)) throw new Error('Invalid merge log path.');
+
+      const dir = path.join(root, 'merge_log');
+      const expected = path.join(dir, `${safeId}_merge_${fileNumber}.log`);
+      if (path.resolve(event.logPath) !== path.resolve(expected) || fs.realpathSync(path.dirname(expected)) !== path.join(fs.realpathSync(root), 'merge_log') || fs.lstatSync(expected).isSymbolicLink()) {
+        throw new Error('Invalid merge log path.');
+      }
+      const document = await vscode.workspace.openTextDocument(vscode.Uri.file(expected));
+      await vscode.window.showTextDocument(document, { preview: true });
+    } catch (error) {
+      vscode.window.showErrorMessage(`Could not open merge log: ${String(error)}`);
+    }
+  }
+
   /** Reviewer log tail for one round, or undefined when the reviewer never ran. */
   private readReviewerOutput(roundNumber: number) {
     const root = path.dirname(this.taskStore.getStoragePath());
@@ -438,9 +478,8 @@ export class TaskDetailPanel {
     const statusBadgeColors: Record<string, string> = {
       queued: '#a855f7',
       running: '#f59e0b',
-      reworking: '#f59e0b',
-      waiting_review: '#3b82f6',
-      waiting_merge: '#8b5cf6',
+      reviewing: '#3b82f6',
+      merging: '#8b5cf6',
       wait_decision: '#eab308',
       merge_failed: '#ef4444',
       paused: '#f97316',
@@ -481,7 +520,7 @@ export class TaskDetailPanel {
         let reviewerTail =
           r.round > newestRound - 10 ? this.readReviewerOutput(r.round) : undefined;
         let reviewerExists = reviewerTail ? true : this.reviewerLogExists(r.round);
-        const reviewerLive = r.round === reviewerRound && thread.status === 'waiting_review';
+        const reviewerLive = r.round === reviewerRound && thread.status === 'reviewing';
         let reviewerLogRound = r.round;
         let reviewerFallback = false;
         // The live wake may run for an older planned round (see
@@ -831,7 +870,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
     }
   </style>
 </head>
-<body class="${thread.status === 'merge_failed' ? 'merge-failed' : ''}">
+<body class="${(thread.status === 'failed' && thread.failure?.stage === 'merge') ? 'merge-failed' : ''}">
   <style>.merge-failed .timeline button { display: none; }</style>
   <div class="header">
     <div class="title-row">
@@ -957,8 +996,13 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
             })()
           : ''
       }
+      ${thread.taskTemplate ? `<div class="meta-item" style="grid-column:1/-1;"><div class="meta-label">Task template</div><div class="meta-val">${escapeHtml(thread.taskTemplate.label)} 璺?${escapeHtml(thread.taskTemplate.version)}<br/>${escapeHtml(thread.taskTemplate.summary)}<details><summary>Worker instructions</summary><pre style="white-space:pre-wrap">${escapeHtml(thread.taskTemplate.workerInstructions)}</pre></details><details><summary>Reviewer instructions</summary><pre style="white-space:pre-wrap">${escapeHtml(thread.taskTemplate.reviewerInstructions)}</pre></details></div></div>` : ''}
       <div class="meta-item">
-        <div class="meta-label">Workspace</div>
+        <div class="meta-label">Workspace / 工作空间</div>
+        <div class="meta-val">${escapeHtml(thread.workspace.rootPath)}</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">Execution Directory / 执行目录</div>
         <div class="meta-val">${escapeHtml(getTaskExecutionPath(thread))}</div>
       </div>
       <div class="meta-item" style="grid-column:1/-1;">
@@ -980,7 +1024,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
         <div class="meta-val">${new Date(thread.createdAt).toLocaleString()}</div>
       </div>
       ${
-        thread.status === 'waiting_review' && thread.reviewBlocked
+        thread.status === 'reviewing' && thread.reviewBlocked
           ? `
       <div class="meta-item" style="grid-column: 1 / -1;">
         <div class="meta-label" style="color: #f59e0b;">Review Parked（检视已完成 · 挂起等待依赖）</div>
@@ -995,7 +1039,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
               ? `<div style="margin-top: 6px; white-space: pre-wrap; color: #fde68a; opacity: 0.9;">${escapeHtml(thread.reviewBlocked.reason.slice(0, 800))}</div>`
               : ''
           }
-          <div style="margin-top: 6px; opacity: 0.85;">检视已经完成并由检视方主动挂起，因此任务生命周期状态保持 <strong>waiting_review</strong>（未批准、未新增返修轮）。任务树的标签会显示“Parked Review · 已挂起”。</div>
+          <div style="margin-top: 6px; opacity: 0.85;">检视已经完成并由检视方主动挂起，因此任务生命周期状态保持 <strong>reviewing</strong>（未批准、未新增返修轮）。任务树的标签会显示“Parked Review · 已挂起”。</div>
         </div>
       </div>`
           : ''
@@ -1030,23 +1074,25 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
       <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">由 <strong>${escapeHtml(thread.initiatorAgent)}</strong> 独立运行全部测试套件完成验证，既有测试与回归测试全绿通过。</div>
     </div>
   </div>`
+      : thread.status === 'queued' && thread.queuePhase === 'merge'
+      ? `<div style="border: 1px solid #a855f7; border-radius: 8px; padding: 16px; margin-bottom: 20px;"><strong>Queued for local integration</strong><div>The approved commit will be merged and validated when the global integration lock is available.</div></div>`
       : thread.status === 'queued'
+      ? `<div style="border: 1px solid #a855f7; border-radius: 8px; padding: 16px; margin-bottom: 20px;"><strong>Queued for development</strong><div>The task will start when its execution requirements are available.</div></div>`
+      : thread.status === 'merging'
+      ? thread.worktree?.integration?.stashRecoveryPending
       ? `
-  <div style="background: rgba(168, 85, 247, 0.15); border: 1px solid #a855f7; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
-    <div style="font-size: 28px;">⏳</div>
-    <div>
-      <div style="font-weight: 700; font-size: 16px; color: #c084fc;">排队等待中 · 检测到文件修改范围冲突 (Task Queued)</div>
-      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">${escapeHtml(thread.summary.lastOutputSnippet)}</div>
-      <div style="font-size: 12px; opacity: 0.75; margin-top: 2px;">当前任务正在等待冲突任务释放文件锁定，释放后网格将自动唤醒开始执行，无需人工干预。</div>
-    </div>
+  <div style="background: rgba(245, 158, 11, 0.15); border: 1px solid #f59e0b; border-radius: 8px; padding: 16px; margin-bottom: 20px;">
+    <strong>${thread.worktree.integration.mergedCommit ? '代码已合入；stash 元数据需要恢复。' : 'stash 元数据需要恢复。'}</strong>
+    <div style="margin-top:6px">${escapeHtml(thread.worktree.integration.error || '请处理本地故障后重试恢复；不会重新 apply 或创建合并提交。')}</div>
   </div>`
-      : thread.status === 'waiting_merge'
-      ? `
+      : `
   <div style="background: rgba(139, 92, 246, 0.15); border: 1px solid #8b5cf6; border-radius: 8px; padding: 16px; margin-bottom: 20px;">
-    <strong>Review approved; waiting for serialized local merge and combined validation.</strong>
+    <strong>Integrating the approved commit and running combined validation.</strong>
     <div style="margin-top:6px">This task remains open until its approved commit is merged into the batch target and validation passes.</div>
   </div>`
-      : thread.status === 'waiting_review'
+      : thread.status === 'reviewing' && thread.worktree?.mergePending && ['blocked', 'conflict', 'validation_failed'].includes(thread.worktree.integration?.phase || '')
+      ? `<div style="border: 1px solid #f59e0b; border-radius: 8px; padding: 16px; margin-bottom: 20px;"><strong>Reviewing an integration issue</strong><div>${escapeHtml(thread.worktree.integration?.error || 'Review the integration context.')}</div></div>`
+      : thread.status === 'reviewing'
       ? thread.reviewWake && thread.reviewWake.round === (thread.currentRound || 1)
         ? `
   <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
@@ -1081,13 +1127,13 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
       <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">已主动唤醒 <strong>${escapeHtml(thread.initiatorAgent)}</strong>，正在后台独立执行全量构建与回归跑测（通常耗时 30~60 秒）。任务正常流转中，请等待审查结论。</div>
     </div>
   </div>`
-      : thread.status === 'review_failed'
+      : (thread.status === 'failed' && thread.failure?.stage === 'review')
       ? `
   <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
     <div style="font-size: 28px;">🚫</div>
     <div>
       <div style="font-weight: 700; font-size: 16px; color: #f87171;">检视失败 · 第 ${thread.reviewFailure?.round || thread.currentRound || 1} 轮未取得检视结论 (Review Failed)</div>
-      <div style="font-size: 13px; opacity: 0.95; margin-top: 6px;"><strong>失败原因：</strong>${escapeHtml(thread.reviewFailure?.reason || '未记录原因')}</div>
+      <div style="font-size: 13px; opacity: 0.95; margin-top: 6px;"><strong>失败原因：</strong>${escapeHtml(thread.failure?.reason || '未记录原因')}</div>
       <div style="font-size: 12px; opacity: 0.8; margin-top: 4px;">
         ${thread.reviewFailure?.kind === 'unresolvable_park'
           ? '检视方挂起在一个桥接无法观测的外部依赖上（未记录 waitingForThreadId），自动恢复不可能成功。'
@@ -1107,45 +1153,57 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
       <div style="font-size: 12px; opacity: 0.75; margin-top: 4px;">Agent 进程已停止，当前轮次与原生会话已保留。点击下方“恢复执行”可从原轮次继续。</div>
     </div>
   </div>`
-      : (thread.status === 'running' || thread.status === 'reworking')
-      ? `
+      : thread.status === 'running'
+      ? (() => {
+          const inFlight = findInFlightRound(thread);
+          const isRework = inFlight?.type === 'rework';
+          const activeRound = inFlight?.round ?? thread.currentRound ?? 1;
+          const bannerTitle = isRework
+            ? `第 ${activeRound} 轮返修正在自主执行中 (${escapeHtml(thread.targetAgent)})`
+            : `第 ${activeRound} 轮正在自主执行中 (${escapeHtml(thread.targetAgent)})`;
+          const bannerDesc = isRework
+            ? `<strong>${escapeHtml(thread.targetAgent)}</strong> 正在原生会话中按 Reviewer 意见返修代码与编写测试，后台每 30 秒流式同步一次最新输出，无需人工干预。`
+            : `<strong>${escapeHtml(thread.targetAgent)}</strong> 正在原生会话中修改代码与编写测试，后台每 30 秒流式同步一次最新输出，无需人工干预。`;
+          return `
   <div style="background: rgba(245, 158, 11, 0.15); border: 1px solid #f59e0b; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
     <div style="font-size: 28px;">⏳</div>
     <div>
-      <div style="font-weight: 700; font-size: 16px; color: #fbbf24;">第 ${thread.currentRound || 1} 轮正在自主执行中 (${escapeHtml(thread.targetAgent)})</div>
-      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;"><strong>${escapeHtml(thread.targetAgent)}</strong> 正在原生会话中修改代码与编写测试，后台每 30 秒流式同步一次最新输出，无需人工干预。</div>
+      <div style="font-weight: 700; font-size: 16px; color: #fbbf24;">${bannerTitle}</div>
+      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">${bannerDesc}</div>
     </div>
-  </div>`
+  </div>`;
+        })()
       : thread.status === 'failed'
       ? `
   <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px;">
     <div style="font-size: 28px;">⚠️</div>
     <div>
-      <div style="font-weight: 700; font-size: 16px; color: #f87171;">第 ${thread.currentRound || 1} 轮执行异常中断</div>
-      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">${thread.interruption?.reason ? `<strong>中断原因：</strong>${escapeHtml(thread.interruption.reason)}<br/>` : ''}进程非零退出、看门狗或执行超时。可点击下方“重试失败轮次”按钮重新执行该轮次。</div>
+      <div style="font-weight: 700; font-size: 16px; color: #f87171;">${thread.failure?.stage === 'merge' ? '合并失败' : thread.failure?.stage === 'bootstrap' ? '初始化失败' : '开发失败'}</div>
+      <div style="font-size: 13px; opacity: 0.9; margin-top: 4px;">${escapeHtml(thread.failure?.reason || '原因未记录')}</div>
     </div>
   </div>`
       : ''
   }
 
-  ${thread.status === 'merge_failed' ? `<div class="action-bar"><button onclick="retryMerge()">重试合并</button><button onclick="deleteTask()">删除任务</button></div>` : ''}
-  <div class="action-bar" ${thread.status === 'merge_failed' ? 'style="display:none"' : ''}>
-    ${(thread.status === 'failed' || thread.rounds.some((r) => r.status === 'failed')) ? `<button class="retry-btn" style="background: #dc2626; color: white;" onclick="retryFailedRound()">🔄 重试失败轮次 (Retry Failed)</button>` : ''}
-    ${thread.status === 'waiting_review' && thread.reviewWake && thread.reviewWake.round === (thread.currentRound || 1) ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（唤醒失败）</button>` : ''}
-    ${thread.status === 'review_failed' ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（检视失败）</button>` : ''}
-    ${(thread.status === 'running' || thread.status === 'reworking' || thread.status === 'queued' || thread.status === 'waiting_merge') ? `<button style="background:#ea580c;color:white;" onclick="pauseTask()">⏸ 暂停任务 (Pause)</button>` : ''}
+  ${(thread.status === 'failed' && thread.failure?.stage === 'merge') ? `<div class="action-bar"><button onclick="retryMerge()">重试合并</button><button onclick="deleteTask()">删除任务</button></div>` : ''}
+  ${thread.status === 'reviewing' && thread.worktree?.integration?.stashRecoveryPending ? `<div class="action-bar"><button onclick="retryMerge()">重试恢复 stash 元数据</button></div>` : ''}
+  <div class="action-bar" ${(thread.status === 'failed' && thread.failure?.stage === 'merge') ? 'style="display:none"' : ''}>
+    ${thread.status === 'failed' && thread.failure?.stage === 'execution' ? `<button class="retry-btn" style="background: #dc2626; color: white;" onclick="retryFailedRound()">🔄 重试失败轮次 (Retry Failed)</button>` : ''}
+    ${thread.status === 'reviewing' && thread.reviewWake && thread.reviewWake.round === (thread.currentRound || 1) ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（唤醒失败）</button>` : ''}
+    ${(thread.status === 'failed' && thread.failure?.stage === 'review') ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（检视失败）</button>` : ''}
+    ${(thread.status === 'running' || thread.status === 'queued' || thread.status === 'merging' || (thread.status === 'reviewing' && thread.worktree?.mergePending && ['blocked', 'conflict', 'validation_failed'].includes(thread.worktree.integration?.phase || ''))) ? `<button style="background:#ea580c;color:white;" onclick="pauseTask()">⏸ 暂停任务 (Pause)</button>` : ''}
     ${thread.status === 'paused' ? `<button class="resume-btn" onclick="resumeTask()">▶ 恢复执行 (Resume)</button>` : ''}
-    ${(thread.status === 'failed' || thread.status === 'waiting_review' || thread.status === 'review_failed') ? `<button class="resume-btn" onclick="resumeTask()">▶ 下发返修要求 / 重新执行</button>` : ''}
-    ${(thread.status === 'waiting_review' || thread.status === 'failed' || thread.status === 'review_failed') ? `<button onclick="approveTask()">✓ 手动验收通过 (Approve Task)</button>` : ''}
-    <button style="background:#7f1d1d;color:white;" onclick="deleteTask()">🗑 删除任务 (Delete)</button>
+    ${(thread.status === 'reviewing' || (thread.status === 'failed' && ['execution', 'review'].includes(thread.failure?.stage || ''))) ? `<button class="resume-btn" onclick="resumeTask()">▶ 下发返修要求 / 重新执行</button>` : ''}
+    ${(thread.status === 'reviewing' || (thread.status === 'failed' && ['execution', 'review'].includes(thread.failure?.stage || ''))) ? `<button onclick="approveTask()">✓ 手动验收通过 (Approve Task)</button>` : ''}
+    ${!thread.worktree?.integration?.stashRecoveryLockHeld ? `<button style="background:#7f1d1d;color:white;" onclick="deleteTask()">🗑 删除任务 (Delete)</button>` : ''}
     <button class="secondary" onclick="printRecentLogs()">📄 打印最近1000行日志 (Print 1,000 Lines)</button>
     <button class="secondary" onclick="refresh()">⟳ Refresh</button>
   </div>
 
-  <div class="live-logs-box" style="${thread.status === 'merge_failed' ? 'display:none;' : ''}margin-top: 16px; margin-bottom: 24px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; padding: 16px;">
+  <div class="live-logs-box" style="${(thread.status === 'failed' && thread.failure?.stage === 'merge') ? 'display:none;' : ''}margin-top: 16px; margin-bottom: 24px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; padding: 16px;">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px; flex-wrap:wrap; gap:8px;">
       <div style="font-weight:600; font-size:14px; display:flex; align-items:center; gap:8px;">
-        ${thread.status === 'running' || thread.status === 'reworking' ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;"></span>` : ''}
+        ${thread.status === 'running' ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;"></span>` : ''}
         <span>最近 1,000 行实时日志 (Live Logs)</span>
         <span style="font-size:12px;opacity:0.6;font-weight:normal;">(${recentLogs.returnedLines} / ${recentLogs.totalLines} 行${recentLogs.isRunning ? ' · 实时运行中' : ''})</span>
       </div>
@@ -1171,15 +1229,15 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
       ${event.suggestion ? `<div style="white-space:pre-wrap">建议: ${escapeHtml(event.suggestion)}</div>` : ''}
       ${event.answer ? `<div style="white-space:pre-wrap">决定: ${escapeHtml(event.answer)}</div>` : ''}
       ${event.conflictFiles?.length ? `<div>Conflicts: ${event.conflictFiles.map(escapeHtml).join(', ')}</div>` : ''}
-      ${event.logPath ? `<div>Log: ${escapeHtml(event.logPath)} · get_merge_log #${event.logNumber || event.number}</div>` : ''}
+      ${event.logPath ? `<div>Log: ${escapeHtml(event.logPath)} · <button class="secondary" style="padding:3px 8px;font-size:12px" onclick="openMergeLog(${event.number})">Open merge log</button> · get_merge_log #${event.logNumber || event.number}</div>` : ''}
       ${event.changedFiles?.length ? `<pre class="code-block">${escapeHtml(event.changedFiles.join('\n'))}</pre>` : ''}
       ${event.mergedCommit ? `<div>Revert by creating a new commit: <code>git revert -m 1 ${escapeHtml(event.mergedCommit)}</code></div>` : ''}
     </div>`).join('')}</div>` : ''}
 
-  ${thread.status === 'wait_decision' ? `<div class="rework-box"><h3>提交合并决定</h3><textarea id="mergeDecision" placeholder="输入您的决定"></textarea><button onclick="submitMergeDecision()">提交决定并唤醒 Reviewer</button></div>` : ''}
+  ${thread.status === 'wait_decision' ? `<div class="rework-box"><h3>提交检视决定</h3><textarea id="mergeDecision" placeholder="输入您的决定"></textarea><button onclick="submitMergeDecision()">提交决定并唤醒 Reviewer</button></div>` : ''}
 
   ${
-    thread.status !== 'completed' && thread.status !== 'merge_failed' && thread.status !== 'wait_decision'
+    thread.status !== 'completed' && !(thread.status === 'failed' && thread.failure?.stage === 'merge') && thread.status !== 'wait_decision'
       ? `
   <div class="rework-box">
     <h3>Manual Rework Intervention</h3>
@@ -1240,6 +1298,9 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
 
     function openReviewerLog(round) {
       vscode.postMessage({ command: 'openReviewerLog', round: round });
+    }
+    function openMergeLog(number) {
+      vscode.postMessage({ command: 'openMergeLog', number: number });
     }
 
     function copyLogs() {

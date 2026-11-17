@@ -1,3 +1,4 @@
+import { appendTemplateInstructions } from './task-templates';
 import { getTaskExecutionPath } from './types';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -24,6 +25,7 @@ import { ConcurrencyPolicy, concurrencyPolicy } from './bridge-policy';
 import { TaskRoleLock } from './task-role-lock';
 import { appendCompactionProtocol, compactRoundBestEffort } from './context-compactor';
 import { readStoredRoundUsage } from './token-usage-collector';
+import { ExecutionController } from './execution-controller';
 import {
   findLatestExecutionLog,
   readTextFilePaged,
@@ -153,6 +155,7 @@ export class TaskSupervisor extends EventEmitter {
 
     updateLock();
     this.heartbeatInterval = setInterval(updateLock, 5000);
+    this.heartbeatInterval.unref?.();
   }
 
   private startWatching(): void {
@@ -165,11 +168,12 @@ export class TaskSupervisor extends EventEmitter {
     this.pollInterval = setInterval(() => {
       this.checkPendingTasks();
     }, 3000);
+    this.pollInterval.unref?.();
 
     // Initial check on startup
     setTimeout(() => {
       this.checkPendingTasks();
-    }, 1000);
+    }, 1000).unref?.();
   }
 
   /**
@@ -261,13 +265,23 @@ export class TaskSupervisor extends EventEmitter {
     const candidates = allTasks
       .filter((thread) => {
         if (!thread || !thread.threadId || this.activeTasks.has(thread.threadId)) return false;
-        if (thread.status === 'paused' || thread.status === 'waiting_review') return false;
-        if (thread.reviewBlocked || isReviewerBootstrapPending(thread)) return false;
-        return thread.status === 'running' || thread.status === 'reworking' || thread.status === 'queued';
+        if (thread.status === 'paused' || thread.status === 'reviewing') return false;
+        if (thread.queuePhase === 'merge' || thread.reviewBlocked || isReviewerBootstrapPending(thread)) return false;
+        return thread.status === 'running' || thread.status === 'queued';
       })
       .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 
     for (const thread of candidates) {
+      if (thread.execution && ExecutionController.getInstance()) {
+        if (thread.execution.queue?.notBefore) {
+          const notBeforeTime = Date.parse(thread.execution.queue.notBefore);
+          if (Number.isFinite(notBeforeTime) && Date.now() < notBeforeTime) {
+            continue;
+          }
+        }
+        void ExecutionController.getInstance()!.startExecution(thread.threadId, thread.execution.phase);
+        continue;
+      }
       this.normalizeRoundIntegrity(thread);
       const round = findInFlightRound(thread);
       if (!round || !round.prompt) continue;
@@ -322,7 +336,8 @@ export class TaskSupervisor extends EventEmitter {
     const freshRound = fresh ? findInFlightRound(fresh) : undefined;
     if (
       !fresh ||
-      (fresh.status !== 'queued' && fresh.status !== 'running' && fresh.status !== 'reworking') ||
+      fresh.queuePhase === 'merge' ||
+      (fresh.status !== 'queued' && fresh.status !== 'running') ||
       fresh.targetAgent !== thread.targetAgent ||
       fresh.reviewBlocked ||
       isReviewerBootstrapPending(fresh) ||
@@ -352,17 +367,18 @@ export class TaskSupervisor extends EventEmitter {
       );
       return Promise.resolve();
     }
+    if (stored.queuePhase === 'merge' || stored.status === 'merging' || stored.status === 'wait_decision') return Promise.resolve();
     try {
       assertCanExecute(stored.targetAgent, 'run a scheduled task round');
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      if (stored.status === 'queued' || stored.status === 'running' || stored.status === 'reworking') {
+      if (stored.status === 'queued' || stored.status === 'running') {
         const pendingRound = findInFlightRound(stored);
         if (pendingRound) {
           pendingRound.status = 'failed';
           pendingRound.error = reason;
         }
-        stored.status = 'failed';
+        enterTaskFailure(stored, { stage: 'execution', reason, at: new Date().toISOString(), round: pendingRound?.round });
         stored.summary.lastOutputSnippet = reason;
         this.taskStore.upsertTask(stored);
         console.warn(`[TaskSupervisor] Refusing unsupported agent for task ${stored.threadId}: ${reason}`);
@@ -376,8 +392,8 @@ export class TaskSupervisor extends EventEmitter {
     }
     const inFlight = findInFlightRound(fresh);
     if (
-      fresh.status === 'paused' || fresh.status === 'waiting_review' ||
-      fresh.status === 'completed' || fresh.status === 'failed' || fresh.status === 'review_failed' ||
+      fresh.queuePhase === 'merge' || fresh.status === 'merging' || fresh.status === 'wait_decision' || fresh.status === 'paused' || fresh.status === 'reviewing' ||
+      fresh.status === 'completed' || fresh.status === 'failed' ||
       fresh.targetAgent !== thread.targetAgent || !inFlight || inFlight.round !== round.round ||
       inFlight.status !== 'running' || inFlight.prompt !== round.prompt
     ) {
@@ -398,8 +414,8 @@ export class TaskSupervisor extends EventEmitter {
     const latest = this.taskStore.getTask(thread.threadId);
     const latestRound = latest?.rounds.filter((entry) => entry.round === round.round).slice(-1)[0];
     if (
-      !latest || latest.status === 'paused' || latest.status === 'waiting_review' ||
-      latest.status === 'completed' || latest.status === 'failed' || latest.status === 'review_failed' ||
+      !latest || latest.queuePhase === 'merge' || latest.status === 'merging' || latest.status === 'wait_decision' || latest.status === 'paused' || latest.status === 'reviewing' ||
+      latest.status === 'completed' || latest.status === 'failed' ||
       latest.targetAgent !== thread.targetAgent || !latestRound || latestRound.status !== 'running' ||
       latestRound.prompt !== round.prompt || findInFlightRound(latest)?.round !== round.round ||
       isReviewerBootstrapPending(latest)
@@ -431,16 +447,16 @@ export class TaskSupervisor extends EventEmitter {
       );
     } catch (error: any) {
       roleLock.release(roleLease);
-      latest.status = 'failed';
       latestRound.status = 'failed';
       latestRound.error = `Could not register task execution: ${error?.message || error}`;
       latest.updatedAt = new Date().toISOString();
+      enterTaskFailure(latest, { stage: 'execution', reason: latestRound.error, at: latest.updatedAt, round: latestRound.round });
       this.taskStore.upsertTask(latest);
       return Promise.resolve();
     }
 
     try {
-      latest.status = round.type === 'rework' ? 'reworking' : 'running';
+      latest.status = 'running';
       latest.summary.lastOutputSnippet = 'Executing in background...';
       this.taskStore.upsertTask(latest);
     } catch (error) {
@@ -460,6 +476,8 @@ export class TaskSupervisor extends EventEmitter {
 
       this.emit('taskStarted', { thread, round });
 
+      const startedFailureRevision = latest.failureRevision || 0;
+      const startedRoundTimestamp = latestRound.timestamp;
       let streamedOutput = '';
       const startTime = Date.now();
       let streamTimer: NodeJS.Timeout | null = null;
@@ -490,6 +508,7 @@ export class TaskSupervisor extends EventEmitter {
             durationMs: elapsedMs,
             status: 'running',
           },
+          undefined, undefined, undefined, undefined, { failureRevision: startedFailureRevision, roundTimestamp: startedRoundTimestamp },
         );
 
         this.emit('taskProgress', {
@@ -520,7 +539,7 @@ export class TaskSupervisor extends EventEmitter {
       try {
         result = await this.runner.execute({
           agent: thread.targetAgent,
-          prompt: isRework ? appendCompactionProtocol(round.prompt, roundNumber) : round.prompt,
+          prompt: appendTemplateInstructions(isRework ? appendCompactionProtocol(round.prompt, roundNumber) : round.prompt, thread.taskTemplate, 'worker'),
           isRework,
           receiverSessionId: thread.receiverSessionId,
           title: thread.title,
@@ -583,6 +602,11 @@ export class TaskSupervisor extends EventEmitter {
         return;
       }
 
+      const liveRound = currentThread.rounds.filter(r => r.round === roundNumber).slice(-1)[0];
+      if (currentThread.archivedAt || (currentThread.failureRevision || 0) !== startedFailureRevision ||
+          currentThread.currentRound !== roundNumber || !liveRound || liveRound.timestamp !== startedRoundTimestamp ||
+          roleLock.getOwner(thread.threadId)?.token !== roleLease.token) return;
+
       // A pause may have landed after the child exited but before this handler
       // ran; the control plane's state wins over a "successful" result.
       const pausedByControl = currentThread.status === 'paused';
@@ -612,7 +636,7 @@ export class TaskSupervisor extends EventEmitter {
         } catch {}
       }
       const finalRoundStatus = isPaused ? 'paused' : isSuccess ? 'completed' : 'failed';
-      const finalThreadStatus = isPaused ? 'paused' : isSuccess ? 'waiting_review' : 'failed';
+      const finalThreadStatus = isPaused ? 'paused' : isSuccess ? 'reviewing' : 'failed';
       const nativeSessionId = result.actualSessionId || currentThread.receiverSessionId;
 
       if (result.actualSessionId && result.actualSessionId !== currentThread.receiverSessionId) {
@@ -652,6 +676,7 @@ export class TaskSupervisor extends EventEmitter {
         nativeSessionId,
         undefined,
         interruption,
+        { failureRevision: startedFailureRevision, roundTimestamp: startedRoundTimestamp },
       );
 
         if (updatedThread && this.taskStore.getTask(updatedThread.threadId)) {
@@ -847,3 +872,4 @@ export class TaskSupervisor extends EventEmitter {
     } catch {}
   }
 }
+import { enterTaskFailure } from './types';

@@ -151,6 +151,35 @@ describe('MCPServer Protocol Tests', () => {
     } finally { window.dispose(); }
   });
 
+  test('linked workspace ID, root and bound context list the dispatch workspace', async () => {
+    const main = process.cwd();
+    const linked = path.join(tempDir, 'linked');
+    const git = spawnSync(gitExe, ['worktree', 'add', '-b', 'linked-test', linked], { cwd: main, encoding: 'utf8', windowsHide: true });
+    assert.equal(git.status, 0, git.stderr);
+    const registry = new WorkspaceRegistry(tempDir);
+    const linkedId = registry.register(linked).id;
+    const mainId = registry.register(main).id;
+    const byId = await mcpServer.handleToolCall('list_task_templates', { workspaceId: linkedId });
+    const byRoot = await mcpServer.handleToolCall('list_task_templates', { workspaceRoot: linked });
+    (mcpServer as any).workspaceContext = { id: linkedId };
+    const inherited = await mcpServer.handleToolCall('list_task_templates', {});
+    assert.equal(byId.workspaceId, mainId);
+    assert.equal(byRoot.workspaceId, mainId);
+    assert.equal(inherited.workspaceId, mainId);
+    assert.equal(fs.existsSync(path.join(linked, '.agent_bridge')), false);
+    const count = taskStore.listTasks(1000, 'all').length;
+    await assert.rejects(mcpServer.handleToolCall('dispatch_task', { workspaceId: linkedId, targetAgent: 'claude_code', initiatorAgent: 'codex', title: 'invalid template', prompt: 'work', templateId: 'missing' }), /TASK_TEMPLATE_INVALID_OR_NOT_FOUND/);
+    assert.equal(taskStore.listTasks(1000, 'all').length, count);
+    const template = byId.templates.find((t: any) => t.id === 'programming');
+    assert.ok(template);
+    assert.equal(template.workerInstructions, undefined);
+    const realDispatch = dispatcher.dispatchTask.bind(dispatcher);
+    dispatcher.dispatchTask = params => realDispatch({ ...params, reviewFlow: 'dedicated' });
+    const result = await mcpServer.handleToolCall('dispatch_task', { workspaceId: linkedId, targetAgent: 'claude_code', initiatorAgent: 'codex', title: 'linked template', prompt: 'work', templateId: template.id });
+    assert.equal(result.workspace.id, mainId);
+    assert.equal(taskStore.getTask(result.threadId)?.taskTemplate?.id, template.id);
+  });
+
   test('explicit cross-workspace dispatch keeps caller window on first and later calls', async () => {
     const rootA = process.cwd();
     const rootB = path.join(tempDir, 'repo-b'); fs.mkdirSync(rootB); initGitRepo(rootB);
@@ -247,7 +276,11 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(!Object.prototype.hasOwnProperty.call(dispatch.inputSchema.properties, 'allowNoScope'));
     assert.ok(toolNames.includes('submit_merge_resolution'));
     assert.ok(toolNames.includes('get_merge_log'));
-    assert.strictEqual(toolNames.length, 24);
+    assert.ok(toolNames.includes('submit_merge_decision'));
+    assert.ok(toolNames.includes('list_task_templates'));
+    assert.ok(toolNames.includes('request_task_decision'));
+    assert.ok(toolNames.includes('submit_task_decision'));
+    assert.strictEqual(toolNames.length, 28);
   });
 
   test('list_agent_models reports the receiver and sender defaults separately', async () => {
@@ -314,7 +347,7 @@ describe('MCPServer Protocol Tests', () => {
         prompt: 'do the work',
       }),
     );
-    await waitForStatus(dispatched.threadId, 'waiting_review');
+    await waitForStatus(dispatched.threadId, 'reviewing');
     // A review decision requires the reviewer role, exactly like a real wake.
     const lease = new TaskRoleLock().tryAcquire(dispatched.threadId, 'reviewer');
     assert.ok(lease);
@@ -354,7 +387,7 @@ describe('MCPServer Protocol Tests', () => {
         prompt: 'do the work',
       }),
     );
-    await waitForStatus(dispatched.threadId, 'waiting_review');
+    await waitForStatus(dispatched.threadId, 'reviewing');
 
     // No wake has been captured for this task yet.
     const missing = payload(await call('get_reviewer_log', { threadId: dispatched.threadId }));
@@ -422,7 +455,7 @@ describe('MCPServer Protocol Tests', () => {
     assert.match(dispatched.message, /^nextAction=END_TURN_AND_WAIT_FOR_CALLBACK/);
     assert.match(dispatched.stopInstruction, /End your turn immediately/);
 
-    await waitForStatus(dispatched.threadId, 'waiting_review');
+    await waitForStatus(dispatched.threadId, 'reviewing');
 
     const first = payload(await call('get_thread_details', { threadId: dispatched.threadId }));
     assert.strictEqual(first.repeatPoll, undefined);
@@ -486,7 +519,7 @@ describe('MCPServer Protocol Tests', () => {
       title: 'capsule projection',
       initiatorAgent: 'codex',
       targetAgent: 'claude_code',
-      status: 'waiting_review',
+      status: 'reviewing',
       currentRound: 3,
       createdAt: now,
       updatedAt: now,
@@ -550,7 +583,7 @@ describe('MCPServer Protocol Tests', () => {
     const logPath = path.join(tempDir, 'merge-logs', threadId, 'merge_log', `${threadId}_merge_1.log`);
     fs.mkdirSync(path.dirname(logPath), { recursive: true }); fs.writeFileSync(logPath, 'abcdefghij');
     taskStore.upsertTask({ threadId, title: 'merge log', initiatorAgent: 'codex', targetAgent: 'claude_code',
-      status: 'waiting_merge', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-abcdef12',
+      status: 'reviewing', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-abcdef12',
       workspace: testWorkspace(tempDir), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 }, rounds: [],
       mergeHistory: [{ id: 'one', number: 1, at: now, phase: 'conflict', result: 'failed', logPath }] });
     const res = await mcpServer.handleRpcMessage({ jsonrpc: '2.0', id: 800, method: 'tools/call',
@@ -566,7 +599,7 @@ describe('MCPServer Protocol Tests', () => {
     const decisionLog = path.join(dir, `${threadId}_merge_9.log`); fs.writeFileSync(decisionLog, 'decision context');
     const outside = path.join(tempDir, `${threadId}_merge_2.log`); fs.writeFileSync(outside, 'private');
     taskStore.upsertTask({ threadId, title: 'merge log', initiatorAgent: 'codex', targetAgent: 'claude_code',
-      status: 'waiting_merge', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-abcdef12',
+      status: 'reviewing', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-abcdef12',
       workspace: testWorkspace(tempDir), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 }, rounds: [],
       mergeHistory: [
         { id: 'legacy', number: 1, at: now, phase: 'attempt', result: 'started', logPath },
@@ -580,7 +613,7 @@ describe('MCPServer Protocol Tests', () => {
     assert.equal(legacy.content, 'cdef'); assert.equal(decision.content, 'cdef');
     await assert.rejects(mcpServer.handleToolCall('get_merge_log', { threadId, number: 3 }), /Invalid merge log path/);
     await assert.rejects(mcpServer.handleToolCall('get_merge_log', { threadId, number: 4 }), /Invalid merge log path/);
-    reworkController.requestMergeDecision(threadId, 'Which fix?', 'background', 'suggestion', [], decisionLog);
+    await reworkController.requestMergeDecision(threadId, 'Which fix?', 'background', 'suggestion', [], decisionLog);
     const question = taskStore.getTask(threadId)!.mergeHistory!.at(-1)!;
     assert.equal(question.logNumber, 5); assert.equal(question.logFileNumber, 9);
     const context = await mcpServer.handleToolCall('get_merge_log', { threadId, number: question.number, limit: 8 });
@@ -589,7 +622,7 @@ describe('MCPServer Protocol Tests', () => {
 
   test('merge_failed rejects ordinary controls and retry_merge keeps task identity', async () => {
     const threadId = 'thread_merge_failed_control'; const now = new Date().toISOString();
-    taskStore.upsertTask({ threadId, title: 'merge failure', initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'merge_failed',
+    taskStore.upsertTask({ threadId, title: 'merge failure', initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'failed', failure: { stage: 'merge', reason: 'conflict', at: now }, failureRevision: 1,
       currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-abcdef12', callerSessionId: 'reviewer-session',
       workspace: testWorkspace(tempDir), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 }, rounds: [],
       mergeControl: { revision: 1, retryGeneration: 0, consecutiveRetries: 6, failureFingerprint: 'failure' } });
@@ -597,7 +630,7 @@ describe('MCPServer Protocol Tests', () => {
       await assert.rejects(() => mcpServer.handleToolCall(name, { threadId }), /only permits retry_merge or delete_task/);
     }
     const result = await mcpServer.handleToolCall('retry_merge', { threadId });
-    assert.equal(result.status, 'waiting_merge');
+    assert.equal(result.status, 'reviewing');
     assert.equal(taskStore.getTask(threadId)!.receiverSessionId, 'session-abcdef12');
     assert.equal(taskStore.getTask(threadId)!.mergeControl!.retryGeneration, 1);
   });
@@ -638,7 +671,7 @@ describe('MCPServer Protocol Tests', () => {
       title: 'token usage',
       initiatorAgent: 'claude_code',
       targetAgent: 'codex',
-      status: 'waiting_review',
+      status: 'reviewing',
       currentRound: 2,
       createdAt: now,
       updatedAt: now,
@@ -736,7 +769,7 @@ describe('MCPServer Protocol Tests', () => {
     // 3. Request Rework.
     // Rounds are strictly sequential, so the receiver's round 1 must reach a
     // terminal state before a new round may be started.
-    await waitForStatus(threadId, 'waiting_review');
+    await waitForStatus(threadId, 'reviewing');
     const reviewer1 = new TaskRoleLock().tryAcquire(threadId, 'reviewer');
     assert.ok(reviewer1, 'reviewer role must be available after the developer handoff');
 
@@ -761,7 +794,7 @@ describe('MCPServer Protocol Tests', () => {
 
     // 4. Approve Task.
     // The rework round started above must reach a terminal state first.
-    await waitForStatus(threadId, 'waiting_review');
+    await waitForStatus(threadId, 'reviewing');
     const reviewer2 = new TaskRoleLock().tryAcquire(threadId, 'reviewer');
     assert.ok(reviewer2, 'reviewer role must be available after the rework handoff');
 
@@ -855,6 +888,8 @@ describe('MCPServer Protocol Tests', () => {
       // The model should not even see new-work tools.
       const toolNames = mcpServer.getToolDefinitions().map((tool: any) => tool.name);
       assert.ok(!toolNames.includes('dispatch_task'));
+      assert.ok(!toolNames.includes('list_task_templates'));
+      await assert.rejects(mcpServer.handleToolCall('list_task_templates', {}), /receiver/i);
       assert.ok(!toolNames.includes('invoke_agent'));
       assert.ok(toolNames.includes('request_rework'));
       assert.ok(toolNames.includes('approve_task'));
@@ -1137,7 +1172,7 @@ describe('MCPServer Protocol Tests', () => {
     assert.strictEqual(retryData.status, 'RETRYING');
     assert.strictEqual(retryData.round, 1, 'retry must reuse the failed round number');
 
-    await waitForStatus(threadId, 'waiting_review', 5000);
+    await waitForStatus(threadId, 'reviewing', 5000);
     const after = taskStore.getTask(threadId)!;
     assert.strictEqual(after.rounds.length, 1, 'retry must not append a second round');
     assert.strictEqual(after.rounds[0].prompt, originalPrompt);
@@ -1160,7 +1195,7 @@ describe('MCPServer Protocol Tests', () => {
       },
     });
     const threadId = JSON.parse(dispatchRes.result.content[0].text).threadId;
-    await waitForStatus(threadId, 'waiting_review');
+    await waitForStatus(threadId, 'reviewing');
 
     new TaskRoleLock().tryAcquire(threadId, 'reviewer');
     const reworkRes = await mcpServer.handleRpcMessage({

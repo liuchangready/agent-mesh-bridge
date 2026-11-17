@@ -14,7 +14,7 @@
 | :-- | :--- | :--- |
 | 1 | 认为“尾部协议包络”能瘦身 **Agent 原生会话** | 不能。桥接从不把历轮 `output` 注入下一轮 prompt，协议包络只影响账本，反而增加每轮 token。原生会话只受 CLI 自身或额外进程影响。 |
 | 2 | 把原生 `/compact` 与“只压 N-1”当作等价 | 不等价。`/compact` 是**整会话**压缩，会连带压掉当前轮（N+1 正要用的那份）。且 `claude --help` 无相关开关，headless 支持未证实。v1 不调用。 |
-| 3 | 压缩失败没有隔离 | 压缩发生在 `updateRound(waiting_review)` 与唤醒 reviewer 之间；任何抛错都会让任务级 FIFO 队头永久卡死。压缩必须 best-effort、绝不阻断回调。 |
+| 3 | 压缩失败没有隔离 | 压缩发生在 `updateRound(reviewing)` 与唤醒 reviewer 之间；任何抛错都会让任务级 FIFO 队头永久卡死。压缩必须 best-effort、绝不阻断回调。 |
 | 4 | 直接改写 `round.output` | 多进程账本合并会“复活”旧数据（每个进程各持副本，`upsertTask` 以传入 rounds 覆盖）。必须加合并保护，否则压缩率不可持久。 |
 | 5 | 冷存“永不删除” | 实测 248 轮已 16.1MB（均 65KB，峰 1.6MB），无界增长不可接受。冷存必须可定位、可清理，且读取必须分页。 |
 
@@ -155,7 +155,7 @@ sequenceDiagram
         R->>Store: 原样落账，禁止压缩
         R->>CB: 唤醒 caller（失败通知）
     else 成功
-        R->>Store: updateRound(N, waiting_review)
+        R->>Store: updateRound(N, reviewing)
         R->>C: compactPrecedingRound(N)（best-effort，绝不抛错）
         C->>C: 选目标轮（<N，终态，未压缩，≥阈值）
         C->>C: 归档全文（失败则放弃压缩并返回 failed）
@@ -166,7 +166,7 @@ sequenceDiagram
     end
 ```
 
-**失败隔离是硬约束**：三个执行器（`async-dispatcher` / `rework-controller` / `task-supervisor`）都在 `finally` 里释放租约，若压缩抛错且发生在 `notifyCaller` 之前，reviewer 永不唤醒，`waiting_review` 队头会阻塞整个网格。因此：
+**失败隔离是硬约束**：三个执行器（`async-dispatcher` / `rework-controller` / `task-supervisor`）都在 `finally` 里释放租约，若压缩抛错且发生在 `notifyCaller` 之前，reviewer 永不唤醒，`reviewing` 队头会阻塞整个网格。因此：
 
 - `compactPrecedingRound()` 内部捕获所有异常并返回 `CompactionOutcome`；
 - 调用点统一走 `compactRoundBestEffort()`，忽略返回值；

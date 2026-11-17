@@ -32,6 +32,8 @@ export function progressSignature(thread: DelegationThread): string {
   const last = rounds.length > 0 ? rounds[rounds.length - 1] : undefined;
   return [
     thread.status,
+    thread.failure?.stage ?? '',
+    thread.failureRevision ?? 0,
     thread.currentRound ?? 0,
     rounds.length,
     last?.round ?? '',
@@ -104,6 +106,8 @@ export class CallerPollGuard {
     return {
       threadId: thread.threadId,
       status: thread.status,
+      failureStage: thread.failure?.stage,
+      failureRevision: thread.failureRevision,
       currentRound: thread.currentRound,
       lastRound: last ? { round: last.round, status: last.status } : undefined,
       targetAgent: thread.targetAgent,
