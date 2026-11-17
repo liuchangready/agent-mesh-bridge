@@ -344,11 +344,15 @@ describe('AutonomousRunner Tests', () => {
     );
   });
 
-  test('fails the real child when native PID binding fails and waits for close', async () => {
+  test('fails the real child when native PID binding fails and waits for close', async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-native-pid-binding-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const ready = path.join(root, 'output-ready');
+    const output = JSON.stringify({ type: 'result', subtype: 'success', result: 'business completed' }) + '\n';
     const local = new AutonomousRunner(detector);
     local.buildCommand = () => ({
       command: process.execPath,
-      args: ['-e', `process.stdout.write(${JSON.stringify('{"type":"result","subtype":"success","result":"business completed"}\\n')});setInterval(()=>{},1000)`],
+      args: ['-e', `process.stdout.write(${JSON.stringify(output)},()=>require('fs').writeFileSync(${JSON.stringify(ready)},'ready'));setInterval(()=>{},1000)`],
       useShell: false,
     });
     let pid: number | undefined;
@@ -357,10 +361,18 @@ describe('AutonomousRunner Tests', () => {
       agent: 'claude_code', prompt: 'temporary child only', isRework: false,
       receiverSessionId: 'temp-native-pid-binding', timeoutMs: 10_000, silenceTimeoutMs: 10_000,
       onChildPid: (value) => {
-        if (value) { pid = value; throw new Error('Could not acquire the native-session owner gate to persist the child PID.'); }
+        if (value) {
+          pid = value;
+          // Binding is synchronous; wait for real output before injecting its failure.
+          const deadline = performance.now() + 5_000;
+          const wait = new Int32Array(new SharedArrayBuffer(4));
+          while (!fs.existsSync(ready) && performance.now() < deadline) Atomics.wait(wait, 0, 0, 10);
+          throw new Error('Could not acquire the native-session owner gate to persist the child PID.');
+        }
         cleared = true;
       },
     });
+    assert.ok(fs.existsSync(ready), 'the child flushed output before the binding failure');
     assert.ok(pid, 'the test child was started');
     assert.equal(cleared, true, 'PID cleanup runs after the actual close event');
     assert.equal(result.exitCode, -1);
