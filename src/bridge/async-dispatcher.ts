@@ -483,10 +483,12 @@ export class AsyncDispatcher {
       const current = stored;
       const currentRound = current.rounds.filter((round) => round.round === roundNumber).slice(-1)[0];
       const terminal =
+        current.queuePhase === 'merge' ||
+        current.status === 'merging' || current.status === 'wait_decision' ||
         current.status === 'completed' ||
         current.status === 'failed' ||
         current.status === 'paused' ||
-        current.status === 'waiting_review';
+        current.status === 'reviewing';
       if (
         terminal ||
         current.targetAgent !== thread.targetAgent ||
@@ -667,7 +669,7 @@ export class AsyncDispatcher {
         } catch {}
       }
       const finalRoundStatus = isPaused ? 'paused' : isSuccess ? 'completed' : 'failed';
-      const finalThreadStatus = isPaused ? 'paused' : isSuccess ? 'waiting_review' : 'failed';
+      const finalThreadStatus = isPaused ? 'paused' : isSuccess ? 'reviewing' : 'failed';
 
       const nativeSessionId = result.actualSessionId || latest.receiverSessionId;
       if (result.actualSessionId && result.actualSessionId !== latest.receiverSessionId) {
@@ -780,6 +782,7 @@ export class AsyncDispatcher {
     const freshRound = fresh ? findInFlightRound(fresh) : undefined;
     if (
       !fresh ||
+      fresh.queuePhase === 'merge' ||
       (fresh.status !== 'queued' && fresh.status !== 'running') ||
       fresh.targetAgent !== thread.targetAgent ||
       fresh.reviewBlocked ||

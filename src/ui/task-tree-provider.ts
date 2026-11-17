@@ -86,13 +86,15 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     // (429 / expired session), and nothing else can move this task. The record is
     // per-round, so a rework that is still being reviewed shows nothing.
     const reviewWake =
-      thread.status === 'waiting_review' &&
+      thread.status === 'reviewing' &&
       thread.reviewWake &&
       thread.reviewWake.round === (thread.currentRound || 1)
         ? thread.reviewWake
         : undefined;
     const reviewBadge = reviewWake
-      ? reviewWake.gaveUp
+      ? reviewWake.kind === 'pending'
+        ? ' · Review wake pending'
+        : reviewWake.gaveUp
         ? ' · ⚠️检视唤醒失败(需手动)'
         : reviewWake.quotaExhausted
           ? ` · ⚠️配额不足${
@@ -110,7 +112,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     // state visible while allowing unrelated tasks to run; only explicitly configured limits
     // or an explicitly configured concurrency limit can delay them.
     const reviewBlocked =
-      thread.status === 'waiting_review' && thread.reviewBlocked ? thread.reviewBlocked : undefined;
+      thread.status === 'reviewing' && thread.reviewBlocked ? thread.reviewBlocked : undefined;
     if (reviewBlocked) {
       statusLabel = `Parked Review · 已挂起 (${roundText})`;
     }
@@ -145,17 +147,17 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
         ? 'failed_merge'
         : thread.status === 'wait_decision'
         ? 'wait_decision'
-        : thread.status === 'waiting_merge'
-        ? 'waiting_merge'
-        : thread.status === 'waiting_review'
+        : thread.status === 'merging'
+        ? 'merging'
+        : thread.status === 'reviewing'
         ? // A healthy review needs no manual wake: only a recorded wake failure
           // exposes the "re-review" action (see the menu `when` clause). A
           // parked review gets its own value so the user can release the park.
-          reviewWake
-          ? 'waiting_review_stalled'
+          reviewWake && reviewWake.kind !== 'pending'
+          ? 'reviewing_stalled'
           : reviewBlocked
-            ? 'waiting_review_blocked'
-            : 'waiting_review'
+            ? 'reviewing_blocked'
+            : 'reviewing'
         : thread.status === 'paused'
           ? 'paused_task'
           : thread.status === 'failed' && thread.failure?.stage === 'review'

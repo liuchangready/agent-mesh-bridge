@@ -25,6 +25,7 @@ import {
   appendInterruption,
   findInFlightRound,
   isMergePending,
+  isMergeReview,
   isIsolatedTaskWorktree,
 } from './types';
 
@@ -93,7 +94,7 @@ export class TaskControlService {
         `Cannot pause task ${threadId}: it already failed. Use resume/retry instead.`,
       );
     }
-    if (thread.status === 'waiting_review') {
+    if (thread.status === 'reviewing' && !isMergeReview(thread)) {
       throw new Error(
         `Cannot pause task ${threadId}: it is waiting for the caller's review, not executing.`,
       );
@@ -112,7 +113,7 @@ export class TaskControlService {
     };
 
     const round = this.resolveCurrentRound(thread);
-    const pausingMerge = thread.status === 'waiting_merge';
+    const pausingMerge = thread.status === 'merging' || (thread.status === 'queued' && thread.queuePhase === 'merge') || isMergeReview(thread);
     if (thread.status === 'paused') {
       // Idempotent, but still publish cancellation and stop this task's child.
       this.cancellationRegistry.request(threadId, 'pause', normalizedReason, by);
@@ -216,7 +217,7 @@ export class TaskControlService {
       thread.status === 'running' ||
       thread.status === 'queued' ||
       thread.status === 'paused' ||
-      thread.status === 'waiting_merge' ||
+      thread.status === 'merging' ||
       !!findInFlightRound(thread) ||
       !!new TaskRoleLock(this.storageDir).getOwner(threadId)?.childPid ||
       this.executionRegistry.listOwners().some((owner) => owner.threadId === threadId && !!owner.childPid);

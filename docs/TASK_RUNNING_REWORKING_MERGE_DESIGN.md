@@ -14,7 +14,7 @@
 - 清理仅因这两个状态分立而存在的重复分支、状态筛选项、文案和颜色映射。
 - 不改变轮次编号、原生会话续用、角色交接、审阅、暂停/恢复、合并和终态语义。
 
-本设计不合并 `RoundStatus`，不改 `RoundType`，也不改变 `waiting_review`、`waiting_merge` 等其他任务状态。
+本设计不合并 `RoundStatus`，不改 `RoundType`，也不改变 `reviewing`、`merging` 等其他任务状态。
 
 ## 3. 目标状态模型
 
@@ -24,8 +24,8 @@
 export type ThreadStatus =
   | 'queued'
   | 'running'
-  | 'waiting_review'
-  | 'waiting_merge'
+  | 'reviewing'
+  | 'merging'
   | 'wait_decision'
   | 'paused'
   | 'completed'
@@ -39,9 +39,9 @@ export type ThreadStatus =
 | `running` | `initial` | 初次开发执行中 |
 | `running` | `rework` | 按 Reviewer 意见返修执行中 |
 | `queued` | 可能有已排队轮次 | 等待调度；不得仅凭轮次类型标成运行中 |
-| `waiting_review` | 无活动开发轮次 | 开发结果已交接，等待检视 |
+| `reviewing` | 无活动开发轮次 | 开发结果已交接，等待检视 |
 
-开发轮次成功、失败、暂停后的任务状态仍分别为 `waiting_review`、`failed`、`paused`。返修成功后仍回到 `waiting_review`；如果任务正在合并审阅闭环中，现有合并逻辑继续决定后续状态。
+开发轮次成功、失败、暂停后的任务状态仍分别为 `reviewing`、`failed`、`paused`。返修成功后仍回到 `reviewing`；如果任务正在合并审阅闭环中，现有合并逻辑继续决定后续状态。
 
 ## 4. 状态与轮次的写入规则
 

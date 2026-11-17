@@ -1,4 +1,4 @@
-﻿# 文件夹级 Bridge Workspace
+# 文件夹级 Bridge Workspace
 
 > 状态：实现进行中；尚未完成验收。此文记录当前实现与未完成边界。
 
@@ -22,7 +22,7 @@ Bridge 工作空间以本地绝对目录为根；`physicalDirectory` 验证目�
 
 ## 上线步骤
 
-停止旧版派发及所有宿主，处理所有旧版未终态任务，包括 queued、running、reworking、paused、waiting_review、waiting_merge 和 bootstrap pending；备份需要保留的结果及旧账本，并在新版本启用前将全部旧任务记录移出其活动账本。新模型不迁移或兼容旧任务，不应以调用者实时账本作为测试数据。确保 Node 20+、依赖和 Git 可用，针对隔离测试主目录运行编译及完整测试。部署后重新选择窗口默认空间；旧任务数据不应作为新模型的输入。
+停止旧版派发及所有宿主，处理所有旧版未终态任务，包括 queued、running、reworking、paused、reviewing、merging 和 bootstrap pending；备份需要保留的结果及旧账本，并在新版本启用前将全部旧任务记录移出其活动账本。新模型不迁移或兼容旧任务，不应以调用者实时账本作为测试数据。确保 Node 20+、依赖和 Git 可用，针对隔离测试主目录运行编译及完整测试。部署后重新选择窗口默认空间；旧任务数据不应作为新模型的输入。
 
 ## 尚待完成
 

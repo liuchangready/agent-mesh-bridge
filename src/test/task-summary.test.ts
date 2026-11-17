@@ -23,7 +23,7 @@ function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread
     title: 'Fix the parser',
     initiatorAgent: 'codex',
     targetAgent: 'claude_code',
-    status: 'waiting_review',
+    status: 'reviewing',
     currentRound: 2,
     createdAt: '2026-11-01T00:00:00.000Z',
     updatedAt: '2026-11-01T00:10:00.000Z',

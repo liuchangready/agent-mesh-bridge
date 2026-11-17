@@ -19,6 +19,7 @@ import {
   isIsolatedTaskWorktree,
   clearTaskFailure,
   enterTaskFailure,
+  isMergeReview,
 } from './types';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -151,7 +152,7 @@ export class ReworkController {
     if (thread.status === 'paused') {
       throw new Error(`Cannot request rework: task ${params.threadId} is paused; resume it first.`);
     }
-    if ((thread.status === 'failed' && thread.failure?.stage === 'merge') || thread.status === 'wait_decision') throw new Error(`Cannot request rework while task is ${thread.status}.`);
+    if ((thread.status === 'failed' && thread.failure?.stage === 'merge') || thread.status === 'wait_decision' || thread.status === 'merging' || (thread.status === 'queued' && thread.queuePhase === 'merge')) throw new Error(`Cannot request rework while task is ${thread.status}.`);
     if (thread.worktree?.integration?.stashRecoveryPending) throw new Error(`Cannot request rework while stash metadata recovery is pending.`);
     this.assertDedicatedReviewerReady(thread, 'request rework');
     assertCanExecute(params.targetAgent || thread.targetAgent, 'receive rework');
@@ -245,6 +246,10 @@ export class ReworkController {
     thread.currentRound = nextRound;
     clearTaskFailure(thread);
     thread.status = 'running';
+    if (thread.worktree?.integration && isMergeReview({ ...thread, status: 'reviewing' })) {
+      thread.worktree.approvedCommit = undefined;
+      thread.worktree.integration = { ...thread.worktree.integration, phase: 'ready', updatedAt: nowIso };
+    }
     thread.interruption = undefined;
     thread.updatedAt = nowIso;
     if (thread.reviewFlow === 'dedicated') {
@@ -514,7 +519,8 @@ export class ReworkController {
           cancellations.clear(threadId);
           if (cancellations.peek(threadId)) throw new Error(`Cannot resume ${threadId}: the cancellation request could not be cleared.`);
           latest.interruption = undefined;
-          latest.status = 'waiting_merge';
+          latest.status = ['conflict', 'validation_failed', 'blocked'].includes(latest.worktree?.integration?.phase || '') ? 'reviewing' : 'queued';
+          latest.queuePhase = latest.status === 'queued' ? 'merge' : undefined;
           latest.updatedAt = new Date().toISOString();
           this.taskStore.upsertTask(latest);
           thread = latest;
@@ -731,7 +737,7 @@ export class ReworkController {
    * The reviewer has exactly two moves — approve or rework — so "this task is
    * fine, but the batch is waiting for another task" had no expression and was
    * encoded as an empty rework round that returned in 15 seconds and burned a
-   * full execution slot, over and over. Blocking keeps the task `waiting_review`
+   * full execution slot, over and over. Blocking keeps the task `reviewing`
    * (queue invariants unchanged), silences the stall watchdog and the wake path,
    * and wakes the reviewer as soon as the dependency reaches a terminal state.
    *
@@ -748,9 +754,9 @@ export class ReworkController {
     if (!thread) {
       throw new Error(`Task thread not found: ${params.threadId}`);
     }
-    if (thread.status !== 'waiting_review') {
+    if (thread.status !== 'reviewing') {
       throw new Error(
-        `Cannot block review: thread ${params.threadId} is "${thread.status}", not "waiting_review".`,
+        `Cannot block review: thread ${params.threadId} is "${thread.status}", not "reviewing".`,
       );
     }
     const inFlight = findInFlightRound(thread);
@@ -814,7 +820,7 @@ export class ReworkController {
       };
     }
     this.assertDedicatedReviewerReady(thread, 'approve task');
-    if ((thread.status === 'failed' && thread.failure?.stage === 'merge') || thread.status === 'wait_decision') throw new Error(`Cannot approve while task is ${thread.status}.`);
+    if ((thread.status === 'failed' && thread.failure?.stage === 'merge') || thread.status === 'wait_decision' || thread.status === 'merging' || (thread.status === 'queued' && thread.queuePhase === 'merge')) throw new Error(`Cannot approve while task is ${thread.status}.`);
     if (thread.worktree?.integration?.stashRecoveryPending) throw new Error('Cannot approve while stash metadata recovery is pending.');
 
     const nowIso = new Date().toISOString();
@@ -843,7 +849,7 @@ export class ReworkController {
         try {
           ({ logPath, logFileNumber } = createMergeLog(dir, safeId, number, `${failure}\n`));
         } catch (logError) { logPath = undefined; failure += `; could not write merge log: ${String(logError)}`; }
-        thread.status = 'waiting_merge';
+        thread.status = 'reviewing';
         const budget = noteMergeFailure(thread, 'snapshot', 'SNAPSHOT_FAILED', failure);
         thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number, at: nowIso, phase: 'snapshot', result: 'failed', error: failure, logPath, logFileNumber, ...budget }];
         worktree.approvedCommit = undefined;
@@ -853,8 +859,8 @@ export class ReworkController {
         thread.updatedAt = nowIso;
         this.taskStore.upsertTask(thread);
         const reviewRound = [...thread.rounds].reverse().find((round) => round.type !== 'approval');
-        if (reviewRound && thread.status === 'waiting_merge') setTimeout(() => { void this.callbackManager.notifyCaller(thread, reviewRound); }, 0).unref();
-        return { threadId: thread.threadId, status: budget.consecutiveRetries >= 6 ? 'MERGE_FAILED' : 'WAITING_MERGE', message: failure };
+        if (reviewRound && thread.status === 'reviewing') setTimeout(() => { void this.callbackManager.notifyCaller(thread, reviewRound); }, 0).unref();
+        return { threadId: thread.threadId, status: budget.consecutiveRetries >= 6 ? 'MERGE_FAILED' : 'REVIEWING', message: failure };
       }
       if (snapshot.tree === gitOutput(worktree.path, ['rev-parse', `${worktree.baseCommit}^{tree}`])) {
         worktree.approvedCommit = undefined;
@@ -865,8 +871,9 @@ export class ReworkController {
         worktree.approvedCommit = snapshot.commit;
         worktree.integration = { phase: 'waiting', sourceCommit: snapshot.commit, updatedAt: nowIso };
         worktree.mergePending = true;
-        thread.status = 'waiting_merge';
-        status = 'WAITING_MERGE';
+        thread.status = 'queued';
+        thread.queuePhase = 'merge';
+        status = 'QUEUED';
       }
     } else {
       // Legacy ledger entries retain their historical review lifecycle.
@@ -881,7 +888,7 @@ export class ReworkController {
         round: nextRoundNumber(thread),
         type: 'approval',
         prompt: params.remarks,
-        output: status === 'WAITING_MERGE' ? 'Review approved; waiting for verified local integration.' : 'Task successfully approved and verified.',
+        output: status === 'QUEUED' ? 'Review approved; waiting for verified local integration.' : 'Task successfully approved and verified.',
         durationMs: 0,
         status: 'completed',
         timestamp: nowIso,
@@ -900,8 +907,8 @@ export class ReworkController {
     return {
       threadId: thread.threadId,
       status,
-      message: status === 'WAITING_MERGE'
-        ? `Task ${thread.threadId} is approved at ${thread.worktree?.approvedCommit}; local integration and combined validation are running asynchronously.`
+      message: status === 'QUEUED'
+        ? `Task ${thread.threadId} is approved at ${thread.worktree?.approvedCommit}; local integration and combined validation are queued.`
         : `Task ${thread.threadId} successfully approved and archived.`,
     };
   }
@@ -912,7 +919,7 @@ export class ReworkController {
 
   public requestMergeDecision(threadId: string, question: string, background: string, suggestion: string, conflictFiles: string[] = [], logPath?: string): { threadId: string; status: 'wait_decision'; decisionId: string; nextAction: string; message: string } {
     const current = this.taskStore.getTask(threadId);
-    if (!current || current.status !== 'waiting_merge' || !question?.trim()) throw new Error('A waiting merge and a non-empty question are required.');
+    if (!current || current.status !== 'reviewing' || !question?.trim()) throw new Error('An active review and a non-empty question are required.');
     if (current.worktree?.integration?.stashRecoveryPending) throw new Error('Cannot request a merge decision while stash metadata recovery is pending.');
     const thread = structuredClone(current);
     const decisionId = crypto.randomUUID(); const at = new Date().toISOString();
@@ -922,35 +929,38 @@ export class ReworkController {
     const contextEvent = (thread.mergeHistory || []).find((entry) => entry.logPath === contextLog && entry.phase !== 'decision');
     const contextLogNumber = contextEvent?.number;
     thread.mergeHistory = [...(thread.mergeHistory || []), { id: decisionId, decisionId, number: (thread.mergeHistory?.length || 0) + 1, at,
-      phase: 'decision', result: 'requested', question: question.trim(), background: (background || '').trim(), suggestion: (suggestion || '').trim(), conflictFiles: files, logPath: contextLog, logNumber: contextLogNumber, logFileNumber: contextEvent?.logFileNumber }];
+      phase: 'decision', result: 'requested', decisionStage: isMergeReview(thread) ? 'merge' : 'review', question: question.trim(), background: (background || '').trim(), suggestion: (suggestion || '').trim(), conflictFiles: files, logPath: contextLog, logNumber: contextLogNumber, logFileNumber: contextEvent?.logFileNumber }];
     const prior = thread.mergeControl;
     thread.mergeControl = { ...prior, revision: (prior?.revision || 0) + 1, retryGeneration: prior?.retryGeneration || 0,
-      consecutiveRetries: prior?.consecutiveRetries || 0, pendingDecisionId: decisionId };
+      consecutiveRetries: prior?.consecutiveRetries || 0, pendingDecisionId: decisionId, decisionStage: isMergeReview(thread) ? 'merge' : 'review' };
     thread.status = 'wait_decision'; thread.updatedAt = at;
     if (thread.reviewWake) thread.reviewWake.autoRetryAt = undefined;
     this.taskStore.upsertTask(thread);
     return { threadId, status: 'wait_decision', decisionId, nextAction: 'END_TURN_AND_WAIT_FOR_USER', message: 'End this reviewer turn; the user decision will wake the same session.' };
   }
 
-  public submitMergeDecision(threadId: string, answer: string): { threadId: string; status: 'waiting_merge'; decisionId: string } {
+  public submitMergeDecision(threadId: string, answer: string): { threadId: string; status: 'reviewing'; decisionId: string } {
     const current = this.taskStore.getTask(threadId);
     if (!current || current.status !== 'wait_decision' || !current.mergeControl?.pendingDecisionId || !answer?.trim()) throw new Error('A pending merge decision and a non-empty answer are required.');
     const thread = structuredClone(current); const decisionId = thread.mergeControl!.pendingDecisionId!; const at = new Date().toISOString();
     thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), decisionId, number: (thread.mergeHistory?.length || 0) + 1,
       at, phase: 'decision', result: 'answered', answer: answer.trim() }];
-    thread.mergeControl = { ...thread.mergeControl!, revision: thread.mergeControl!.revision + 1, pendingDecisionId: undefined };
-    thread.status = 'waiting_merge'; thread.updatedAt = at;
-    if (thread.worktree?.integration && thread.worktree.integration.phase === 'waiting') thread.worktree.integration = { ...thread.worktree.integration, phase: 'blocked', updatedAt: at };
+    const stage = thread.mergeControl!.decisionStage || 'merge';
+    thread.mergeControl = { ...thread.mergeControl!, revision: thread.mergeControl!.revision + 1, pendingDecisionId: undefined, decisionStage: undefined };
+    thread.reviewWake = undefined;
+    thread.status = 'reviewing'; thread.updatedAt = at;
+    if (stage === 'merge' && thread.worktree?.integration && thread.worktree.integration.phase === 'waiting') thread.worktree.integration = { ...thread.worktree.integration, phase: 'blocked', updatedAt: at };
     this.taskStore.upsertTask(thread);
     const round = [...thread.rounds].reverse().find((entry) => entry.type !== 'approval');
     if (round) setTimeout(() => { void this.callbackManager.notifyCaller(thread, round); }, 0).unref();
-    return { threadId, status: 'waiting_merge', decisionId };
+    return { threadId, status: 'reviewing', decisionId };
   }
 
-  public retryMerge(threadId: string): { threadId: string; status: 'waiting_merge'; retryGeneration: number } {
+  public retryMerge(threadId: string): { threadId: string; status: 'queued' | 'reviewing'; retryGeneration: number } {
     const current = this.taskStore.getTask(threadId);
     if (!current || current.archivedAt || current.status !== 'failed' || current.failure?.stage !== 'merge') throw new Error('Only a merge failure can restart its merge budget.');
-    const thread = structuredClone(current); resetMergeBudget(thread); clearTaskFailure(thread); thread.status = 'waiting_merge';
+    const thread = structuredClone(current); resetMergeBudget(thread); clearTaskFailure(thread); thread.status = thread.worktree?.mergeResolutionSubmitted ? 'queued' : 'reviewing';
+    thread.queuePhase = thread.status === 'queued' ? 'merge' : undefined;
     const at = new Date().toISOString(); thread.updatedAt = at;
     if (thread.worktree?.integration) {
       const phase = thread.worktree.mergeResolutionSubmitted ? 'waiting' :
@@ -965,13 +975,13 @@ export class ReworkController {
       const round = [...thread.rounds].reverse().find((entry) => entry.type !== 'approval');
       if (round) setTimeout(() => { void this.callbackManager.notifyCaller(thread, round); }, 0).unref();
     }
-    return { threadId, status: 'waiting_merge', retryGeneration: thread.mergeControl!.retryGeneration };
+    return { threadId, status: thread.status, retryGeneration: thread.mergeControl!.retryGeneration };
   }
 
-  public submitMergeResolution(threadId: string): { threadId: string; status: 'WAITING_MERGE'; message: string } {
+  public submitMergeResolution(threadId: string): { threadId: string; status: 'QUEUED'; message: string } {
     const thread = this.taskStore.getTask(threadId);
     const worktree = thread?.worktree;
-    if (!thread || thread.status !== 'waiting_merge' || !worktree?.approvedCommit || !worktree.mergeResolutionPath || !worktree.integration?.targetOldCommit) {
+    if (!thread || !isMergeReview(thread) || !worktree?.approvedCommit || !worktree.mergeResolutionPath || !worktree.integration?.targetOldCommit) {
       throw new Error('No approved merge resolution workspace is awaiting submission.');
     }
     if (worktree.integration.stashRecoveryPending) throw new Error('Cannot submit a merge resolution while stash metadata recovery is pending.');
@@ -993,21 +1003,51 @@ export class ReworkController {
       throw new Error('Stage all resolution changes before submitting.');
     }
     worktree.mergeResolutionSubmitted = true;
+    thread.status = 'queued';
+    thread.queuePhase = 'merge';
     worktree.integration = { ...worktree.integration, phase: 'waiting', updatedAt: new Date().toISOString() };
     thread.updatedAt = new Date().toISOString();
     this.taskStore.upsertTask(thread);
-    return { threadId, status: 'WAITING_MERGE', message: 'Resolution submitted; end the reviewer turn so the bridge can validate and integrate it.' };
+    return { threadId, status: 'QUEUED', message: 'Resolution submitted; end the reviewer turn so the bridge can validate and integrate it.' };
   }
 
   public resumePendingMerges(): void {
     this.taskStore.loadFromDisk();
     for (const thread of this.taskStore.getAllTasks()) {
-      if (thread.status !== 'waiting_merge') continue;
+      if (!(thread.status === 'queued' && thread.queuePhase === 'merge') && thread.status !== 'merging') continue;
       if (['blocked', 'conflict', 'validation_failed'].includes(thread.worktree?.integration?.phase || '')) continue;
       const blockedAt = this.blockedMergeRetries.get(thread.threadId);
       if (blockedAt && blockedAt === thread.updatedAt) continue;
       if (blockedAt) this.blockedMergeRetries.delete(thread.threadId);
       if (this.mergeWorkers.has(thread.threadId)) continue;
+      if (thread.status === 'merging') {
+        const roles = new TaskRoleLock(this.storageDir);
+        const lease = roles.tryAcquire(thread.threadId, 'reviewer', thread.reviewFlow === 'dedicated' ? thread.reviewerSessionId : undefined);
+        if (!lease) continue;
+        this.mergeWorkers.add(thread.threadId);
+        let recovered = false;
+        try {
+          this.taskStore.loadFromDisk();
+          const latest = this.taskStore.getTask(thread.threadId);
+          if (latest?.status === 'merging' && !new CancellationRegistry(this.storageDir).peek(thread.threadId)) {
+            const queued = structuredClone(latest);
+            queued.status = 'queued'; queued.queuePhase = 'merge'; queued.updatedAt = new Date().toISOString();
+            this.taskStore.upsertTask(queued);
+            recovered = true;
+          }
+        } catch (error) {
+          console.error(`[ReworkController] Could not queue interrupted merge ${thread.threadId}: ${String(error)}`);
+          this.blockedMergeRetries.set(thread.threadId, thread.updatedAt);
+          const timer = setTimeout(() => { this.blockedMergeRetries.delete(thread.threadId); this.resumePendingMerges(); }, 3_000);
+          timer.unref();
+          this.mergePersistenceRetries.set(thread.threadId, { attempts: 1, timer });
+        } finally {
+          this.mergeWorkers.delete(thread.threadId);
+          roles.release(lease);
+        }
+        if (recovered) this.resumePendingMerges();
+        continue;
+      }
       this.mergeWorkers.add(thread.threadId);
       void this.mergeApproved(thread.threadId).then(() => {
         const previous = this.mergePersistenceRetries.get(thread.threadId);
@@ -1020,9 +1060,9 @@ export class ReworkController {
           return;
         }
         const current = this.taskStore.getTask(thread.threadId);
-        if (current?.status !== 'waiting_merge' || !current.worktree) return;
+        if (!current || (current.status !== 'merging' && !(current.status === 'queued' && current.queuePhase === 'merge')) || !current.worktree) return;
         const latest = structuredClone(current);
-        latest.status = 'waiting_merge';
+        latest.status = 'reviewing';
         const failure = `Merge coordinator failed: ${error?.message || error}`;
         latest.worktree!.integration = { ...latest.worktree!.integration, phase: 'blocked', error: failure, updatedAt: new Date().toISOString() };
         const budget = noteMergeFailure(latest, 'coordinator', 'COORDINATOR_ERROR', failure);
@@ -1047,7 +1087,7 @@ export class ReworkController {
         const previous = this.mergePersistenceRetries.get(thread.threadId);
         if (previous) { clearTimeout(previous.timer); this.mergePersistenceRetries.delete(thread.threadId); }
         const reviewRound = [...(latest.rounds || [])].reverse().find((round) => round.type !== 'approval');
-        if (reviewRound && latest.status === 'waiting_merge') void this.callbackManager.notifyCaller(latest, reviewRound);
+        if (reviewRound && latest.status === 'reviewing') void this.callbackManager.notifyCaller(latest, reviewRound);
       }).finally(() => this.mergeWorkers.delete(thread.threadId));
     }
   }
@@ -1083,7 +1123,7 @@ export class ReworkController {
     const latest = this.taskStore.getTask(thread.threadId);
     const latestRound = latest?.rounds.filter((entry) => entry.round === roundNumber).slice(-1)[0];
     if (
-      !latest || latest.status === 'paused' || latest.status === 'waiting_review' ||
+      !latest || latest.queuePhase === 'merge' || latest.status === 'merging' || latest.status === 'wait_decision' || latest.status === 'paused' || latest.status === 'reviewing' ||
       latest.status === 'completed' || latest.status === 'failed' ||
       latest.targetAgent !== thread.targetAgent || !latestRound || latestRound.status !== 'running' ||
       latestRound.prompt !== feedback || findInFlightRound(latest)?.round !== roundNumber ||
@@ -1241,7 +1281,7 @@ export class ReworkController {
         } catch {}
       }
       const finalRoundStatus = isPaused ? 'paused' : isSuccess ? 'completed' : 'failed';
-      const finalThreadStatus = isPaused ? 'paused' : isSuccess ? 'waiting_review' : 'failed';
+      const finalThreadStatus = isPaused ? 'paused' : isSuccess ? 'reviewing' : 'failed';
 
       const nativeSessionId = result.actualSessionId || latest.receiverSessionId;
       if (result.actualSessionId && result.actualSessionId !== latest.receiverSessionId) {
@@ -1360,6 +1400,7 @@ export class ReworkController {
     const freshRound = fresh ? findInFlightRound(fresh) : undefined;
     if (
       !fresh ||
+      fresh.queuePhase === 'merge' ||
       (fresh.status !== 'queued' && fresh.status !== 'running') ||
       fresh.targetAgent !== thread.targetAgent ||
       fresh.reviewBlocked ||

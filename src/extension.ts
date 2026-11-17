@@ -416,7 +416,7 @@ export function activate(context: vscode.ExtensionContext) {
   callbackManager.setTaskStore(taskStore);
 
   // A reviewer wake can die before it reviews anything (429 / exhausted quota).
-  // The thread then stays `waiting_review` and blocks its workspace queue, so the
+  // The thread then stays `reviewing` and blocks its workspace queue, so the
   // scheduling plan lives in the ledger (`thread.reviewWake`) and this scheduler
   // re-wakes the SAME caller session once the provider's quota is back.
   //
@@ -637,7 +637,7 @@ export function activate(context: vscode.ExtensionContext) {
     for (const t of taskList) {
       const blocked = t.reviewBlocked;
       if (!blocked?.waitingForThreadId) continue;
-      if (t.status !== 'waiting_review') continue;
+      if (t.status !== 'reviewing') continue;
       const dependency = byThreadId.get(blocked.waitingForThreadId);
       if (!dependency) continue;
       if (dependency.status !== 'completed' && dependency.status !== 'failed') continue;
@@ -763,7 +763,7 @@ export function activate(context: vscode.ExtensionContext) {
     const title = thread ? thread.title : threadId;
     const worktree = thread?.worktree;
     const mergeGate = !!thread && isMergePending(thread);
-    const running = !!thread && (thread.status === 'running' || thread.status === 'waiting_merge');
+    const running = !!thread && (thread.status === 'running' || thread.status === 'merging');
 
     const details = [
       force ? `确定要【强制删除】任务【${title}】吗？` : `确定要永久删除任务【${title}】吗？`,
@@ -1442,7 +1442,7 @@ export function activate(context: vscode.ExtensionContext) {
             `【${thread.title}】上次检视失败（${thread.reviewFailure?.reason || '原因未记录'}），正在重新打开检视并唤醒下发者。`,
           );
         }
-        if (thread.status !== 'waiting_review') {
+        if (thread.status !== 'reviewing') {
           vscode.window.showWarningMessage(
             `任务【${thread.title}】当前状态为 ${thread.status}；只有处于“等待检视”的任务才能重新检视。`,
           );

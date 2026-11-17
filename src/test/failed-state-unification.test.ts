@@ -44,6 +44,21 @@ test('legacy failures and summaries normalize without inventing events', () => {
   assert.equal(legacy.finalSummary?.kind, 'failed'); assert.equal(legacy.finalSummary?.failureStage, 'review'); assert.equal(legacy.finalSummary?.summary, 'saved');
 });
 
+test('legacy review and merge states normalize according to the persisted integration phase', () => {
+  const review = task(os.tmpdir()); (review as any).status = 'waiting_review';
+  normalizeThread(review); assert.equal(review.status, 'reviewing');
+  for (const [phase, status] of [['waiting', 'queued'], ['merging', 'merging'], ['conflict', 'reviewing']] as const) {
+    const item = task(os.tmpdir()); (item as any).status = 'waiting_merge';
+    item.worktree = { path: os.tmpdir(), mainPath: os.tmpdir(), integration: { phase, updatedAt: item.updatedAt } };
+    item.reviewFlow = 'legacy'; item.callerSessionId = 'original-session';
+    item.worktree.deliveryTarget = { branch: 'master', ref: 'refs/heads/master', repositoryPath: os.tmpdir(), baseCommit: 'base' };
+    normalizeThread(item); assert.equal(item.status, status);
+    assert.equal(item.reviewFlow, 'legacy'); assert.equal(item.callerSessionId, 'original-session');
+    assert.equal(item.worktree.deliveryTarget?.ref, 'refs/heads/master');
+    if (phase === 'waiting') assert.equal(item.queuePhase, 'merge');
+  }
+});
+
 test('failure revisions protect persisted failure and recovered state from stale writers and callbacks', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-failure-revision-'));
   const store = new TaskStore(root);
@@ -84,7 +99,7 @@ test('merge failures cannot be archived even without worktree metadata and filte
     assert.equal(store.listTasks(10, 'review_failed').length, 0); assert.equal(store.listTasks(10, 'failed')[0].status, 'failed');
     assert.equal(ensureFinalSummary(item), false); const signature = progressSignature(item);
     assert.equal(item.finalSummary?.error, 'conflict');
-    const revision = item.failureRevision!; clearTaskFailure(item); item.status = 'waiting_merge';
+    const revision = item.failureRevision!; clearTaskFailure(item); item.status = 'merging';
     enterTaskFailure(item, { stage: 'merge', reason: 'second failure', at: item.updatedAt }); ensureFinalSummary(item);
     assert.ok(item.failureRevision! > revision); assert.notEqual(progressSignature(item), signature); assert.equal(item.finalSummary?.error, 'second failure');
   } finally { store.dispose(); fs.rmSync(root, { recursive: true, force: true }); }
@@ -93,14 +108,14 @@ test('merge failures cannot be archived even without worktree metadata and filte
 test('a delayed review outcome cannot overwrite a later failure generation', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stale-review-')); const store = new TaskStore(root);
   try {
-    const item = task(root); item.status = 'waiting_review'; item.rounds[0].status = 'completed';
+    const item = task(root); item.status = 'reviewing'; item.rounds[0].status = 'completed';
     store.upsertTask(item); const wakeSnapshot = structuredClone(item);
     const newer = structuredClone(item); enterTaskFailure(newer, { stage: 'review', reason: 'first review', at: newer.updatedAt, round: 1 });
-    clearTaskFailure(newer); newer.status = 'waiting_review'; store.upsertTask(newer);
+    clearTaskFailure(newer); newer.status = 'reviewing'; store.upsertTask(newer);
     const callback = new CallbackManager(new AgentDetector(), root); callback.setTaskStore(store);
     callback.finalizeWake(wakeSnapshot, wakeSnapshot.rounds[0], 'reviewer', { exitCode: 1, error: 'late review' });
     const saved = store.getTask(item.threadId)!;
-    assert.equal(saved.status, 'waiting_review'); assert.equal(saved.failureRevision, 2); assert.equal(saved.reviewWake, undefined);
+    assert.equal(saved.status, 'reviewing'); assert.equal(saved.failureRevision, 2); assert.equal(saved.reviewWake, undefined);
   } finally { store.dispose(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -149,7 +164,7 @@ test('persisted local merge wins over a stale failure even with a higher control
   try {
     const item = task(root);
     item.worktree = { path: root, mainPath: root, baseCommit: 'base', headCommit: 'head', integration: { phase: 'waiting', updatedAt: item.updatedAt } };
-    item.status = 'waiting_merge'; store.upsertTask(item);
+    item.status = 'merging'; store.upsertTask(item);
     const stale = structuredClone(item);
     const merged = structuredClone(item); merged.status = 'completed'; merged.worktree!.integration = { phase: 'merged', updatedAt: item.updatedAt };
     store.upsertTask(merged);

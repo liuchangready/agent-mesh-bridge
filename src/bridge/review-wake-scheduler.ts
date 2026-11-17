@@ -21,6 +21,7 @@ import {
   ReviewWakeState,
   latestCompletedWorkRound,
   isReviewerWakeEligible,
+  isMergeReview,
   appendInterruption,
 } from './types';
 import { noteMergeFailure } from './merge-recovery';
@@ -30,7 +31,7 @@ import { callerSessionKey } from './caller-wake-queue';
 export interface ReviewWakeSchedulerOptions {
   now?: () => number;
   maxTimerMs?: number;
-  /** How long a silent `waiting_review` may last before it counts as stalled. */
+  /** How long a silent `reviewing` may last before it counts as stalled. */
   stallTimeoutMs?: number;
   /** Watchdog cadence; mostly exists so tests do not wait a minute. */
   watchdogIntervalMs?: number;
@@ -49,7 +50,7 @@ export interface ReviewWakeSchedulerOptions {
  *
  * It also runs a watchdog for the stalls nobody reported: a wake whose process
  * vanished with the extension host, or a caller CLI that exits 0 without doing
- * anything. A task in `waiting_review` with no live `reviewer` role lock and no
+ * anything. A task in `reviewing` with no live `reviewer` role lock and no
  * progress for `stallTimeoutMs` is recorded as a timeout so it becomes visible
  * (and retryable) instead of blocking the workspace queue forever.
  *
@@ -58,7 +59,7 @@ export interface ReviewWakeSchedulerOptions {
  *    every ledger access is wrapped;
  *  - the plan lives in the ledger (`thread.reviewWake.autoRetryAt`), so a
  *    VS Code restart resumes it instead of silently dropping the retry;
- *  - a retry only happens while the task is still `waiting_review`; any other
+ *  - a retry only happens while the task is still `reviewing`; any other
  *    status (approved, reworked, paused, deleted) drops the plan.
  */
 export class ReviewWakeScheduler extends EventEmitter {
@@ -173,7 +174,7 @@ export class ReviewWakeScheduler extends EventEmitter {
       if (!state) continue;
 
       try {
-        if (thread.status === 'waiting_merge') {
+        if (isMergeReview(thread)) {
           if (!state.autoRetryAt || state.gaveUp || Date.parse(state.autoRetryAt) > now) continue;
           const quota = this.rateLimitOf(thread);
           const reset = quota?.resetsAt ? Date.parse(quota.resetsAt) : NaN;
@@ -185,7 +186,7 @@ export class ReviewWakeScheduler extends EventEmitter {
           if (!round) continue;
           const accepted = await Promise.resolve(this.callbackManager.notifyCaller(thread, round));
           const latest = this.taskStore.getTask(thread.threadId);
-          if (latest?.status === 'waiting_merge' && latest.reviewWake?.lastAttemptAt === state.lastAttemptAt) {
+          if ((latest && isMergeReview(latest)) && latest.reviewWake?.lastAttemptAt === state.lastAttemptAt) {
             latest.reviewWake = { ...state, autoRetryAt: accepted ? undefined : new Date(now + 60_000).toISOString() };
             this.taskStore.upsertTask(latest);
           }
@@ -193,7 +194,7 @@ export class ReviewWakeScheduler extends EventEmitter {
           continue;
         }
         // The record only describes the review of one round. After a rework the
-        // task briefly returns to `waiting_review` for a NEW round, and the old
+        // task briefly returns to `reviewing` for a NEW round, and the old
         // failure must not leak into it (nor burn its retry budget).
         if (state.round !== thread.currentRound) {
           this.clear(thread);
@@ -250,7 +251,7 @@ export class ReviewWakeScheduler extends EventEmitter {
   /**
    * Detect reviews that died without reporting anything.
    *
-   * A `waiting_review` task holds its workspace queue slot forever when the
+   * A `reviewing` task holds its workspace queue slot forever when the
    * reviewer process disappears without an exit event (extension host crash) or
    * exits cleanly without acting. Neither path has a recorded failure, so the
    * re-review action would stay hidden and nobody would know why the queue
@@ -276,11 +277,39 @@ export class ReviewWakeScheduler extends EventEmitter {
     const stalled: DelegationThread[] = [];
     for (const thread of tasks) {
       try {
-        if (thread.status === 'waiting_merge' && isReviewerWakeEligible(thread)) {
+        if (isMergeReview(thread) && isReviewerWakeEligible(thread)) {
           if (this.isReviewerActive(thread.threadId)) continue;
+          if (thread.reviewBlocked || thread.worktree?.integration?.stashRecoveryPending) continue;
           const history = thread.mergeHistory || [];
-          const started = [...history].reverse().find(event => event.phase === 'reviewer' && event.result === 'started' && event.attemptId);
-          if (!started || history.some(event => event.phase === 'reviewer' && event.attemptId === started.attemptId && event.result !== 'started')) continue;
+          const startedIndex = history.map(event => event.phase === 'reviewer' && event.result === 'started' && !!event.attemptId).lastIndexOf(true);
+          const started = startedIndex < 0 ? undefined : history[startedIndex];
+          const handoffAfterStart = started && history.slice(startedIndex + 1).some(event =>
+            (event.phase === 'decision' && event.result === 'answered') ||
+            (['conflict', 'validation_failed', 'blocked', 'snapshot', 'coordinator'].includes(event.phase) && event.result === 'failed'));
+          const finished = started && history.some(event => event.phase === 'reviewer' && event.attemptId === started.attemptId && event.result !== 'started');
+          if (!started || finished || handoffAfterStart) {
+            if ((thread.reviewWake?.autoRetryAt && !thread.reviewWake.gaveUp) || this.reviewAgeMs(thread, now) < this.stallTimeoutMs) continue;
+            const lastDecision = [...history].reverse().find(event => event.phase === 'decision' && event.result === 'answered');
+            const decisionAfterWake = !!lastDecision && Date.parse(lastDecision.at) >= Date.parse(thread.reviewWake?.lastAttemptAt || '');
+            if (thread.reviewWake?.gaveUp && !decisionAfterWake) {
+              applyReviewFailure(thread, { kind: 'retries_exhausted', reason: thread.reviewWake.lastError || 'Merge reviewer retries were exhausted.', round: thread.currentRound || 1, by: 'watchdog', wake: thread.reviewWake });
+              this.taskStore.upsertTask(thread);
+              stalled.push(thread);
+              continue;
+            }
+            const round = this.reviewRound(thread);
+            if (!round) {
+              applyReviewFailure(thread, { kind: 'retries_exhausted', reason: 'Cannot resume merge review: no completed work round is available.', round: thread.currentRound || 1, by: 'watchdog' });
+              this.taskStore.upsertTask(thread);
+            } else {
+              const state: ReviewWakeState = { kind: 'pending', round: round.round, agent: thread.initiatorAgent,
+                attempts: thread.reviewWake?.attempts || 0, autoRetryAttempts: thread.reviewWake?.autoRetryAttempts || 0,
+                lastAttemptAt: new Date(now).toISOString(), lastError: '', autoRetryAt: new Date(now).toISOString() };
+              this.persist(thread, state);
+            }
+            stalled.push(thread);
+            continue;
+          }
           const startedAt = Date.parse(started.at);
           if (!Number.isFinite(startedAt) || now - startedAt < this.stallTimeoutMs) continue;
           const reason = 'Reviewer process disappeared before reporting completion';
@@ -298,7 +327,7 @@ export class ReviewWakeScheduler extends EventEmitter {
           stalled.push(thread);
           continue;
         }
-        if (thread.status !== 'waiting_review') continue;
+        if (thread.status !== 'reviewing') continue;
         if (this.isReviewerActive(thread.threadId)) continue;
         const state = thread.reviewWake;
         if (state) {
@@ -312,7 +341,7 @@ export class ReviewWakeScheduler extends EventEmitter {
           // otherwise the callback or this watchdog records the final failure.
           // Heal ledgers written before `review_failed` existed: a wake plan that
           // already gave up means no reviewer is coming. Rows used to stay
-          // `waiting_review` forever in that shape (the old watchdog skipped any
+          // `reviewing` forever in that shape (the old watchdog skipped any
           // thread that already had a record), which keeps occupying the queue.
           if (state.gaveUp) {
             const healed = applyReviewFailure(thread, {
@@ -514,7 +543,7 @@ export class ReviewWakeScheduler extends EventEmitter {
         // No automatic attempt left: the review did not succeed and will not
         // retry itself. Make that a first-class terminal status so the queue
         // advances and the cause stays visible, instead of parking the task in
-        // `waiting_review` forever.
+        // `reviewing` forever.
         applyReviewFailure(thread, {
           kind: failure?.kind || 'retries_exhausted',
           reason:

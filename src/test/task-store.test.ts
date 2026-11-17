@@ -133,12 +133,12 @@ describe('TaskStore Tests', () => {
         durationMs: 4200,
         status: 'completed',
       },
-      'waiting_review',
+      'reviewing',
     );
 
     const updated = taskStore.getTask('thread_update_test');
     assert.ok(updated);
-    assert.strictEqual(updated.status, 'waiting_review');
+    assert.strictEqual(updated.status, 'reviewing');
     assert.strictEqual(updated.rounds[0].status, 'completed');
     assert.strictEqual(updated.rounds[0].durationMs, 4200);
     assert.ok(updated.summary.lastOutputSnippet.includes('Successfully implemented TCP decoder'));
@@ -191,20 +191,20 @@ describe('TaskStore Tests', () => {
     const now = new Date(Date.now() - 10_000).toISOString();
     const thread: DelegationThread = {
       threadId: 'thread_merge_failure', title: 'merge failure', initiatorAgent: 'codex', targetAgent: 'claude_code',
-      status: 'waiting_merge', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session', workspace: testWorkspace(tempDir),
+      status: 'merging', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session', workspace: testWorkspace(tempDir),
       summary: { lastPromptSnippet: 'review', lastOutputSnippet: 'approved', totalDurationMs: 1 }, rounds: [],
       worktree: { path: tempDir, mainPath: tempDir, repositoryPath: tempDir, commonDir: tempDir, targetRef: 'refs/mesh/batch', taskBranch: 'mesh/task/x', baseCommit: 'base', headCommit: 'approved', approvedCommit: 'approved', integration: { phase: 'waiting', updatedAt: now } },
     };
     taskStore.upsertTask(thread);
     const stale = JSON.parse(JSON.stringify(thread)) as DelegationThread;
     const latest = taskStore.getTask(thread.threadId)!;
-    latest.status = 'waiting_review';
+    latest.status = 'reviewing';
     latest.worktree!.approvedCommit = undefined;
     latest.worktree!.integration = { phase: 'validation_failed', error: 'combined test failed', updatedAt: new Date().toISOString() };
     taskStore.upsertTask(latest);
     taskStore.upsertTask(stale);
     const persisted = taskStore.getTask(thread.threadId)!;
-    assert.equal(persisted.status, 'waiting_review');
+    assert.equal(persisted.status, 'reviewing');
     assert.equal(persisted.worktree!.approvedCommit, undefined);
     assert.equal(persisted.worktree!.integration!.phase, 'validation_failed');
     assert.equal(persisted.worktree!.integration!.error, 'combined test failed');
