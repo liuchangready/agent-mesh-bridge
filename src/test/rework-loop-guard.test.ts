@@ -27,7 +27,7 @@ function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread
     title: 'no-op rework guard',
     initiatorAgent: 'codex',
     targetAgent: 'deepseek_harness',
-    status: 'waiting_review',
+    status: 'reviewing',
     currentRound: 1,
     createdAt: '2026-10-23T10:00:00.000Z',
     updatedAt: '2026-10-23T10:00:00.000Z',
@@ -116,7 +116,7 @@ describe('review block and terminal state', () => {
     });
 
     const parked = store.getTask('thread_loop_1')!;
-    assert.strictEqual(parked.status, 'waiting_review');
+    assert.strictEqual(parked.status, 'reviewing');
     assert.strictEqual(parked.rounds.length, before, 'a blocked review must not add a round');
     assert.strictEqual(parked.reviewWake, undefined, 'no retry timer for a parked review');
     assert.strictEqual(parked.reviewBlocked?.waitingForThreadId, 'thread_pg_1');
@@ -127,7 +127,7 @@ describe('review block and terminal state', () => {
     store.upsertTask(makeThread({ status: 'running' }));
     assert.throws(
       () => controller.blockReview({ threadId: 'thread_loop_1', reason: 'x' }),
-      /not "waiting_review"/,
+      /not "reviewing"/,
     );
   });
 

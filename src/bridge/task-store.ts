@@ -12,6 +12,7 @@ import {
   TokenUsageComponent,
   appendInterruption,
   isMergePending,
+  isMergeReview,
   findInFlightRound,
   enterTaskFailure,
 } from './types';
@@ -56,9 +57,23 @@ function canEvictForCapacity(task: DelegationThread): boolean {
 export function normalizeThread(thread: DelegationThread): DelegationThread {
   if (!thread) return thread;
   const oldStatus = thread.status as string;
+  if (oldStatus === 'waiting_review') thread.status = 'reviewing';
+  if (oldStatus === 'waiting_merge') {
+    const phase = thread.worktree?.integration?.phase;
+    if (phase === 'waiting' || phase === 'ready' || !phase) {
+      thread.status = 'queued';
+      thread.queuePhase = 'merge';
+    } else if (['blocked', 'conflict', 'validation_failed'].includes(phase)) {
+      thread.status = 'reviewing';
+      if (thread.worktree) thread.worktree.mergePending = true;
+    } else {
+      thread.status = 'merging';
+    }
+  }
   if (oldStatus === 'reworking') {
     thread.status = 'running';
   }
+  if (thread.status !== 'queued' && thread.status !== 'paused') thread.queuePhase = undefined;
   if (oldStatus === 'review_failed' || oldStatus === 'merge_failed' || oldStatus === 'failed') {
     const validStage = thread.failure?.stage && ['bootstrap', 'execution', 'review', 'merge'].includes(thread.failure.stage)
       ? thread.failure.stage : undefined;
@@ -903,9 +918,9 @@ export class TaskStore extends EventEmitter {
         all = all.filter(
           (t) =>
             t.status === 'running' ||
-            t.status === 'waiting_review' ||
+            t.status === 'reviewing' ||
             t.status === 'queued' ||
-            t.status === 'waiting_merge' ||
+            t.status === 'merging' ||
             t.status === 'wait_decision' ||
             (t.status === 'failed' && t.failure?.stage === 'merge') ||
             t.status === 'paused',
@@ -916,6 +931,10 @@ export class TaskStore extends EventEmitter {
       } else if (statusFilter === 'reworking') {
         // Compatibility alias: match tasks normalized to 'running' whose in-flight round is rework
         all = all.filter((t) => t.status === 'running' && findInFlightRound(t)?.type === 'rework');
+      } else if (statusFilter === 'waiting_review') {
+        all = all.filter((t) => t.status === 'reviewing');
+      } else if (statusFilter === 'waiting_merge') {
+        all = all.filter((t) => t.status === 'merging' || (t.status === 'queued' && t.queuePhase === 'merge') || isMergeReview(t));
       } else {
         all = all.filter((t) => t.status === statusFilter);
       }

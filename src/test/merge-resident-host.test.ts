@@ -48,7 +48,7 @@ function initRepo(root: string): void {
 function makeThread(threadId: string, worktree: ReturnType<typeof createTaskWorktree>): DelegationThread {
   const now = new Date().toISOString();
   return {
-    threadId, title: threadId, initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'waiting_review', currentRound: 1,
+    threadId, title: threadId, initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'reviewing', currentRound: 1,
     createdAt: now, updatedAt: now, receiverSessionId: `session-${threadId}`, workspace: testWorkspace(worktree.path),
     summary: { lastPromptSnippet: 'review', lastOutputSnippet: 'done', totalDurationMs: 1 },
     rounds: [{ round: 1, type: 'initial', prompt: 'change', output: 'changed file', durationMs: 1, status: 'completed', timestamp: now }],
@@ -76,7 +76,7 @@ test('resident host observes a short-lived MCP approval from disk and merges wit
   const host = makeController(hostStore, true); const shortMcp = makeController(mcpStore);
   t.after(() => { host.dispose(); hostStore.dispose(); mcpStore.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
   mcpStore.upsertTask(makeThread('thread_resident_merge', worktree));
-  assert.equal(shortMcp.approveTask({ threadId: 'thread_resident_merge' }).status, 'WAITING_MERGE');
+  assert.equal(shortMcp.approveTask({ threadId: 'thread_resident_merge' }).status, 'QUEUED');
   await waitFor(() => hostStore.getTask('thread_resident_merge')?.status === 'completed', 30_000);
   assert.equal(gitOutput(repo, ['rev-parse', target.targetRef]), hostStore.getTask('thread_resident_merge')?.worktree?.integration?.mergedCommit);
 });
@@ -92,11 +92,11 @@ test('pre-ref merge infrastructure failure returns a concrete error to the origi
   const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector);
   t.after(() => { store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
   const original = makeThread('thread_merge_review_error', worktree); original.callerSessionId = 'reviewer-session-original';
-  store.upsertTask({ ...original, status: 'waiting_merge', worktree: { ...worktree, approvedCommit: worktree.headCommit, integration: { phase: 'waiting', updatedAt: new Date().toISOString() } } });
+  store.upsertTask({ ...original, status: 'merging', worktree: { ...worktree, approvedCommit: worktree.headCommit, integration: { phase: 'waiting', updatedAt: new Date().toISOString() } } });
   controller.resumePendingMerges();
   await waitFor(() => notified.length === 1);
   const latest = store.getTask('thread_merge_review_error')!;
-  assert.equal(latest.status, 'waiting_merge');
+  assert.equal(latest.status, 'reviewing');
   assert.equal(latest.worktree?.approvedCommit, worktree.headCommit);
   assert.match(latest.worktree?.integration?.error || '', /Git|fatal|unknown revision|not a valid object/i);
   assert.equal(notified[0].threadId, 'thread_merge_review_error');
@@ -109,7 +109,7 @@ test('a landed ref with repeated ledger EIO is not retried in a loop and recover
   const repo = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repo);
   const target = resolveGitRepository(repo, storage); const worktree = createTaskWorktree(target, 'thread_resident_ledger_eio', storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'changed\n'); worktree.headCommit = commitTaskChanges(worktree, 'task change');
-  const task = makeThread('thread_resident_ledger_eio', worktree); task.status = 'waiting_merge'; task.worktree!.approvedCommit = worktree.headCommit;
+  const task = makeThread('thread_resident_ledger_eio', worktree); task.status = 'merging'; task.worktree!.approvedCommit = worktree.headCommit;
   task.worktree!.integration = { phase: 'waiting', updatedAt: new Date().toISOString() };
   const store = new TaskStore(storage); store.upsertTask(task);
   let host: ReworkController;
@@ -131,8 +131,8 @@ test('a landed ref with repeated ledger EIO is not retried in a loop and recover
   assert.equal(writeFailures, failuresAfterSettlement, 'the landed transaction is parked instead of retrying each poll');
   assert.equal(gitOutput(repo, ['rev-parse', target.targetRef]), landed);
   assert.equal(JSON.parse(fs.readFileSync(txFile, 'utf8')).phase, 'checkout_synced');
-  assert.equal(store.getTask('thread_resident_ledger_eio')?.status, 'waiting_merge');
-  assert.equal(JSON.parse(fs.readFileSync(taskFile, 'utf8')).status, 'waiting_merge');
+  assert.equal(store.getTask('thread_resident_ledger_eio')?.status, 'merging');
+  assert.equal(JSON.parse(fs.readFileSync(taskFile, 'utf8')).status, 'merging');
 
   mutableFs.renameSync = realRename;
   host.dispose(); store.dispose();
@@ -149,7 +149,7 @@ test('an initial ledger EIO is logged and backed off until the same host can rec
   const target = resolveGitRepository(repo, storage); const id = 'thread_resident_pre_ref_eio';
   const worktree = createTaskWorktree(target, id, storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'changed\n'); worktree.headCommit = commitTaskChanges(worktree, 'task change');
-  const task = makeThread(id, worktree); task.status = 'waiting_merge'; task.worktree!.approvedCommit = worktree.headCommit;
+  const task = makeThread(id, worktree); task.status = 'queued'; task.queuePhase = 'merge'; task.worktree!.approvedCommit = worktree.headCommit;
   task.worktree!.integration = { phase: 'waiting', updatedAt: new Date().toISOString() };
   const store = new TaskStore(storage); store.upsertTask(task);
   const detector = new AgentDetector(); const callback = new CallbackManager(detector); let wakes = 0;
@@ -167,7 +167,7 @@ test('an initial ledger EIO is logged and backed off until the same host can rec
   await new Promise((resolve) => setTimeout(resolve, 1_500));
   assert.equal(failures, failuresAfterSettlement, 'one-second host polls must not retry a failed ledger write');
   assert.equal(wakes, 0); assert.equal(gitOutput(repo, ['rev-parse', target.targetRef]), target.baseCommit);
-  assert.equal(store.getTask(id)?.status, 'waiting_merge');
+  assert.equal(store.getTask(id)?.status, 'queued');
   const logs = path.join(storage, 'merge-logs', id, 'merge_log');
   const originalLog = path.join(logs, `${id}_merge_1.log`);
   const originalContent = fs.readFileSync(originalLog, 'utf8'); assert.match(originalContent, /EIO/i);

@@ -24,8 +24,8 @@
 export type ThreadStatus =
   | 'queued'
   | 'running'
-  | 'waiting_review'
-  | 'waiting_merge'
+  | 'reviewing'
+  | 'merging'
   | 'wait_decision'
   | 'paused'
   | 'completed'
@@ -74,14 +74,15 @@ failureRevision?: number;
 stateDiagram-v2
     queued --> failed: bootstrap 失败，stage=bootstrap
     running --> failed: 开发失败，stage=execution
-    waiting_review --> failed: 检视耗尽，stage=review
-    waiting_merge --> failed: 合并耗尽，stage=merge
+    reviewing --> failed: 检视耗尽，stage=review
+    merging --> failed: 合并耗尽，stage=merge
     failed --> running: execution 原轮重试 / 合法返修
-    failed --> waiting_review: review 显式重新检视
-    failed --> waiting_merge: merge 显式 retry_merge
-    running --> waiting_review: 开发成功
-    waiting_review --> waiting_merge: 批准候选
-    waiting_merge --> completed: 合并和验证成功
+    failed --> reviewing: review 显式重新检视
+    failed --> reviewing: merge 显式 retry_merge 后恢复合入检视
+    running --> reviewing: 开发成功
+    reviewing --> queued: 批准候选，queuePhase=merge
+    queued --> merging: 取得全局合入锁
+    merging --> completed: 合并和验证成功
 ```
 
 图中从 `failed` 出发的动作都必须校验失败阶段。原有角色锁、单轮在飞、bootstrap、会话身份和归档不可恢复约束继续优先执行。
@@ -89,19 +90,19 @@ stateDiagram-v2
 ### 恢复入口的具体调整
 
 1. `retryFailedRound()` 只接受 `failed/execution`，且仍要求最新工作轮为失败；`failed/review` 返回“使用重新检视”，`failed/merge` 返回“使用 retry_merge”，bootstrap 返回既有安全交接错误。不追加轮次。
-2. `reopenFailedReview()` 只接受 `failed/review`，回到 `waiting_review`、清理旧唤醒计划和当前失败，保留 `reviewFailure`。`notifyCaller()` 只能从这个阶段走重新检视分支；不能把普通 `failed` 全部重开。
-3. `retryMerge()` 只接受 `failed/merge`，保留 thread、批准快照、合并工作区和两端 session，增加 `retryGeneration`、清理当前失败、按既有规则回到 `waiting_merge`。工具名不改。
+2. `reopenFailedReview()` 只接受 `failed/review`，回到 `reviewing`、清理旧唤醒计划和当前失败，保留 `reviewFailure`。`notifyCaller()` 只能从这个阶段走重新检视分支；不能把普通 `failed` 全部重开。
+3. `retryMerge()` 只接受 `failed/merge`，保留 thread、批准快照、合并工作区和两端 session，增加 `retryGeneration`、清理当前失败，并按恢复阶段回到 `reviewing` 或 `queued`（merge）。工具名不改。
 4. rework/approve/retarget 在 `failed/merge` 继续拒绝；execution/review 沿用原有准入，bootstrap 不得绕过 `assertDedicatedReviewerReady()`。所有入口都保留 `archivedAt` 拒绝恢复。
 5. `pause_task` 继续拒绝失败态；恢复暂停任务仍使用 `resume_task`，不能把失败状态当暂停恢复。
-6. 用户决定提交仍是 `wait_decision -> waiting_merge`；不得因为统一失败字段而调用 `retryMerge()` 或重置合并预算。
+6. 用户决定提交是 `wait_decision -> reviewing`，恢复原检视阶段；不得因为统一失败字段而调用 `retryMerge()` 或重置合并预算。
 
 ## 4. 写入、回调与并发副本
 
 在现有 types/失败处理模块内增加少量阶段判断和进入/清除失败的共享函数即可，不建立通用转换引擎。所有现存失败写入点都要改造，不能只修改枚举和 UI。
 
 - Dispatcher、Supervisor、ReworkController 的开发结果分支写 `failed/execution`；bootstrap token 写入失败、服务失败、恢复时凭证缺失写 `failed/bootstrap`，同时结束对应占位轮。
-- `applyReviewFailure()` 写 `failed/review`，reason 取该次 `ReviewFailure.reason`；仍只允许从当前有效 `waiting_review` 转换。
-- `noteMergeFailure()` 保留 fingerprint、初次失败不算 retry、连续第六次 retry 失败的算法；达到阈值时写 `failed/merge`，reason/code 取触发阈值的失败，而非旧开发轮错误。低于阈值仍为 `waiting_merge`。
+- `applyReviewFailure()` 写 `failed/review`，reason 取该次 `ReviewFailure.reason`；仍只允许从当前有效 `reviewing` 转换。
+- `noteMergeFailure()` 保留 fingerprint、初次失败不算 retry、连续第六次 retry 失败的算法；达到阈值时写 `failed/merge`，reason/code 取触发阈值的失败，而非旧开发轮错误。低于阈值时合入问题交回 `reviewing`。
 - 合并失败落账后，停止该任务自动合并和 Reviewer 唤醒，按既有取消/退出机制释放进程、角色和会话租约。不能仅改成 `failed` 后仍被开发失败通知重新激活。
 - `notifyCallerOfFailure()`、失败唤醒队列重放只处理 `failed/execution`；review/merge/bootstrap 走自己的路径。旧 pending failure wake 重放时重新读取任务并检查阶段，拒绝错阶段重放。
 - `ReviewWakeScheduler` 的普通检视耗尽和合并 Reviewer 重试分支分别落账到 review/merge；候选仍由 `isReviewerWakeEligible()`、预算、角色和会话锁决定，不把所有 `failed` 纳入定时调度。

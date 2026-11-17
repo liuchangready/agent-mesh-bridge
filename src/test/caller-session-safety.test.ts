@@ -89,7 +89,7 @@ describe('caller session resolution', () => {
       title: 'Caller session fixture',
       initiatorAgent: 'codex',
       targetAgent: 'claude_code',
-      status: 'waiting_review',
+      status: 'reviewing',
       currentRound: 1,
       createdAt: new Date(0).toISOString(),
       updatedAt: new Date(0).toISOString(),

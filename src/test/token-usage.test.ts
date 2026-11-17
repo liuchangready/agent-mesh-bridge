@@ -55,7 +55,7 @@ function makeThread(rounds: DelegationRound[]): DelegationThread {
     title: 'token fixture',
     initiatorAgent: 'claude_code',
     targetAgent: 'codex',
-    status: 'waiting_review',
+    status: 'reviewing',
     currentRound: rounds.length,
     createdAt: now,
     updatedAt: now,

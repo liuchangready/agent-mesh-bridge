@@ -194,7 +194,7 @@ describe('TaskControlService - pause/delete reasons', () => {
   });
 
   test('deleting a task stops and waits for its live reviewer child before removing it', async () => {
-    const thread = makeThread({ status: 'waiting_review', rounds: [{ round: 1, type: 'initial', prompt: 'p', output: 'o', durationMs: 1, status: 'completed', timestamp: new Date().toISOString() }] });
+    const thread = makeThread({ status: 'reviewing', rounds: [{ round: 1, type: 'initial', prompt: 'p', output: 'o', durationMs: 1, status: 'completed', timestamp: new Date().toISOString() }] });
     taskStore.upsertTask(thread);
     const roles = new TaskRoleLock(tempDir); const lease = roles.tryAcquire(thread.threadId, 'reviewer'); assert.ok(lease);
     const reviewer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
@@ -262,13 +262,13 @@ describe('TaskControlService - pause/delete reasons', () => {
 
     const deadline = Date.now() + 2_000;
     while (Date.now() < deadline) {
-      if (taskStore.getTask('thread_control_1')?.status === 'waiting_review') break;
+      if (taskStore.getTask('thread_control_1')?.status === 'reviewing') break;
       await new Promise((r) => setTimeout(r, 20));
     }
 
     const thread = taskStore.getTask('thread_control_1')!;
     assert.strictEqual(executedPrompt, 'do the work');
-    assert.strictEqual(thread.status, 'waiting_review');
+    assert.strictEqual(thread.status, 'reviewing');
     assert.strictEqual(thread.interruption, undefined, 'current interruption cleared');
     assert.strictEqual(thread.rounds[0].interruption, undefined, 'persisted round clears its pause marker');
     assert.strictEqual(thread.interruptions?.[0]?.reason, 'pause for inspection', 'history kept');

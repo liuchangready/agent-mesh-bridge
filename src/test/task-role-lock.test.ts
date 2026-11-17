@@ -204,12 +204,12 @@ describe('Task role enforcement in execution', () => {
 
       const deadline = Date.now() + 2_000;
       while (Date.now() < deadline) {
-        if (store.getTask('thread_role_1')?.status === 'waiting_review') break;
+        if (store.getTask('thread_role_1')?.status === 'reviewing') break;
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
 
       assert.strictEqual(executions, 1, 'developer starts after reviewer handoff');
-      assert.strictEqual(store.getTask('thread_role_1')?.status, 'waiting_review');
+      assert.strictEqual(store.getTask('thread_role_1')?.status, 'reviewing');
     } finally {
       if (reviewer) roleLock.release(reviewer);
       supervisor.dispose();
@@ -224,7 +224,7 @@ describe('Task role enforcement in execution', () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-role-cb-'));
     const store = new TaskStore(tempDir);
     const thread = makeThread({
-      status: 'waiting_review',
+      status: 'reviewing',
       rounds: [
         {
           round: 1,

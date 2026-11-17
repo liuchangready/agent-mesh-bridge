@@ -62,7 +62,7 @@ function makeThread(rounds: DelegationRound[], over: Partial<DelegationThread> =
     title: 'compaction fixture',
     initiatorAgent: 'codex',
     targetAgent: 'claude_code',
-    status: 'waiting_review',
+    status: 'reviewing',
     currentRound: rounds.length,
     createdAt: now,
     updatedAt: now,

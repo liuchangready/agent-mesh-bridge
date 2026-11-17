@@ -136,14 +136,14 @@ test('completed and archived tasks cannot be retried or have output cleared', as
 test('waiting review cannot retry an older failure behind a newer successful round', async () => {
   await withController(async ({ store, controller }) => {
     const waiting = task({
-      status: 'waiting_review',
+      status: 'reviewing',
       currentRound: 3,
       rounds: [round(1, 'failed', 'initial'), round(2, 'completed'), round(3, 'completed')],
     });
     store.upsertTask(waiting);
     const before = persisted(store.getTask(waiting.threadId));
 
-    await assert.rejects(controller.retryFailedRound(waiting.threadId), /while it is waiting_review/i);
+    await assert.rejects(controller.retryFailedRound(waiting.threadId), /while it is reviewing/i);
 
     assert.deepEqual(persisted(store.getTask(waiting.threadId)), before);
   });
@@ -203,7 +203,7 @@ test('retry does not revive a task completed during executor approval', async ()
 
 test('dedicated rework cannot rebind reviewer session from params or detector', async () => {
   await withController(async ({ store, controller }) => {
-    const ready = task({ status: 'waiting_review', currentRound: 1, rounds: [round(1, 'completed', 'initial')] });
+    const ready = task({ status: 'reviewing', currentRound: 1, rounds: [round(1, 'completed', 'initial')] });
     store.upsertTask(ready);
     const before = persisted(store.getTask(ready.threadId));
 

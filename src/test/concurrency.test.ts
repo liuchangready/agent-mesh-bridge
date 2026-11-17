@@ -195,7 +195,7 @@ describe('AsyncDispatcher - independent task admission', () => {
       assert.strictEqual(taskStore.getTask(task.threadId)?.status, 'running');
     } finally {
       releaseTask();
-      await waitFor(() => taskStore.getTask(task.threadId)?.status === 'waiting_review').catch(() => {});
+      await waitFor(() => taskStore.getTask(task.threadId)?.status === 'reviewing').catch(() => {});
     }
     assert.strictEqual(taskStore.getTask(task.threadId)?.rounds[0].status, 'completed');
   });
@@ -227,7 +227,7 @@ describe('AsyncDispatcher - independent task admission', () => {
       assert.ok(!running.logs.includes('[LOG LINE 1] processing data chunk 1'));
     } finally {
       releaseTask();
-      await waitFor(() => taskStore.getTask(task.threadId)?.status === 'waiting_review');
+      await waitFor(() => taskStore.getTask(task.threadId)?.status === 'reviewing');
       supervisor.dispose();
     }
     const completed = TaskSupervisor.getRecentLogs(task.threadId, 500, taskStore);
@@ -340,10 +340,11 @@ describe('QueueDrainer - scan every runnable candidate', () => {
     store.upsertTask(makePendingThread('review', workspace, old) as any);
     store.upsertTask(makePendingThread('blocked', workspace, old) as any);
     store.upsertTask(makePendingThread('bootstrap', workspace, old) as any);
+    store.upsertTask({ ...makePendingThread('merge', workspace, old), status: 'queued', queuePhase: 'merge' });
     store.upsertTask(makePendingThread('ready', workspace, old) as any);
     const paused = store.getTask('paused')!; paused.status = 'paused'; store.upsertTask(paused);
-    const review = store.getTask('review')!; review.status = 'waiting_review'; store.upsertTask(review);
-    const blocked = store.getTask('blocked')!; blocked.status = 'waiting_review'; blocked.reviewBlocked = { reason: 'dependency', at: old } as any; store.upsertTask(blocked);
+    const review = store.getTask('review')!; review.status = 'reviewing'; store.upsertTask(review);
+    const blocked = store.getTask('blocked')!; blocked.status = 'reviewing'; blocked.reviewBlocked = { reason: 'dependency', at: old } as any; store.upsertTask(blocked);
     const bootstrap = store.getTask('bootstrap')!; bootstrap.reviewFlow = 'dedicated'; bootstrap.reviewBootstrap = { phase: 'pending', attempts: 0 }; store.upsertTask(bootstrap);
 
     const started: string[] = [];
@@ -396,10 +397,13 @@ describe('TaskSupervisor - same-workspace overlap and same-thread exclusion', ()
     const when = new Date().toISOString();
     const a = makePendingThread('thread_a', ws, when);
     const b = makePendingThread('thread_b', ws, when);
-    store.upsertTask(a); store.upsertTask(b);
+    const merge = { ...makePendingThread('thread_merge', ws, when), status: 'queued' as const, queuePhase: 'merge' as const };
+    store.upsertTask(merge); store.upsertTask(a); store.upsertTask(b);
     supervisor.checkPendingTasks();
     await waitFor(() => starts.length === 2);
     assert.deepStrictEqual(starts.slice().sort(), ['thread_a', 'thread_b']);
+    await supervisor.executeThreadRound(merge, merge.rounds[0]);
+    assert.equal(starts.includes('thread_merge'), false);
     assert.strictEqual(registry.listOwners().length, 2);
 
     const same = makePendingThread('thread_same', ws, when);

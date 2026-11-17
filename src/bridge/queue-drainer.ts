@@ -53,10 +53,10 @@ export class QueueDrainer {
     const allTasks = this.taskStore.getAllTasks();
     const candidates = allTasks
       .filter((thread) => {
-        if (!thread || !thread.threadId || thread.status === 'paused' || thread.status === 'waiting_review') {
+        if (!thread || !thread.threadId || thread.status === 'paused' || thread.status === 'reviewing') {
           return false;
         }
-        if (thread.reviewBlocked || isReviewerBootstrapPending(thread)) return false;
+        if (thread.queuePhase === 'merge' || thread.reviewBlocked || isReviewerBootstrapPending(thread)) return false;
         return thread.status === 'queued' || thread.status === 'running';
       })
       .map((thread) => ({ thread, round: findInFlightRound(thread) }))

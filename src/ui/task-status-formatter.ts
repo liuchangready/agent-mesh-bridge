@@ -17,7 +17,7 @@ export function formatTaskTreeStatus(thread: DelegationThread): TaskStatusDispla
   switch (thread.status) {
     case 'queued':
       iconName = 'clock';
-      statusLabel = `Queued (排队中)`;
+      statusLabel = thread.queuePhase === 'merge' ? 'Queued for integration' : `Queued (排队中)`;
       break;
     case 'running': {
       iconName = 'sync~spin';
@@ -32,15 +32,15 @@ export function formatTaskTreeStatus(thread: DelegationThread): TaskStatusDispla
       }
       break;
     }
-    case 'waiting_merge':
+    case 'merging':
       iconName = 'git-merge';
-      statusLabel = 'Waiting for verified integration';
+      statusLabel = 'Integrating and validating';
       break;
     case 'wait_decision':
       iconName = 'question';
       statusLabel = 'Waiting for user decision';
       break;
-    case 'waiting_review':
+    case 'reviewing':
       iconName = 'eye';
       statusLabel = `In-Review (${roundText})`;
       break;

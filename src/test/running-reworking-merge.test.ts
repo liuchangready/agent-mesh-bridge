@@ -251,7 +251,7 @@ describe('Running and Reworking Status Merge Tests', () => {
       title: 'Lifecycle Task',
       initiatorAgent: 'codex',
       targetAgent: 'antigravity',
-      status: 'waiting_review',
+      status: 'reviewing',
       currentRound: 1,
       createdAt: '2026-10-20T10:00:00.000Z',
       updatedAt: '2026-10-20T10:00:00.000Z',

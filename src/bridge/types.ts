@@ -29,8 +29,8 @@ export type ModelResolutionSource =
 export type ThreadStatus =
   | 'queued'
   | 'running'
-  | 'waiting_review'
-  | 'waiting_merge'
+  | 'reviewing'
+  | 'merging'
   | 'wait_decision'
   | 'paused'
   | 'completed'
@@ -64,8 +64,12 @@ export function clearTaskFailure(thread: DelegationThread): void {
 
 /** States in which a completed developer round can be reviewed. */
 export function isReviewerWakeEligible(thread: DelegationThread): boolean {
-  return thread.status === 'waiting_review' ||
-    (thread.status === 'waiting_merge' && ['blocked', 'conflict', 'validation_failed'].includes(thread.worktree?.integration?.phase || ''));
+  return thread.status === 'reviewing';
+}
+
+export function isMergeReview(thread: DelegationThread): boolean {
+  return thread.status === 'reviewing' && !!(thread.worktree?.mergePending || thread.worktree?.approvedCommit) &&
+    ['blocked', 'conflict', 'validation_failed'].includes(thread.worktree.integration?.phase || '');
 }
 
 /**
@@ -621,12 +625,12 @@ export function isIsolatedTaskWorktree(worktree?: WorktreeInfo): worktree is Wor
  * The receiver round finishing does not imply the review happened: the wake
  * spawns the caller's CLI, and that process can die (quota, expired session,
  * provider outage) before it calls `approve_task` / `request_rework`. Without a
- * record, the task would sit in `waiting_review` forever with no trace of why.
+ * record, the task would sit in `reviewing` forever with no trace of why.
  * This is that trace, plus the plan for the automatic retry.
  */
 export interface ReviewWakeState {
   /** How the stall was detected. */
-  kind?: 'wake_failed' | 'timeout';
+  kind?: 'wake_failed' | 'timeout' | 'pending';
   /** Round the reviewer still has to inspect. */
   round: number;
   /** Failed wake attempts since the last recorded review handoff. */
@@ -673,7 +677,7 @@ export interface ReviewBlockInfo {
  * reviewer ever produced a verdict (the wake died, the retry budget ran out, or
  * the review was parked on a dependency nothing in the mesh can observe). It is
  * kept separate from `failed` because the delivered work may be perfectly good —
- * only the review is missing — and separate from `waiting_review` because no
+ * only the review is missing — and separate from `reviewing` because no
  * reviewer is working and nothing will ever move it without human action.
  *
  * Terminal semantics (identical to `failed` for scheduling): the task releases
@@ -716,14 +720,15 @@ export interface DelegationThread {
   initiatorAgent: AgentId; // Initiator (Caller A)
   targetAgent: AgentId; // Receiver (Target B)
   status: ThreadStatus; // Lifecycle status; each task has its own isolated Git worktree.
+  queuePhase?: 'development' | 'merge'; // Missing means development for existing ledgers.
   currentRound: number; // Current round (1: initial, 2+: rework)
   createdAt: string; // ISO8601 creation timestamp
   updatedAt: string; // ISO8601 update timestamp
   mergeHistory?: Array<{ id: string; number: number; at: string; phase: string; result: string; error?: string; logPath?: string;
     targetRef?: string; targetOldCommit?: string; targetCommit?: string; sourceCommit?: string; candidateCommit?: string; candidateTree?: string; conflictFiles?: string[];
     mergedCommit?: string; changedFiles?: string[]; decisionId?: string; question?: string; background?: string; suggestion?: string;
-    answer?: string; fingerprint?: string; retryGeneration?: number; consecutiveRetries?: number; errorCode?: string; exitCode?: number; attemptId?: string; logNumber?: number; logFileNumber?: number; assessment?: ResponseAssessment; interruption?: TaskInterruption }>;
-  mergeControl?: { revision: number; retryGeneration: number; failureFingerprint?: string; consecutiveRetries: number; pendingDecisionId?: string };
+    answer?: string; decisionStage?: 'review' | 'merge'; fingerprint?: string; retryGeneration?: number; consecutiveRetries?: number; errorCode?: string; exitCode?: number; attemptId?: string; logNumber?: number; logFileNumber?: number; assessment?: ResponseAssessment; interruption?: TaskInterruption }>;
+  mergeControl?: { revision: number; retryGeneration: number; failureFingerprint?: string; consecutiveRetries: number; pendingDecisionId?: string; decisionStage?: 'review' | 'merge' };
 
   // Native session bindings for continuous rework resume
   receiverSessionId: string; // Native session ID for target agent
@@ -847,7 +852,7 @@ export interface DelegationThread {
    * with no code change: a full execution slot and a new ledger round every few
    * minutes, forever, until the sibling landed.
    *
-   * With this flag the task stays `waiting_review` (so the queue invariants are
+   * With this flag the task stays `reviewing` (so the queue invariants are
    * unchanged) but the watchdog and the wake path leave it alone; it is woken
    * again the moment `waitingForThreadId` reaches a terminal state.
    */
@@ -1035,7 +1040,7 @@ export interface ApproveTaskParams {
 
 export interface ApproveResult {
   threadId: string;
-  status: 'WAITING_MERGE' | 'MERGE_FAILED' | 'COMPLETED';
+  status: 'QUEUED' | 'REVIEWING' | 'MERGE_FAILED' | 'COMPLETED';
   message: string;
 }
 
@@ -1201,7 +1206,7 @@ export function shouldResumeNativeSession(
  * Task-level queue occupancy.
  *
  * A task occupies the one global task slot until it reaches a terminal state:
- * `completed`, `failed` or `review_failed`. `waiting_review` and `paused` are
+ * `completed`, `failed` or `review_failed`. `reviewing` and `paused` are
  * still unfinished tasks and MUST block every other task, not just developer
  * rounds. `failed` and `review_failed` are terminal for queue purposes so old
  * failures cannot block the mesh forever; retrying/re-reviewing either one
