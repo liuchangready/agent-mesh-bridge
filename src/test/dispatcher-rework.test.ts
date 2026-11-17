@@ -630,7 +630,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     // A thread may only be approved once nothing is in flight.
     await waitForStatus(dispatchRes.threadId, 'reviewing');
 
-    const approveRes = reworkController.approveTask({
+    const approveRes = await reworkController.approveTask({
       threadId: dispatchRes.threadId,
       remarks: 'All lint checks passed.',
     });

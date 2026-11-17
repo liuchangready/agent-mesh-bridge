@@ -28,6 +28,7 @@ import {
 import { cleanupThreadNativeSessions, collectThreadSessionRefs } from './native-session-cleanup';
 import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
 import { removeTaskDataDir } from './task-data-dir';
+import { MeshFileLock } from './mesh-file-lock';
 
 export const MAX_STORED_TASKS = 1000;
 
@@ -74,6 +75,8 @@ export function normalizeThread(thread: DelegationThread): DelegationThread {
     thread.status = 'running';
   }
   if (thread.status !== 'queued' && thread.status !== 'paused') thread.queuePhase = undefined;
+  // Controller records already carry explicit failure and execution identities.
+  if (thread.execution) return thread;
   if (oldStatus === 'review_failed' || oldStatus === 'merge_failed' || oldStatus === 'failed') {
     const validStage = thread.failure?.stage && ['bootstrap', 'execution', 'review', 'merge'].includes(thread.failure.stage)
       ? thread.failure.stage : undefined;
@@ -550,11 +553,13 @@ export class TaskStore extends EventEmitter {
           this.ensureUpToDate();
           this.emit('changed', Array.from(this.tasks.values()));
         }, 300);
+        this.watchDebounceTimer.unref?.();
       };
       this.ensureThreadsDir();
-      fs.watchFile(this.threadsDir, { interval: 1000 }, (curr, prev) => {
+      const watcher = fs.watchFile(this.threadsDir, { interval: 1000 }, (curr, prev) => {
         if (curr.mtimeMs !== prev.mtimeMs) onChange();
       });
+      (watcher as any)?.unref?.();
       this.isWatching = true;
     } catch (err) {
       console.warn(`[TaskStore] Failed to setup watchFile:`, err);
@@ -580,6 +585,61 @@ export class TaskStore extends EventEmitter {
   public getTask(threadId: string): DelegationThread | undefined {
     this.ensureUpToDate();
     return this.tasks.get(threadId);
+  }
+
+  /**
+   * Sole gateway for protected execution control, lifecycle, and decision transitions.
+   * Runs inside a short OS file lock, reads fresh state from disk, validates expected revision,
+   * applies change, increments revision, and atomically writes.
+   */
+  public async transitionExecution(
+    threadId: string,
+    expectedRevision: number,
+    change: (thread: DelegationThread) => void,
+  ): Promise<DelegationThread> {
+    const lockDir = path.join(this.storageDir, 'execution-locks');
+    fs.mkdirSync(lockDir, { recursive: true });
+    const lockFile = path.join(lockDir, `${threadId.replace(/[^A-Za-z0-9_-]/g, '_')}.lock`);
+    const lock = new MeshFileLock(lockFile);
+    const release = await lock.acquire(undefined, undefined, 15_000);
+    if (!release) {
+      throw new Error(`Timed out acquiring task execution lock for ${threadId}: ${lockFile}`);
+    }
+    try {
+      this.ensureUpToDate();
+      let thread = this.tasks.get(threadId);
+      const file = this.threadFilePath(threadId);
+      if (fs.existsSync(file)) {
+        try {
+          thread = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+        } catch (err) {
+          throw new Error(`Corrupted task file on disk for ${threadId}: ${(err as Error)?.message || err}`);
+        }
+      }
+      if (!thread) {
+        throw new Error(`Task thread not found: ${threadId}`);
+      }
+      const currentRev = thread.execution?.revision ?? 0;
+      if (currentRev !== expectedRevision) {
+        throw new Error(
+          `Execution revision mismatch for task ${threadId}: expected revision ${expectedRevision}, but found ${currentRev}`,
+        );
+      }
+      change(thread);
+      if (thread.execution) {
+        thread.execution.revision = currentRev + 1;
+      }
+      thread.updatedAt = new Date().toISOString();
+      ensureFinalSummary(thread);
+      this.persistThread(thread);
+      this.tasks.set(thread.threadId, thread);
+      this.writeAggregate();
+      this.emit('changed', Array.from(this.tasks.values()));
+      return thread;
+    } finally {
+      release();
+      lock.dispose();
+    }
   }
 
   /**
@@ -644,6 +704,30 @@ export class TaskStore extends EventEmitter {
         if (prior.mergeControl && (!thread.mergeControl || prior.mergeControl.revision > thread.mergeControl.revision)) {
           thread.mergeControl = structuredClone(prior.mergeControl);
           thread.status = prior.status;
+        }
+        if (prior.execution && (!thread.execution || prior.execution.revision > thread.execution.revision)) {
+          // Ordinary stale upsertTask must not overwrite protected execution, lifecycle status, decisions, or failure!
+          thread.execution = structuredClone(prior.execution);
+          thread.status = prior.status;
+          if (prior.failure) thread.failure = structuredClone(prior.failure);
+          if (prior.decision) thread.decision = structuredClone(prior.decision);
+          if (prior.decisions?.length) thread.decisions = structuredClone(prior.decisions);
+        }
+        if (prior.decision && (!thread.decision || prior.decision.id !== thread.decision.id)) {
+          if (!thread.decision || prior.status === 'wait_decision') {
+            thread.decision = structuredClone(prior.decision);
+          }
+        }
+        if (prior.decisions?.length) {
+          const existingIds = new Set((thread.decisions || []).map((d) => d.id));
+          const mergedDecisions = [...(thread.decisions || [])];
+          for (const d of prior.decisions) {
+            if (!existingIds.has(d.id)) {
+              mergedDecisions.push(structuredClone(d));
+              existingIds.add(d.id);
+            }
+          }
+          thread.decisions = mergedDecisions;
         }
       }
       thread.nativeSessionCompaction = mergeNativeCursors(
@@ -736,7 +820,7 @@ export class TaskStore extends EventEmitter {
         .sort((a, b) => (b.mergeControl?.revision || 0) - (a.mergeControl?.revision || 0))[0];
       if (newestControl?.mergeControl) { thread.mergeControl = structuredClone(newestControl.mergeControl); thread.status = newestControl.status; }
       const persisted = onDisk || inMemory;
-      if (persisted && ((persisted.failureRevision || 0) > (thread.failureRevision || 0) ||
+      if (!thread.execution && persisted && ((persisted.failureRevision || 0) > (thread.failureRevision || 0) ||
           ((persisted.failureRevision || 0) === (thread.failureRevision || 0) &&
            ((persisted.status !== thread.status && (persisted.status === 'failed' || thread.status === 'failed')) ||
             (persisted.status === 'failed' && JSON.stringify(persisted.failure) !== JSON.stringify(thread.failure)))))) {
@@ -870,13 +954,16 @@ export class TaskStore extends EventEmitter {
 
     if (newThreadStatus) {
       // Only transition thread status if this round is the latest round or newer,
-      // or if explicitly closing task
+      // or if explicitly closing task. Tasks with execution records manage lifecycle
+      // strictly through transitionExecution.
       const isLatest = !thread.currentRound || roundNumber >= thread.currentRound;
       if (isLatest) {
         if (newThreadStatus === 'failed') {
           enterTaskFailure(thread, { stage: 'execution', reason: roundUpdate.error || interruption?.reason || 'Execution failed',
             at: new Date().toISOString(), round: roundNumber, code: roundUpdate.assessment?.errorCode });
-        } else thread.status = newThreadStatus;
+        } else {
+          thread.status = newThreadStatus;
+        }
       }
     }
 

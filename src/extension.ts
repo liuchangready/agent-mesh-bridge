@@ -15,6 +15,7 @@ import { ReviewWakeScheduler } from './bridge/review-wake-scheduler';
 import { reopenFailedReview } from './bridge/review-wake';
 import { AsyncDispatcher } from './bridge/async-dispatcher';
 import { ReworkController } from './bridge/rework-controller';
+import { ExecutionController } from './bridge/execution-controller';
 import { ConfigSyncService } from './config/config-sync';
 import { StatusBarController } from './ui/status-bar';
 import { TaskTreeProvider, TaskTreeItem } from './ui/task-tree-provider';
@@ -485,6 +486,16 @@ export function activate(context: vscode.ExtensionContext) {
     true,
   );
   context.subscriptions.push({ dispose: () => reworkController.dispose() });
+  const executionController = new ExecutionController(
+    taskStore,
+    runner,
+    callbackManager,
+    reworkController.getMergeCoordinator(),
+    undefined,
+    undefined,
+    executionRegistry,
+  );
+  context.subscriptions.push({ dispose: () => executionController.dispose() });
   const taskControl = new TaskControlService(taskStore, runner);
   const configSync = new ConfigSyncService(undefined, dshProvider);
   configSync.setAgentMcpEnv(agentMcpEnvFor(dshProvider));

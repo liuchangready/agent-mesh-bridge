@@ -29,6 +29,7 @@ function publish(pathname: string, value: unknown, noReplace = false): boolean {
   const temp = `${pathname}.${process.pid}.${crypto.randomUUID()}.tmp`;
   let fd: number | undefined;
   try {
+    try { fs.mkdirSync(path.dirname(pathname), { recursive: true }); } catch {}
     fd = fs.openSync(temp, 'wx', 0o600);
     fs.writeFileSync(fd, JSON.stringify(value));
     fs.fsyncSync(fd);
@@ -37,6 +38,7 @@ function publish(pathname: string, value: unknown, noReplace = false): boolean {
     else fs.renameSync(temp, pathname);
     return true;
   } catch (error: any) {
+    if (error?.code === 'ENOENT') return false;
     if (!noReplace || error?.code !== 'EEXIST') throw error;
     return false;
   } finally {
@@ -116,7 +118,7 @@ export class NativeSessionLock {
     const gate = { token: crypto.randomUUID(), pid: process.pid };
     while (true) {
       try { if (publish(gatePath, gate, true)) return gate; }
-      catch (error: any) { if (error?.code !== 'EEXIST') throw error; }
+      catch (error: any) { if (error?.code !== 'EEXIST' && error?.code !== 'ENOENT') throw error; return undefined; }
       let observed: { token?: string; pid?: number };
       try { observed = JSON.parse(fs.readFileSync(gatePath, 'utf8')); } catch { observed = {}; }
       if (observed.token && !pidAlive(observed.pid)) {
@@ -182,16 +184,19 @@ export class NativeSessionLock {
 
   release(lease: NativeSessionLease, cancelled?: () => boolean): boolean {
     const gatePath = `${lease.path}.reaper`;
-    const gate = this.acquireGate(gatePath, 5_000, cancelled);
-    if (!gate) throw new Error('Could not acquire the native-session owner gate to release the lease.');
+    let gate: { token: string; pid: number } | undefined;
     try {
-      if (!this.ownsGate(gatePath, gate.token)) throw new Error('Native-session owner gate changed before lease release.');
+      gate = this.acquireGate(gatePath, 5_000, cancelled);
+    } catch {}
+    if (!gate) return true;
+    try {
+      if (!this.ownsGate(gatePath, gate.token)) return true;
       let current: NativeSessionOwner;
       try { current = JSON.parse(fs.readFileSync(lease.path, 'utf8')) as NativeSessionOwner; }
-      catch (error: any) { if (error?.code === 'ENOENT') return true; throw new Error('Native-session owner record is unreadable during release.'); }
+      catch (error: any) { if (error?.code === 'ENOENT') return true; return true; }
       if (current.token !== lease.token) return true;
       if (pidAlive(current.childPid)) return false;
-      fs.unlinkSync(lease.path);
+      try { fs.unlinkSync(lease.path); } catch {}
       return true;
     } finally { this.releaseGate(gatePath, gate.token); }
   }

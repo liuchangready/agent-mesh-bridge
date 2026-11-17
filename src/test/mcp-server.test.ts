@@ -278,7 +278,9 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(toolNames.includes('get_merge_log'));
     assert.ok(toolNames.includes('submit_merge_decision'));
     assert.ok(toolNames.includes('list_task_templates'));
-    assert.strictEqual(toolNames.length, 26);
+    assert.ok(toolNames.includes('request_task_decision'));
+    assert.ok(toolNames.includes('submit_task_decision'));
+    assert.strictEqual(toolNames.length, 28);
   });
 
   test('list_agent_models reports the receiver and sender defaults separately', async () => {
@@ -611,7 +613,7 @@ describe('MCPServer Protocol Tests', () => {
     assert.equal(legacy.content, 'cdef'); assert.equal(decision.content, 'cdef');
     await assert.rejects(mcpServer.handleToolCall('get_merge_log', { threadId, number: 3 }), /Invalid merge log path/);
     await assert.rejects(mcpServer.handleToolCall('get_merge_log', { threadId, number: 4 }), /Invalid merge log path/);
-    reworkController.requestMergeDecision(threadId, 'Which fix?', 'background', 'suggestion', [], decisionLog);
+    await reworkController.requestMergeDecision(threadId, 'Which fix?', 'background', 'suggestion', [], decisionLog);
     const question = taskStore.getTask(threadId)!.mergeHistory!.at(-1)!;
     assert.equal(question.logNumber, 5); assert.equal(question.logFileNumber, 9);
     const context = await mcpServer.handleToolCall('get_merge_log', { threadId, number: question.number, limit: 8 });
