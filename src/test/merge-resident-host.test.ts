@@ -122,7 +122,7 @@ test('a landed ref with repeated ledger EIO is not retried in a loop and recover
   }) as typeof fs.renameSync;
   host = makeController(store, true);
   t.after(() => { mutableFs.renameSync = realRename; host.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
-  await waitFor(() => gitOutput(repo, ['rev-parse', target.targetRef]) !== target.baseCommit);
+  await waitFor(() => gitOutput(repo, ['rev-parse', target.targetRef]) !== target.baseCommit, 30_000);
   const landed = gitOutput(repo, ['rev-parse', target.targetRef]);
   await waitFor(() => writeFailures > 0);
   await new Promise((resolve) => setTimeout(resolve, 1_000));

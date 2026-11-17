@@ -439,7 +439,7 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "test": "node --test --test-concurrency=2 out/test/**/*.test.js",
+    "test": "node --test --test-concurrency=4 out/test/**/*.test.js",
     "package": "npx @vscode/vsce package --no-dependencies --allow-missing-repository",
     "smoke:extension-host": "npm run package && node scripts/extension-host-smoke.cjs",
     "lint": "eslint .",
