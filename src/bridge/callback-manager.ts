@@ -1,4 +1,4 @@
-import { getTaskExecutionPath, isReviewerWakeEligible } from './types';
+import { getTaskExecutionPath, isReviewerWakeEligible, isMergeReview } from './types';
 import * as child_process from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -178,7 +178,7 @@ export class CallbackManager extends EventEmitter {
     if (!isReviewerWakeEligible(thread)) {
       console.warn(
         `[CallbackManager] Refusing to wake reviewer for ${thread.threadId}: ` +
-          `task status is "${thread.status}", not "waiting_review".`,
+          `task status is "${thread.status}", not "reviewing".`,
       );
       return false;
     }
@@ -261,8 +261,8 @@ export class CallbackManager extends EventEmitter {
         executionRegistration = executionRegistry.begin(
           thread.threadId,
           reviewRound.round,
-          thread.status === 'waiting_merge' ? 'merge-reviewer' : thread.initiatorAgent,
-          thread.status === 'waiting_merge' && thread.worktree?.mergeResolutionPath || getTaskExecutionPath(thread),
+          isMergeReview(thread) ? 'merge-reviewer' : thread.initiatorAgent,
+          isMergeReview(thread) && thread.worktree?.mergeResolutionPath || getTaskExecutionPath(thread),
           'reviewer',
         );
         ownsExecutionRegistration = true;
@@ -322,11 +322,14 @@ export class CallbackManager extends EventEmitter {
 
     const promptMessage = `[Agent Mesh Bridge 自动化闭环验收指令] 任务【${thread.title}】第 ${reviewRound.round} 轮已由 ${thread.targetAgent} 执行完成。\n结果摘要: ${preview}${tokenLine}\n\n本任务已有中间文档链保存在任务账本（历轮指令 / 开发报告 / 返修意见）。get_thread_details(threadId="${thread.threadId}") 默认返回有界视图：最新轮完整，较早轮次可能是「提纯胶囊」卡片；需要逐字核对某一历史轮时用 get_round_raw_log(threadId="${thread.threadId}", round=<轮号>)，不要为此读取整段历史。必须沿用同一 threadId 与当前 callerSessionId 继续，禁止新建任务、另起会话或转派给其他 Agent。\n\n请作为任务下发方立即执行自动化检视闭环（判据只看**本任务自身范围**）：\n1. 审查本任务范围的代码与产出，并在当前工作区实际运行相关测试验证；\n2. 本任务范围内存在编译报错、测试未通过或功能缺陷：立即调用 request_rework(threadId="${thread.threadId}", feedback="具体报错与修复要求")；\n3. 本任务范围已通过、只是同批其他任务/依赖尚未交付：**不要**再发一轮 rework 空转，改用 request_rework(threadId="${thread.threadId}", feedback="阻塞说明", blocked=true, waitingForThreadId="<被依赖的 threadId>") 挂起；桥接不占用轮次，并在依赖到达 completed/failed 时自动唤醒你；\n4. 本任务范围通过即调用 approve_task(threadId="${thread.threadId}", remarks="本任务范围的验收结论与测试结果")。**不要用同批其他任务的 skip/失败否决本任务**——批次门禁属于收口阶段，由你在第 5 步统一处理；\n5. 验收通过后，由你作为调用者统一收口一个 MR：汇总该任务及同一批尚未推送的改动，只创建一个 MR，使用仓库既有远端与 gh/glab/等价 CLI 推送到远端；然后调用 mcp 工具 record_merge_request(threadId="${thread.threadId}", url="MR URL", branch="源分支", commit="提交 SHA", remote="origin", status="synced", summary="MR 摘要") 记录 MR 信息。不要每个子任务各推一次，不要新建任务/会话；开发者(receiver)不负责提交/推送。\n注意：上一轮没有任何文件改动时，本轮若再提交几乎相同的 rework 指令会被桥接拒绝（REWORK_NOOP_LOOP），只能 approve_task 或 blocked=true。\n请注意：请直接调用上述 MCP 工具完成闭环，请勿仅输出文本结论。`;
 
-    const wakeMessage = thread.status === 'waiting_merge'
+    const wakeMessage = isMergeReview(thread)
       ? `The approved task could not be integrated: ${thread.worktree?.integration?.error || 'unknown error'}. Resolution workspace: ${thread.worktree?.mergeResolutionPath || 'not available'}. Worker assessment: ${JSON.stringify(reviewRound.assessment || null)}. Interruptions: ${JSON.stringify(thread.interruptions || [])}. Recent merge decisions and recovery: ${JSON.stringify((thread.mergeHistory || []).slice(-8))}. Inspect get_thread_details, get_merge_log and get_round_raw_log for task ${thread.threadId}. Preserve the existing thread and reviewer session; use standard Git to resolve and stage changes, then call submit_merge_resolution. Request rework only if the candidate itself needs changes; request_merge_decision when a user decision is needed. Treat STREAM_GAP_EXCEEDED as a warning, defer quota failures, and investigate authentication, permission, CLI startup, environment, Git and validation failures.`
       : promptMessage;
-    const reviewWakeMessage = thread.taskTemplate ? `${wakeMessage}\n\n[Task template reviewer instructions]\n${thread.taskTemplate.reviewerInstructions}` : wakeMessage;
-    const mergeWakeId = thread.status === 'waiting_merge' ? crypto.randomUUID() : undefined;
+    const answer = [...(thread.mergeHistory || [])].reverse().find((entry) => entry.phase === 'decision' && entry.result === 'answered');
+    const question = answer && (thread.mergeHistory || []).find((entry) => entry.decisionId === answer.decisionId && entry.result === 'requested');
+    const decisionMessage = answer ? `\n\nUser decision for ${question?.question || 'the pending question'}: ${answer.answer || ''}` : '';
+    const reviewWakeMessage = (thread.taskTemplate ? `${wakeMessage}\n\n[Task template reviewer instructions]\n${thread.taskTemplate.reviewerInstructions}` : wakeMessage) + decisionMessage;
+    const mergeWakeId = isMergeReview(thread) ? crypto.randomUUID() : undefined;
     let released = false;
     let sessionLeaseReleased = !reviewerSessionLease;
     const release = () => {
@@ -368,7 +371,7 @@ export class CallbackManager extends EventEmitter {
         if (!roleLock.attachChild(roleLease, childPid) && childPid) throw new Error('Could not bind reviewer child PID to the task role.');
         if (childPid && mergeWakeId && this.taskStore) {
           const current = this.taskStore.getTask(thread.threadId);
-          if (!current || current.status !== 'waiting_merge' || !isReviewerWakeEligible(current)) throw new Error('Merge review state changed before reviewer launch.');
+          if (!current || !isMergeReview(current) || !isReviewerWakeEligible(current)) throw new Error('Merge review state changed before reviewer launch.');
           const updated = structuredClone(current);
           updated.mergeHistory = [...(updated.mergeHistory || []), { id: mergeWakeId, attemptId: mergeWakeId, number: (updated.mergeHistory?.length || 0) + 1,
             at: new Date().toISOString(), phase: 'reviewer', result: 'started', retryGeneration: updated.mergeControl?.retryGeneration || 0 }];
@@ -641,7 +644,7 @@ export class CallbackManager extends EventEmitter {
     assertCanExecute(thread.initiatorAgent, 'resume as a reviewer', 'initiator');
     const startedThread = structuredClone(thread);
     const initiator = thread.initiatorAgent;
-    const cwd = thread.status === 'waiting_merge' && thread.worktree?.mergeResolutionPath || getTaskExecutionPath(thread);
+    const cwd = isMergeReview(thread) && thread.worktree?.mergeResolutionPath || getTaskExecutionPath(thread);
     // Wake the caller on its SENDER-side default model, which is configured
     // separately from the receiver-side default: the same agent can dispatch a
     // task to itself and execute it with a different model. An empty sender
@@ -713,7 +716,7 @@ export class CallbackManager extends EventEmitter {
     // anything: a 429 / exhausted quota kills it before its first tool call.
     // Tee a bounded tail of its output (still written verbatim to
     // callbacks.log) so a failed wake can be classified and retried instead of
-    // leaving the task parked in `waiting_review` forever.
+    // leaving the task parked in `reviewing` forever.
     const capture = new WakeOutputCapture();
     const stdoutCapture = new WakeOutputCapture(); const stderrCapture = new WakeOutputCapture();
     const suspension = new HostSuspensionGuard();
@@ -741,7 +744,7 @@ export class CallbackManager extends EventEmitter {
     const attachErrorLogging = (child: child_process.ChildProcess) => {
       suspension.start();
       let interruption: TaskInterruption | undefined;
-      const watchdog = thread.status === 'waiting_merge' && wakeKind === 'review' ? setInterval(() => {
+      const watchdog = isMergeReview(thread) && wakeKind === 'review' ? setInterval(() => {
         suspension.sync(); const now = monotonicNowMs();
         const elapsed = now - startedAt - suspension.totalSuspendedMs();
         const silent = now - previousOutput - suspension.suspendedWithin(previousOutput, now);
@@ -766,7 +769,7 @@ export class CallbackManager extends EventEmitter {
         try { reviewerLog.writeOutcome(outcome); reviewerLog.close(); }
         catch (error: any) { console.error(`[CallbackManager] Reviewer log finalization failed for ${thread.threadId}: ${error?.message || error}`); }
         suspension.sync(); suspension.stop();
-        const assessment = wakeKind === 'review' && thread.status === 'waiting_merge'
+        const assessment = wakeKind === 'review' && isMergeReview(thread)
           ? (this.runner || new AutonomousRunner(this.detector)).evaluateResponse({ exitCode: outcome.exitCode ?? -1,
               stdout: stdoutCapture.text(), stderr: stderrCapture.text(), chunkCount, stdoutBytes, stderrBytes,
               firstOutputAtMs, lastOutputAtMs, maxGapMs, rawMaxGapMs, excludedSuspensionMs, suspensionCount: suspension.suspensionCount,
@@ -1015,7 +1018,7 @@ export class CallbackManager extends EventEmitter {
    * "Success" requires the caller process to exit cleanly AND print no
    * quota/rate-limit signal: several CLIs exit 0 after printing "429" or
    * "insufficient quota", and treating that as a delivered review is exactly how
-   * a task ends up parked in `waiting_review` with nobody looking at it.
+   * a task ends up parked in `reviewing` with nobody looking at it.
    *
    * On failure the state is written to the thread so the tree/detail panel can
    * show "检视唤醒失败" with a one-click re-review, and so the scheduler knows
@@ -1054,7 +1057,7 @@ export class CallbackManager extends EventEmitter {
       }
     }
 
-    const mergeWake = thread.status === 'waiting_merge' && isReviewerWakeEligible(thread);
+    const mergeWake = isMergeReview(thread) && isReviewerWakeEligible(thread);
     if (mergeWake && target.status === 'wait_decision' && outcome.assessment && !outcome.assessment.success) {
       const reason = outcome.assessment.reason || outcome.assessment.errorCode;
       if (outcome.interruption) appendInterruption(target, outcome.interruption);
@@ -1064,18 +1067,20 @@ export class CallbackManager extends EventEmitter {
       target.updatedAt = new Date().toISOString(); this.taskStore?.upsertTask(target);
       return undefined;
     }
-    if (mergeWake && target.status === 'waiting_merge' && !isReviewerWakeEligible(target) && outcome.assessment && !outcome.assessment.success && target.worktree?.integration) {
+    if (mergeWake && target.status === 'queued' && target.queuePhase === 'merge' && outcome.assessment && !outcome.assessment.success && target.worktree?.integration) {
       const priorAt = Date.parse(target.worktree.integration.updatedAt || '') || 0;
+      target.status = 'reviewing';
+      target.queuePhase = undefined;
       target.worktree.integration = { ...target.worktree.integration, phase: 'blocked', error: `Reviewer ${outcome.assessment.errorCode}: ${outcome.assessment.reason || 'response failed'}`, updatedAt: new Date(Math.max(Date.now(), priorAt + 1)).toISOString() };
     }
-    if (mergeWake && outcome.attemptId && (target.status !== 'waiting_merge' || !isReviewerWakeEligible(target))) {
+    if (mergeWake && outcome.attemptId && (!isMergeReview(target) || !isReviewerWakeEligible(target))) {
       const result = target.status === 'paused' ? 'cancelled' : 'completed';
       target.mergeHistory = [...(target.mergeHistory || []), { id: crypto.randomUUID(), attemptId: outcome.attemptId,
         number: (target.mergeHistory?.length || 0) + 1, at: new Date().toISOString(), phase: 'reviewer', result,
         assessment: outcome.assessment, interruption: outcome.interruption }];
       this.taskStore?.upsertTask(target);
     }
-    if (target.status === 'completed' || (target.status === 'waiting_merge' && (!mergeWake || !isReviewerWakeEligible(target)))) {
+    if (target.status === 'completed' || (isMergeReview(target) && (!mergeWake || !isReviewerWakeEligible(target)))) {
       if (target.reviewWake?.round === round.round) {
         target.reviewWake = undefined;
         target.updatedAt = new Date().toISOString();
@@ -1087,7 +1092,7 @@ export class CallbackManager extends EventEmitter {
     }
 
     // Paused/failed/deleted/review_failed tasks no longer own a review slot.
-    if (target.status !== 'waiting_review' && !(mergeWake && isReviewerWakeEligible(target))) return undefined;
+    if (target.status !== 'reviewing' && !(mergeWake && isReviewerWakeEligible(target))) return undefined;
 
     const handedOff =
       (target.rounds || []).some((candidate) => candidate.round > round.round && candidate.type !== 'approval') ||
@@ -1147,18 +1152,18 @@ export class CallbackManager extends EventEmitter {
       target.mergeHistory = [...(target.mergeHistory || []), {
         id: crypto.randomUUID(), number, at: target.updatedAt, phase: 'reviewer', result: 'failed', attemptId: outcome.attemptId, error: state.lastError, errorCode: code, exitCode: outcome.exitCode, assessment: outcome.assessment, interruption: outcome.interruption, ...budget,
       }];
-      if (code === 'AUTH_OR_PERMISSION' && target.status === 'waiting_merge') {
+      if (code === 'AUTH_OR_PERMISSION' && isMergeReview(target)) {
         const decisionId = crypto.randomUUID();
         target.mergeHistory.push({ id: decisionId, decisionId, number: number + 1, at: target.updatedAt, phase: 'decision', result: 'requested',
-          question: 'How should the reviewer proceed after the authentication or permission failure?', background: reason,
+          decisionStage: 'merge', question: 'How should the reviewer proceed after the authentication or permission failure?', background: reason,
           suggestion: 'Restore the required credentials or permissions, then submit a decision.' });
-        target.mergeControl = { ...target.mergeControl!, revision: target.mergeControl!.revision + 1, pendingDecisionId: decisionId };
+        target.mergeControl = { ...target.mergeControl!, revision: target.mergeControl!.revision + 1, pendingDecisionId: decisionId, decisionStage: 'merge' };
         target.status = 'wait_decision';
       }
     } else if (state.gaveUp) {
       // The retry budget is spent: no reviewer will ever be woken again on its
       // own. Surface that as a terminal `review_failed` (releasing the queue
-      // slot) with the concrete cause, rather than a silent `waiting_review`.
+      // slot) with the concrete cause, rather than a silent `reviewing`.
       applyReviewFailure(target, {
         kind: 'retries_exhausted',
         reason: `检视唤醒自动重试已耗尽（${state.attempts} 次失败）：${state.lastError}`,

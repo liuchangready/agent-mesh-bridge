@@ -262,8 +262,8 @@ export class TaskSupervisor extends EventEmitter {
     const candidates = allTasks
       .filter((thread) => {
         if (!thread || !thread.threadId || this.activeTasks.has(thread.threadId)) return false;
-        if (thread.status === 'paused' || thread.status === 'waiting_review') return false;
-        if (thread.reviewBlocked || isReviewerBootstrapPending(thread)) return false;
+        if (thread.status === 'paused' || thread.status === 'reviewing') return false;
+        if (thread.queuePhase === 'merge' || thread.reviewBlocked || isReviewerBootstrapPending(thread)) return false;
         return thread.status === 'running' || thread.status === 'queued';
       })
       .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
@@ -323,6 +323,7 @@ export class TaskSupervisor extends EventEmitter {
     const freshRound = fresh ? findInFlightRound(fresh) : undefined;
     if (
       !fresh ||
+      fresh.queuePhase === 'merge' ||
       (fresh.status !== 'queued' && fresh.status !== 'running') ||
       fresh.targetAgent !== thread.targetAgent ||
       fresh.reviewBlocked ||
@@ -353,6 +354,7 @@ export class TaskSupervisor extends EventEmitter {
       );
       return Promise.resolve();
     }
+    if (stored.queuePhase === 'merge' || stored.status === 'merging' || stored.status === 'wait_decision') return Promise.resolve();
     try {
       assertCanExecute(stored.targetAgent, 'run a scheduled task round');
     } catch (error) {
@@ -377,7 +379,7 @@ export class TaskSupervisor extends EventEmitter {
     }
     const inFlight = findInFlightRound(fresh);
     if (
-      fresh.status === 'paused' || fresh.status === 'waiting_review' ||
+      fresh.queuePhase === 'merge' || fresh.status === 'merging' || fresh.status === 'wait_decision' || fresh.status === 'paused' || fresh.status === 'reviewing' ||
       fresh.status === 'completed' || fresh.status === 'failed' ||
       fresh.targetAgent !== thread.targetAgent || !inFlight || inFlight.round !== round.round ||
       inFlight.status !== 'running' || inFlight.prompt !== round.prompt
@@ -399,7 +401,7 @@ export class TaskSupervisor extends EventEmitter {
     const latest = this.taskStore.getTask(thread.threadId);
     const latestRound = latest?.rounds.filter((entry) => entry.round === round.round).slice(-1)[0];
     if (
-      !latest || latest.status === 'paused' || latest.status === 'waiting_review' ||
+      !latest || latest.queuePhase === 'merge' || latest.status === 'merging' || latest.status === 'wait_decision' || latest.status === 'paused' || latest.status === 'reviewing' ||
       latest.status === 'completed' || latest.status === 'failed' ||
       latest.targetAgent !== thread.targetAgent || !latestRound || latestRound.status !== 'running' ||
       latestRound.prompt !== round.prompt || findInFlightRound(latest)?.round !== round.round ||
@@ -621,7 +623,7 @@ export class TaskSupervisor extends EventEmitter {
         } catch {}
       }
       const finalRoundStatus = isPaused ? 'paused' : isSuccess ? 'completed' : 'failed';
-      const finalThreadStatus = isPaused ? 'paused' : isSuccess ? 'waiting_review' : 'failed';
+      const finalThreadStatus = isPaused ? 'paused' : isSuccess ? 'reviewing' : 'failed';
       const nativeSessionId = result.actualSessionId || currentThread.receiverSessionId;
 
       if (result.actualSessionId && result.actualSessionId !== currentThread.receiverSessionId) {

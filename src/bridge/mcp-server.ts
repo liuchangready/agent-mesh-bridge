@@ -84,6 +84,7 @@ const CONTROL_TOOLS = new Set([
   'record_merge_request',
   'submit_merge_resolution',
   'request_merge_decision',
+  'submit_merge_decision',
   'retry_merge',
 ]);
 
@@ -343,7 +344,7 @@ export class MCPServer {
         roundsWithReviewerLog: [],
         message:
           'No reviewer log exists for this task yet: the bridge only records one while it wakes the caller ' +
-          '(waiting_review), and rounds reviewed before this artifact existed have none. ' +
+          '(reviewing), and rounds reviewed before this artifact existed have none. ' +
           'The reviewer verdict itself is still on the round ledger (approval remarks / next round feedback).',
       };
     }
@@ -394,7 +395,7 @@ export class MCPServer {
       returnedBytes: Buffer.byteLength(page.content, 'utf8'),
       reviewerAgent: task.initiatorAgent,
       /** True while the caller is still reviewing this round. */
-      live: task.status === 'waiting_review' && round === (task.currentRound || latest),
+      live: task.status === 'reviewing' && round === (task.currentRound || latest),
       roundsWithReviewerLog: withLogs,
       hint: page.truncated
         ? `Paged: continue with offsetBytes=${page.nextOffset}.`
@@ -545,8 +546,13 @@ export class MCPServer {
       },
       {
         name: 'request_merge_decision',
-        description: 'Ask the user to decide a merge issue and end the reviewer turn.',
+        description: 'Ask the user to decide an issue during review or merge review and end the reviewer turn.',
         inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, question: { type: 'string' }, background: { type: 'string' }, suggestion: { type: 'string' }, conflictFiles: { type: 'array', items: { type: 'string' } }, logPath: { type: 'string' } }, required: ['threadId', 'question'] },
+      },
+      {
+        name: 'submit_merge_decision',
+        description: 'Answer a pending review or merge decision and resume the same reviewer session.',
+        inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, answer: { type: 'string' } }, required: ['threadId', 'answer'] },
       },
       {
         name: 'retry_merge',
@@ -566,7 +572,7 @@ export class MCPServer {
       {
         name: 'approve_task',
         description:
-          'Approve a snapshot of the reviewed task worktree. Code changes enter waiting_merge until serialized local integration and combined validation succeed; no-change tasks complete immediately.',
+          'Approve a snapshot of the reviewed task worktree. Code changes queue for serialized local integration and validation; no-change tasks complete immediately.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -664,7 +670,7 @@ export class MCPServer {
       {
         name: 'retarget_task',
         description:
-          'Move an existing task to another executor: another agent and/or another model, keeping the same thread, round history and isolated worktree. Works on queued, paused, failed and waiting_review tasks; refuses while a round is in flight (pause first) and on completed tasks. Switching the agent starts a fresh native session because the previous agent\'s session cannot be resumed. Model policy: omitted model keeps the current one (or uses the new agent\'s configured default); a non-default model requires modelRequestedByUser: true and the user\'s click consent in VS Code.',
+          'Move an existing task to another executor: another agent and/or another model, keeping the same thread, round history and isolated worktree. Works on queued, paused, failed and reviewing tasks; refuses while a round is in flight (pause first) and on completed tasks. Switching the agent starts a fresh native session because the previous agent\'s session cannot be resumed. Model policy: omitted model keeps the current one (or uses the new agent\'s configured default); a non-default model requires modelRequestedByUser: true and the user\'s click consent in VS Code.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -774,6 +780,8 @@ export class MCPServer {
                 'queued',
                 'running',
                 'reworking',
+                'reviewing',
+                'merging',
                 'waiting_review',
                 'waiting_merge',
                 'wait_decision',
@@ -1371,6 +1379,8 @@ export class MCPServer {
         this.assertActiveReviewerRole(args.threadId);
         return this.reworkController.requestMergeDecision(args.threadId, args.question, args.background, args.suggestion, args.conflictFiles, args.logPath);
       }
+
+      case 'submit_merge_decision': return this.reworkController.submitMergeDecision(args.threadId, args.answer);
 
       case 'retry_merge': return this.reworkController.retryMerge(args.threadId);
 

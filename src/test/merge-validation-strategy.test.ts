@@ -45,7 +45,7 @@ function thread(threadId: string, worktree: WorktreeInfo): DelegationThread {
     title: threadId,
     initiatorAgent: 'codex',
     targetAgent: 'codex',
-    status: 'waiting_merge',
+    status: 'merging',
     currentRound: 1,
     createdAt: now,
     updatedAt: now,

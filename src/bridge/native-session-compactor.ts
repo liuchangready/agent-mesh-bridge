@@ -1,4 +1,4 @@
-import { getTaskExecutionPath, isReviewerWakeEligible } from './types';
+import { getTaskExecutionPath, isReviewerWakeEligible, isMergeReview } from './types';
 import * as crypto from 'crypto';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
@@ -291,7 +291,7 @@ export class NativeSessionCompactor {
           registration: registry.begin(
             threadId,
             currentRound?.round || thread!.currentRound || 1,
-            role === 'reviewer' && thread!.status === 'waiting_merge' ? 'merge-reviewer' : agent,
+            role === 'reviewer' && isMergeReview(thread!) ? 'merge-reviewer' : agent,
             getTaskExecutionPath(thread!),
             'maintenance',
           ),
@@ -658,7 +658,7 @@ export class NativeSessionCompactor {
     const boundSessionId = role === 'developer' ? thread.receiverSessionId : thread.reviewerSessionId;
     const successfulStatus = role === 'developer'
       ? ['running', 'queued'].includes(thread.status)
-      : ['waiting_merge', 'completed'].includes(thread.status) || (['running', 'queued'].includes(thread.status) && findInFlightRound(thread)?.type === 'rework');
+      : ['merging', 'completed', 'wait_decision'].includes(thread.status) || (thread.status === 'queued' && thread.queuePhase === 'merge') || (['running', 'queued'].includes(thread.status) && findInFlightRound(thread)?.type === 'rework');
     if (boundSessionId !== sessionId || !successfulStatus || new CancellationRegistry(root).peek(threadId)) return;
     const old = thread.nativeSessionCompaction?.[role];
     const cursor = old?.sessionId === sessionId ? old : { sessionId, turnsSinceCompaction: 0 };

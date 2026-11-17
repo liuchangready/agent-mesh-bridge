@@ -357,8 +357,8 @@ test('paused and waiting-review tasks do not serialize independent reviewer boot
   const dir = makeTempDir('bridge-bootstrap-independent-');
   const store = new TaskStore(dir);
   const workspace = makeTempDir('bridge-bootstrap-shared-ws-');
-  const parked = makeDedicatedThread('thread_waiting_review', {
-    status: 'waiting_review',
+  const parked = makeDedicatedThread('thread_reviewing', {
+    status: 'reviewing',
     workspace: testWorkspace(workspace),
   });
   parked.reviewFlow = 'legacy';
@@ -405,7 +405,7 @@ test('paused and waiting-review tasks do not serialize independent reviewer boot
   service.stop();
 
   assert.deepStrictEqual(calls.slice().sort(), targets.map((task) => task.threadId).sort());
-  assert.strictEqual(store.getTask(parked.threadId)?.status, 'waiting_review');
+  assert.strictEqual(store.getTask(parked.threadId)?.status, 'reviewing');
   for (const task of targets) {
     const stored = store.getTask(task.threadId)!;
     assert.strictEqual(stored.reviewBootstrap?.phase, 'confirmed');

@@ -113,7 +113,7 @@ describe('CallbackManager records stalled reviewer wakes', () => {
       title: 'Lobby service',
       initiatorAgent: 'codex',
       targetAgent: 'deepseek_harness',
-      status: 'waiting_review',
+      status: 'reviewing',
       currentRound: 1,
       createdAt: '2026-10-23T10:00:00.000Z',
       updatedAt: '2026-10-23T11:00:00.000Z',
@@ -158,7 +158,7 @@ describe('CallbackManager records stalled reviewer wakes', () => {
     const stored = store.getTask(thread.threadId)!;
     assert.ok(stored.reviewWake, 'the stall is visible in the ledger');
     assert.strictEqual(stored.reviewWake!.round, 1);
-    assert.strictEqual(stored.status, 'waiting_review');
+    assert.strictEqual(stored.status, 'reviewing');
     store.dispose();
   });
 
@@ -190,10 +190,10 @@ describe('CallbackManager records stalled reviewer wakes', () => {
     const { dir, store, manager } = setup();
     const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1';
     const workspace = dirWorkspace();
-    const thread = makeThread({ threadId: 'thread_blocked_merge_wake', status: 'waiting_merge', reviewFlow: 'dedicated',
+    const thread = makeThread({ threadId: 'thread_blocked_merge_wake', status: 'reviewing', reviewFlow: 'dedicated',
       reviewBootstrap: { phase: 'confirmed', attempts: 1 }, reviewerSessionId: sessionId,
       reviewerSessionCaptured: true, callerSessionId: sessionId, reviewerModel: 'test-model',
-      worktree: { path: workspace, mainPath: workspace, integration: { phase: 'blocked', error: 'snapshot failed', updatedAt: new Date().toISOString() } } });
+      worktree: { path: workspace, mainPath: workspace, mergePending: true, integration: { phase: 'blocked', error: 'snapshot failed', updatedAt: new Date().toISOString() } } });
     store.upsertTask(thread);
     let release: (() => void) | undefined;
     let onChildPid: ((pid: number | undefined) => void) | undefined;
@@ -224,7 +224,7 @@ describe('CallbackManager records stalled reviewer wakes', () => {
       const control = new TaskControlService(store, runner, undefined, dir);
       const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1'; const workspace = dirWorkspace();
       fs.mkdirSync(workspace, { recursive: true });
-      const thread = makeThread({ threadId: `thread_resume_${phase}`, status: 'waiting_merge', reviewFlow: 'dedicated',
+      const thread = makeThread({ threadId: `thread_resume_${phase}`, status: phase === 'waiting' ? 'queued' : phase === 'merging' ? 'merging' : 'reviewing', queuePhase: phase === 'waiting' ? 'merge' : undefined, reviewFlow: 'dedicated',
         reviewBootstrap: { phase: 'confirmed', attempts: 1 }, reviewerSessionId: sessionId, reviewerSessionCaptured: true,
         callerSessionId: sessionId, reviewerModel: 'test-model', mergeControl: { revision: 2, retryGeneration: 1, consecutiveRetries: 3, failureFingerprint: 'old' },
         mergeHistory: [{ id: 'prior', number: 1, at: new Date().toISOString(), phase: 'conflict', result: 'failed' }],
@@ -253,7 +253,7 @@ describe('CallbackManager records stalled reviewer wakes', () => {
       for (let n = 0; n < 100 && needsReview && !launches; n++) await new Promise((resolve) => setTimeout(resolve, 10));
       const saved = store.getTask(thread.threadId)!;
       assert.equal(new CancellationRegistry(dir).peek(thread.threadId), undefined);
-      assert.equal(saved.status, 'waiting_merge'); assert.equal(saved.interruption, undefined);
+      assert.equal(saved.status, needsReview ? 'reviewing' : 'queued'); assert.equal(saved.interruption, undefined);
       assert.equal(saved.interruptions?.at(-1)?.kind, 'paused'); assert.equal(JSON.stringify(saved.rounds), JSON.stringify(thread.rounds));
       assert.equal(saved.worktree?.integration?.phase, phase); assert.deepEqual(saved.worktree?.approvedSnapshot, thread.worktree?.approvedSnapshot);
       assert.equal(saved.worktree?.mergeResolutionPath, workspace); assert.deepEqual(saved.mergeControl, thread.mergeControl);
@@ -271,10 +271,10 @@ describe('CallbackManager records stalled reviewer wakes', () => {
     const detector = new AgentDetector();
     const controller = new ReworkController(store, new AutonomousRunner(detector), manager, detector);
     const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1'; const workspace = dirWorkspace();
-    const thread = makeThread({ threadId: 'thread_merge_decision_real', status: 'waiting_merge', reviewFlow: 'dedicated',
+    const thread = makeThread({ threadId: 'thread_merge_decision_real', status: 'reviewing', reviewFlow: 'dedicated',
       reviewBootstrap: { phase: 'confirmed', attempts: 1 }, reviewerSessionId: sessionId,
       reviewerSessionCaptured: true, callerSessionId: sessionId, reviewerModel: 'test-model',
-      worktree: { path: workspace, mainPath: workspace, integration: { phase: 'blocked', error: 'need decision', updatedAt: new Date().toISOString() } } });
+      worktree: { path: workspace, mainPath: workspace, mergePending: true, integration: { phase: 'blocked', error: 'need decision', updatedAt: new Date().toISOString() } } });
     store.upsertTask(thread);
     const sessions: string[] = [];
     (manager as any).launchCaller = (...args: any[]) => {
@@ -292,15 +292,15 @@ describe('CallbackManager records stalled reviewer wakes', () => {
     controller.submitMergeDecision(thread.threadId, 'A');
     for (let n = 0; n < 100 && sessions.length < 2; n++) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.deepEqual(sessions, [sessionId, sessionId]);
-    assert.equal(store.getTask(thread.threadId)!.status, 'waiting_merge');
+    assert.equal(store.getTask(thread.threadId)!.status, 'reviewing');
     controller.dispose(); store.dispose();
   });
 
-  test('a failed merge reviewer is recorded without treating waiting_merge as a successful handoff', () => {
+  test('a failed merge reviewer is recorded without treating merging as a successful handoff', () => {
     const { store, manager } = setup();
     const workspace = dirWorkspace();
-    const thread = makeThread({ threadId: 'thread_failed_merge_reviewer', status: 'waiting_merge',
-      worktree: { path: workspace, mainPath: workspace, integration: { phase: 'blocked', error: 'snapshot failed', updatedAt: new Date().toISOString() } } });
+    const thread = makeThread({ threadId: 'thread_failed_merge_reviewer', status: 'reviewing',
+      worktree: { path: workspace, mainPath: workspace, mergePending: true, integration: { phase: 'blocked', error: 'snapshot failed', updatedAt: new Date().toISOString() } } });
     store.upsertTask(thread);
     const state = manager.finalizeWake(thread, thread.rounds[0], thread.callerSessionId!, { exitCode: 1, output: 'permission denied' });
     assert.ok(state);
@@ -315,10 +315,10 @@ describe('CallbackManager records stalled reviewer wakes', () => {
   test('a launched merge reviewer with status-only output records EMPTY_OUTPUT', async () => {
     const { dir, store, manager } = setup(); const originalSpawn = childProcess.spawn;
     const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1'; const workspace = dirWorkspace();
-    const thread = makeThread({ threadId: 'thread_merge_empty_live', initiatorAgent: 'antigravity', status: 'waiting_merge', reviewFlow: 'dedicated',
+    const thread = makeThread({ threadId: 'thread_merge_empty_live', initiatorAgent: 'antigravity', status: 'reviewing', reviewFlow: 'dedicated',
       reviewerSessionId: sessionId, reviewerSessionCaptured: true, callerSessionId: sessionId, reviewerModel: 'test-model',
       reviewBootstrap: { phase: 'confirmed', attempts: 1 },
-      worktree: { path: workspace, mainPath: workspace, integration: { phase: 'blocked', error: 'merge failed', updatedAt: new Date().toISOString() } } });
+      worktree: { path: workspace, mainPath: workspace, mergePending: true, integration: { phase: 'blocked', error: 'merge failed', updatedAt: new Date().toISOString() } } });
     fs.mkdirSync(workspace, { recursive: true }); store.upsertTask(thread);
     (childProcess as any).spawn = (_command: string, _args: string[], options: any) =>
       originalSpawn(process.execPath, ['-e', 'process.stdout.write(JSON.stringify({type:"status"}))'], options);
@@ -331,7 +331,7 @@ describe('CallbackManager records stalled reviewer wakes', () => {
       assert.equal(saved.mergeHistory?.at(-1)?.assessment?.errorCode, 'EMPTY_OUTPUT');
       assert.equal(saved.mergeHistory?.at(-1)?.errorCode, 'EMPTY_OUTPUT');
       assert.equal(saved.mergeControl?.consecutiveRetries, 0);
-      assert.equal(saved.status, 'waiting_merge');
+      assert.equal(saved.status, 'reviewing');
       assert.equal(new TaskRoleLock(dir).getOwner(thread.threadId), undefined);
     } finally { (childProcess as any).spawn = originalSpawn; store.dispose(); }
   });
@@ -513,7 +513,7 @@ describe('CallbackManager records stalled reviewer wakes', () => {
     assert.ok(cleared);
     assert.match(cleared!.lastError, /REVIEW_NO_DECISION/);
     assert.strictEqual(cleared!.attempts, 2);
-    assert.strictEqual(store.getTask(thread.threadId)!.status, 'waiting_review');
+    assert.strictEqual(store.getTask(thread.threadId)!.status, 'reviewing');
     assert.strictEqual(store.getTask(thread.threadId)!.reviewWake!.attempts, 2);
     store.dispose();
   });
@@ -541,7 +541,7 @@ describe('CallbackManager records stalled reviewer wakes', () => {
     assert.strictEqual(store.getTask(approvedThread.threadId)!.reviewWake, undefined);
 
     const reworkThread = makeThread({ threadId: 'thread_wake_rework', reviewWake: wake });
-    reworkThread.status = 'waiting_review';
+    reworkThread.status = 'reviewing';
     reworkThread.currentRound = 2;
     reworkThread.rounds.push({ ...reworkThread.rounds[0], round: 2, type: 'rework' });
     reworkThread.reviewWake = {
@@ -627,7 +627,7 @@ describe('ReviewWakeScheduler', () => {
     title: 'Lobby service',
     initiatorAgent: 'codex',
     targetAgent: 'deepseek_harness',
-    status: 'waiting_review',
+    status: 'reviewing',
     currentRound: 1,
     createdAt: '2026-10-23T10:00:00.000Z',
     updatedAt: '2026-10-23T11:00:00.000Z',
@@ -698,7 +698,7 @@ describe('ReviewWakeScheduler', () => {
     assert.strictEqual(launched, 1);
     assert.deepStrictEqual(launches, [{ threadId: 'thread_review_wake_sched', round: 1 }]);
     const stored = store.getTask('thread_review_wake_sched')!;
-    assert.strictEqual(stored.status, 'waiting_review');
+    assert.strictEqual(stored.status, 'reviewing');
     assert.strictEqual(stored.reviewWake!.autoRetryAttempts, 1);
     assert.ok(Date.parse(stored.reviewWake!.autoRetryAt!) > nowMs);
     scheduler.dispose();
@@ -749,7 +749,7 @@ describe('ReviewWakeScheduler', () => {
         }
         assert.strictEqual(await scheduler.runDue(), 1);
         const launched = store.getTask(thread.threadId)!;
-        assert.strictEqual(launched.status, verdict === 'approve' && attempt === 5 ? 'completed' : 'waiting_review');
+        assert.strictEqual(launched.status, verdict === 'approve' && attempt === 5 ? 'completed' : 'reviewing');
         assert.strictEqual(launched.reviewWake!.autoRetryAttempts, attempt);
         if (attempt < 5) {
           finishWake?.();
@@ -994,7 +994,7 @@ describe('ReviewWakeScheduler', () => {
       assert.strictEqual(await scheduler.runWatchdog(), 1);
 
       const stalled = store.getTask('thread_review_wake_sched')!;
-      assert.strictEqual(stalled.status, 'waiting_review');
+      assert.strictEqual(stalled.status, 'reviewing');
       assert.strictEqual(stalled.reviewWake!.kind, 'timeout');
       assert.match(stalled.reviewWake!.lastError, /reviewer timeout/);
       assert.ok(stalled.reviewWake!.autoRetryAt, 'a retry must be planned');
@@ -1125,7 +1125,7 @@ describe('ReviewWakeScheduler', () => {
       });
       const thread = staleThread(nowMs);
       // Exactly the ledger shape written before `review_failed` existed: the
-      // review already gave up, but the task is still `waiting_review` forever.
+      // review already gave up, but the task is still `reviewing` forever.
       thread.reviewWake = {
         round: 1,
         attempts: 1,
@@ -1174,7 +1174,7 @@ describe('review_failed lifecycle status', () => {
     title: 'Review failed task',
     initiatorAgent: 'codex',
     targetAgent: 'deepseek_harness',
-    status: 'waiting_review',
+    status: 'reviewing',
     currentRound: 3,
     createdAt: '2026-10-23T10:00:00.000Z',
     updatedAt: '2026-10-23T11:00:00.000Z',
@@ -1187,7 +1187,7 @@ describe('review_failed lifecycle status', () => {
 
   test('records a non-empty cause and releases the task queue slot', () => {
     const thread = baseThread();
-    assert.strictEqual(isTaskUnfinished(thread), true, 'waiting_review still owns the slot');
+    assert.strictEqual(isTaskUnfinished(thread), true, 'reviewing still owns the slot');
 
     const changed = applyReviewFailure(thread, {
       kind: 'unresolvable_park',
@@ -1220,12 +1220,12 @@ describe('review_failed lifecycle status', () => {
     }
   });
 
-  test('re-opening returns to waiting_review and keeps the failure as history', () => {
+  test('re-opening returns to reviewing and keeps the failure as history', () => {
     const thread = baseThread();
     applyReviewFailure(thread, { kind: 'retries_exhausted', reason: '唤醒重试耗尽' });
 
     assert.strictEqual(reopenFailedReview(thread), true);
-    assert.strictEqual(thread.status, 'waiting_review');
+    assert.strictEqual(thread.status, 'reviewing');
     assert.strictEqual(thread.reviewWake, undefined);
     assert.strictEqual(thread.reviewFailure?.reason, '唤醒重试耗尽', 'audit history is kept');
     assert.strictEqual(isTaskUnfinished(thread), true, 'a re-opened review owns the slot again');

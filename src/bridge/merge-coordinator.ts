@@ -5,7 +5,7 @@ import * as path from 'path';
 import { spawn } from 'child_process';
 import { TaskRoleLock } from './task-role-lock';
 import { TaskStore } from './task-store';
-import { DelegationThread } from './types';
+import { DelegationThread, isMergeReview } from './types';
 import { gitOutput, gitExecutable } from './git-worktree';
 import { TaskExecutionRegistry } from './task-execution-registry';
 import { killProcessTree } from './platform';
@@ -531,10 +531,15 @@ export class MergeCoordinator {
   }
 
   private async mergeApprovedOnce(threadId: string): Promise<MergeResult | (MergeResult & { retryTarget: true })> {
-    const thread = this.store.getTask(threadId);
+    let thread = this.store.getTask(threadId);
     if (!thread?.worktree?.targetRef || !thread.worktree.approvedCommit) throw new Error(`Task ${threadId} has no approved isolated worktree commit.`);
-    if (thread.status !== 'waiting_merge') throw new Error(`Task ${threadId} is not waiting to merge.`);
-    const worktree = thread.worktree;
+    if (isMergeReview(thread)) {
+      thread = structuredClone(thread);
+      thread.status = 'queued'; thread.queuePhase = 'merge'; thread.updatedAt = new Date().toISOString();
+      this.store.upsertTask(thread);
+    }
+    if (!(thread.status === 'queued' && thread.queuePhase === 'merge') && thread.status !== 'merging') throw new Error(`Task ${threadId} is not waiting to merge.`);
+    const worktree = thread.worktree!;
     const repoPath = worktree.deliveryTarget?.repositoryPath || worktree.repositoryPath || worktree.mainPath;
     const targetRef = worktree.deliveryTarget?.ref || worktree.targetRef!;
     const sourceCommit = worktree.approvedCommit!;
@@ -560,7 +565,7 @@ export class MergeCoordinator {
       // This is intentionally the first target read in the critical section.
       if (!this.isMergeStillAllowed(threadId, sourceCommit)) return { status: 'stale', message: 'Task was paused or deleted before integration started.' };
       {
-        const latest = this.store.getTask(threadId)!;
+        const latest = structuredClone(this.store.getTask(threadId)!);
         const number = (latest.mergeHistory?.length || 0) + 1;
         const safeId = threadId.replace(/[^A-Za-z0-9_-]/g, '_');
         const dir = path.join(latest.artifactDir || path.join(this.storageDir, 'merge-logs', safeId), 'merge_log');
@@ -568,6 +573,9 @@ export class MergeCoordinator {
         const id = crypto.randomUUID();
         this.attemptLogs.set(threadId, { id, number, path: logPath, candidateTree: worktree.approvedSnapshot?.tree });
         const updated = structuredClone(latest);
+        updated.status = 'merging';
+        updated.queuePhase = undefined;
+        updated.updatedAt = new Date().toISOString();
         updated.mergeHistory = [...(updated.mergeHistory || []), { id, number, at: new Date().toISOString(), phase: 'attempt', result: 'started',
           logPath, logFileNumber, targetRef, sourceCommit: worktree.approvedSnapshot?.sourceCommit, candidateCommit: sourceCommit, candidateTree: worktree.approvedSnapshot?.tree,
           retryGeneration: updated.mergeControl?.retryGeneration || 0,
@@ -939,7 +947,7 @@ export class MergeCoordinator {
       if (!this.isMergeStillAllowed(threadId, sourceCommit)) return { status: 'stale', message: 'Task was paused or deleted during integration.' };
       if (/Could not durably persist task/i.test(String(error))) throw error;
       const latest = this.store.getTask(threadId);
-      if (latest?.status === 'waiting_merge' && latest.worktree?.deliveryTarget) {
+      if (latest?.status === 'merging' && latest.worktree?.deliveryTarget) {
         const reason = `Could not safely deliver to ${targetRef}: ${String(error)}`;
         // A prepared resolution is still based on its previous target even if
         // the checkout reset completed before the interruption.  The durable
@@ -1376,7 +1384,7 @@ export class MergeCoordinator {
       if (target !== tx.candidateCommit) gitOutput(repo, ['merge-base', '--is-ancestor', tx.candidateCommit, target]);
       landedTarget = target;
     } catch {}
-    if (thread.status !== 'paused') thread.status = 'waiting_merge';
+    if (thread.status !== 'paused') thread.status = 'reviewing';
     worktree.integration = { ...worktree.integration, phase: 'blocked', sourceCommit: tx.sourceCommit, candidateCommit: tx.candidateCommit,
       targetOldCommit: tx.targetOldCommit, targetPath: tx.checkoutPath, stashRecoveryPending: true, stashRecoveryLockHeld: tx.phase === 'stash_cleanup_needs_recovery',
       ...(landedTarget ? { targetCommit: landedTarget, mergedCommit: tx.candidateCommit } : {}),
@@ -1390,7 +1398,7 @@ export class MergeCoordinator {
   private finishBlocked(threadId: string, reason: string, targetOldCommit: string, sourceCommit: string, targetPath?: string, resolutionPath?: string): void {
     const current = this.store.getTask(threadId); if (!current?.worktree) return;
     const thread = structuredClone(current);
-    thread.status = 'waiting_merge';
+    thread.status = 'reviewing';
     if (resolutionPath) { thread.worktree!.mergeResolutionPath = resolutionPath; thread.worktree!.mergeResolutionSourceCommit = sourceCommit; }
     thread.worktree!.integration = { ...thread.worktree!.integration, phase: 'blocked', error: reason, targetOldCommit, targetPath, sourceCommit, updatedAt: new Date().toISOString() };
     if (thread.worktree!.approvedCommit) {
@@ -1403,10 +1411,10 @@ export class MergeCoordinator {
         candidateTree: this.attemptLogs.get(threadId)?.candidateTree, attemptId: this.attemptLogs.get(threadId)?.id, ...budget }];
     }
     thread.summary.lastOutputSnippet = reason; thread.updatedAt = new Date().toISOString(); this.store.upsertTask(thread);
-    if (thread.worktree!.approvedCommit && thread.status === 'waiting_merge') {
+    if (thread.worktree!.approvedCommit && thread.status === 'reviewing') {
       const timer = setTimeout(() => {
         const latest = this.store.getTask(threadId);
-        if (latest?.status === 'waiting_merge' && latest.worktree?.integration?.phase === 'blocked') this.requestReview?.(latest);
+        if (latest?.status === 'reviewing' && latest.worktree?.integration?.phase === 'blocked') this.requestReview?.(latest);
       }, 0);
       timer.unref();
     }
@@ -1483,17 +1491,17 @@ export class MergeCoordinator {
 
   private isMergeStillAllowed(threadId: string, sourceCommit: string): boolean {
     const latest = this.store.getTask(threadId);
-    return !!latest && latest.status === 'waiting_merge' && latest.worktree?.approvedCommit === sourceCommit;
+    return !!latest && (latest.status === 'merging' || (latest.status === 'queued' && latest.queuePhase === 'merge')) && latest.worktree?.approvedCommit === sourceCommit;
   }
 
   private markNeedsReview(thread: DelegationThread, reason: string): void {
     thread = structuredClone(thread);
-    thread.status = 'waiting_review'; thread.worktree!.approvedCommit = undefined;
+    thread.status = 'reviewing'; thread.worktree!.approvedCommit = undefined;
     thread.worktree!.integration = { phase: 'ready', error: reason, updatedAt: new Date().toISOString() };
     thread.summary.lastOutputSnippet = reason; thread.updatedAt = new Date().toISOString(); this.store.upsertTask(thread);
     const timer = setTimeout(() => {
       const latest = this.store.getTask(thread.threadId);
-      if (latest?.status === 'waiting_review') this.requestReview?.(latest);
+      if (latest?.status === 'reviewing') this.requestReview?.(latest);
     }, 0);
     timer.unref();
   }
@@ -1502,10 +1510,10 @@ export class MergeCoordinator {
     const current = this.store.getTask(threadId); if (!current?.worktree) return;
     const thread = structuredClone(current);
     const worktree = thread.worktree!;
-    thread.status = resolutionPath ? 'waiting_merge' : 'waiting_review';
+    thread.status = 'reviewing';
     if (resolutionPath) { worktree.mergeResolutionPath = resolutionPath; worktree.mergeResolutionSubmitted = false; worktree.mergeResolutionSourceCommit = sourceCommit; }
     const at = new Date().toISOString();
-    if (resolutionPath) {
+    {
       const number = (thread.mergeHistory?.length || 0) + 1;
       const safeId = threadId.replace(/[^A-Za-z0-9_-]/g, '_');
       const dir = path.join(thread.artifactDir || path.join(this.storageDir, 'merge-logs', safeId), 'merge_log');
@@ -1525,7 +1533,7 @@ export class MergeCoordinator {
     this.writeTransaction(file, { threadId, sourceCommit, targetOldCommit, phase, error, conflictFiles, at: new Date().toISOString() });
     const timer = setTimeout(() => {
       const latest = this.store.getTask(threadId);
-      if (latest && (latest.status === 'waiting_review' || (latest.status === 'waiting_merge' && latest.worktree?.mergeResolutionPath === resolutionPath))) this.requestReview?.(latest);
+      if (latest && (latest.status === 'reviewing' || (latest.status === 'merging' && latest.worktree?.mergeResolutionPath === resolutionPath))) this.requestReview?.(latest);
     }, 0);
     timer.unref();
   }

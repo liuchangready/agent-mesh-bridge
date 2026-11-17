@@ -87,7 +87,7 @@ function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread
     // a task may never run on its own initiator (AGENTS.md §22).
     initiatorAgent: 'claude_code',
     targetAgent: 'deepseek_harness',
-    status: 'waiting_review',
+    status: 'reviewing',
     currentRound: 1,
     createdAt: now,
     updatedAt: now,
@@ -168,7 +168,7 @@ describe('TaskRetargetService - switching a task executor', () => {
     assert.strictEqual(stored.receiverSessionCaptured, false);
     // History and worktree metadata survive the switch.
     assert.strictEqual(stored.rounds.length, 1);
-    assert.strictEqual(stored.status, 'waiting_review');
+    assert.strictEqual(stored.status, 'reviewing');
 
     const record = latestRetarget(stored)!;
     assert.strictEqual(record.fromAgent, 'deepseek_harness');
