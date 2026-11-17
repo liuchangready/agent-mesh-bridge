@@ -359,6 +359,8 @@ export interface DelegationRound {
 
 `failed` carries `failure.stage` (`bootstrap`, `execution`, `review`, or `merge`) and a monotonic `failureRevision`. Legacy ledger statuses and the deprecated `review_failed` / `merge_failed` filter inputs are normalized on read. Only `retry_merge` can restart a merge failure; unmerged results remain protected from archival and capacity eviction. See [FAILED_STATE_UNIFICATION_DESIGN.md](docs/FAILED_STATE_UNIFICATION_DESIGN.md).
 
+开发、检视、合并共用运行记录、活动时间预算和自动重试策略的后续方案见 [统一执行设计](docs/UNIFIED_EXECUTION_LIFECYCLE_DESIGN.md)。该文为待实现设计，不改变本节已实现行为。
+
 ### 4.2 1000 条容量控制与磁盘持久化规则
 
 1. **物理路径**：`~/.agent-mesh-bridge/delegation_threads.json`。
