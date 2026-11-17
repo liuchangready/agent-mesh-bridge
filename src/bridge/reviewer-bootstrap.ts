@@ -28,6 +28,7 @@ import { concurrencyPolicy } from './bridge-policy';
 import { TaskExecutionRegistry } from './task-execution-registry';
 import { TaskRoleLock } from './task-role-lock';
 import { TaskStore } from './task-store';
+import { ExecutionController } from './execution-controller';
 import { bootstrapDir } from './task-summary';
 import { reviewerBootstrapLogPath } from './reviewer-log';
 import { taskBootstrapDir, bridgeHomeDir } from './round-log';
@@ -476,6 +477,10 @@ export class ReviewerBootstrapService {
 
     for (const candidate of pending) {
       if (candidate.reviewBootstrap?.phase === 'failed') continue;
+      if (candidate.execution && ExecutionController.getInstance()) {
+        void ExecutionController.getInstance()!.startExecution(candidate.threadId, 'review', { purpose: 'bootstrap' });
+        continue;
+      }
       if (this.launching.has(candidate.threadId)) continue;
       // An active same-task bootstrap must be left to its owning process. Check
       // this before the retry budget so another extension host cannot mark a

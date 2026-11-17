@@ -186,8 +186,19 @@ export function killProcessTree(child: child_process.ChildProcess): void {
  *
  * Used for orphan cleanup when only the recorded pid survives, not a handle.
  */
+export type KillPidTreeProvider = (pid: number) => void;
+let customKillPidTreeProvider: KillPidTreeProvider | undefined;
+
+export function setKillPidTreeProvider(provider: KillPidTreeProvider | undefined): void {
+  customKillPidTreeProvider = provider;
+}
+
 export function killPidTree(pid: number): void {
   if (!pid) return;
+  if (customKillPidTreeProvider) {
+    customKillPidTreeProvider(pid);
+    return;
+  }
 
   if (IS_WINDOWS) {
     try {
@@ -215,46 +226,253 @@ export function killPidTree(pid: number): void {
 /**
  * Every descendant PID of `rootPid`, parents before children.
  *
- * Linux exposes the parent link in `/proc/<pid>/stat`; elsewhere (macOS) there
- * is no dependency-free source, so callers degrade to killing the direct child.
+ * Windows uses wmic/CIM process table; Linux reads `/proc/<pid>/stat`.
  */
-function collectDescendants(rootPid: number): number[] {
-  let entries: string[];
-  try {
-    entries = fs.readdirSync('/proc');
-  } catch {
-    return [];
-  }
-
+export function collectDescendants(rootPid: number): number[] {
+  if (!rootPid || rootPid <= 0) return [];
   const childrenByParent = new Map<number, number[]>();
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry)) continue;
-    const pid = Number(entry);
-    let stat: string;
+
+  if (IS_WINDOWS) {
     try {
-      stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    } catch {
-      continue; // The process exited while we were scanning.
-    }
-    // `comm` (field 2) may contain spaces and parentheses, so the parent id is
-    // parsed after the final ')': state ppid pgrp ...
-    const closeParen = stat.lastIndexOf(')');
-    if (closeParen === -1) continue;
-    const ppid = Number(stat.slice(closeParen + 2).split(' ')[1]);
-    if (!Number.isFinite(ppid)) continue;
-    const siblings = childrenByParent.get(ppid);
-    if (siblings) siblings.push(pid);
-    else childrenByParent.set(ppid, [pid]);
+      const output = child_process.execFileSync(
+        'wmic',
+        ['process', 'get', 'ParentProcessId,ProcessId'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000, windowsHide: true },
+      );
+      for (const line of output.split(/\r?\n/)) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length >= 2) {
+          const ppid = parseInt(parts[0], 10);
+          const pid = parseInt(parts[1], 10);
+          if (ppid > 0 && pid > 0) {
+            const siblings = childrenByParent.get(ppid);
+            if (siblings) siblings.push(pid);
+            else childrenByParent.set(ppid, [pid]);
+          }
+        }
+      }
+    } catch {}
+  } else {
+    try {
+      const entries = fs.readdirSync('/proc');
+      for (const entry of entries) {
+        if (!/^\d+$/.test(entry)) continue;
+        const pid = Number(entry);
+        try {
+          const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+          const closeParen = stat.lastIndexOf(')');
+          if (closeParen === -1) continue;
+          const ppid = Number(stat.slice(closeParen + 2).split(' ')[1]);
+          if (!Number.isFinite(ppid)) continue;
+          const siblings = childrenByParent.get(ppid);
+          if (siblings) siblings.push(pid);
+          else childrenByParent.set(ppid, [pid]);
+        } catch {}
+      }
+    } catch {}
   }
 
   const descendants: number[] = [];
   const queue: number[] = [rootPid];
+  const seen = new Set<number>([rootPid]);
   while (queue.length > 0) {
     const current = queue.shift()!;
     for (const pid of childrenByParent.get(current) ?? []) {
-      descendants.push(pid);
-      queue.push(pid);
+      if (!seen.has(pid)) {
+        seen.add(pid);
+        descendants.push(pid);
+        queue.push(pid);
+      }
     }
   }
   return descendants;
+}
+
+/**
+ * Returns true if candidatePid is rootPid or a descendant of rootPid.
+ */
+export function isProcessDescendant(candidatePid: number, rootPid: number): boolean {
+  if (!candidatePid || !rootPid || candidatePid <= 0 || rootPid <= 0) return false;
+  if (candidatePid === rootPid) return true;
+  return collectDescendants(rootPid).includes(candidatePid);
+}
+
+/**
+ * Process birth identity resolver.
+ *
+ * Windows: process creation time (UTC file time).
+ * Linux: starttime tick from /proc/<pid>/stat.
+ * macOS: process start time via ps.
+ */
+let cachedCurrentProcessBirthId: string | undefined;
+
+export type ProcessBirthIdProvider = (pid: number) => string | undefined;
+let customBirthIdProvider: ProcessBirthIdProvider | undefined;
+
+export function setProcessBirthIdProvider(provider: ProcessBirthIdProvider | undefined): void {
+  customBirthIdProvider = provider;
+}
+
+export function getProcessBirthId(pid: number): string | undefined {
+  if (!pid || pid <= 0) return undefined;
+  if (customBirthIdProvider) {
+    return customBirthIdProvider(pid);
+  }
+  if (pid === process.pid && cachedCurrentProcessBirthId) {
+    return cachedCurrentProcessBirthId;
+  }
+  try {
+    if (IS_WINDOWS) {
+      const output = child_process.execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($p) { $p.StartTime.ToFileTimeUtc() }`,
+        ],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true, timeout: 5000 },
+      );
+      const trimmed = output.trim();
+      const birthId = /^\d+$/.test(trimmed) ? trimmed : undefined;
+      if (pid === process.pid && birthId) cachedCurrentProcessBirthId = birthId;
+      return birthId;
+    } else if (process.platform === 'linux') {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const closeParen = stat.lastIndexOf(')');
+      if (closeParen !== -1) {
+        const fields = stat.slice(closeParen + 2).split(' ');
+        const starttime = fields[19];
+        if (starttime && /^\d+$/.test(starttime)) {
+          if (pid === process.pid) cachedCurrentProcessBirthId = starttime;
+          return starttime;
+        }
+      }
+    } else {
+      const output = child_process.execFileSync(
+        'ps',
+        ['-o', 'lstart=', '-p', String(pid)],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 },
+      );
+      const birthId = output.trim();
+      if (birthId) {
+        if (pid === process.pid) cachedCurrentProcessBirthId = birthId;
+        return birthId;
+      }
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+export type ProcessProbeProvider = (pid: number, expectedBirthId?: string) => 'alive' | 'exited' | 'unknown';
+let customProbeProvider: ProcessProbeProvider | undefined;
+
+export function setProcessProbeProvider(provider: ProcessProbeProvider | undefined): void {
+  customProbeProvider = provider;
+}
+
+/**
+ * Probes process identity against expected birth ID to prevent PID reuse.
+ * Returns 'alive' if alive and matching, 'exited' if not running or birthId changed,
+ * or 'unknown' if permissions prevent checking or birthId is indeterminate.
+ */
+export function probeProcessIdentity(
+  pid: number,
+  expectedBirthId?: string,
+): 'alive' | 'exited' | 'unknown' {
+  if (!pid || pid <= 0) return 'exited';
+  if (customProbeProvider) {
+    return customProbeProvider(pid, expectedBirthId);
+  }
+  try {
+    process.kill(pid, 0);
+  } catch (err: any) {
+    if (err?.code === 'EPERM') return 'unknown';
+    return 'exited';
+  }
+
+  if (!expectedBirthId) {
+    return 'alive';
+  }
+
+  const actualBirthId = getProcessBirthId(pid);
+  if (!actualBirthId) {
+    return 'unknown';
+  }
+  return actualBirthId === expectedBirthId ? 'alive' : 'exited';
+}
+
+export type ConfirmProcessTreeExitProvider = (
+  pid: number,
+  timeoutMs?: number,
+  expectedBirthId?: string,
+) => Promise<boolean>;
+let customConfirmExitProvider: ConfirmProcessTreeExitProvider | undefined;
+
+export function setConfirmProcessTreeExitProvider(
+  provider: ConfirmProcessTreeExitProvider | undefined,
+): void {
+  customConfirmExitProvider = provider;
+}
+
+/**
+ * Waits for a process and all its descendants to exit within timeoutMs (default 10s).
+ * Tracks descendant PIDs and their birthIds, verifying exit with probeProcessIdentity.
+ * Only returns true when root and all descendants are confirmed dead.
+ */
+export async function confirmProcessTreeExit(
+  pid: number,
+  timeoutMs: number = 10_000,
+  expectedBirthId?: string,
+): Promise<boolean> {
+  if (!pid || pid <= 0) return true;
+  if (customConfirmExitProvider) {
+    return customConfirmExitProvider(pid, timeoutMs, expectedBirthId);
+  }
+  const deadline = Date.now() + timeoutMs;
+  const knownProcessBirthIds = new Map<number, string | undefined>();
+
+  // Root process birthId
+  knownProcessBirthIds.set(pid, expectedBirthId ?? getProcessBirthId(pid));
+
+  const scanDescendants = () => {
+    try {
+      const descendants = collectDescendants(pid);
+      for (const d of descendants) {
+        if (!knownProcessBirthIds.has(d)) {
+          knownProcessBirthIds.set(d, getProcessBirthId(d));
+        }
+      }
+    } catch {}
+  };
+
+  // Perform initial descendant discovery
+  scanDescendants();
+
+  while (Date.now() < deadline) {
+    let allExited = true;
+
+    for (const [p, birthId] of knownProcessBirthIds.entries()) {
+      const status = probeProcessIdentity(p, birthId);
+      if (status !== 'exited') {
+        allExited = false;
+        break;
+      }
+    }
+
+    if (allExited) {
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  // Final check at deadline
+  for (const [p, birthId] of knownProcessBirthIds.entries()) {
+    if (probeProcessIdentity(p, birthId) !== 'exited') {
+      return false;
+    }
+  }
+  return true;
 }

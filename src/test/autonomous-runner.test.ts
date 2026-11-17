@@ -76,12 +76,12 @@ describe('AutonomousRunner Tests', () => {
     assert.match(result.stdout, /pipeline finished/);
   });
 
-  test('a silent round with no park declaration is still killed', async () => {
-    // The park budget must not turn the watchdog off for ordinary silence.
+  test('a successful round with a stream gap records a warning without being killed', async () => {
+    // Stream gaps remain observable while the controller owns termination.
     const silentRunner = new AutonomousRunner(detector);
     silentRunner.buildCommand = () => ({
       command: process.execPath,
-      args: ['-e', 'setTimeout(() => process.stdout.write("late\\n"), 20000);'],
+      args: ['-e', 'process.stdout.write("start\\n"); setTimeout(() => process.stdout.write("late\\n"), 400);'],
       useShell: false,
     });
 
@@ -91,13 +91,14 @@ describe('AutonomousRunner Tests', () => {
       isRework: false,
       receiverSessionId: 'session-silent',
       timeoutMs: 120_000,
-      silenceTimeoutMs: 3_000,
+      silenceTimeoutMs: 100,
       retryBackoffMs: 10,
     });
 
-    assert.strictEqual(result.interruption?.kind, 'watchdog');
-    assert.strictEqual(result.assessment?.success, false);
-    assert.strictEqual(result.assessment?.errorCode, 'WATCHDOG');
+    assert.strictEqual(result.interruption, undefined);
+    assert.strictEqual(result.assessment?.success, true);
+    assert.ok(result.assessment?.warnings?.some(warning => warning.code === 'STREAM_GAP_EXCEEDED'));
+    assert.strictEqual(result.assessment?.stream.gapExceeded, true);
   });
 
   test('detects provider rate-limit signals in structured output and stderr text', () => {

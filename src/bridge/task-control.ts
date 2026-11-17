@@ -16,6 +16,7 @@ import { changedFiles, currentHead } from './git-worktree';
 import { gitOutput } from './git-worktree';
 import { MeshFileLock } from './merge-coordinator';
 import { TaskRoleLock } from './task-role-lock';
+import { ExecutionController } from './execution-controller';
 import { killPidTree } from './platform';
 import { taskValidationDir } from './round-log';
 import {
@@ -94,7 +95,7 @@ export class TaskControlService {
         `Cannot pause task ${threadId}: it already failed. Use resume/retry instead.`,
       );
     }
-    if (thread.status === 'reviewing' && !isMergeReview(thread)) {
+    if (thread.status === 'reviewing' && !thread.execution && !isMergeReview(thread)) {
       throw new Error(
         `Cannot pause task ${threadId}: it is waiting for the caller's review, not executing.`,
       );
@@ -104,6 +105,20 @@ export class TaskControlService {
     }
 
     const normalizedReason = (reason || '').trim() || 'Paused by user';
+    if (thread.execution && ExecutionController.getInstance()) {
+      void ExecutionController.getInstance()!.pauseExecution(threadId, normalizedReason, by);
+      this.cancellationRegistry.request(threadId, 'pause', normalizedReason, by);
+      this.runner?.cancelThread(threadId, 'pause', normalizedReason, by);
+      this.executionRegistry.killOrphanChild(threadId, true);
+      return {
+        threadId,
+        status: 'PAUSED',
+        reason: normalizedReason,
+        message:
+          `Task ${threadId} paused. Interruption reason: ${normalizedReason}. ` +
+          `The round is preserved and can be resumed later.`,
+      };
+    }
     const now = new Date().toISOString();
     const interruption: TaskInterruption = {
       kind: 'paused',

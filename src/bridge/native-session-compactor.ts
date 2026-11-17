@@ -7,7 +7,7 @@ import * as path from 'path';
 import { AgentDetector } from './agent-detector';
 import { CancellationRegistry } from './cancellation-registry';
 import { CodexNativeCompaction } from './codex-native-compaction';
-import { NativeSessionLock } from './native-session-lock';
+import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
 import { resolveConfiguredModel } from './model-catalog';
 import { getReviewerLogDir, getWorkerLogDir, safeThreadIdPart, taskReviewerLogDir, taskWorkerLogDir } from './round-log';
 import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
@@ -237,7 +237,7 @@ export class NativeSessionCompactor {
   }
 
   /** Acquire the session write lease and supply any still-undelivered recovery document. */
-  public async prepareBeforeResume(threadId: string, role: TaskRole, model?: string, reviewerBootstrap = false): Promise<NativeSessionPreparation> {
+  public async prepareBeforeResume(threadId: string, role: TaskRole, model?: string, reviewerBootstrap = false, existingLease?: NativeSessionLease): Promise<NativeSessionPreparation> {
     const root = path.dirname(this.store.getStoragePath());
     this.store.loadFromDisk();
     let thread = this.store.getTask(threadId);
@@ -247,14 +247,14 @@ export class NativeSessionCompactor {
     const captured = role === 'developer' ? thread.receiverSessionCaptured : thread.reviewerSessionCaptured;
     const sessionId = role === 'developer' ? thread.receiverSessionId : thread.reviewerSessionId;
     if (!captured || !isValidSessionId(sessionId || '')) return {};
-    const lease = new NativeSessionLock(root).acquire(agent, sessionId!);
+    const lease = existingLease || new NativeSessionLock(root).acquire(agent, sessionId!);
     if (!lease) throw new Error(`Native session ${sessionId} is already owned by another Bridge process.`);
     let executionLease: NativeSessionPreparation['executionLease'];
-    let keepLease = false;
+    let keepLease = Boolean(existingLease);
     try {
     const roleOwnerAtStart = new TaskRoleLock(root).getOwner(threadId);
     if (!roleOwnerAtStart || roleOwnerAtStart.role !== role) {
-      new NativeSessionLock(root).release(lease);
+      if (!existingLease) new NativeSessionLock(root).release(lease);
       throw new Error('The task role lease is not held during native-session preparation.');
     }
     const cancellation = new CancellationRegistry(root).peek(threadId);
@@ -274,7 +274,7 @@ export class NativeSessionCompactor {
         freshModel !== model || worktreeChanged || cancellation ||
         (role === 'developer' && !['running', 'queued'].includes(fresh.status)) ||
         (role === 'reviewer' && !isReviewerWakeEligible(fresh) && !(reviewerBootstrap && fresh.status === 'queued' && fresh.reviewBootstrap?.phase === 'launching'))) {
-      new NativeSessionLock(root).release(lease);
+      if (!existingLease) new NativeSessionLock(root).release(lease);
       throw new Error('Task state, cancellation, model, worktree, or native session changed before resume preparation.');
     }
     thread = fresh;
@@ -416,7 +416,7 @@ export class NativeSessionCompactor {
           const result = await this.compactAutomatically(thread, role, agent, model!, sessionId!, lease, cursor || { sessionId: sessionId!, turnsSinceCompaction: 0 }, identity);
           if (result.pauseReason) {
             releaseExecutionLease();
-            new NativeSessionLock(root).release(lease);
+            if (!existingLease) new NativeSessionLock(root).release(lease);
             return { sessionId, pauseReason: result.pauseReason };
           }
           warning = result.warning;
@@ -435,7 +435,7 @@ export class NativeSessionCompactor {
         releaseExecutionLease();
         const reason = 'Pending native-session recovery record is missing; refusing to resume without task context.';
         appendInterruption(thread, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' });
-        thread.status = 'paused'; this.store.upsertTask(thread); new NativeSessionLock(root).release(lease);
+        thread.status = 'paused'; this.store.upsertTask(thread); if (!existingLease) new NativeSessionLock(root).release(lease);
         return { sessionId, pauseReason: reason };
       }
       const logDir = roleLogDir(thread, role, agent, root);
@@ -444,7 +444,7 @@ export class NativeSessionCompactor {
         releaseExecutionLease();
         const reason = 'Pending native-session recovery path is outside the task agent log directory.';
         appendInterruption(thread, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' });
-        thread.status = 'paused'; this.store.upsertTask(thread); new NativeSessionLock(root).release(lease);
+        thread.status = 'paused'; this.store.upsertTask(thread); if (!existingLease) new NativeSessionLock(root).release(lease);
         return { sessionId, pauseReason: reason };
       }
       try { recoveryPrefix = fs.readFileSync(recoveryPath, 'utf8'); }
@@ -452,7 +452,7 @@ export class NativeSessionCompactor {
         releaseExecutionLease();
         const reason = `Pending native-session recovery document is unavailable: ${String(error?.message || error).slice(0, 300)}`;
         appendInterruption(thread, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' });
-        thread.status = 'paused'; this.store.upsertTask(thread); new NativeSessionLock(root).release(lease);
+        thread.status = 'paused'; this.store.upsertTask(thread); if (!existingLease) new NativeSessionLock(root).release(lease);
         return { sessionId, pauseReason: reason };
       }
     }
@@ -475,7 +475,7 @@ export class NativeSessionCompactor {
     if (!latestThread || latestThread.archivedAt || !statusAllowed || latestAgent !== agent || latestSession !== sessionId ||
         latestModel !== model || latestWorktree !== originalWorktree || new CancellationRegistry(root).peek(threadId) ||
         new TaskRoleLock(root).getOwner(threadId)?.token !== roleOwnerAtStart.token) {
-      new NativeSessionLock(root).release(lease);
+      if (!existingLease) new NativeSessionLock(root).release(lease);
       releaseExecutionLease();
       return { sessionId, pauseReason: 'Task, role, model, session, worktree, or cancellation state changed during preparation.' };
     }
@@ -484,7 +484,7 @@ export class NativeSessionCompactor {
     } catch (error) {
       if (executionLease?.owned) executionLease.registry.end(executionLease.registration);
       executionLease?.registry.dispose();
-      if (!keepLease) new NativeSessionLock(root).release(lease);
+      if (!keepLease && !existingLease) new NativeSessionLock(root).release(lease);
       throw error;
     }
   }
