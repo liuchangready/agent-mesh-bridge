@@ -9,7 +9,7 @@ import { resolveGitRepository, createTaskWorktree, commitTaskChanges, removeTask
 import { MergeCoordinator, MeshFileLock } from '../bridge/merge-coordinator';
 import { TaskStore } from '../bridge/task-store';
 import { TaskControlService } from '../bridge/task-control';
-import { gitExe, git, initRepo, thread } from './git-worktree-fixture';
+import { gitExe, git, initRepo, initMultiStashRepo, thread } from './git-worktree-fixture';
 
 test('a dirty checked-out delivery target restores staged, unstaged, deleted and untracked files', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-dirty-delivery-'));
@@ -66,11 +66,9 @@ test('stash restoration conflict leaves the merge completed and preserves both s
 
 test('landing restores its own stash when another stash is added after it', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-order-'));
-  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); const { old: oldSha } = initMultiStashRepo(repository);
   const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, 'thread_stash_order', storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task\nmiddle\nbeta\n'); worktree.headCommit = commitTaskChanges(worktree, 'task');
-  fs.writeFileSync(path.join(repository, 'old.txt'), 'old'); git(repository, 'stash', 'push', '-u', '-m', 'old');
-  const oldSha = git(repository, 'rev-parse', 'refs/stash');
   fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
   const store = new TaskStore(storage); store.upsertTask(thread('thread_stash_order', worktree));
   t.after(() => { store.dispose(); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
@@ -182,11 +180,10 @@ test('stash identity drift before cleanup preserves the new entry', async (t) =>
 
 test('landing removes its top stash while preserving an older stash', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-old-'));
-  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); const { old } = initMultiStashRepo(repository);
   const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, 'thread_stash_old', storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task\nmiddle\nbeta\n'); worktree.headCommit = commitTaskChanges(worktree, 'task');
-  fs.writeFileSync(path.join(repository, 'old.txt'), 'old'); git(repository, 'stash', 'push', '-u', '-m', 'old');
-  const old = git(repository, 'rev-parse', 'refs/stash'); fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
+  fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
   const store = new TaskStore(storage); store.upsertTask(thread('thread_stash_old', worktree));
   t.after(() => { store.dispose(); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
   const result = await new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock'))).mergeApproved('thread_stash_old');
@@ -198,16 +195,41 @@ test('landing removes its top stash while preserving an older stash', async (t) 
 
 test('a held Git stash ref lock prevents cleanup without deleting any entry', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-lock-fail-'));
-  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); const { old } = initMultiStashRepo(repository);
   const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, 'thread_stash_lock_fail', storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task\nmiddle\nbeta\n'); worktree.headCommit = commitTaskChanges(worktree, 'task');
-  fs.writeFileSync(path.join(repository, 'old.txt'), 'old'); git(repository, 'stash', 'push', '-u', '-m', 'old');
-  const old = git(repository, 'rev-parse', 'refs/stash'); fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
+  fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
   const store = new TaskStore(storage); store.upsertTask(thread('thread_stash_lock_fail', worktree));
   t.after(() => { store.dispose(); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
   const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));
   const lockPath = path.join(repository, '.git', 'refs', 'stash.lock');
   (coordinator as any).removeSoleLandingStash = async () => { fs.writeFileSync(lockPath, '', { flag: 'wx' }); return false; };
+  const multi = (coordinator as any).removeMultipleLandingStash.bind(coordinator);
+  const mutableFs = createRequire(__filename)('fs') as typeof fs;
+  const link = mutableFs.linkSync;
+  let attempts = 0;
+  t.mock.method(mutableFs, 'linkSync', (source: fs.PathLike, target: fs.PathLike) => {
+    if (String(target) === lockPath) attempts++;
+    return link(source, target);
+  });
+  (coordinator as any).removeMultipleLandingStash = async (...args: any[]) => {
+    // Advance only the retry stage; process startup, Git and lock ownership stay real.
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      let settled = false;
+      const pending = multi(...args).then((value: boolean) => { settled = true; return value; });
+      for (let n = 0; n < 99; n++) { t.mock.timers.tick(100); await Promise.resolve(); }
+      assert.equal(attempts, 100);
+      t.mock.timers.tick(99); await Promise.resolve();
+      assert.equal(settled, false, 'cleanup still waits at 9999ms');
+      t.mock.timers.tick(1);
+      const removed = await pending;
+      assert.equal(removed, false, 'the retry budget expires at 10000ms');
+      assert.equal(attempts, 100, 'the retry budget does not allow an extra attempt');
+      assert.equal(fs.existsSync(lockPath), true, 'the held ref lock is preserved');
+      return removed;
+    } finally { t.mock.timers.reset(); }
+  };
   const result = await coordinator.mergeApproved('thread_stash_lock_fail');
   fs.unlinkSync(lockPath);
   assert.equal(result.status, 'merged', result.message);
@@ -219,11 +241,10 @@ test('a held Git stash ref lock prevents cleanup without deleting any entry', as
 
 test('a failed reflog publication preserves all stash entries and reports the cleanup failure', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-log-fail-'));
-  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); const { old } = initMultiStashRepo(repository);
   const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, 'thread_stash_log_fail', storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task\nmiddle\nbeta\n'); worktree.headCommit = commitTaskChanges(worktree, 'task');
-  fs.writeFileSync(path.join(repository, 'old.txt'), 'old'); git(repository, 'stash', 'push', '-u', '-m', 'old');
-  const old = git(repository, 'rev-parse', 'refs/stash'); fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
+  fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
   const store = new TaskStore(storage); store.upsertTask(thread('thread_stash_log_fail', worktree));
   t.after(() => { store.dispose(); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
   const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));
@@ -239,11 +260,9 @@ test('a failed reflog publication preserves all stash entries and reports the cl
 
 for (const failRollback of [false, true]) test(`ref publication failure preserves recoverable stash metadata, rollback failure=${failRollback}`, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-ref-fail-'));
-  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); const { old } = initMultiStashRepo(repository);
   const id = 'thread_stash_ref_fail'; const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, id, storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task\nmiddle\nbeta\n'); worktree.headCommit = commitTaskChanges(worktree, 'task');
-  fs.writeFileSync(path.join(repository, 'old.txt'), 'old'); git(repository, 'stash', 'push', '-u', '-m', 'old');
-  const old = git(repository, 'rev-parse', 'refs/stash');
   fs.writeFileSync(path.join(repository, 'later-stash.txt'), 'later'); git(repository, 'stash', 'push', '-u', '-m', 'later');
   const later = git(repository, 'rev-parse', 'refs/stash'); git(repository, 'stash', 'drop');
   fs.writeFileSync(path.join(repository, 'staged.txt'), 'staged\n'); git(repository, 'add', 'staged.txt');
@@ -322,11 +341,10 @@ for (const failRollback of [false, true]) test(`ref publication failure preserve
 
 test('a retained inconsistent stash lock survives process exit and is adopted by the same transaction', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-protected-restart-'));
-  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); const { old } = initMultiStashRepo(repository);
   const id = 'thread_stash_protected_restart'; const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, id, storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task\nmiddle\nbeta\n'); worktree.headCommit = commitTaskChanges(worktree, 'task');
-  fs.writeFileSync(path.join(repository, 'old.txt'), 'old'); git(repository, 'stash', 'push', '-u', '-m', 'old');
-  const old = git(repository, 'rev-parse', 'refs/stash'); fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
+  fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
   const initial = new TaskStore(storage); initial.upsertTask(thread(id, worktree)); initial.dispose();
   t.after(() => { try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
   const script = `const path=require('path'),{TaskStore}=require(process.argv[1]),{MergeCoordinator,MeshFileLock}=require(process.argv[2]);
@@ -353,11 +371,10 @@ test('a retained inconsistent stash lock survives process exit and is adopted by
 
 test('an error after ref publication recognizes the already consistent stash state', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-ref-after-write-'));
-  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); const { old } = initMultiStashRepo(repository);
   const id = 'thread_stash_ref_after_write'; const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, id, storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task\nmiddle\nbeta\n'); worktree.headCommit = commitTaskChanges(worktree, 'task');
-  fs.writeFileSync(path.join(repository, 'old.txt'), 'old'); git(repository, 'stash', 'push', '-u', '-m', 'old');
-  const old = git(repository, 'rev-parse', 'refs/stash'); fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
+  fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
   const store = new TaskStore(storage); store.upsertTask(thread(id, worktree));
   t.after(() => { store.dispose(); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
   const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));
@@ -376,11 +393,10 @@ test('an error after ref publication recognizes the already consistent stash sta
 
 test('pausing during multi-stash publication preserves the ref lock until cleanup is consistent', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-pause-publish-'));
-  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); const { old } = initMultiStashRepo(repository);
   const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, 'thread_stash_pause_publish', storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task\nmiddle\nbeta\n'); worktree.headCommit = commitTaskChanges(worktree, 'task');
-  fs.writeFileSync(path.join(repository, 'old.txt'), 'old'); git(repository, 'stash', 'push', '-u', '-m', 'old');
-  const old = git(repository, 'rev-parse', 'refs/stash'); fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
+  fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
   const store = new TaskStore(storage); store.upsertTask(thread('thread_stash_pause_publish', worktree));
   t.after(() => { store.dispose(); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
   const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));
@@ -402,11 +418,10 @@ test('pausing during multi-stash publication preserves the ref lock until cleanu
 
 test('a transient failure releasing the stash lock retains enough evidence to recover', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-unlock-fail-'));
-  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); const { old } = initMultiStashRepo(repository);
   const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, 'thread_stash_unlock_fail', storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task\nmiddle\nbeta\n'); worktree.headCommit = commitTaskChanges(worktree, 'task');
-  fs.writeFileSync(path.join(repository, 'old.txt'), 'old'); git(repository, 'stash', 'push', '-u', '-m', 'old');
-  const old = git(repository, 'rev-parse', 'refs/stash'); fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
+  fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
   const store = new TaskStore(storage); store.upsertTask(thread('thread_stash_unlock_fail', worktree));
   const mutableFs = createRequire(__filename)('fs') as { unlinkSync: typeof fs.unlinkSync };
   const unlink = mutableFs.unlinkSync; const lockPath = path.join(repository, '.git', 'refs', 'stash.lock'); let failed = false;
@@ -425,13 +440,9 @@ test('a transient failure releasing the stash lock retains enough evidence to re
 
 test('stash cleanup retries identification when the ref moves before its lock is acquired', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-lock-drift-'));
-  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
+  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); const { old, extra } = initMultiStashRepo(repository);
   const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, 'thread_stash_lock_drift', storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task\nmiddle\nbeta\n'); worktree.headCommit = commitTaskChanges(worktree, 'task');
-  fs.writeFileSync(path.join(repository, 'old.txt'), 'old'); git(repository, 'stash', 'push', '-u', '-m', 'old');
-  const old = git(repository, 'rev-parse', 'refs/stash');
-  fs.writeFileSync(path.join(repository, 'extra.txt'), 'extra'); git(repository, 'stash', 'push', '-u', '-m', 'extra');
-  const extra = git(repository, 'rev-parse', 'refs/stash'); git(repository, 'stash', 'drop');
   fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
   const store = new TaskStore(storage); store.upsertTask(thread('thread_stash_lock_drift', worktree));
   t.after(() => { store.dispose(); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
