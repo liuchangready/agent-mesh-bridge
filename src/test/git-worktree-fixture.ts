@@ -13,6 +13,8 @@ process.env.USERPROFILE = isolatedHome;
 process.env.HOME = isolatedHome;
 const repositoryTemplate = path.join(isolatedHome, 'repository-template');
 let templateReady = false;
+const stashTemplate = path.join(isolatedHome, 'stash-template');
+let preparedStashes: { old: string; extra: string } | undefined;
 
 export function git(cwd: string, ...args: string[]): string {
   const result = spawnSync(gitExe, args, { cwd, encoding: 'utf8', windowsHide: true });
@@ -39,6 +41,22 @@ export function initRepo(root: string): void {
   }
   // Copy ordinary files, including .git, so refs, config and objects stay independent.
   fs.cpSync(repositoryTemplate, root, { recursive: true });
+}
+
+export function initMultiStashRepo(root: string): { old: string; extra: string } {
+  if (!preparedStashes) {
+    initRepo(stashTemplate);
+    fs.writeFileSync(path.join(stashTemplate, 'old.txt'), 'old');
+    git(stashTemplate, 'stash', 'push', '-u', '-m', 'old');
+    const old = git(stashTemplate, 'rev-parse', 'refs/stash');
+    fs.writeFileSync(path.join(stashTemplate, 'extra.txt'), 'extra');
+    git(stashTemplate, 'stash', 'push', '-u', '-m', 'extra');
+    const extra = git(stashTemplate, 'rev-parse', 'refs/stash');
+    git(stashTemplate, 'stash', 'drop');
+    preparedStashes = { old, extra };
+  }
+  fs.cpSync(stashTemplate, root, { recursive: true });
+  return { ...preparedStashes };
 }
 
 function createRepositoryTemplate(): void {
