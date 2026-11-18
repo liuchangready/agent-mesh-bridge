@@ -1,0 +1,189 @@
+{
+  "metadata": {
+    "date": "2026-11-18T06:54:10.238Z",
+    "nodeVersion": "v26.13.1",
+    "platform": "Windows_NT 10.0.19045 (x64)",
+    "baselineCommit": "3830923af0aae89bae0776d173d293935aa47e8d",
+    "candidateBranch": "mesh/task/thread_20261118_100841_0e3f",
+    "concurrency": 4
+  },
+  "compilation": {
+    "baselineMs": 28005,
+    "candidateMs": 27678
+  },
+  "warmup": {
+    "baselineMs": 531113,
+    "candidateMs": 400815
+  },
+  "fullRuns": {
+    "baselinesMs": [
+      507131,
+      480032,
+      551518
+    ],
+    "candidatesMs": [
+      370839,
+      406405,
+      430379
+    ],
+    "medianBaselineMs": 507131,
+    "medianCandidateMs": 406405,
+    "medianDiffMs": 100726,
+    "speedupPercent": 19.86,
+    "speedupSeconds": 100.73,
+    "rangeBaselineMs": 71486,
+    "rangeCandidateMs": 59540,
+    "rawRuns": {
+      "A1": {
+        "exitCode": 0,
+        "durationMs": 507131,
+        "tests": 680,
+        "pass": 680,
+        "fail": 0,
+        "skip": 0,
+        "todo": 0,
+        "error": null
+      },
+      "B1": {
+        "exitCode": 0,
+        "durationMs": 370839,
+        "tests": 680,
+        "pass": 680,
+        "fail": 0,
+        "skip": 0,
+        "todo": 0,
+        "error": null
+      },
+      "B2": {
+        "exitCode": 0,
+        "durationMs": 406405,
+        "tests": 680,
+        "pass": 680,
+        "fail": 0,
+        "skip": 0,
+        "todo": 0,
+        "error": null
+      },
+      "A2": {
+        "exitCode": 0,
+        "durationMs": 480032,
+        "tests": 680,
+        "pass": 680,
+        "fail": 0,
+        "skip": 0,
+        "todo": 0,
+        "error": null
+      },
+      "A3": {
+        "exitCode": 0,
+        "durationMs": 551518,
+        "tests": 680,
+        "pass": 680,
+        "fail": 0,
+        "skip": 0,
+        "todo": 0,
+        "error": null
+      },
+      "B3": {
+        "exitCode": 0,
+        "durationMs": 430379,
+        "tests": 680,
+        "pass": 680,
+        "fail": 0,
+        "skip": 0,
+        "todo": 0,
+        "error": null
+      }
+    }
+  },
+  "layers": {
+    "policy": {
+      "exitCode": 0,
+      "durationMs": 58331,
+      "tests": 287,
+      "pass": 287,
+      "fail": 0,
+      "skip": 0,
+      "todo": 0,
+      "error": null
+    },
+    "boundary": {
+      "exitCode": 0,
+      "durationMs": 179472,
+      "tests": 212,
+      "pass": 212,
+      "fail": 0,
+      "skip": 0,
+      "todo": 0,
+      "error": null
+    },
+    "integration": {
+      "exitCode": 0,
+      "durationMs": 215836,
+      "tests": 181,
+      "pass": 181,
+      "fail": 0,
+      "skip": 0,
+      "todo": 0,
+      "error": null
+    }
+  },
+  "operations": {
+    "baseline": {
+      "git": 7375,
+      "lock_helper": 348,
+      "taskstore_cas": 170,
+      "taskstore_write": 2653
+    },
+    "candidate": {
+      "git": 7285,
+      "lock_helper": 258,
+      "taskstore_cas": 173,
+      "taskstore_write": 1665
+    }
+  },
+  "acceptanceCriteria": {
+    "allThreePairsFaster": {
+      "met": true,
+      "pairs": [
+        {
+          "pair": 1,
+          "baselineMs": 507131,
+          "candidateMs": 370839,
+          "diffMs": 136292
+        },
+        {
+          "pair": 2,
+          "baselineMs": 480032,
+          "candidateMs": 406405,
+          "diffMs": 73627
+        },
+        {
+          "pair": 3,
+          "baselineMs": 551518,
+          "candidateMs": 430379,
+          "diffMs": 121139
+        }
+      ]
+    },
+    "medianDropAtLeast10Percent": {
+      "met": true,
+      "actualPercent": 19.86192916623121
+    },
+    "medianDropAtLeast30Seconds": {
+      "met": true,
+      "actualSeconds": 100.726
+    },
+    "medianDiffExceedsMaxRange": {
+      "met": true,
+      "medianDiffMs": 100726,
+      "maxRangeMs": 71486,
+      "rangeA": 71486,
+      "rangeB": 59540
+    },
+    "allTestsPassWithoutFailures": {
+      "met": true
+    },
+    "recommendedForMerge": true
+  }
+}

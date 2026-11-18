@@ -1,0 +1,3026 @@
+{
+  "fingerprint": {
+    "fingerprintId": "699b673fe6ff9d80",
+    "baselineCommit": "3830923af0aae89bae0776d173d293935aa47e8d",
+    "candidateCommit": "3830923af0aae89bae0776d173d293935aa47e8d",
+    "candidateDiff": "2d3fef5aafaeefe8",
+    "probeHash": "8073b45c5b96224a",
+    "testScriptHash": "2fccffa1097f20a9",
+    "benchmarkScriptHash": "1b09f92c0d8af526",
+    "layeringConfigHash": "missing"
+  },
+  "metadata": {
+    "timestamp": "2026-11-18T11:24:14.148Z",
+    "nodeVersion": "v26.13.1",
+    "platform": "Windows_NT 10.0.19045 (x64)",
+    "cpuModel": "12th Gen Intel(R) Core(TM) i7-1260P",
+    "cpuCores": 16,
+    "totalMemoryGb": 15.73,
+    "freeMemoryGb": 3.27,
+    "gitVersion": "git version 2.56.0.windows.4",
+    "powershellVersion": "5.1.19041.6456",
+    "loadAverage": [
+      0,
+      0,
+      0
+    ],
+    "concurrencyLimit": 4
+  },
+  "compile": {
+    "baseline": {
+      "durationMs": 11691,
+      "startedAt": "2026-11-18T11:24:14.181Z",
+      "endedAt": "2026-11-18T11:24:25.872Z"
+    },
+    "candidate": {
+      "durationMs": 8919,
+      "startedAt": "2026-11-18T11:24:25.899Z",
+      "endedAt": "2026-11-18T11:24:34.818Z"
+    }
+  },
+  "warmup": {
+    "baseline": {
+      "exitCode": 0,
+      "signal": null,
+      "error": null,
+      "status": "pass",
+      "durationMs": 516993,
+      "tests": 680,
+      "pass": 680,
+      "fail": 0,
+      "cancelled": 0,
+      "skip": 0,
+      "todo": 0,
+      "suiteTimings": [
+        {
+          "name": "a dirty checked-out delivery target restores staged, unstaged, deleted and untracked files",
+          "durationMs": 18276.3124
+        },
+        {
+          "name": "stash restoration conflict leaves the merge completed and preserves both stashes",
+          "durationMs": 13867.7511
+        },
+        {
+          "name": "landing restores its own stash when another stash is added after it",
+          "durationMs": 14829.5787
+        },
+        {
+          "name": "sole stash cleanup verifies its identity while Git holds the ref lock",
+          "durationMs": 14034.8937
+        },
+        {
+          "name": "cleanup failure retains the exact stash and does not fail a landed merge",
+          "durationMs": 12550.7594
+        },
+        {
+          "name": "stash cleanup never deletes a branch if refs/stash becomes symbolic",
+          "durationMs": 15980.8918
+        },
+        {
+          "name": "stash identity drift before cleanup preserves the new entry",
+          "durationMs": 12696.1737
+        },
+        {
+          "name": "landing removes its top stash while preserving an older stash",
+          "durationMs": 10502.1425
+        },
+        {
+          "name": "a held Git stash ref lock prevents cleanup without deleting any entry",
+          "durationMs": 9167.2188
+        },
+        {
+          "name": "a failed reflog publication preserves all stash entries and reports the cleanup failure",
+          "durationMs": 12510.0023
+        },
+        {
+          "name": "ref publication failure preserves recoverable stash metadata, rollback failure=false",
+          "durationMs": 17285.8597
+        },
+        {
+          "name": "ref publication failure preserves recoverable stash metadata, rollback failure=true",
+          "durationMs": 14782.525
+        },
+        {
+          "name": "a retained inconsistent stash lock survives process exit and is adopted by the same transaction",
+          "durationMs": 15064.5595
+        },
+        {
+          "name": "an error after ref publication recognizes the already consistent stash state",
+          "durationMs": 11201.7784
+        },
+        {
+          "name": "pausing during multi-stash publication preserves the ref lock until cleanup is consistent",
+          "durationMs": 10824.7824
+        },
+        {
+          "name": "a transient failure releasing the stash lock retains enough evidence to recover",
+          "durationMs": 10664.1768
+        },
+        {
+          "name": "stash cleanup retries identification when the ref moves before its lock is acquired",
+          "durationMs": 12167.6958
+        },
+        {
+          "name": "stash creation failure never advances the target or discards local files",
+          "durationMs": 5578.587
+        },
+        {
+          "name": "an unconfirmed new stash is restored without advancing the target",
+          "durationMs": 7264.6345
+        },
+        {
+          "name": "ignored checkout file that blocks synchronization is preserved before ref update",
+          "durationMs": 7382.5015
+        },
+        {
+          "name": "pause immediately after ref update finishes the existing landing and restores the stash",
+          "durationMs": 9243.4204
+        },
+        {
+          "name": "pause after stashing but before ref update restores local changes, existing=false",
+          "durationMs": 9006.0616
+        },
+        {
+          "name": "pause after stashing but before ref update restores local changes, existing=true",
+          "durationMs": 9869.7434
+        },
+        {
+          "name": "an uncertain post-apply transaction preserves the checkout without applying the stash twice",
+          "durationMs": 10467.4035
+        },
+        {
+          "name": "candidate snapshots preserve the worker index and exclude ignored and later changes",
+          "durationMs": 5657.3199
+        },
+        {
+          "name": "approval integrates the frozen dirty candidate after later worker edits",
+          "durationMs": 12300.8714
+        },
+        {
+          "name": "CAS competition retries against the advanced target without waking a reviewer",
+          "durationMs": 22295.8335
+        },
+        {
+          "name": "snapshot failure records a blocked merge and requests a reviewer wake",
+          "durationMs": 1937.5873
+        },
+        {
+          "name": "conflicting approved snapshot keeps the merge workspace and approval for review",
+          "durationMs": 15346.5211
+        },
+        {
+          "name": "failed combined validation retains the approved snapshot and resolution workspace",
+          "durationMs": 14700.4673
+        },
+        {
+          "name": "the last merge retry enters failed and retry_merge starts a new generation",
+          "durationMs": 11498.1251
+        },
+        {
+          "name": "deleting an unmerged snapshot unregisters its retained resolution worktree",
+          "durationMs": 10502.6641
+        },
+        {
+          "name": "a target that advances during conflict resolution is merged with the staged fix",
+          "durationMs": 15876.0602
+        },
+        {
+          "name": "rework and reapproval bind a new snapshot instead of the old submitted resolution",
+          "durationMs": 11843.0519
+        },
+        {
+          "name": "a second conflict after target advancement keeps the same resolution workspace for another review",
+          "durationMs": 18160.9153
+        },
+        {
+          "name": "two tasks edit the same file in independent worktrees and integrate serially from the lock-protected latest target",
+          "durationMs": 17945.9628
+        },
+        {
+          "name": "target advancement before preflight restarts merge and validation",
+          "durationMs": 13549.8724
+        },
+        {
+          "name": "delivery remains pinned after the user checks out a different branch",
+          "durationMs": 7891.0541
+        },
+        {
+          "name": "legacy records without deliveryTarget keep their recorded targetRef semantics",
+          "durationMs": 7765.7002
+        },
+        {
+          "name": "dirty approved work and failed combined validation never update the target ref",
+          "durationMs": 8793.8107
+        },
+        {
+          "name": "delete protects running dirty output, force waits and cleans, and clean merged output deletes without force",
+          "durationMs": 7855.0764
+        },
+        {
+          "name": "combined validation resolves node even when the bridge environment has no node on PATH",
+          "durationMs": 7752.0612
+        },
+        {
+          "name": "a removed persisted default is rejected without preventing startup routing",
+          "durationMs": 109.8398
+        },
+        {
+          "name": "unknown historical agent IDs are refused at execution boundaries",
+          "durationMs": 1.9483
+        },
+        {
+          "name": "should use a 10-minute silence watchdog by default",
+          "durationMs": 3.0524
+        },
+        {
+          "name": "a declared background wait is liveness, not a hang",
+          "durationMs": 6186.7339
+        },
+        {
+          "name": "a successful round with a stream gap records a warning without being killed",
+          "durationMs": 596.9761
+        },
+        {
+          "name": "detects provider rate-limit signals in structured output and stderr text",
+          "durationMs": 1.4158
+        },
+        {
+          "name": "ignores rate-limit words quoted from source, tool output and final answers",
+          "durationMs": 0.5763
+        },
+        {
+          "name": "still detects structured provider errors",
+          "durationMs": 0.3569
+        },
+        {
+          "name": "replays a DSH round without --session-id when the native session vanished",
+          "durationMs": 2.3422
+        },
+        {
+          "name": "replays a Claude round fresh when its reserved session has no transcript",
+          "durationMs": 1.1995
+        },
+        {
+          "name": "a transcript quoting RATE_LIMITED does not abort the run",
+          "durationMs": 173.1289
+        },
+        {
+          "name": "fails the real child when native PID binding fails and waits for close",
+          "durationMs": 398.9644
+        },
+        {
+          "name": "clears only dead-owner Claude session records",
+          "durationMs": 25.3146
+        },
+        {
+          "name": "parses the session id out of the in-use error",
+          "durationMs": 0.5517
+        },
+        {
+          "name": "a fresh start that hits an existing session resumes it instead of failing",
+          "durationMs": 420.8242
+        },
+        {
+          "name": "clears a stale Claude session lock and retries instead of failing in one second",
+          "durationMs": 408.6626
+        },
+        {
+          "name": "aborts immediately on a provider 429 instead of waiting out CLI retries",
+          "durationMs": 586.5512
+        },
+        {
+          "name": "should generate compliant skip-danger command for Codex initial run",
+          "durationMs": 24.5036
+        },
+        {
+          "name": "should generate compliant rework resume command for Codex reusing exact session ID",
+          "durationMs": 37.8689
+        },
+        {
+          "name": "should generate compliant skip-danger command for Claude Code initial run",
+          "durationMs": 24.5245
+        },
+        {
+          "name": "should generate compliant rework resume command for Claude Code reusing exact session ID",
+          "durationMs": 40.7868
+        },
+        {
+          "name": "should generate compliant skip-danger command for Antigravity initial and rework",
+          "durationMs": 68.9315
+        },
+        {
+          "name": "should accurately extract session ID and output from stream-json stream",
+          "durationMs": 0.3031
+        },
+        {
+          "name": "Claude Code stream-json keeps the silence watchdog fed and yields the final answer",
+          "durationMs": 0.2963
+        },
+        {
+          "name": "Claude Code stream killed before the result event still yields assistant text",
+          "durationMs": 0.2528
+        },
+        {
+          "name": "cancelThread kills the child and reports a paused interruption",
+          "durationMs": 640.2123
+        },
+        {
+          "name": "a cancellation file from another process stops the child",
+          "durationMs": 1342.6992
+        },
+        {
+          "name": "should detect active sessions for claude_code and antigravity",
+          "durationMs": 11.3176
+        },
+        {
+          "name": "should detect transient network and eligibility errors correctly",
+          "durationMs": 0.9492
+        },
+        {
+          "name": "should treat the DSH transport connection error as transient and retryable",
+          "durationMs": 0.3822
+        },
+        {
+          "name": "should treat an agy non-interactive auth timeout as transient and retryable",
+          "durationMs": 0.2008
+        },
+        {
+          "name": "should replay an agent that died in the auth fallback and succeed on the retry",
+          "durationMs": 577.8859
+        },
+        {
+          "name": "should retry a dropped transport that still exited 0 with no final answer",
+          "durationMs": 0.5269
+        },
+        {
+          "name": "execute replays the same prompt after a transport drop and returns the good attempt",
+          "durationMs": 393.6271
+        },
+        {
+          "name": "execute records wall-clock and suspension-adjusted gap metrics separately",
+          "durationMs": 435.3069
+        },
+        {
+          "name": "execute resumes the native session opened by the failed attempt instead of starting a new one",
+          "durationMs": 6.6099
+        },
+        {
+          "name": "execute aborts retry loop and does not spawn subsequent attempts when cancelled during backoff sleep",
+          "durationMs": 115.7722
+        },
+        {
+          "name": "pre-spawn cancellation check prevents any process from being spawned",
+          "durationMs": 1.1626
+        },
+        {
+          "name": "a pause remembered without a child must be cleared before a resume can run",
+          "durationMs": 376.805
+        },
+        {
+          "name": "a runner holding the task store reports a paused or deleted task as cancelled",
+          "durationMs": 54.5477
+        },
+        {
+          "name": "should distinguish rate limit errors from innocent code outputs, hashes, UUIDs and line numbers",
+          "durationMs": 0.3592
+        },
+        {
+          "name": "AutonomousRunner Tests",
+          "durationMs": 12972.6725
+        },
+        {
+          "name": "a build installed and compiled before this module loaded is fresh",
+          "durationMs": 2.0182
+        },
+        {
+          "name": "a `tsc -w` recompile after load is stale even without manifest metadata",
+          "durationMs": 0.308
+        },
+        {
+          "name": "the newest signal wins when the manifest is older than the script",
+          "durationMs": 0.3024
+        },
+        {
+          "name": "a write that lands inside the tolerance window is not reported",
+          "durationMs": 0.3566
+        },
+        {
+          "name": "the tolerance is configurable",
+          "durationMs": 0.2749
+        },
+        {
+          "name": "an undatable build is never called stale",
+          "durationMs": 0.2239
+        },
+        {
+          "name": "a newer version in a sibling folder is stale even when this folder is untouched",
+          "durationMs": 0.9735
+        },
+        {
+          "name": "an equal or older sibling version is ignored",
+          "durationMs": 0.5178
+        },
+        {
+          "name": "detectStaleBuild",
+          "durationMs": 9.2024
+        },
+        {
+          "name": "compares numerically, not lexically",
+          "durationMs": 0.6921
+        },
+        {
+          "name": "a prerelease sorts below its release",
+          "durationMs": 0.317
+        },
+        {
+          "name": "tolerates a leading v and short forms",
+          "durationMs": 0.1529
+        },
+        {
+          "name": "compareVersions",
+          "durationMs": 1.6132
+        },
+        {
+          "name": "extracts the version from an installed folder suffix",
+          "durationMs": 0.3701
+        },
+        {
+          "name": "drops the platform/arch suffix instead of treating it as a prerelease",
+          "durationMs": 0.1728
+        },
+        {
+          "name": "ignores a folder that carries no version",
+          "durationMs": 0.1236
+        },
+        {
+          "name": "parseFolderVersion",
+          "durationMs": 0.8831
+        },
+        {
+          "name": "reads version, install timestamp and the entry script mtime",
+          "durationMs": 17.5383
+        },
+        {
+          "name": "an unreadable folder yields an empty stamp instead of throwing",
+          "durationMs": 3.1484
+        },
+        {
+          "name": "readBuildStamp",
+          "durationMs": 21.1667
+        },
+        {
+          "name": "finds a newer sibling folder for the same extension",
+          "durationMs": 5.3992
+        },
+        {
+          "name": "an unknown extension id or running version disables the check",
+          "durationMs": 2.5772
+        },
+        {
+          "name": "findNewerInstalledVersion",
+          "durationMs": 8.3334
+        },
+        {
+          "name": "is empty for a fresh host",
+          "durationMs": 0.3685
+        },
+        {
+          "name": "names the drift in seconds",
+          "durationMs": 0.1776
+        },
+        {
+          "name": "names the newer installed version",
+          "durationMs": 0.162
+        },
+        {
+          "name": "describeStaleBuild",
+          "durationMs": 0.9631
+        },
+        {
+          "name": "wakes the caller with the retry_task instruction and records the round once",
+          "durationMs": 51.1612
+        },
+        {
+          "name": "failure callback sends only reviewer template instructions",
+          "durationMs": 55.1112
+        },
+        {
+          "name": "does not wake the caller twice for the same failed round",
+          "durationMs": 37.7192
+        },
+        {
+          "name": "stays silent for paused tasks and after three failure wake-ups",
+          "durationMs": 0.7863
+        },
+        {
+          "name": "tells the caller when the round merely repeats an earlier instruction",
+          "durationMs": 43.0622
+        },
+        {
+          "name": "CallbackManager failure wake-ups",
+          "durationMs": 190.1125
+        },
+        {
+          "name": "changes when the round actually progresses",
+          "durationMs": 3.8207
+        },
+        {
+          "name": "progressSignature",
+          "durationMs": 5.2093
+        },
+        {
+          "name": "allows the first read, starves an identical second read",
+          "durationMs": 1.1561
+        },
+        {
+          "name": "counts reads per view, so one inspection may read details and logs",
+          "durationMs": 0.2101
+        },
+        {
+          "name": "real progress restores the full payload",
+          "durationMs": 0.229
+        },
+        {
+          "name": "never guards threads this process did not dispatch",
+          "durationMs": 0.1651
+        },
+        {
+          "name": "forget stops guarding a finished task",
+          "durationMs": 0.151
+        },
+        {
+          "name": "the repeat payload carries a machine-readable stop directive",
+          "durationMs": 0.3911
+        },
+        {
+          "name": "CallerPollGuard",
+          "durationMs": 2.7519
+        },
+        {
+          "name": "selects only a CLI session whose session_meta cwd matches the workspace",
+          "durationMs": 39.1697
+        },
+        {
+          "name": "Codex active session selection",
+          "durationMs": 40.2349
+        },
+        {
+          "name": "dedicated reviewer requires confirmed captured matching handoff",
+          "durationMs": 1.6307
+        },
+        {
+          "name": "legacy caller session retains the previous id and detection fallback behavior",
+          "durationMs": 0.8353
+        },
+        {
+          "name": "caller session resolution",
+          "durationMs": 2.7231
+        },
+        {
+          "name": "treats a codex rollout name and its bare thread id as one wake slot",
+          "durationMs": 3.0584
+        },
+        {
+          "name": "compatibility admission hook never creates a second session lock",
+          "durationMs": 3.3294
+        },
+        {
+          "name": "queued wakes drain in FIFO order and survive a restart",
+          "durationMs": 24.0804
+        },
+        {
+          "name": "stale orchestration markers do not participate in writer admission",
+          "durationMs": 4.1694
+        },
+        {
+          "name": "legacy active markers are ignored by the native-session admission path",
+          "durationMs": 4.261
+        },
+        {
+          "name": "discard drops queued wakes for a thread that no longer needs review",
+          "durationMs": 24.9587
+        },
+        {
+          "name": "CallerWakeQueue - one wake at a time per caller session",
+          "durationMs": 66.3303
+        },
+        {
+          "name": "classifies the two spellings",
+          "durationMs": 1.2092
+        },
+        {
+          "name": "normalises a bare UUID to the rollout name codex exec resume expects",
+          "durationMs": 5.0058
+        },
+        {
+          "name": "leaves an unknown UUID alone so codex reports its own error",
+          "durationMs": 8.7906
+        },
+        {
+          "name": "extracts the canonical thread id from either spelling",
+          "durationMs": 0.7521
+        },
+        {
+          "name": "Codex session id resolution",
+          "durationMs": 17.8023
+        },
+        {
+          "name": "reads the modern help: UUID ids and --no-daemon",
+          "durationMs": 2.512
+        },
+        {
+          "name": "reads a legacy help that talks about the rollout record",
+          "durationMs": 2.1731
+        },
+        {
+          "name": "an unreadable help defaults to the modern UUID form",
+          "durationMs": 0.2598
+        },
+        {
+          "name": "the argument follows the probed form and the cache is shared",
+          "durationMs": 8.5209
+        },
+        {
+          "name": "Codex resume capability",
+          "durationMs": 14.2784
+        },
+        {
+          "name": "disabled means no configured cap; getter shape and historical enabled semantics stay stable",
+          "durationMs": 28.6275
+        },
+        {
+          "name": "invalid limits preserve prior values and only explicit true enables them",
+          "durationMs": 48.076
+        },
+        {
+          "name": "bridge policy - optional best-effort concurrency limits",
+          "durationMs": 78.5542
+        },
+        {
+          "name": "same-file tasks in one repository run concurrently in isolated worktrees",
+          "durationMs": 8921.4114
+        },
+        {
+          "name": "live stdout chunks are persisted while a round is still running",
+          "durationMs": 5562.903
+        },
+        {
+          "name": "recent execution logs return the requested tail while running and after completion",
+          "durationMs": 4442.7417
+        },
+        {
+          "name": "an old execution.lock record does not block a new independent task",
+          "durationMs": 3666.3889
+        },
+        {
+          "name": "enabled limits queue only after observed registrations reach the cap",
+          "durationMs": 6242.0318
+        },
+        {
+          "name": "merge process registrations do not consume a configured agent slot",
+          "durationMs": 3594.3431
+        },
+        {
+          "name": "a per-agent cap skips only that agent and still starts a different agent candidate",
+          "durationMs": 7370.0451
+        },
+        {
+          "name": "delayed queue marking cannot resurrect deleted or overwrite paused/completed tasks",
+          "durationMs": 8773.8234
+        },
+        {
+          "name": "AsyncDispatcher - independent task admission",
+          "durationMs": 48575.9646
+        },
+        {
+          "name": "paused, waiting review, blocked and bootstrap-pending tasks do not hide later candidates",
+          "durationMs": 81.485
+        },
+        {
+          "name": "disabled limits allow all disjoint same-workspace candidates; enabled limits are best-effort admission",
+          "durationMs": 49.706
+        },
+        {
+          "name": "QueueDrainer - scan every runnable candidate",
+          "durationMs": 131.5649
+        },
+        {
+          "name": "two disjoint same-workspace tasks run at once; duplicate scheduling starts one thread once",
+          "durationMs": 377.6456
+        },
+        {
+          "name": "TaskSupervisor - same-workspace overlap and same-thread exclusion",
+          "durationMs": 378.1222
+        },
+        {
+          "name": "local integration state controls pending results, regardless of MR metadata",
+          "durationMs": 0.8042
+        },
+        {
+          "name": "merge gate - pendingMerges",
+          "durationMs": 1.1092
+        },
+        {
+          "name": "registers one Codex server and cleans up the legacy duplicate",
+          "durationMs": 115.9022
+        },
+        {
+          "name": "registers one server for Claude Code and Antigravity too",
+          "durationMs": 31.9268
+        },
+        {
+          "name": "hands the provider key to every bridge MCP process explicitly",
+          "durationMs": 70.5518
+        },
+        {
+          "name": "ConfigSyncService - single MCP registration per agent",
+          "durationMs": 222.1852
+        },
+        {
+          "name": "the protocol is appended only for resumed rounds and names the previous round",
+          "durationMs": 3.7851
+        },
+        {
+          "name": "parses a Chinese capsule emitted inside a normal final answer",
+          "durationMs": 4.9884
+        },
+        {
+          "name": "tolerates an unclosed tag and empty content",
+          "durationMs": 1.8262
+        },
+        {
+          "name": "a plain answer without a structured key still yields a headline",
+          "durationMs": 2.3471
+        },
+        {
+          "name": "context compaction - protocol and capsule parsing",
+          "durationMs": 17.7791
+        },
+        {
+          "name": "condenses the previous round from the capsule of the current round",
+          "durationMs": 100.351
+        },
+        {
+          "name": "falls back to a deterministic head/tail card when the agent does not comply",
+          "durationMs": 39.1003
+        },
+        {
+          "name": "never replaces a small output with a bigger card",
+          "durationMs": 19.0065
+        },
+        {
+          "name": "a failed previous round is archived too, but its error stays verbatim",
+          "durationMs": 39.1775
+        },
+        {
+          "name": "never condenses the synthetic approval round or a short round",
+          "durationMs": 9.0097
+        },
+        {
+          "name": "an undersized immediate round does not block an older oversized one",
+          "durationMs": 9.9369
+        },
+        {
+          "name": "is idempotent: a second pass does nothing",
+          "durationMs": 48.7236
+        },
+        {
+          "name": "respects the mirrored opt-out policy",
+          "durationMs": 30.5835
+        },
+        {
+          "name": "a failing archive returns a failed outcome instead of throwing",
+          "durationMs": 16.03
+        },
+        {
+          "name": "a stale writer cannot resurrect a compacted round",
+          "durationMs": 117.5502
+        },
+        {
+          "name": "context compaction - lagged ledger rule",
+          "durationMs": 431.381
+        },
+        {
+          "name": "latest execution log is chosen numerically, not lexicographically",
+          "durationMs": 19.3104
+        },
+        {
+          "name": "paged reads honor offsets and clamp the window",
+          "durationMs": 39.3781
+        },
+        {
+          "name": "context compaction - round log helpers",
+          "durationMs": 59.2355
+        },
+        {
+          "name": "should collapse separator runs into a single dash",
+          "durationMs": 2.5123
+        },
+        {
+          "name": "DeepSeek Harness - workspace slug encoding",
+          "durationMs": 4.9817
+        },
+        {
+          "name": "should return null for a missing launcher",
+          "durationMs": 1.4207
+        },
+        {
+          "name": "should derive the install root from the profile launcher path",
+          "durationMs": 11.1523
+        },
+        {
+          "name": "should prefer the Electron binary when the packaged layout is present",
+          "durationMs": 7.9131
+        },
+        {
+          "name": "DeepSeek Harness - launcher resolution",
+          "durationMs": 25.907
+        },
+        {
+          "name": "should omit --session-id for a fresh task and close stdin safely",
+          "durationMs": 11.2377
+        },
+        {
+          "name": "should pass --session-id when resuming a rework round",
+          "durationMs": 42.004
+        },
+        {
+          "name": "DeepSeek Harness - headless command contract",
+          "durationMs": 55.4062
+        },
+        {
+          "name": "should prefer the session recorded for the requested workspace",
+          "durationMs": 34.5211
+        },
+        {
+          "name": "should return undefined when no session store exists",
+          "durationMs": 1.4897
+        },
+        {
+          "name": "DeepSeek Harness - native session detection",
+          "durationMs": 36.5706
+        },
+        {
+          "name": "should emit a single-server stdio MCP registration block",
+          "durationMs": 2.3072
+        },
+        {
+          "name": "should replace a bare empty-array document rather than append a second root",
+          "durationMs": 0.9145
+        },
+        {
+          "name": "should preserve user patch entries",
+          "durationMs": 0.3447
+        },
+        {
+          "name": "should be idempotent across repeated syncs",
+          "durationMs": 0.2939
+        },
+        {
+          "name": "should replace a stale managed block with the current one",
+          "durationMs": 0.3862
+        },
+        {
+          "name": "DeepSeek Harness - profile patch management",
+          "durationMs": 5.3029
+        },
+        {
+          "name": "should capture the native session id from the first run event",
+          "durationMs": 0.5311
+        },
+        {
+          "name": "should extract the final answer from the run-event stream",
+          "durationMs": 0.5609
+        },
+        {
+          "name": "DeepSeek Harness - run-output parsing",
+          "durationMs": 1.3384
+        },
+        {
+          "name": "should accept native DSH session ids and reject agent identifiers",
+          "durationMs": 0.2627
+        },
+        {
+          "name": "DeepSeek Harness - session id validation",
+          "durationMs": 0.4335
+        },
+        {
+          "name": "should require every field DSH needs to boot the route",
+          "durationMs": 0.3637
+        },
+        {
+          "name": "should render the provider block without ever embedding the key",
+          "durationMs": 0.5978
+        },
+        {
+          "name": "should keep the MCP and provider blocks independent",
+          "durationMs": 0.342
+        },
+        {
+          "name": "should report the configured provider as the login route",
+          "durationMs": 5.5844
+        },
+        {
+          "name": "should resolve the configured route from disk, for any process",
+          "durationMs": 72.3035
+        },
+        {
+          "name": "should authenticate official route with DEEPSEEK_API_KEY when no custom provider is configured",
+          "durationMs": 2.102
+        },
+        {
+          "name": "DeepSeek Harness - configurable model provider",
+          "durationMs": 82.0449
+        },
+        {
+          "name": "every setting blank keeps the shipped deepseek-official route",
+          "durationMs": 0.7241
+        },
+        {
+          "name": "a URL without a provider derives one, plus its key variable and model",
+          "durationMs": 0.3822
+        },
+        {
+          "name": "a named legacy provider with no URL keeps its shipped endpoint and model",
+          "durationMs": 0.2197
+        },
+        {
+          "name": "explicit values win over every derived one",
+          "durationMs": 0.1313
+        },
+        {
+          "name": "an unknown named provider without a URL stays unroutable rather than guessing",
+          "durationMs": 0.107
+        },
+        {
+          "name": "DeepSeek Harness - model route resolution",
+          "durationMs": 1.9561
+        },
+        {
+          "name": "does not capture a Claude session after a silent first-launch failure",
+          "durationMs": 4447.2141
+        },
+        {
+          "name": "rework does not capture a Claude session when its initial launch fails",
+          "durationMs": 1372.108
+        },
+        {
+          "name": "supervisor does not capture a Claude session when its initial launch fails",
+          "durationMs": 1367.5408
+        },
+        {
+          "name": "preserves a captured claude_code session when a later launch fails silently",
+          "durationMs": 5447.7654
+        },
+        {
+          "name": "preserves a captured codex session when a later launch fails silently",
+          "durationMs": 5193.6625
+        },
+        {
+          "name": "should dispatch task asynchronously and create thread with round 1",
+          "durationMs": 3016.5373
+        },
+        {
+          "name": "default auto in the host mirror keeps resolver and CLI defaults working",
+          "durationMs": 4669.1384
+        },
+        {
+          "name": "refuses a same-agent dispatch while the legacy review flow is active",
+          "durationMs": 637.1612
+        },
+        {
+          "name": "dedicated flow prepares a reviewer bootstrap instead of starting the developer",
+          "durationMs": 2430.3123
+        },
+        {
+          "name": "dedicated same-agent dispatch rejects an identical reviewer/executor model",
+          "durationMs": 2024.6827
+        },
+        {
+          "name": "dedicated same-agent dispatch requires a configured reviewer model",
+          "durationMs": 2207.9946
+        },
+        {
+          "name": "pins the model chosen at dispatch on the task and the runner call",
+          "durationMs": 3683.7467
+        },
+        {
+          "name": "records the sender-side default separately from the receiver-side default",
+          "durationMs": 3656.9354
+        },
+        {
+          "name": "ignores a non-default model the caller did not declare as a user request",
+          "durationMs": 3441.9378
+        },
+        {
+          "name": "a declined model switch aborts the dispatch before anything is queued",
+          "durationMs": 1886.1551
+        },
+        {
+          "name": "should treat exit 0 with no actual output as a failed response",
+          "durationMs": 3794.6457
+        },
+        {
+          "name": "refuses a rework that would move a legacy task onto its own reviewer",
+          "durationMs": 3743.4886
+        },
+        {
+          "name": "should request rework strictly reusing same receiverSessionId and incrementing round",
+          "durationMs": 6778.7325
+        },
+        {
+          "name": "request_rework can move the task to another agent on a fresh session",
+          "durationMs": 8083.4091
+        },
+        {
+          "name": "should approve task and mark it completed",
+          "durationMs": 7284.5757
+        },
+        {
+          "name": "supervisor injects worker snapshot without changing round prompt",
+          "durationMs": 1426.4694
+        },
+        {
+          "name": "dispatcher rework and retry use the original worker template snapshot",
+          "durationMs": 7013.7839
+        },
+        {
+          "name": "should retry failed round preserving original round number and prompt",
+          "durationMs": 5268.6836
+        },
+        {
+          "name": "AsyncDispatcher and ReworkController Tests",
+          "durationMs": 98423.4767
+        },
+        {
+          "name": "same-workspace registrations coexist and legacy lock files do not block them",
+          "durationMs": 26.1724
+        },
+        {
+          "name": "end only removes the matching thread registration",
+          "durationMs": 29.6549
+        },
+        {
+          "name": "orphan cancellation targets the registered thread PID only",
+          "durationMs": 305.7252
+        },
+        {
+          "name": "TaskExecutionRegistry - observation without mutual exclusion",
+          "durationMs": 364.1748
+        },
+        {
+          "name": "temp execution-registry directories are removed",
+          "durationMs": 5.5769
+        },
+        {
+          "name": "legacy failures and summaries normalize without inventing events",
+          "durationMs": 3.631
+        },
+        {
+          "name": "legacy review and merge states normalize according to the persisted integration phase",
+          "durationMs": 0.816
+        },
+        {
+          "name": "failure revisions protect persisted failure and recovered state from stale writers and callbacks",
+          "durationMs": 162.2933
+        },
+        {
+          "name": "merge failures cannot be archived even without worktree metadata and filters preserve stage",
+          "durationMs": 11.8122
+        },
+        {
+          "name": "a delayed review outcome cannot overwrite a later failure generation",
+          "durationMs": 44.3075
+        },
+        {
+          "name": "an old writer cannot restore rounds after archival",
+          "durationMs": 88.925
+        },
+        {
+          "name": "ordinary execution-failure notifications reject other failure stages",
+          "durationMs": 1.8629
+        },
+        {
+          "name": "queued failure wake from an old revision cannot wake a new failure",
+          "durationMs": 27.1044
+        },
+        {
+          "name": "repeated reporting of the same failure does not create a new revision",
+          "durationMs": 0.6419
+        },
+        {
+          "name": "persisted local merge wins over a stale failure even with a higher control revision",
+          "durationMs": 50.0641
+        },
+        {
+          "name": "reports created, modified and deleted files, and ignores untouched ones",
+          "durationMs": 2941.8695
+        },
+        {
+          "name": "reports files committed by the round itself",
+          "durationMs": 2139.4587
+        },
+        {
+          "name": "reports nothing for a directory that is not a git repository",
+          "durationMs": 986.3168
+        },
+        {
+          "name": "git-probe - attributing a round to the files it changed",
+          "durationMs": 6069.9931
+        },
+        {
+          "name": "repository fixtures keep working files, refs and config independent",
+          "durationMs": 2759.5172
+        },
+        {
+          "name": "multi-stash fixtures preserve stash contents and isolate refs and objects",
+          "durationMs": 3176.1311
+        },
+        {
+          "name": "POSIX helper command passes its channel path and acknowledges child registration",
+          "durationMs": 633.2972
+        },
+        {
+          "name": "the mesh lock serializes processes, preserves a live owner, and recovers after a process crash",
+          "durationMs": 6704.323
+        },
+        {
+          "name": "three processes contend after an owner crash without overlapping lock ownership",
+          "durationMs": 10817.9219
+        },
+        {
+          "name": "one lock instance keeps child tracking bound to each acquired lease across overlapping waits",
+          "durationMs": 8136.6868
+        },
+        {
+          "name": "immediate and post-spawn lock cancellation settle in an independent Node process",
+          "durationMs": 1270.5451
+        },
+        {
+          "name": "cancelling a started lock waiter settles readiness and lets its Node process exit naturally",
+          "durationMs": 6912.2042
+        },
+        {
+          "name": "POSIX waiter may wait longer than the helper startup budget for the global lock",
+          "durationMs": 342.221
+        },
+        {
+          "name": "child registration times out, rejects, and removes its pending waiter",
+          "durationMs": 1765.8849
+        },
+        {
+          "name": "cancelling a same-instance lock waiter leaves the current owner lease intact",
+          "durationMs": 3997.6694
+        },
+        {
+          "name": "pause cancels an approved merge while it is waiting for the global lock",
+          "durationMs": 5264.5728
+        },
+        {
+          "name": "forced deletion cancels a queued merge before the global lock is released",
+          "durationMs": 5276.681
+        },
+        {
+          "name": "an approved task cannot integrate until its reviewer process releases the task role",
+          "durationMs": 9161.4219
+        },
+        {
+          "name": "a dead reviewer launcher does not permit merge while its native child lives",
+          "durationMs": 9816.3933
+        },
+        {
+          "name": "a dead lock worker rejects child registration, stops validation, and leaves the target unchanged",
+          "durationMs": 5469.3969
+        },
+        {
+          "name": "pausing while child registration is pending ends validation without integrating",
+          "durationMs": 4162.5342
+        },
+        {
+          "name": "pause stops combined validation and forced delete waits for it before cleaning the worktree",
+          "durationMs": 12192.3248
+        },
+        {
+          "name": "pause and delete terminate a running Git process tree and record cancelled merge attempts",
+          "durationMs": 9130.5042
+        },
+        {
+          "name": "a merge waiting for a reviewer cannot resume after a rapid pause and resume",
+          "durationMs": 2361.3275
+        },
+        {
+          "name": "a saved resolution survives a coordinator failure before switching to the advanced target",
+          "durationMs": 18760.8652
+        },
+        {
+          "name": "a saved resolution can recover when switching the merge workspace is interrupted",
+          "durationMs": 19535.8319
+        },
+        {
+          "name": "an interrupted resolution merge is replayed in a fresh workspace when the target advances again",
+          "durationMs": 20232.9943
+        },
+        {
+          "name": "multi-stash cleanup recovers stash_cleanup_started, concurrent=true",
+          "durationMs": 15764.8272
+        },
+        {
+          "name": "multi-stash cleanup recovers stash_reflog_published, concurrent=true",
+          "durationMs": 14994.8863
+        },
+        {
+          "name": "multi-stash cleanup recovers before_stash_reflog_published, concurrent=true",
+          "durationMs": 13200.3249
+        },
+        {
+          "name": "a process crash after stash_created recovers local files and landing",
+          "durationMs": 17591.7675
+        },
+        {
+          "name": "a process crash after after_reflog_deleted recovers local files and landing",
+          "durationMs": 11904.447
+        },
+        {
+          "name": "a process crash after before_stash_restored_concurrent recovers local files and landing",
+          "durationMs": 13392.6932
+        },
+        {
+          "name": "multi-stash cleanup recovers stash_cleanup_started, concurrent=false",
+          "durationMs": 15650.3295
+        },
+        {
+          "name": "multi-stash cleanup recovers stash_cleanup_prepared, concurrent=true",
+          "durationMs": 14339.4242
+        },
+        {
+          "name": "multi-stash cleanup recovers before_stash_ref_published, concurrent=true",
+          "durationMs": 13356.9761
+        },
+        {
+          "name": "multi-stash cleanup recovers before_stash_ref_published, concurrent=false",
+          "durationMs": 13789.1383
+        },
+        {
+          "name": "a process crash after stash_applied recovers local files and landing",
+          "durationMs": 11981.0879
+        },
+        {
+          "name": "multi-stash cleanup recovers stash_reflog_published, concurrent=false",
+          "durationMs": 16035.5479
+        },
+        {
+          "name": "multi-stash cleanup recovers before_stash_reflog_published, concurrent=false",
+          "durationMs": 12638.4147
+        },
+        {
+          "name": "multi-stash cleanup recovers stash_ref_published, concurrent=false",
+          "durationMs": 14075.1901
+        },
+        {
+          "name": "multi-stash cleanup recovers hard_stash_reflog_published, concurrent=false",
+          "durationMs": 14368.8648
+        },
+        {
+          "name": "a process crash after ref_updated recovers local files and landing",
+          "durationMs": 14071.7236
+        },
+        {
+          "name": "a process crash after before_stash_restored recovers local files and landing",
+          "durationMs": 12094.0263
+        },
+        {
+          "name": "multi-stash cleanup recovers stash_cleanup_prepared, concurrent=false",
+          "durationMs": 15597.3947
+        },
+        {
+          "name": "multi-stash cleanup recovers stash_ref_published, concurrent=true",
+          "durationMs": 14250.4661
+        },
+        {
+          "name": "multi-stash cleanup recovers hard_stash_cleanup_prepared, concurrent=false",
+          "durationMs": 14435.866
+        },
+        {
+          "name": "multi-stash cleanup recovers hard_stash_ref_published, concurrent=false",
+          "durationMs": 12163.7442
+        },
+        {
+          "name": "a process crash after checkout_synced recovers local files and landing",
+          "durationMs": 12993.7751
+        },
+        {
+          "name": "a process crash after before_stash_applied recovers local files and landing",
+          "durationMs": 12366.2439
+        },
+        {
+          "name": "an unchecked delivery target that is externally rewound after landing stays blocked",
+          "durationMs": 8284.4276
+        },
+        {
+          "name": "host recovery requeues an interrupted merge until the global lock is available",
+          "durationMs": 10350.6421
+        },
+        {
+          "name": "recovery syncs the actual latest checkout and reports validation cleanup truthfully",
+          "durationMs": 8727.8477
+        },
+        {
+          "name": "ref-updated transaction recovers durable ledger failure and ledger_written cannot remerge or regress target",
+          "durationMs": 12756.1849
+        },
+        {
+          "name": "monotonic clock is available and does not jump backwards",
+          "durationMs": 2.9114
+        },
+        {
+          "name": "an on-time heartbeat records no suspension",
+          "durationMs": 0.904
+        },
+        {
+          "name": "overlap math is clamped to the requested interval",
+          "durationMs": 0.3074
+        },
+        {
+          "name": "a blocked event loop is detected as host suspension",
+          "durationMs": 532.7787
+        },
+        {
+          "name": "HostSuspensionGuard",
+          "durationMs": 540.7812
+        },
+        {
+          "name": "resuming a paused pending/launching bootstrap preserves its token and queues bootstrap only",
+          "durationMs": 61.1231
+        },
+        {
+          "name": "a consumed token without a captured reviewer session fails visibly and cannot relaunch",
+          "durationMs": 57.371
+        },
+        {
+          "name": "a captured reviewer handoff resumes the existing receiver session in the same task",
+          "durationMs": 320.5081
+        },
+        {
+          "name": "dedicated reviewer bootstrap pause/resume lifecycle",
+          "durationMs": 441.4581
+        },
+        {
+          "name": "should handle initialize request with proper capabilities",
+          "durationMs": 533.6432
+        },
+        {
+          "name": "client roots resolve only a unique live window and its manual default",
+          "durationMs": 2812.2802
+        },
+        {
+          "name": "linked workspace ID, root and bound context list the dispatch workspace",
+          "durationMs": 3855.9877
+        },
+        {
+          "name": "explicit cross-workspace dispatch keeps caller window on first and later calls",
+          "durationMs": 10118.9991
+        },
+        {
+          "name": "should handle tools/list and return all 18 specified tools",
+          "durationMs": 572.1506
+        },
+        {
+          "name": "list_agent_models reports the receiver and sender defaults separately",
+          "durationMs": 561.5281
+        },
+        {
+          "name": "get_task_summary survives archival with the read-only digest",
+          "durationMs": 5046.4785
+        },
+        {
+          "name": "serves the reviewer side of a round and reports a missing log honestly",
+          "durationMs": 3381.4408
+        },
+        {
+          "name": "tells the caller to stop and wait, and starves repeated polls",
+          "durationMs": 2890.2014
+        },
+        {
+          "name": "get_thread_details condenses older rounds and get_round_raw_log pages the archive",
+          "durationMs": 572.7509
+        },
+        {
+          "name": "get_merge_log reads bounded pages from the task-owned log",
+          "durationMs": 488.8145
+        },
+        {
+          "name": "get_merge_log resolves decision and legacy file numbers but rejects paths outside the task log",
+          "durationMs": 558.8015
+        },
+        {
+          "name": "merge_failed rejects ordinary controls and retry_merge keeps task identity",
+          "durationMs": 576.0085
+        },
+        {
+          "name": "get_task_token_usage reports task rollup and single-round detail",
+          "durationMs": 498.2547
+        },
+        {
+          "name": "should execute dispatch_task, get_thread_details, request_rework, and approve_task via tools/call",
+          "durationMs": 7468.5067
+        },
+        {
+          "name": "should hide forwarding tools and reject them while acting as a task receiver",
+          "durationMs": 461.3072
+        },
+        {
+          "name": "should detect a receiver by the pid of the launched task process when the host scrubs the environment",
+          "durationMs": 438.2506
+        },
+        {
+          "name": "should not treat an unrelated process as a receiver when no execution record matches its pid",
+          "durationMs": 401.9216
+        },
+        {
+          "name": "should never treat a reviewer or bootstrap round as a task receiver",
+          "durationMs": 455.9946
+        },
+        {
+          "name": "should execute query_agent_mesh_status and return mesh info",
+          "durationMs": 1979.0253
+        },
+        {
+          "name": "retry_task re-runs the failed round in place instead of creating a duplicate round",
+          "durationMs": 4255.5405
+        },
+        {
+          "name": "request_rework flags a round whose instruction repeats an earlier one",
+          "durationMs": 5039.9734
+        },
+        {
+          "name": "rejects self-dispatch instead of parking a task that can never be reviewed",
+          "durationMs": 439.6334
+        },
+        {
+          "name": "reviewer bootstrap confirms the prepared task instead of creating a new one",
+          "durationMs": 454.1108
+        },
+        {
+          "name": "reviewer bootstrap still confirms when the host scrubs the MCP server environment",
+          "durationMs": 546.68
+        },
+        {
+          "name": "MCPServer Protocol Tests",
+          "durationMs": 54413.8645
+        },
+        {
+          "name": "merge failures count the sixth retry, reset on a different fingerprint and on a new generation",
+          "durationMs": 4.6254
+        },
+        {
+          "name": "failure fingerprints ignore temporary paths and object ids but retain the failing paths",
+          "durationMs": 0.4448
+        },
+        {
+          "name": "merge decisions append immutable question and answer records and wake the same session",
+          "durationMs": 127.437
+        },
+        {
+          "name": "a review decision resumes the same reviewer without creating a development round",
+          "durationMs": 63.6477
+        },
+        {
+          "name": "retry_merge preserves the task identities and history while starting a new budget",
+          "durationMs": 24.7643
+        },
+        {
+          "name": "pending stash metadata recovery survives stale writes and pause/resume without waking a reviewer",
+          "durationMs": 102.0036
+        },
+        {
+          "name": "actual merge reviewer failures consume the budget, but waiting for a wake does not",
+          "durationMs": 158.48
+        },
+        {
+          "name": "quota deferral does not consume a merge retry",
+          "durationMs": 33.7065
+        },
+        {
+          "name": "watchdog counts a disappeared launched merge reviewer once, but not an unlaunched wake",
+          "durationMs": 50.2911
+        },
+        {
+          "name": "restart schedules unlaunched merge reviews without consuming the merge retry budget",
+          "durationMs": 521.2778
+        },
+        {
+          "name": "an answered merge decision is recovered after a crash before the reviewer starts",
+          "durationMs": 94.0103
+        },
+        {
+          "name": "a wake accepted before a second crash is recovered without charging an unstarted attempt",
+          "durationMs": 73.5665
+        },
+        {
+          "name": "an unrecoverable merge review is failed with a recorded review reason",
+          "durationMs": 57.8281
+        },
+        {
+          "name": "merge reviewer warnings after handoff and user pauses do not consume retry budget",
+          "durationMs": 42.5809
+        },
+        {
+          "name": "empty reviewer output after a merge handoff blocks integration and records assessment",
+          "durationMs": 32.073
+        },
+        {
+          "name": "reviewer watchdog interruption is recorded without changing the worker round",
+          "durationMs": 23.9086
+        },
+        {
+          "name": "nonterminal merge states remain unfinished and are not selected for archive",
+          "durationMs": 0.6578
+        },
+        {
+          "name": "a ledger full of merge waiting states has no capacity eviction candidate",
+          "durationMs": 6.5637
+        },
+        {
+          "name": "merge Git and validation registrations do not consume agent concurrency slots",
+          "durationMs": 18.258
+        },
+        {
+          "name": "task archival includes merge history and complete merge log before cleanup",
+          "durationMs": 27.2674
+        },
+        {
+          "name": "resident host observes a short-lived MCP approval from disk and merges without restart or polling",
+          "durationMs": 8740.8934
+        },
+        {
+          "name": "pre-ref merge infrastructure failure returns a concrete error to the original reviewer",
+          "durationMs": 4028.024
+        },
+        {
+          "name": "a landed ref with repeated ledger EIO is not retried in a loop and recovers after host restart",
+          "durationMs": 15263.6202
+        },
+        {
+          "name": "an initial ledger EIO is logged and backed off until the same host can recover",
+          "durationMs": 14008.9846
+        },
+        {
+          "name": "package.json scripts remain the primary validation strategy",
+          "durationMs": 16.5492
+        },
+        {
+          "name": "a package.json without compile and test is refused even when a manifest exists",
+          "durationMs": 14.0778
+        },
+        {
+          "name": "a repository with neither package.json nor manifest is refused",
+          "durationMs": 1.9465
+        },
+        {
+          "name": "a malformed or empty manifest is refused instead of silently passing",
+          "durationMs": 24.9516
+        },
+        {
+          "name": "an entry without a command is refused",
+          "durationMs": 15.2754
+        },
+        {
+          "name": "manifest strings and object entries both resolve to executable steps",
+          "durationMs": 13.1541
+        },
+        {
+          "name": "a Unity-style repository without package.json integrates through its manifest",
+          "durationMs": 8911.3826
+        },
+        {
+          "name": "a manifest whose command fails reports the failure and leaves the target unchanged",
+          "durationMs": 5671.7132
+        },
+        {
+          "name": "hoists the configured default to the front and tags it in place",
+          "durationMs": 3.5047
+        },
+        {
+          "name": "keeps an existing hint when tagging",
+          "durationMs": 0.4606
+        },
+        {
+          "name": "prepends a synthetic entry when the probe did not return the default",
+          "durationMs": 0.413
+        },
+        {
+          "name": "leaves the list alone when no default is configured",
+          "durationMs": 0.4652
+        },
+        {
+          "name": "annotateConfiguredModel",
+          "durationMs": 8.4596
+        },
+        {
+          "name": "no requested model -> the configured default",
+          "durationMs": 26.1675
+        },
+        {
+          "name": "requested model equal to the default needs no approval",
+          "durationMs": 18.41
+        },
+        {
+          "name": "a guessed non-default model is ignored in favour of the default",
+          "durationMs": 14.5678
+        },
+        {
+          "name": "an approved user request switches the model and is recorded",
+          "durationMs": 21.4271
+        },
+        {
+          "name": "\"use default\" keeps the configured default with a notice",
+          "durationMs": 21.7882
+        },
+        {
+          "name": "a cancelled confirmation fails the dispatch closed",
+          "durationMs": 20.7602
+        },
+        {
+          "name": "an unanswered confirmation fails the dispatch closed",
+          "durationMs": 18.7947
+        },
+        {
+          "name": "an unavailable confirmation channel falls back to the default",
+          "durationMs": 14.7424
+        },
+        {
+          "name": "the approval policy can be turned off for a declared user request",
+          "durationMs": 17.3187
+        },
+        {
+          "name": "resolveDispatchModel",
+          "durationMs": 176.3673
+        },
+        {
+          "name": "an answered request resolves through the request/decision files",
+          "durationMs": 56.8263
+        },
+        {
+          "name": "an unwritable channel degrades to the configured default",
+          "durationMs": 23.4811
+        },
+        {
+          "name": "expired requests are never handed to the user",
+          "durationMs": 25.4349
+        },
+        {
+          "name": "model approval file channel",
+          "durationMs": 106.5289
+        },
+        {
+          "name": "Model catalog - Antigravity output parser",
+          "durationMs": 5.3453
+        },
+        {
+          "name": "Model catalog - Codex catalog parser tolerates leading noise",
+          "durationMs": 0.8534
+        },
+        {
+          "name": "Model catalog - OpenAI/Anthropic model list parser",
+          "durationMs": 0.6664
+        },
+        {
+          "name": "Model catalog - JSON extraction rejects non-JSON payloads",
+          "durationMs": 0.3716
+        },
+        {
+          "name": "Model catalog - model ids are trimmed and empty means unset",
+          "durationMs": 0.3351
+        },
+        {
+          "name": "Model catalog - defaults round-trip and drop empty values",
+          "durationMs": 41.0489
+        },
+        {
+          "name": "Model catalog - receiver and sender defaults are independent and durable",
+          "durationMs": 58.274
+        },
+        {
+          "name": "Model catalog - resolveConfiguredModel memoizes the saved snapshot",
+          "durationMs": 38.0547
+        },
+        {
+          "name": "Model catalog - bridge home can be redirected for isolation",
+          "durationMs": 2.4393
+        },
+        {
+          "name": "Model catalog - missing executables fall back without throwing",
+          "durationMs": 10.2984
+        },
+        {
+          "name": "Model catalog - cached catalogue is reused between instances",
+          "durationMs": 20.9546
+        },
+        {
+          "name": "Model catalog - explicit model reaches every agent CLI",
+          "durationMs": 144.488
+        },
+        {
+          "name": "Model catalog - configured default is used when no model is pinned",
+          "durationMs": 68.5442
+        },
+        {
+          "name": "Model catalog - DSH runs get a per-run overlay patch",
+          "durationMs": 27.6332
+        },
+        {
+          "name": "Model catalog - task DSH overlay stays in the fixed task dir across root changes",
+          "durationMs": 34.9659
+        },
+        {
+          "name": "Model catalog - DSH refuses an overlay when no provider route exists",
+          "durationMs": 1.2603
+        },
+        {
+          "name": "Model routing - sender model resolution precedence",
+          "durationMs": 16.6529
+        },
+        {
+          "name": "Model routing - the sender-side default wins over the receiver-side default",
+          "durationMs": 35.7881
+        },
+        {
+          "name": "Model routing - both ends are summarized for tasks and messages",
+          "durationMs": 1.1657
+        },
+        {
+          "name": "Claude Code: removes the transcript, subagent dir and per-session state",
+          "durationMs": 25.5392
+        },
+        {
+          "name": "Codex: removes the rollout and its session_index entry",
+          "durationMs": 42.2693
+        },
+        {
+          "name": "Antigravity: removes the DB, brain, annotations, implicit record and cache entries",
+          "durationMs": 71.9786
+        },
+        {
+          "name": "DeepSeek Harness: removes the session dir, projcache and workspace references",
+          "durationMs": 45.5331
+        },
+        {
+          "name": "a missing conversation is not an error",
+          "durationMs": 2.2772
+        },
+        {
+          "name": "the caller session is never deleted",
+          "durationMs": 8.4392
+        },
+        {
+          "name": "a dedicated task without a captured reviewer never deletes the requester chat",
+          "durationMs": 7.2906
+        },
+        {
+          "name": "a dedicated task deletes only the captured reviewer, never the requester",
+          "durationMs": 9.3588
+        },
+        {
+          "name": "retarget history cleans the sessions of previously-used agents",
+          "durationMs": 11.827
+        },
+        {
+          "name": "unsafe session ids are rejected before they can reach the file system",
+          "durationMs": 1.9105
+        },
+        {
+          "name": "native conversation cleanup on task deletion",
+          "durationMs": 231.2782
+        },
+        {
+          "name": "Codex UUID and rollout name share one session write lease",
+          "durationMs": 86.9314
+        },
+        {
+          "name": "session write lease excludes a separate bridge process",
+          "durationMs": 162.7891
+        },
+        {
+          "name": "a live owner is never reclaimed from a stale heartbeat",
+          "durationMs": 52.818
+        },
+        {
+          "name": "concurrent stale-owner recovery grants only one lease across processes",
+          "durationMs": 2247.7721
+        },
+        {
+          "name": "simultaneous first acquisition publishes exactly one owner",
+          "durationMs": 2171.6782
+        },
+        {
+          "name": "an unreadable owner publication is never mistaken for a dead session owner",
+          "durationMs": 209.6337
+        },
+        {
+          "name": "a live pending owner is restored after a crash between owner replacement steps",
+          "durationMs": 58.9474
+        },
+        {
+          "name": "attachChild replaces the complete owner record atomically while another process reads it",
+          "durationMs": 565.5537
+        },
+        {
+          "name": "attachChild waits for a live reaper gate and never reports an unpersisted PID as attached",
+          "durationMs": 662.1051
+        },
+        {
+          "name": "release waits for transient reaper ownership and removes the lease before returning",
+          "durationMs": 683.8497
+        },
+        {
+          "name": "child binding can abandon a contended gate on cancellation without claiming success",
+          "durationMs": 861.2407
+        },
+        {
+          "name": "a live child keeps the session locked after its bridge parent exits",
+          "durationMs": 226.5544
+        },
+        {
+          "name": "resolves per-agent custom log directories and creates the three subdirectories",
+          "durationMs": 18.5802
+        },
+        {
+          "name": "worker_log stores both raw execution logs and compacted output archives",
+          "durationMs": 43.669
+        },
+        {
+          "name": "reviewer_log stores round review logs and bootstrap logs",
+          "durationMs": 40.8027
+        },
+        {
+          "name": "Archive compresses and packages task logs on completion, preserving archive while pruning active logs",
+          "durationMs": 77.4354
+        },
+        {
+          "name": "maintains seamless backwards compatibility with legacy flat logs/ directory",
+          "durationMs": 15.041
+        },
+        {
+          "name": "finds structured logs written before custom log directories were configured",
+          "durationMs": 38.0925
+        },
+        {
+          "name": "TaskStore.archiveTask creates the compressed archive in Archive/ and retains the digest",
+          "durationMs": 90.9176
+        },
+        {
+          "name": "Per-agent log directories with worker_log, reviewer_log, Archive",
+          "durationMs": 326.7376
+        },
+        {
+          "name": "should record exhaustion and calculate recovery time correctly from \"retry after\" message",
+          "durationMs": 20.6816
+        },
+        {
+          "name": "should record exhaustion and calculate recovery time from \"resets at\" message",
+          "durationMs": 4.951
+        },
+        {
+          "name": "should clear exhaustion status manually",
+          "durationMs": 20.1288
+        },
+        {
+          "name": "should reflect exhausted status in AgentDetector probeAgent",
+          "durationMs": 175.047
+        },
+        {
+          "name": "should extract appropriate reason without false 429 classification",
+          "durationMs": 2.9275
+        },
+        {
+          "name": "RateLimitTracker & Agent Status Tests",
+          "durationMs": 226.2924
+        },
+        {
+          "name": "waits for the provider reset time when quota exhaustion is reported",
+          "durationMs": 3.6245
+        },
+        {
+          "name": "backs off when the failure carries no reset time",
+          "durationMs": 0.8209
+        },
+        {
+          "name": "stops scheduling after the automatic retry budget is spent",
+          "durationMs": 0.5259
+        },
+        {
+          "name": "Review wake failure policy",
+          "durationMs": 7.2961
+        },
+        {
+          "name": "review callback injects only reviewer template instructions",
+          "durationMs": 58.4233
+        },
+        {
+          "name": "a 429 that still exits 0 is a failed review, not a delivered one",
+          "durationMs": 46.9269
+        },
+        {
+          "name": "a dedicated reviewer wake does not launch after prepare pauses an unknown native operation",
+          "durationMs": 93.4145
+        },
+        {
+          "name": "a blocked merge resumes its dedicated reviewer through real preparation and releases leases",
+          "durationMs": 184.2371
+        },
+        {
+          "name": "pause and resume preserve every merge phase and wake the same dedicated reviewer after shutdown",
+          "durationMs": 1482.9795
+        },
+        {
+          "name": "merge decision handoff releases reviewer resources and answers resume the same native session",
+          "durationMs": 304.9066
+        },
+        {
+          "name": "a failed merge reviewer is recorded without treating merging as a successful handoff",
+          "durationMs": 28.0119
+        },
+        {
+          "name": "a launched merge reviewer with status-only output records EMPTY_OUTPUT",
+          "durationMs": 223.4359
+        },
+        {
+          "name": "a reviewer tail process keeps the native session lease after its role is handed off",
+          "durationMs": 189.291
+        },
+        {
+          "name": "reviewer launch binding and exit cleanup failures kill or fail safely without escaping callbacks",
+          "durationMs": 175.0074
+        },
+        {
+          "name": "dedicated reviewer launch rechecks cancellation, deletion, retargeting, and missing session lease",
+          "durationMs": 133.9947
+        },
+        {
+          "name": "a rework starts a fresh review budget instead of inheriting the old one",
+          "durationMs": 22.5031
+        },
+        {
+          "name": "a clean exit without a ledger verdict is a retryable no-decision",
+          "durationMs": 40.8459
+        },
+        {
+          "name": "clears the round wake only after a recorded approval, rework, or park",
+          "durationMs": 79.4907
+        },
+        {
+          "name": "does not rewrite paused, archived, deleted, or failure-notification tasks",
+          "durationMs": 68.0626
+        },
+        {
+          "name": "CallbackManager records stalled reviewer wakes",
+          "durationMs": 3133.8265
+        },
+        {
+          "name": "re-wakes the same session once the plan is due, and consumes one attempt",
+          "durationMs": 44.881
+        },
+        {
+          "name": "keeps the fifth launch in flight and exhausts only after its recorded outcome",
+          "durationMs": 839.041
+        },
+        {
+          "name": "retries against the newest completed work round, never an approval round",
+          "durationMs": 36.0987
+        },
+        {
+          "name": "does not fire a planned retry while a reviewer is already running",
+          "durationMs": 6.9957
+        },
+        {
+          "name": "does not retry while a sibling task is reviewing the same caller session",
+          "durationMs": 28.2009
+        },
+        {
+          "name": "does not retry while the quota is still cooling down",
+          "durationMs": 31.6804
+        },
+        {
+          "name": "marks the plan as given up once attempts are exhausted",
+          "durationMs": 35.1183
+        },
+        {
+          "name": "drops a failure record that belongs to an older round",
+          "durationMs": 34.399
+        },
+        {
+          "name": "records a silent review as stalled and then retries it",
+          "durationMs": 51.5978
+        },
+        {
+          "name": "leaves a review alone while its reviewer process is alive",
+          "durationMs": 7.7752
+        },
+        {
+          "name": "leaves a review parked on a live dependency alone",
+          "durationMs": 28.7629
+        },
+        {
+          "name": "turns a park without a dependency id into a visible, terminal stall",
+          "durationMs": 42.1805
+        },
+        {
+          "name": "turns a park on a deleted dependency into a visible, terminal stall",
+          "durationMs": 34.8664
+        },
+        {
+          "name": "heals a pre-existing gave-up wake into the terminal review_failed status",
+          "durationMs": 43.1652
+        },
+        {
+          "name": "does not fire before the stall threshold",
+          "durationMs": 17.0064
+        },
+        {
+          "name": "stall watchdog",
+          "durationMs": 226.2049
+        },
+        {
+          "name": "ReviewWakeScheduler",
+          "durationMs": 1283.4925
+        },
+        {
+          "name": "records a non-empty cause and releases the task queue slot",
+          "durationMs": 0.3948
+        },
+        {
+          "name": "never downgrades a task that is no longer waiting for review",
+          "durationMs": 0.1318
+        },
+        {
+          "name": "re-opening returns to reviewing and keeps the failure as history",
+          "durationMs": 0.1498
+        },
+        {
+          "name": "review_failed lifecycle status",
+          "durationMs": 0.8113
+        },
+        {
+          "name": "the prompt credential confirms the prepared task",
+          "durationMs": 50.1965
+        },
+        {
+          "name": "a brief-less call claims the only pending bootstrap of its agent",
+          "durationMs": 35.7786
+        },
+        {
+          "name": "a wrong prompt token cannot claim the task",
+          "durationMs": 31.383
+        },
+        {
+          "name": "a paused task cannot be confirmed by a delayed bootstrap and keeps its token",
+          "durationMs": 47.2842
+        },
+        {
+          "name": "without a pending bootstrap a brief-less call is still an ordinary error",
+          "durationMs": 137.6291
+        },
+        {
+          "name": "dedicated reviewer bootstrap identity",
+          "durationMs": 304.7209
+        },
+        {
+          "name": "bootstrap token round-trips and clears",
+          "durationMs": 23.1443
+        },
+        {
+          "name": "a bootstrap is identifiable by the launched reviewer pid, without any env",
+          "durationMs": 30.2983
+        },
+        {
+          "name": "pid lookup follows the ledger artifactDir after taskDataRoot changes, and keeps legacy records",
+          "durationMs": 68.3821
+        },
+        {
+          "name": "a stale launch record cannot be claimed by a reused pid",
+          "durationMs": 16.692
+        },
+        {
+          "name": "the launched reviewer pid is written before the turn runs",
+          "durationMs": 89.6647
+        },
+        {
+          "name": "pending dedicated task is bootstrapped by a fresh reviewer session",
+          "durationMs": 184.8198
+        },
+        {
+          "name": "a reviewer turn that never dispatches fails the task without starting a developer",
+          "durationMs": 63.8807
+        },
+        {
+          "name": "a failed reviewer bootstrap is terminal, not \"still starting\"",
+          "durationMs": 4.6035
+        },
+        {
+          "name": "paused and waiting-review tasks do not serialize independent reviewer bootstraps",
+          "durationMs": 158.8025
+        },
+        {
+          "name": "concurrency: a running task in another workspace does not block a pending bootstrap",
+          "durationMs": 87.1393
+        },
+        {
+          "name": "the bootstrap prompt carries the one-time credential",
+          "durationMs": 1.265
+        },
+        {
+          "name": "the last-resort finder answers only when one bootstrap can be meant",
+          "durationMs": 49.7156
+        },
+        {
+          "name": "a reviewer that never saw dispatch_task is relaunched instead of failed",
+          "durationMs": 57.7015
+        },
+        {
+          "name": "a reviewer that HAD dispatch_task and ignored it stays terminal",
+          "durationMs": 64.4688
+        },
+        {
+          "name": "bootstrap attempts are capped so a permanently racy host still terminates",
+          "durationMs": 34.3943
+        },
+        {
+          "name": "bootstrap includes only the reviewer template snapshot",
+          "durationMs": 2.6236
+        },
+        {
+          "name": "tees the caller stdout/stderr into the per-round reviewer log",
+          "durationMs": 140.9501
+        },
+        {
+          "name": "resumes codex with the canonical thread UUID by default",
+          "durationMs": 52.7805
+        },
+        {
+          "name": "uses the rollout name for a legacy CLI but still stores the UUID",
+          "durationMs": 53.465
+        },
+        {
+          "name": "wakes the caller on its sender-side default model, not the receiver default",
+          "durationMs": 53.622
+        },
+        {
+          "name": "dedicated review resumes the reviewer conversation and binds the lock to it",
+          "durationMs": 69.1211
+        },
+        {
+          "name": "a stale wake round is normalised to the newest completed work round",
+          "durationMs": 70.736
+        },
+        {
+          "name": "Reviewer stream capture",
+          "durationMs": 443.2957
+        },
+        {
+          "name": "keeps reviewer logs out of the receiver round-log namespace",
+          "durationMs": 5.7985
+        },
+        {
+          "name": "sanitizes caller-controlled thread ids and rounds",
+          "durationMs": 3.665
+        },
+        {
+          "name": "writes a banner, streams chunks and reports its size",
+          "durationMs": 22.1215
+        },
+        {
+          "name": "appends a new banner when the same round is woken again",
+          "durationMs": 28.1572
+        },
+        {
+          "name": "stops at the byte cap with an explicit truncation marker",
+          "durationMs": 19.7508
+        },
+        {
+          "name": "reads only the tail and flags truncation",
+          "durationMs": 21.8679
+        },
+        {
+          "name": "reports missing logs instead of an empty string",
+          "durationMs": 11.0711
+        },
+        {
+          "name": "lists rounds with a reviewer log, newest first, ignoring receiver logs",
+          "durationMs": 18.4948
+        },
+        {
+          "name": "falls back to the newest reviewer log when the requested round has none",
+          "durationMs": 15.0143
+        },
+        {
+          "name": "Reviewer log artifact",
+          "durationMs": 148.5729
+        },
+        {
+          "name": "dedicated bootstrap readiness requires a confirmed captured canonical reviewer session",
+          "durationMs": 1.4166
+        },
+        {
+          "name": "failed bootstrap retry rejects before retarget or ledger mutation",
+          "durationMs": 27.8595
+        },
+        {
+          "name": "completed and archived tasks cannot be retried or have output cleared",
+          "durationMs": 35.8712
+        },
+        {
+          "name": "waiting review cannot retry an older failure behind a newer successful round",
+          "durationMs": 20.3731
+        },
+        {
+          "name": "latest failed execution round retries in place and retains its receiver session",
+          "durationMs": 25.0323
+        },
+        {
+          "name": "retry does not revive a task completed during executor approval",
+          "durationMs": 36.4131
+        },
+        {
+          "name": "dedicated rework cannot rebind reviewer session from params or detector",
+          "durationMs": 12.6021
+        },
+        {
+          "name": "paused pending bootstrap resumes with its existing token and no developer run",
+          "durationMs": 36.3992
+        },
+        {
+          "name": "rejects a rework that repeats the previous instruction after an empty round",
+          "durationMs": 4.4594
+        },
+        {
+          "name": "allows the same words when the previous round did change files",
+          "durationMs": 0.2835
+        },
+        {
+          "name": "allows genuinely new feedback after an empty round",
+          "durationMs": 0.4704
+        },
+        {
+          "name": "legacy rounds without touchedFiles are never treated as no-ops",
+          "durationMs": 0.3024
+        },
+        {
+          "name": "no-op rework guard",
+          "durationMs": 7.0182
+        },
+        {
+          "name": "blockReview parks the review without creating a round",
+          "durationMs": 31.9485
+        },
+        {
+          "name": "blockReview refuses a task that is not waiting for review",
+          "durationMs": 10.1896
+        },
+        {
+          "name": "a completed task cannot be resurrected by a late rework",
+          "durationMs": 14.3313
+        },
+        {
+          "name": "review block and terminal state",
+          "durationMs": 57.1442
+        },
+        {
+          "name": "findInFlightRound returns undefined when the thread is idle",
+          "durationMs": 1.1768
+        },
+        {
+          "name": "findInFlightRound returns the single running round",
+          "durationMs": 0.2037
+        },
+        {
+          "name": "findInFlightRound picks the highest round when several are running",
+          "durationMs": 0.1848
+        },
+        {
+          "name": "findInFlightRound keeps the newest entry when round numbers tie",
+          "durationMs": 0.1416
+        },
+        {
+          "name": "nextRoundNumber is monotonic and never reuses an existing number",
+          "durationMs": 0.2043
+        },
+        {
+          "name": "Round invariant - pure helpers",
+          "durationMs": 3.4246
+        },
+        {
+          "name": "requestRework throws while a round is still running",
+          "durationMs": 18.0209
+        },
+        {
+          "name": "requestRework succeeds once the previous round is finalized",
+          "durationMs": 263.5438
+        },
+        {
+          "name": "requestRework numbers monotonically after a retry rewound currentRound",
+          "durationMs": 246.1224
+        },
+        {
+          "name": "retryFailedRound throws while another round is running",
+          "durationMs": 17.8923
+        },
+        {
+          "name": "approveTask throws while a round is still running",
+          "durationMs": 7.8003
+        },
+        {
+          "name": "approveTask is idempotent once the thread is completed",
+          "durationMs": 20.6034
+        },
+        {
+          "name": "Round invariant - ReworkController refuses to overlap rounds",
+          "durationMs": 574.9528
+        },
+        {
+          "name": "updateRound will not append a running round while one is in flight",
+          "durationMs": 7.3324
+        },
+        {
+          "name": "updateRound updates the newest entry when round numbers are duplicated",
+          "durationMs": 20.4179
+        },
+        {
+          "name": "Round invariant - TaskStore refuses a second running round",
+          "durationMs": 28.0908
+        },
+        {
+          "name": "normalizeRoundIntegrity keeps the highest running round and finalizes the rest",
+          "durationMs": 206.9574
+        },
+        {
+          "name": "normalizeRoundIntegrity is a no-op for a healthy ledger",
+          "durationMs": 209.2479
+        },
+        {
+          "name": "executeThreadRound refuses to start a round while another is in flight",
+          "durationMs": 216.0513
+        },
+        {
+          "name": "executeThreadRound terminally refuses a historical unsupported agent without executing it",
+          "durationMs": 25.7276
+        },
+        {
+          "name": "Round invariant - supervisor repairs and guards",
+          "durationMs": 658.4181
+        },
+        {
+          "name": "read-time normalization: legacy status \"reworking\" on disk loads as \"running\" with all metadata preserved",
+          "durationMs": 39.7454
+        },
+        {
+          "name": "statusFilter compatibility alias: \"reworking\" filters tasks in running status with active rework round",
+          "durationMs": 17.1801
+        },
+        {
+          "name": "rework creation and retry/resume lifecycle writes status \"running\"",
+          "durationMs": 429.103
+        },
+        {
+          "name": "UI task tree status formatter: differentiates Running vs Reworking based on active round type",
+          "durationMs": 2.6424
+        },
+        {
+          "name": "NativeSessionCompactor business success acknowledges rework under running status",
+          "durationMs": 33.998
+        },
+        {
+          "name": "Running and Reworking Status Merge Tests",
+          "durationMs": 524.6957
+        },
+        {
+          "name": "pausing a running task records the interruption reason and stops the child",
+          "durationMs": 39.7486
+        },
+        {
+          "name": "deleting a task removes it, stops the child, and writes a tombstone reason",
+          "durationMs": 63.9202
+        },
+        {
+          "name": "deleting a task also records the receiver conversation cleanup",
+          "durationMs": 56.5338
+        },
+        {
+          "name": "a failing native conversation cleanup never blocks the deletion",
+          "durationMs": 57.1243
+        },
+        {
+          "name": "deleting a task stops and waits for its live reviewer child before removing it",
+          "durationMs": 221.4596
+        },
+        {
+          "name": "forced deletion retains the ledger until the registered developer process exits",
+          "durationMs": 323.7304
+        },
+        {
+          "name": "resuming a paused task keeps history and clears the current interruption",
+          "durationMs": 203.9622
+        },
+        {
+          "name": "resuming clears the pause the runner remembered while nothing was running",
+          "durationMs": 200.9392
+        },
+        {
+          "name": "TaskControlService - pause/delete reasons",
+          "durationMs": 1171.3829
+        },
+        {
+          "name": "task data root defaults to <storage>/tasks and resolves relative values against the bridge home",
+          "durationMs": 36.8302
+        },
+        {
+          "name": "a task directory is created with the standard layout and the worktree lives inside it",
+          "durationMs": 1759.3628
+        },
+        {
+          "name": "archive and cleanup stay inside the task directory and never delete the archive prematurely",
+          "durationMs": 78.0032
+        },
+        {
+          "name": "TaskStore.deleteTask removes a task directory and its bootstrap credential",
+          "durationMs": 28.3997
+        },
+        {
+          "name": "delete_task removes the unified directory including its worktree",
+          "durationMs": 4942.8148
+        },
+        {
+          "name": "legacy threads without artifactDir keep using per-agent log directories",
+          "durationMs": 22.3407
+        },
+        {
+          "name": "TaskStore.archiveTask keeps overlays, rounds and sessions when an overlay read fails, then retries",
+          "durationMs": 147.6997
+        },
+        {
+          "name": "dispatch pins the absolute task directory and writes its round log there",
+          "durationMs": 3251.1335
+        },
+        {
+          "name": "the first round after an agent switch starts a brand-new session",
+          "durationMs": 1.2389
+        },
+        {
+          "name": "once the new session was captured, later rounds resume it",
+          "durationMs": 0.5543
+        },
+        {
+          "name": "a model-only switch keeps the existing session",
+          "durationMs": 0.2995
+        },
+        {
+          "name": "an initial round still needs a captured session to resume",
+          "durationMs": 0.2539
+        },
+        {
+          "name": "shouldResumeNativeSession after an executor switch",
+          "durationMs": 4.029
+        },
+        {
+          "name": "switching the agent drops the native session and keeps the task",
+          "durationMs": 32.7998
+        },
+        {
+          "name": "a model-only switch approved by the user keeps the native session",
+          "durationMs": 26.9944
+        },
+        {
+          "name": "a model the caller did not attribute to the user is ignored",
+          "durationMs": 17.9524
+        },
+        {
+          "name": "the user choosing the default moves the task onto the configured default",
+          "durationMs": 27.4047
+        },
+        {
+          "name": "a declined switch aborts before touching the thread",
+          "durationMs": 21.4675
+        },
+        {
+          "name": "an approval result cannot overwrite a task completed while the dialog was open",
+          "durationMs": 29.619
+        },
+        {
+          "name": "an approval result cannot overwrite a task paused while the dialog was open",
+          "durationMs": 31.6314
+        },
+        {
+          "name": "refuses while a round is still in flight",
+          "durationMs": 15.8662
+        },
+        {
+          "name": "refuses on a completed task and on an unknown thread",
+          "durationMs": 15.8891
+        },
+        {
+          "name": "queued and paused tasks are switchable, and the queue is released",
+          "durationMs": 38.3213
+        },
+        {
+          "name": "TaskRetargetService - switching a task executor",
+          "durationMs": 276.7927
+        },
+        {
+          "name": "reviewer and developer cannot hold the same task at once",
+          "durationMs": 34.6174
+        },
+        {
+          "name": "a detached reviewer child keeps the role alive after its launcher stops",
+          "durationMs": 24.4165
+        },
+        {
+          "name": "attachChild binds the role to the spawned caller process",
+          "durationMs": 31.1259
+        },
+        {
+          "name": "a stale role lock is reclaimed",
+          "durationMs": 29.3163
+        },
+        {
+          "name": "TaskRoleLock - one role per task",
+          "durationMs": 121.5556
+        },
+        {
+          "name": "developer waits while reviewer owns the task, then starts after handoff",
+          "durationMs": 297.6449
+        },
+        {
+          "name": "a second reviewer wake-up is refused while one is active",
+          "durationMs": 28.6082
+        },
+        {
+          "name": "Task role enforcement in execution",
+          "durationMs": 326.8269
+        },
+        {
+          "name": "should initialize with empty store when file does not exist",
+          "durationMs": 7.9084
+        },
+        {
+          "name": "should upsert, retrieve and persist task thread",
+          "durationMs": 24.9982
+        },
+        {
+          "name": "preserves task template snapshot when an old copy is saved after reload",
+          "durationMs": 37.7312
+        },
+        {
+          "name": "should update round and refresh summary accurately",
+          "durationMs": 34.01
+        },
+        {
+          "name": "should persist the caller merge-request handoff",
+          "durationMs": 41.0733
+        },
+        {
+          "name": "newer merge failure revokes approval and stale snapshots cannot restore it",
+          "durationMs": 48.4314
+        },
+        {
+          "name": "should enforce strict 1,000 tasks cap with LRU truncation",
+          "durationMs": 36325.3787
+        },
+        {
+          "name": "TaskStore Tests",
+          "durationMs": 36521.7973
+        },
+        {
+          "name": "final summary - completed task keeps verdict, files and MR",
+          "durationMs": 8.0119
+        },
+        {
+          "name": "final summary - failed task records the terminal error",
+          "durationMs": 0.7174
+        },
+        {
+          "name": "final summary - review_failed records why no verdict was reached",
+          "durationMs": 0.6419
+        },
+        {
+          "name": "final summary - only terminal tasks get one",
+          "durationMs": 1.2606
+        },
+        {
+          "name": "archive - keeps only the digest and metadata",
+          "durationMs": 3.2095
+        },
+        {
+          "name": "archive policy - newest N stay hot and only terminal tasks are eligible",
+          "durationMs": 1.1087
+        },
+        {
+          "name": "TaskStore.archiveTask strips rounds, logs and persists the digest",
+          "durationMs": 96.6644
+        },
+        {
+          "name": "TaskStore does not archive while a native session write lease is active",
+          "durationMs": 126.5087
+        },
+        {
+          "name": "TaskArchiveService archives terminal tasks beyond the retention window",
+          "durationMs": 229.3289
+        },
+        {
+          "name": "removeTaskArtifacts removes only that task bridge files",
+          "durationMs": 9.0251
+        },
+        {
+          "name": "unsafe links are rejected while a normal workspace works",
+          "durationMs": 49.2535
+        },
+        {
+          "name": "templates are isolated, initialized once, and snapshots survive edits and deletion",
+          "durationMs": 82.3103
+        },
+        {
+          "name": "invalid, duplicate, oversized and unsafe templates are diagnosed; creation never overwrites",
+          "durationMs": 81.6743
+        },
+        {
+          "name": "junctions cannot redirect template storage outside the workspace",
+          "durationMs": 4.7987
+        },
+        {
+          "name": "rejects a changed ancestor before creating a template",
+          "durationMs": 36.9109
+        },
+        {
+          "name": "registered template commands use clicked workspace rather than active workspace",
+          "durationMs": 1509.8128
+        },
+        {
+          "name": "test runner prioritizes long files, discovers nested tests and propagates failures",
+          "durationMs": 669.4396
+        },
+        {
+          "name": "DSH: cached prompt tokens are NOT part of inputTokens and must be added",
+          "durationMs": 3.8251
+        },
+        {
+          "name": "Claude: input excludes cache, so prompt = input + cache read + cache write",
+          "durationMs": 0.6369
+        },
+        {
+          "name": "Antigravity: per-step usage is summed and the conversation-total result is ignored",
+          "durationMs": 0.6397
+        },
+        {
+          "name": "Codex: cached and cache-write tokens are subsets of input; reasoning is not added twice",
+          "durationMs": 0.3848
+        },
+        {
+          "name": "interrupted rounds keep native per-step usage but are flagged partial",
+          "durationMs": 0.6063
+        },
+        {
+          "name": "token usage - per-agent normalization",
+          "durationMs": 7.5907
+        },
+        {
+          "name": "no native usage: estimate the output only, never the input",
+          "durationMs": 1.0115
+        },
+        {
+          "name": "nothing measured is unavailable, not free",
+          "durationMs": 0.2956
+        },
+        {
+          "name": "output estimation is a rough mixed-script ratio",
+          "durationMs": 0.2961
+        },
+        {
+          "name": "formatTokenCount keeps numbers readable",
+          "durationMs": 0.34
+        },
+        {
+          "name": "token usage - fallbacks",
+          "durationMs": 2.4699
+        },
+        {
+          "name": "retries add up and record the attempt count",
+          "durationMs": 0.6088
+        },
+        {
+          "name": "an estimate cannot overwrite a native measurement",
+          "durationMs": 0.1856
+        },
+        {
+          "name": "thread rollup sums rounds, splits by agent/model and flags partial data",
+          "durationMs": 0.5648
+        },
+        {
+          "name": "legacy Claude result cost is counted once",
+          "durationMs": 0.3795
+        },
+        {
+          "name": "a reviewer compaction component is counted once and grouped by its own agent/model",
+          "durationMs": 0.5921
+        },
+        {
+          "name": "business attempts after maintenance remain in the durable component rollup",
+          "durationMs": 2.5451
+        },
+        {
+          "name": "token usage - accumulation and rollup",
+          "durationMs": 7.8769
+        },
+        {
+          "name": "changing the Codex configured provider invalidates a certified capability identity",
+          "durationMs": 17.2912
+        },
+        {
+          "name": "lagged context compaction keeps the token metadata",
+          "durationMs": 55.5276
+        },
+        {
+          "name": "a stale writer cannot erase the token metadata",
+          "durationMs": 22.1022
+        },
+        {
+          "name": "maintenance and multiple retry attempts survive store reload without re-billing stale snapshots",
+          "durationMs": 38.838
+        },
+        {
+          "name": "TaskStore migrates legacy round usage once before merging a maintenance component",
+          "durationMs": 40.5226
+        },
+        {
+          "name": "a stale task snapshot cannot restore the pre-retarget session cursor",
+          "durationMs": 35.9818
+        },
+        {
+          "name": "runner repeats pending recovery until a carried business turn succeeds and holds one session lease",
+          "durationMs": 172.2476
+        },
+        {
+          "name": "a recovered running maintenance operation becomes unknown and is never replayed",
+          "durationMs": 112.2627
+        },
+        {
+          "name": "unknown compaction uses a same-ID read-only probe and carries recovery without replay",
+          "durationMs": 132.6918
+        },
+        {
+          "name": "auto mode also suppresses compaction after a healthy interrupted-operation probe",
+          "durationMs": 79.7662
+        },
+        {
+          "name": "a delivered unknown recovery can re-enter automatic compaction after four successful turns and reload",
+          "durationMs": 184.634
+        },
+        {
+          "name": "automatic failure probe binds its live PID and cancellation waits for probe exit",
+          "durationMs": 337.6682
+        },
+        {
+          "name": "auto mode compacts at the threshold only with an injected certified capability",
+          "durationMs": 151.9522
+        },
+        {
+          "name": "native automatic compaction events are consumed once and an immediate repeat disables auto maintenance",
+          "durationMs": 37.8015
+        },
+        {
+          "name": "missing maintenance usage is partial and cannot erase an already measured operation",
+          "durationMs": 55.639
+        },
+        {
+          "name": "token usage - durability",
+          "durationMs": 1477.087
+        },
+        {
+          "name": "Scenario 1: develop, review, and merge share execution control record and transition through controller",
+          "durationMs": 8420.4678
+        },
+        {
+          "name": "Scenario 2: Active time budget is enforced and output does not extend deadline",
+          "durationMs": 5791.4715
+        },
+        {
+          "name": "Scenario 3: Transient error auto-retries max 2 times; error message change preserves retry count",
+          "durationMs": 18348.3595
+        },
+        {
+          "name": "Scenario 5: Two approved tasks serialize on global merge lock; only holder is merging",
+          "durationMs": 4571.8565
+        },
+        {
+          "name": "Scenario 6: Between Git commands child is temporarily undefined, probeRun returns alive via owner",
+          "durationMs": 10.2306
+        },
+        {
+          "name": "Scenario 7: Mismatched birthId identifies exited process despite reused PID",
+          "durationMs": 7.6772
+        },
+        {
+          "name": "Scenario 8: Reviewer exit without tool verdict enters NO_VERDICT failure",
+          "durationMs": 13.9367
+        },
+        {
+          "name": "Scenario 9: transitionExecution throws on revision conflict and protects execution state",
+          "durationMs": 1923.9962
+        },
+        {
+          "name": "Scenario 10: requestTaskDecision transitions to wait_decision and submitTaskDecision resumes with budget preserved",
+          "durationMs": 5781.9666
+        },
+        {
+          "name": "Scenario 11: Write failure before spawn aborts execution without spawning child",
+          "durationMs": 45.2143
+        },
+        {
+          "name": "Scenario 12: Manual retry resets autoRetriesUsed and starts new generation; resume preserves budget",
+          "durationMs": 4895.1213
+        },
+        {
+          "name": "Scenario 13: TaskStore upsertTask preserves execution record and does not overwrite with stale copies",
+          "durationMs": 762.1173
+        },
+        {
+          "name": "Scenario 14: Legacy tasks without execution field retain legacy status semantics",
+          "durationMs": 7.0727
+        },
+        {
+          "name": "Scenario 15: Phase handoff advances directly when resources free; independent reviews are concurrent",
+          "durationMs": 2638.5995
+        },
+        {
+          "name": "Scenario 16: retryOperation and resumeOperation restore state to queued/running and clear failures",
+          "durationMs": 10980.5475
+        },
+        {
+          "name": "Scenario 17: submitTaskDecision injects user answer, clears decision, and resumes execution",
+          "durationMs": 8267.9581
+        },
+        {
+          "name": "Scenario 18: Anti-stale protection prevents older run callbacks from overwriting new run state",
+          "durationMs": 5192.8395
+        },
+        {
+          "name": "Scenario 19: MeshFileLock helper holds OS lock until attached child terminates",
+          "durationMs": 4374.1971
+        },
+        {
+          "name": "Scenario 20: Alive run identity preservation and stale callback rejection with empty run",
+          "durationMs": 970.0983
+        },
+        {
+          "name": "Scenario 21: MergeCoordinator lock sharing and external lease avoids self-deadlock",
+          "durationMs": 963.3093
+        },
+        {
+          "name": "Scenario 22: TaskStore CAS Lock mutual exclusion and immune to mtime backdating",
+          "durationMs": 3101.2455
+        },
+        {
+          "name": "Scenario 24: retryOperation, resumeOperation, and submitTaskDecision start directly without queued state",
+          "durationMs": 15351.1029
+        },
+        {
+          "name": "Scenario 25: Stdio MCP decision request persists first and skips self-kill",
+          "durationMs": 1440.98
+        },
+        {
+          "name": "Scenario 26: confirmProcessTreeExit tracks descendant tree and verifies exit with birthId",
+          "durationMs": 1977.491
+        },
+        {
+          "name": "Scenario 27: Crash recovery candidate ref alone must NOT mark completed",
+          "durationMs": 4612.6917
+        },
+        {
+          "name": "Scenario 28: Stop unconfirmed retains run protection and blocks concurrent retry/resume",
+          "durationMs": 21053.1633
+        },
+        {
+          "name": "Scenario 29: approveTask retains Reviewer run until CLI exits and non-zero tail exit does not revoke verdict",
+          "durationMs": 14125.8264
+        },
+        {
+          "name": "Scenario 30: Controlled CAS concurrency on rework and approve rejects stale generation/run/status without wiping out new generation",
+          "durationMs": 18855.6732
+        },
+        {
+          "name": "Scenario 31: recovery CAS cannot clear a concurrently started generation",
+          "durationMs": 4989.0492
+        },
+        {
+          "name": "workspace identity resolves aliases and rejects invalid directories",
+          "durationMs": 66.8486
+        },
+        {
+          "name": "physical file identity distinguishes projects and detects hard links",
+          "durationMs": 8.1051
+        },
+        {
+          "name": "concurrent processes register the same workspace once",
+          "durationMs": 182.8398
+        },
+        {
+          "name": "window adoption is local, requires successful dispatch, and never replaces a default",
+          "durationMs": 30.0447
+        },
+        {
+          "name": "execution path must agree with the isolated worktree",
+          "durationMs": 0.5288
+        },
+        {
+          "name": "workspace selection survives a new host while clear and first-dispatch choices persist",
+          "durationMs": 69.2183
+        },
+        {
+          "name": "workspace state stays isolated and missing saved directories do not break startup",
+          "durationMs": 71.9602
+        },
+        {
+          "name": "ledger refuses a missing or changed binding and filters before limiting",
+          "durationMs": 77.8158
+        },
+        {
+          "name": "legacy aggregate and task files are not loaded or migrated",
+          "durationMs": 79.8192
+        },
+        {
+          "name": "task detail shows separate escaped task, delivery and cleaned validation locations",
+          "durationMs": 10.5822
+        },
+        {
+          "name": "legacy worktree detail labels the target checkout as unknown",
+          "durationMs": 0.6695
+        },
+        {
+          "name": "dispatch creates a separate task branch from committed target state and ignores caller dirt",
+          "durationMs": 2750.5341
+        },
+        {
+          "name": "explicit delivery branch is pinned and task worktrees pass it to child tasks",
+          "durationMs": 2471.2352
+        },
+        {
+          "name": "ordinary linked checkouts group with their main workspace without changing the delivery branch",
+          "durationMs": 11399.4457
+        },
+        {
+          "name": "detached source requires an explicit existing local delivery branch",
+          "durationMs": 2347.7964
+        },
+        {
+          "name": "new dispatch creates its worktree while final integration validation holds the mesh lock",
+          "durationMs": 4080.327
+        },
+        {
+          "name": "non-Git source paths fail instead of dispatching in a shared directory",
+          "durationMs": 96.5788
+        },
+        {
+          "name": "local merge state, not MR metadata, controls preservation and deletion",
+          "durationMs": 1477.035
+        },
+        {
+          "name": "an unconfigured bridge keeps the historical worktrees location",
+          "durationMs": 3.3915
+        },
+        {
+          "name": "an absolute configured root is used verbatim",
+          "durationMs": 16.885
+        },
+        {
+          "name": "a relative configured root resolves against the bridge home, not the cwd",
+          "durationMs": 13.0427
+        },
+        {
+          "name": "clearing the setting restores the default root",
+          "durationMs": 25.1901
+        },
+        {
+          "name": "saving the worktree root does not disturb the other mirrored policy switches",
+          "durationMs": 24.983
+        },
+        {
+          "name": "a new task worktree is actually created under the configured root",
+          "durationMs": 1756.187
+        },
+        {
+          "name": "omitting the root keeps creating worktrees under storage",
+          "durationMs": 1725.7859
+        }
+      ],
+      "startedAt": "2026-11-18T11:24:34.819Z",
+      "endedAt": "2026-11-18T11:33:11.812Z"
+    }
+  },
+  "runs": {
+    "A1": null,
+    "B1": null,
+    "B2": null,
+    "A2": null,
+    "A3": null,
+    "B3": null
+  },
+  "layers": {},
+  "operations": {}
+}

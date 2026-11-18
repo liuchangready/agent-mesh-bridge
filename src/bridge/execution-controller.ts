@@ -59,6 +59,8 @@ export interface ExecutionControllerOptions {
   streamSyncIntervalMs?: number;
   retryBackoffsMs?: number[];
   monotonicNow?: () => number;
+  wallClockNow?: () => number;
+  standingScanIntervalMs?: number;
 }
 
 export class ExecutionController {
@@ -75,6 +77,7 @@ export class ExecutionController {
   private readonly checkpointIntervalMs: number;
   private readonly retryBackoffsMs: number[];
   private readonly monotonicNow: () => number;
+  private readonly wallClockNow: () => number;
   private readonly mergeLock: MeshFileLock;
   private readonly activeExecutions = new Map<string, { abort: () => void; activeSinceMs: number }>();
   private readonly backoffTimers = new Map<string, NodeJS.Timeout>();
@@ -101,6 +104,7 @@ export class ExecutionController {
     this.checkpointIntervalMs = options?.streamSyncIntervalMs ?? 5_000;
     this.retryBackoffsMs = options?.retryBackoffsMs ?? AUTO_RETRY_BACKOFFS_MS;
     this.monotonicNow = options?.monotonicNow ?? monotonicNowMs;
+    this.wallClockNow = options?.wallClockNow ?? (() => Date.now());
     this.roleLock = roleLock || new TaskRoleLock(this.storageDir);
     this.sessionLock = sessionLock || new NativeSessionLock(this.storageDir);
     this.executionRegistry = executionRegistry || new TaskExecutionRegistry(this.storageDir);
@@ -114,12 +118,17 @@ export class ExecutionController {
         if (reviewRound) void this.callbackManager.notifyCaller(thread, reviewRound);
       });
 
-    this.standingScanTimer = setInterval(() => {
-      if (!this.isDisposed) {
-        void this.scanAndDrain().catch(() => {});
-      }
-    }, 5_000);
-    this.standingScanTimer.unref?.();
+    const scanInterval = options?.standingScanIntervalMs !== undefined
+      ? options.standingScanIntervalMs
+      : 5_000;
+    if (scanInterval > 0) {
+      this.standingScanTimer = setInterval(() => {
+        if (!this.isDisposed) {
+          void this.scanAndDrain().catch(() => {});
+        }
+      }, scanInterval);
+      this.standingScanTimer.unref?.();
+    }
   }
 
   public static getInstance(): ExecutionController | undefined {
@@ -372,7 +381,7 @@ export class ExecutionController {
         operationId =
           options?.operationId ||
           existing?.operationId ||
-          `${phase}_${t.currentRound || 1}_${Date.now()}`;
+          `${phase}_${t.currentRound || 1}_${this.wallClockNow()}`;
         const currentAttempt = (existing?.attempt || 0) + 1;
         const autoRetriesUsed = existing?.autoRetriesUsed || 0;
         const curLimitMs = existing?.budget?.limitMs ?? this.defaultBudgetLimitMs;
@@ -479,7 +488,7 @@ export class ExecutionController {
         t.execution = {
           version: 1,
           revision: (existing?.revision || 0) + 1,
-          operationId: existing?.operationId || `${phase}_${t.currentRound || 1}_${Date.now()}`,
+          operationId: existing?.operationId || `${phase}_${t.currentRound || 1}_${this.wallClockNow()}`,
           phase,
           round: t.currentRound || 1,
           generation: existing?.generation || 1,
@@ -1076,7 +1085,10 @@ export class ExecutionController {
           t.execution!.autoRetriesUsed = 0;
           t.execution!.budget.spentActiveMs = 0;
         });
-        void this.startExecution(threadId, 'review');
+        const reviewStartRes = await this.startExecution(threadId, 'review');
+        if (!reviewStartRes.started) {
+          console.error(`[ExecutionController] Failed to auto-start review phase for ${threadId}:`, reviewStartRes);
+        }
       } else if (phase === 'review') {
         const verdict = (result as { ok: true; verdict?: string }).verdict;
         if (verdict === 'bootstrap' || (thread.reviewBootstrap?.phase === 'confirmed' && !thread.worktree?.approvedCommit && thread.rounds.length === 1 && thread.rounds[0].status !== 'completed')) {
@@ -1144,7 +1156,7 @@ export class ExecutionController {
     if (quotaResetsAt) {
       // Known quota reset time: queue until reset without consuming retry count
       const resetTime = Date.parse(quotaResetsAt);
-      const notBefore = new Date(Math.max(Date.now() + 30_000, resetTime + 20_000)).toISOString();
+      const notBefore = new Date(Math.max(this.wallClockNow() + 30_000, resetTime + 20_000)).toISOString();
       await this.setQueuedState(threadId, phase, 'quota', notBefore);
       return;
     }
@@ -1152,7 +1164,7 @@ export class ExecutionController {
     if (canRetry) {
       const nextUsed = autoRetriesUsed + 1;
       const backoffMs = this.retryBackoffsMs[Math.min(nextUsed - 1, this.retryBackoffsMs.length - 1)];
-      const notBefore = new Date(Date.now() + backoffMs).toISOString();
+      const notBefore = new Date(this.wallClockNow() + backoffMs).toISOString();
 
       await this.transitionTask(threadId, (t) => {
         validateRunMatch(t);
@@ -1221,7 +1233,7 @@ export class ExecutionController {
     const phase: ExecutionPhase = thread.execution?.phase || 'develop';
     const decision: TaskDecisionRecord = {
       id: decisionId,
-      operationId: thread.execution?.operationId || `op_${Date.now()}`,
+      operationId: thread.execution?.operationId || `op_${this.wallClockNow()}`,
       generation: thread.execution?.generation || 1,
       phase,
       round: thread.currentRound || 1,
@@ -1570,7 +1582,7 @@ export class ExecutionController {
       if (status === 'queued') {
         if (thread.execution.queue?.notBefore) {
           const notBeforeTime = Date.parse(thread.execution.queue.notBefore);
-          if (Number.isFinite(notBeforeTime) && Date.now() < notBeforeTime) {
+          if (Number.isFinite(notBeforeTime) && this.wallClockNow() < notBeforeTime) {
             continue;
           }
         }

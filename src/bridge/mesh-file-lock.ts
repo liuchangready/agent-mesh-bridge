@@ -33,6 +33,27 @@ unlink glob "$channel.child.*"`;
   return { command: 'perl', args: ['-e', script, lockPath, channelPath] };
 }
 
+/**
+ * The mesh-wide merge lock path for a given bridge home.
+ *
+ * The real home (`~/.agent-mesh-bridge`) owns the one shared lock that
+ * serializes merges across every process. Any other home — a test fixture, a
+ * task's isolated storage — must use its own lock inside that directory:
+ * otherwise every isolated fixture in a concurrently executed test file
+ * contends for the single global lock and blocks for the full held duration.
+ */
+export function meshMergeLockPath(storageDir: string): string {
+  const meshHome = path.join(os.homedir(), '.agent-mesh-bridge');
+  let resolved: string | undefined;
+  try {
+    resolved = path.resolve(storageDir);
+    if (resolved === path.resolve(meshHome)) {
+      return path.join(os.homedir(), '.agent-mesh-bridge', 'merge.lock');
+    }
+  } catch {}
+  return path.join(resolved || storageDir, 'merge.lock');
+}
+
 export class MeshFileLock {
   readonly lockPath: string;
   private activeLease?: {

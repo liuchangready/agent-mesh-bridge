@@ -14,6 +14,7 @@ import { CallbackManager } from '../bridge/callback-manager';
 import { AsyncDispatcher } from '../bridge/async-dispatcher';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { MeshFileLock } from '../bridge/merge-coordinator';
+import { meshMergeLockPath } from '../bridge/mesh-file-lock';
 import { DelegationThread, pendingMerges } from '../bridge/types';
 import { createTaskWorktree, resolveGitRepository } from '../bridge/git-worktree';
 import { WorkspaceRegistry } from '../bridge/workspace';
@@ -170,7 +171,7 @@ test('new dispatch creates its worktree while final integration validation holds
   runner.execute = async () => ({ exitCode: 0, stdout: 'done', stderr: '', extractedOutput: 'done', durationMs: 1 });
   const callback = new CallbackManager(detector, storage); callback.notifyCaller = async () => true; callback.notifyCallerOfFailure = async () => false;
   const registry = new TaskExecutionRegistry(storage); const dispatcher = new AsyncDispatcher(store, new ActiveAgentResolver(detector), runner, callback, detector, registry);
-  const lock = new MeshFileLock(); const release = await lock.acquire(); assert.ok(release);
+  const lock = new MeshFileLock(meshMergeLockPath(storage)); const release = await lock.acquire(); assert.ok(release);
   t.after(() => { release(); (dispatcher as unknown as { queueDrainer?: { dispose(): void } }).queueDrainer?.dispose(); registry.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
   const result = await Promise.race([
     dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'parallel dispatch', prompt: 'start independent task', workspaceRoot: repository }),
