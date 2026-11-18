@@ -178,7 +178,7 @@ export class TaskDetailPanel {
 
   private async handleApprove(remarks?: string) {
     try {
-      const result = this.reworkController.approveTask({
+      const result = await this.reworkController.approveTask({
         threadId: this.currentThreadId,
         remarks: remarks || 'Approved via Detail Panel',
       });

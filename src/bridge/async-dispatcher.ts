@@ -18,7 +18,9 @@ import {
   isValidSessionId,
   isUserInterruption,
   shouldResumeNativeSession,
+  ExecutionPhase,
 } from './types';
+import { ExecutionController } from './execution-controller';
 import { readBridgePolicy } from './bridge-policy';
 import { roundExecutionLogPath } from './round-log';
 import { ensureTaskDataDir, removeTaskDataDir } from './task-data-dir';
@@ -287,6 +289,26 @@ export class AsyncDispatcher {
       rounds: [round1],
     };
 
+    const initialPhase: ExecutionPhase = reviewFlow === 'dedicated' ? 'review' : 'develop';
+    const initialPurpose = reviewFlow === 'dedicated' ? 'bootstrap' : undefined;
+    tempCandidate.execution = {
+      version: 1,
+      revision: 1,
+      operationId: `${initialPhase}_1_${Date.now()}`,
+      phase: initialPhase,
+      round: 1,
+      purpose: initialPurpose,
+      generation: 1,
+      attempt: 0,
+      autoRetriesUsed: 0,
+      budget: {
+        limitMs: 120 * 60 * 1000,
+        spentActiveMs: 0,
+        maxAutoRetries: 2,
+      },
+      queue: undefined,
+    };
+
     const policy = concurrencyPolicy();
     const owners = policy.enabled ? this.executionRegistry.listAgentOwners() : [];
     const globalSlotFull = policy.enabled && owners.length >= policy.maxConcurrentTasks;
@@ -309,6 +331,9 @@ export class AsyncDispatcher {
     if (isQueued) {
       tempCandidate.status = 'queued';
       tempCandidate.summary.lastOutputSnippet = queueDetail;
+      if (tempCandidate.execution) {
+        tempCandidate.execution.queue = { reason: 'capacity' };
+      }
     }
 
     const thread = tempCandidate;
@@ -350,6 +375,9 @@ export class AsyncDispatcher {
       }
       thread.workspace.dispatchAccepted = true;
       this.taskStore.upsertTask(thread);
+      if (ExecutionController.getInstance()) {
+        void ExecutionController.getInstance()!.startExecution(threadId, 'review', { purpose: 'bootstrap' });
+      }
       const routing = getModelRouting(thread);
       const reviewerLine =
         `Dedicated reviewer ${initiatorAgent}` +
@@ -378,9 +406,11 @@ export class AsyncDispatcher {
 
     thread.workspace.dispatchAccepted = true;
     this.taskStore.upsertTask(thread);
-    // If TaskSupervisor is actively running (e.g. in VS Code extension host),
-    // let it supervise execution persistently to prevent child processes from being killed when ephemeral MCP CLI exits.
-    if (TaskSupervisor.isSupervisorActive()) {
+    if (ExecutionController.getInstance()) {
+      if (!isQueued) {
+        void ExecutionController.getInstance()!.startExecution(threadId, 'develop');
+      }
+    } else if (TaskSupervisor.isSupervisorActive()) {
       console.log(
         `[AsyncDispatcher] Active TaskSupervisor detected. Delegating Thread ${threadId} (status: ${thread.status}) execution to supervisor.`,
       );

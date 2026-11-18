@@ -36,6 +36,80 @@ export type ThreadStatus =
   | 'completed'
   | 'failed';
 
+export type ExecutionPhase = 'develop' | 'review' | 'merge';
+
+export interface ProcessIdentity {
+  pid: number;
+  birthId?: string;
+}
+
+export interface ExecutionControl {
+  version: 1;
+  revision: number;
+  operationId: string;
+  phase: ExecutionPhase;
+  round: number;
+  purpose?: 'bootstrap' | 'merge_resolution';
+  generation: number;
+  attempt: number;
+  autoRetriesUsed: number;
+  queue?: {
+    reason: 'role' | 'session' | 'merge_lock' |
+      'capacity' | 'backoff' | 'quota';
+    notBefore?: string;
+  };
+  run?: {
+    id: string;
+    owner: ProcessIdentity;
+    child?: ProcessIdentity;
+    step: string;
+    state: 'starting' | 'active' | 'stopping';
+    startedAt: string;
+  };
+  budget: {
+    limitMs: number;
+    spentActiveMs: number;
+    maxAutoRetries: number;
+  };
+  lastOutcome?: {
+    code: string;
+    reason: string;
+    at: string;
+    evidencePath?: string;
+  };
+}
+
+export type TaskDecisionResumePoint =
+  | 'continue_develop'
+  | 'continue_review'
+  | 'retry_merge'
+  | 'continue_merge_resolution';
+
+export interface TaskDecisionRecord {
+  id: string;
+  operationId: string;
+  generation: number;
+  phase: ExecutionPhase;
+  round: number;
+  question: string;
+  background?: string;
+  suggestion?: string;
+  resumePoint: TaskDecisionResumePoint;
+  createdAt: string;
+  answer?: string;
+  answeredAt?: string;
+  answeredBy?: string;
+  conflictFiles?: string[];
+  logPath?: string;
+}
+
+export type NextAction =
+  | { kind: 'advance'; phase?: ExecutionPhase }
+  | { kind: 'retry'; notBefore: string; reason?: string }
+  | { kind: 'decision'; requestId: string }
+  | { kind: 'failed'; code: string; reason?: string; stage?: FailureStage }
+  | { kind: 'paused' };
+
 export type FailureStage = 'bootstrap' | 'execution' | 'review' | 'merge';
 export interface TaskFailure {
   stage: FailureStage;
@@ -714,6 +788,9 @@ export function getTaskExecutionPath(thread: DelegationThread): string {
 export interface DelegationThread {
   failure?: TaskFailure;
   failureRevision?: number;
+  execution?: ExecutionControl;
+  decision?: TaskDecisionRecord;
+  decisions?: TaskDecisionRecord[];
   taskTemplate?: import('./task-templates').TaskTemplate;
   threadId: string; // e.g. "thread_20261016_163000_a7f9"
   title: string; // Brief title, e.g. "Fix TCP cursor drift"

@@ -67,8 +67,11 @@ const STALE_AFTER_MS = 30_000;
 
 export class TaskRoleLock {
   private readonly dir: string;
-  private activeLease: TaskRoleLease | null = null;
-  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private activeLeases = new Map<string, { lease: TaskRoleLease; timer?: NodeJS.Timeout }>();
+
+  public get activeLease(): TaskRoleLease | null {
+    return this.activeLeases.values().next().value?.lease ?? null;
+  }
 
   constructor(storageDir?: string) {
     const base = storageDir || path.join(os.homedir(), '.agent-mesh-bridge');
@@ -83,7 +86,7 @@ export class TaskRoleLock {
     role: TaskRole,
     conversationId?: string,
   ): TaskRoleLease | null {
-    if (this.activeLease) return null;
+    if (this.activeLeases.has(threadId)) return null;
 
     // Old dedicated-reviewer builds used conv_<hash>.json. Check those records
     // before taking the canonical thread lock, then write only the canonical
@@ -109,8 +112,8 @@ export class TaskRoleLock {
           role,
           ...(conversationId ? { conversationId } : {}),
         };
-        this.activeLease = lease;
-        this.startHeartbeat(lease);
+        const timer = this.startHeartbeatFor(lease);
+        this.activeLeases.set(threadId, { lease, timer });
         return lease;
       } catch (err: any) {
         if (err?.code !== 'EEXIST') return null;
@@ -137,9 +140,12 @@ export class TaskRoleLock {
 
   public release(lease?: TaskRoleLease): void {
     const target = lease || this.activeLease;
-    this.stopHeartbeat();
-    this.activeLease = null;
     if (!target) return;
+    const entry = this.activeLeases.get(target.threadId);
+    if (entry?.timer) {
+      clearInterval(entry.timer);
+    }
+    this.activeLeases.delete(target.threadId);
 
     const file = this.findOwnerPath(target.threadId, target.token) || this.filePath(target.threadId);
     const owner = this.readOwnerFile(file);
@@ -303,20 +309,19 @@ export class TaskRoleLock {
     } catch {}
   }
 
-  private startHeartbeat(lease: TaskRoleLease): void {
-    if (this.heartbeatTimer) return;
+  private startHeartbeatFor(lease: TaskRoleLease): NodeJS.Timeout {
     const file = this.filePath(lease.threadId, lease.conversationId);
-    this.heartbeatTimer = setInterval(() => {
-      const current = this.activeLease;
-      if (!current) {
-        this.stopHeartbeat();
+    const timer = setInterval(() => {
+      const entry = this.activeLeases.get(lease.threadId);
+      if (!entry || entry.lease.token !== lease.token) {
+        clearInterval(timer);
         return;
       }
 
       const owner = this.readOwnerFile(file);
-      if (!owner || owner.token !== current.token) {
-        this.activeLease = null;
-        this.stopHeartbeat();
+      if (!owner || owner.token !== lease.token) {
+        this.activeLeases.delete(lease.threadId);
+        clearInterval(timer);
         return;
       }
 
@@ -325,13 +330,19 @@ export class TaskRoleLock {
         fs.writeFileSync(file, JSON.stringify(owner), 'utf8');
       } catch {}
     }, HEARTBEAT_INTERVAL_MS);
-    this.heartbeatTimer.unref?.();
+    timer.unref?.();
+    return timer;
+  }
+
+  public dispose(): void {
+    this.stopHeartbeat();
   }
 
   private stopHeartbeat(): void {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
+    for (const entry of this.activeLeases.values()) {
+      if (entry.timer) {
+        clearInterval(entry.timer);
+      }
     }
   }
 }
