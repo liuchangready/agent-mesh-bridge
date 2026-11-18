@@ -1,5 +1,7 @@
 # 🌉 多 Agent 协同桥接 VSCode 插件设计与架构规范 (Agent Mesh Bridge)
 
+> 测试分层、覆盖边界及四并发性能验收见 [测试分层与性能验收设计](docs/TEST_LAYERING_DESIGN.md)。完整测试集实测有稳定收益后才尝试合入。
+
 > 文件夹级 Bridge Workspace 的实现状态和上线条件见 [WORKSPACE_DESIGN.md](docs/WORKSPACE_DESIGN.md)。上线前必须处理所有未终态旧任务；新模型不兼容或迁移旧账本，代码任务继续要求有 HEAD 的 Git 仓库及隔离 worktree。
 
 > MCP 调用窗口来源与显式目标空间分别解析；来源不明确时不能由目标目录猜测窗口。Git linked worktree 经 worktree 列表和 common directory 验证后归入主 checkout 空间，交付分支仍固定为原 checkout 的分支或显式目标。
