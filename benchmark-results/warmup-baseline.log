@@ -1,0 +1,1098 @@
+✔ a dirty checked-out delivery target restores staged, unstaged, deleted and untracked files (18276.3124ms)
+✔ stash restoration conflict leaves the merge completed and preserves both stashes (13867.7511ms)
+✔ landing restores its own stash when another stash is added after it (14829.5787ms)
+✔ sole stash cleanup verifies its identity while Git holds the ref lock (14034.8937ms)
+✔ cleanup failure retains the exact stash and does not fail a landed merge (12550.7594ms)
+✔ stash cleanup never deletes a branch if refs/stash becomes symbolic (15980.8918ms)
+✔ stash identity drift before cleanup preserves the new entry (12696.1737ms)
+✔ landing removes its top stash while preserving an older stash (10502.1425ms)
+✔ a held Git stash ref lock prevents cleanup without deleting any entry (9167.2188ms)
+✔ a failed reflog publication preserves all stash entries and reports the cleanup failure (12510.0023ms)
+✔ ref publication failure preserves recoverable stash metadata, rollback failure=false (17285.8597ms)
+✔ ref publication failure preserves recoverable stash metadata, rollback failure=true (14782.525ms)
+✔ a retained inconsistent stash lock survives process exit and is adopted by the same transaction (15064.5595ms)
+✔ an error after ref publication recognizes the already consistent stash state (11201.7784ms)
+✔ pausing during multi-stash publication preserves the ref lock until cleanup is consistent (10824.7824ms)
+✔ a transient failure releasing the stash lock retains enough evidence to recover (10664.1768ms)
+✔ stash cleanup retries identification when the ref moves before its lock is acquired (12167.6958ms)
+✔ stash creation failure never advances the target or discards local files (5578.587ms)
+✔ an unconfirmed new stash is restored without advancing the target (7264.6345ms)
+✔ ignored checkout file that blocks synchronization is preserved before ref update (7382.5015ms)
+✔ pause immediately after ref update finishes the existing landing and restores the stash (9243.4204ms)
+✔ pause after stashing but before ref update restores local changes, existing=false (9006.0616ms)
+✔ pause after stashing but before ref update restores local changes, existing=true (9869.7434ms)
+✔ an uncertain post-apply transaction preserves the checkout without applying the stash twice (10467.4035ms)
+✔ candidate snapshots preserve the worker index and exclude ignored and later changes (5657.3199ms)
+✔ approval integrates the frozen dirty candidate after later worker edits (12300.8714ms)
+✔ CAS competition retries against the advanced target without waking a reviewer (22295.8335ms)
+✔ snapshot failure records a blocked merge and requests a reviewer wake (1937.5873ms)
+✔ conflicting approved snapshot keeps the merge workspace and approval for review (15346.5211ms)
+✔ failed combined validation retains the approved snapshot and resolution workspace (14700.4673ms)
+✔ the last merge retry enters failed and retry_merge starts a new generation (11498.1251ms)
+[CallbackManager] Thread thread_merge_budget completed round 1, but no valid callerSessionId provided or detected.
+[CallbackManager] Thread thread_merge_budget completed round 1, but no valid callerSessionId provided or detected.
+[CallbackManager] Thread thread_delete_resolution completed round 1, but no valid callerSessionId provided or detected.
+✔ deleting an unmerged snapshot unregisters its retained resolution worktree (10502.6641ms)
+✔ a target that advances during conflict resolution is merged with the staged fix (15876.0602ms)
+[ReworkController] Resuming session session-thread_reapprove_resolution for claude_code (Round 2)
+[CallbackManager] Thread thread_reapprove_resolution completed round 2, but no valid callerSessionId provided or detected.
+✔ rework and reapproval bind a new snapshot instead of the old submitted resolution (11843.0519ms)
+✔ a second conflict after target advancement keeps the same resolution workspace for another review (18160.9153ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_192701_23c6 (Round 1) on claude_code
+[CallbackManager] Thread thread_20261118_192701_23c6 completed round 1, but no valid callerSessionId provided or detected.
+✔ two tasks edit the same file in independent worktrees and integrate serially from the lock-protected latest target (17945.9628ms)
+✔ target advancement before preflight restarts merge and validation (13549.8724ms)
+✔ delivery remains pinned after the user checks out a different branch (7891.0541ms)
+✔ legacy records without deliveryTarget keep their recorded targetRef semantics (7765.7002ms)
+✔ dirty approved work and failed combined validation never update the target ref (8793.8107ms)
+✔ delete protects running dirty output, force waits and cleans, and clean merged output deletes without force (7855.0764ms)
+✔ combined validation resolves node even when the bridge environment has no node on PATH (7752.0612ms)
+✔ a removed persisted default is rejected without preventing startup routing (109.8398ms)
+✔ unknown historical agent IDs are refused at execution boundaries (1.9483ms)
+▶ AutonomousRunner Tests
+  ✔ should use a 10-minute silence watchdog by default (3.0524ms)
+  ✔ a declared background wait is liveness, not a hang (6186.7339ms)
+[AutonomousRunner] DSH session session-gone no longer exists; starting a fresh session for the same prompt.
+[AutonomousRunner] Claude session 5c562220-839a-47d5-92c6-e61561e66f07 has no transcript; reserving that id with a fresh run of the same prompt.
+  ✔ a successful round with a stream gap records a warning without being killed (596.9761ms)
+  ✔ detects provider rate-limit signals in structured output and stderr text (1.4158ms)
+  ✔ ignores rate-limit words quoted from source, tool output and final answers (0.5763ms)
+  ✔ still detects structured provider errors (0.3569ms)
+  ✔ replays a DSH round without --session-id when the native session vanished (2.3422ms)
+  ✔ replays a Claude round fresh when its reserved session has no transcript (1.1995ms)
+  ✔ a transcript quoting RATE_LIMITED does not abort the run (173.1289ms)
+  ✔ fails the real child when native PID binding fails and waits for close (398.9644ms)
+  ✔ clears only dead-owner Claude session records (25.3146ms)
+  ✔ parses the session id out of the in-use error (0.5517ms)
+[AutonomousRunner] claude_code reported session aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee as already in use; resuming that session instead of reserving it again.
+  ✔ a fresh start that hits an existing session resumes it instead of failing (420.8242ms)
+[AutonomousRunner] claude_code reported session aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee as already in use; cleared 1 stale ownership record(s).
+  ✔ clears a stale Claude session lock and retries instead of failing in one second (408.6626ms)
+[AutonomousRunner] Provider rate limit detected ("error_status":429) for antigravity; aborting instead of waiting out its internal retries.
+  ✔ aborts immediately on a provider 429 instead of waiting out CLI retries (586.5512ms)
+  ✔ should generate compliant skip-danger command for Codex initial run (24.5036ms)
+  ✔ should generate compliant rework resume command for Codex reusing exact session ID (37.8689ms)
+  ✔ should generate compliant skip-danger command for Claude Code initial run (24.5245ms)
+  ✔ should generate compliant rework resume command for Claude Code reusing exact session ID (40.7868ms)
+  ✔ should generate compliant skip-danger command for Antigravity initial and rework (68.9315ms)
+  ✔ should assess success by error code AND continuous actual output (Codex JSON) (1.2906ms)
+  ✔ should accurately extract session ID and output from stream-json stream (0.3031ms)
+  ✔ Claude Code stream-json keeps the silence watchdog fed and yields the final answer (0.2963ms)
+  ✔ Claude Code stream killed before the result event still yields assistant text (0.2528ms)
+  ✔ cancelThread kills the child and reports a paused interruption (640.2123ms)
+[AutonomousRunner] pause requested for thread_cancel_external: external pause
+  ✔ a cancellation file from another process stops the child (1342.6992ms)
+  ✔ should detect active sessions for claude_code and antigravity (11.3176ms)
+  ✔ should detect transient network and eligibility errors correctly (0.9492ms)
+  ✔ should treat the DSH transport connection error as transient and retryable (0.3822ms)
+  ✔ should treat an agy non-interactive auth timeout as transient and retryable (0.2008ms)
+[AutonomousRunner] Authentication timeout on attempt 1/3 for antigravity: "error: authentication failed or timed out". Retrying in 0.001s...
+  ✔ should replay an agent that died in the auth fallback and succeed on the retry (577.8859ms)
+  ✔ should retry a dropped transport that still exited 0 with no final answer (0.5269ms)
+[AutonomousRunner] Transient startup/network error on attempt 1/2 for deepseek_harness: "Process exited with code 0 but the stream contained no actual final answer (only status/metadata or no output).". Retrying in 0.01s...
+  ✔ execute replays the same prompt after a transport drop and returns the good attempt (393.6271ms)
+[AutonomousRunner] Transient startup/network error on attempt 1/1 for deepseek_harness: "dsh: TRANSPORT: Connection error.". Retrying in 0.005s...
+  ✔ execute records wall-clock and suspension-adjusted gap metrics separately (435.3069ms)
+[AutonomousRunner] Retry for deepseek_harness resumes native session session-carried-1 instead of starting a fresh one.
+[AutonomousRunner] Transient startup/network error on attempt 1/3 for deepseek_harness: "dsh: TRANSPORT: Connection error.". Retrying in 0.5s...
+  ✔ execute resumes the native session opened by the failed attempt instead of starting a new one (6.6099ms)
+  ✔ execute aborts retry loop and does not spawn subsequent attempts when cancelled during backoff sleep (115.7722ms)
+  ✔ pre-spawn cancellation check prevents any process from being spawned (1.1626ms)
+  ✔ a pause remembered without a child must be cleared before a resume can run (376.805ms)
+  ✔ a runner holding the task store reports a paused or deleted task as cancelled (54.5477ms)
+  ✔ should distinguish rate limit errors from innocent code outputs, hashes, UUIDs and line numbers (0.3592ms)
+✔ AutonomousRunner Tests (12972.6725ms)
+▶ detectStaleBuild
+  ✔ a build installed and compiled before this module loaded is fresh (2.0182ms)
+  ✔ a reinstall after this module loaded is stale (same-version force reinstall) (0.5409ms)
+  ✔ a `tsc -w` recompile after load is stale even without manifest metadata (0.308ms)
+  ✔ the newest signal wins when the manifest is older than the script (0.3024ms)
+  ✔ a write that lands inside the tolerance window is not reported (0.3566ms)
+  ✔ the tolerance is configurable (0.2749ms)
+  ✔ an undatable build is never called stale (0.2239ms)
+  ✔ a newer version in a sibling folder is stale even when this folder is untouched (0.9735ms)
+  ✔ an equal or older sibling version is ignored (0.5178ms)
+✔ detectStaleBuild (9.2024ms)
+▶ compareVersions
+  ✔ compares numerically, not lexically (0.6921ms)
+  ✔ a prerelease sorts below its release (0.317ms)
+  ✔ tolerates a leading v and short forms (0.1529ms)
+✔ compareVersions (1.6132ms)
+▶ parseFolderVersion
+  ✔ extracts the version from an installed folder suffix (0.3701ms)
+  ✔ drops the platform/arch suffix instead of treating it as a prerelease (0.1728ms)
+  ✔ ignores a folder that carries no version (0.1236ms)
+✔ parseFolderVersion (0.8831ms)
+▶ readBuildStamp
+  ✔ reads version, install timestamp and the entry script mtime (17.5383ms)
+  ✔ an unreadable folder yields an empty stamp instead of throwing (3.1484ms)
+✔ readBuildStamp (21.1667ms)
+▶ findNewerInstalledVersion
+  ✔ finds a newer sibling folder for the same extension (5.3992ms)
+  ✔ an unknown extension id or running version disables the check (2.5772ms)
+✔ findNewerInstalledVersion (8.3334ms)
+▶ describeStaleBuild
+  ✔ is empty for a fresh host (0.3685ms)
+  ✔ names the drift in seconds (0.1776ms)
+  ✔ names the newer installed version (0.162ms)
+✔ describeStaleBuild (0.9631ms)
+[CallbackManager] Waking caller codex about failed round 2 of thread_cb_1...
+[CallbackManager] Waking caller codex about failed round 2 of thread_cb_1...
+[CallbackManager] Waking caller codex about failed round 2 of thread_cb_1...
+[CallbackManager] Caller already notified about failed round 2 of thread_cb_1; skipping.
+[CallbackManager] thread_cb_1 already used 3 failure notifications (rounds: 1, 2, 3); not waking the caller again.
+[CallbackManager] Waking caller codex about failed round 2 of thread_cb_1...
+▶ CallbackManager failure wake-ups
+  ✔ wakes the caller with the retry_task instruction and records the round once (51.1612ms)
+  ✔ failure callback sends only reviewer template instructions (55.1112ms)
+  ✔ does not wake the caller twice for the same failed round (37.7192ms)
+  ✔ stays silent for paused tasks and after three failure wake-ups (0.7863ms)
+  ✔ tells the caller when the round merely repeats an earlier instruction (43.0622ms)
+✔ CallbackManager failure wake-ups (190.1125ms)
+▶ progressSignature
+  ✔ changes when the round actually progresses (3.8207ms)
+✔ progressSignature (5.2093ms)
+▶ CallerPollGuard
+  ✔ allows the first read, starves an identical second read (1.1561ms)
+  ✔ counts reads per view, so one inspection may read details and logs (0.2101ms)
+  ✔ real progress restores the full payload (0.229ms)
+  ✔ never guards threads this process did not dispatch (0.1651ms)
+  ✔ forget stops guarding a finished task (0.151ms)
+  ✔ the repeat payload carries a machine-readable stop directive (0.3911ms)
+✔ CallerPollGuard (2.7519ms)
+[CallbackManager] Auto-detected caller session for codex: detected-legacy-session
+▶ Codex active session selection
+  ✔ selects only a CLI session whose session_meta cwd matches the workspace (39.1697ms)
+✔ Codex active session selection (40.2349ms)
+▶ caller session resolution
+  ✔ dedicated reviewer requires confirmed captured matching handoff (1.6307ms)
+  ✔ legacy caller session retains the previous id and detection fallback behavior (0.8353ms)
+✔ caller session resolution (2.7231ms)
+▶ CallerWakeQueue - one wake at a time per caller session
+  ✔ treats a codex rollout name and its bare thread id as one wake slot (3.0584ms)
+  ✔ compatibility admission hook never creates a second session lock (3.3294ms)
+  ✔ queued wakes drain in FIFO order and survive a restart (24.0804ms)
+  ✔ stale orchestration markers do not participate in writer admission (4.1694ms)
+  ✔ legacy active markers are ignored by the native-session admission path (4.261ms)
+  ✔ discard drops queued wakes for a thread that no longer needs review (24.9587ms)
+✔ CallerWakeQueue - one wake at a time per caller session (66.3303ms)
+▶ Codex session id resolution
+  ✔ classifies the two spellings (1.2092ms)
+  ✔ normalises a bare UUID to the rollout name codex exec resume expects (5.0058ms)
+  ✔ leaves an unknown UUID alone so codex reports its own error (8.7906ms)
+  ✔ extracts the canonical thread id from either spelling (0.7521ms)
+✔ Codex session id resolution (17.8023ms)
+▶ Codex resume capability
+  ✔ reads the modern help: UUID ids and --no-daemon (2.512ms)
+  ✔ reads a legacy help that talks about the rollout record (2.1731ms)
+  ✔ an unreadable help defaults to the modern UUID form (0.2598ms)
+  ✔ the argument follows the probed form and the cache is shared (8.5209ms)
+✔ Codex resume capability (14.2784ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_192437_830b (Round 1) on codex
+[AsyncDispatcher] Starting background execution: thread_20261118_192439_b1c3 (Round 1) on antigravity
+[AsyncDispatcher] Starting background execution: thread_20261118_192441_bf01 (Round 1) on claude_code
+▶ bridge policy - optional best-effort concurrency limits
+  ✔ disabled means no configured cap; getter shape and historical enabled semantics stay stable (28.6275ms)
+  ✔ invalid limits preserve prior values and only explicit true enables them (48.076ms)
+✔ bridge policy - optional best-effort concurrency limits (78.5542ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_192446_9ed5 (Round 1) on antigravity
+▶ AsyncDispatcher - independent task admission
+  ✔ same-file tasks in one repository run concurrently in isolated worktrees (8921.4114ms)
+[TaskSupervisor] Executing thread_20261118_192452_27b1 Round 1 on antigravity (isRework: false)...
+[TaskSupervisor] thread_20261118_192452_27b1 Round 1 completed with exitCode 0. Updating store...
+[TaskSupervisor] Round 1 successful and is latest. Notifying caller antigravity...
+  ✔ live stdout chunks are persisted while a round is still running (5562.903ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_192456_ff6d (Round 1) on codex
+  ✔ recent execution logs return the requested tail while running and after completion (4442.7417ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_192500_9bfb (Round 1) on codex
+  ✔ an old execution.lock record does not block a new independent task (3666.3889ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_192506_cea0 (Round 1) on codex
+  ✔ enabled limits queue only after observed registrations reach the cap (6242.0318ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_192509_2bb1 (Round 1) on codex
+[AsyncDispatcher] Starting background execution: thread_20261118_192513_cac7 (Round 1) on antigravity
+  ✔ merge process registrations do not consume a configured agent slot (3594.3431ms)
+[TaskSupervisor] Executing thread_delayed_queue_0_paused Round 1 on antigravity (isRework: false)...
+[TaskSupervisor] Executing thread_delayed_queue_0_completed Round 1 on antigravity (isRework: false)...
+[TaskSupervisor] Executing thread_delayed_queue_0_deleted Round 1 on antigravity (isRework: false)...
+[TaskSupervisor] Executing thread_delayed_queue_1_paused Round 1 on antigravity (isRework: false)...
+[TaskSupervisor] Executing thread_delayed_queue_1_completed Round 1 on antigravity (isRework: false)...
+[TaskSupervisor] Executing thread_delayed_queue_1_deleted Round 1 on antigravity (isRework: false)...
+[TaskSupervisor] Executing thread_delayed_queue_2_paused Round 1 on antigravity (isRework: false)...
+[TaskSupervisor] Executing thread_delayed_queue_2_completed Round 1 on antigravity (isRework: false)...
+[TaskSupervisor] Executing thread_delayed_queue_2_deleted Round 1 on antigravity (isRework: false)...
+[TaskSupervisor] thread_delayed_queue_0_paused Round 1 completed with exitCode 0. Updating store...
+[TaskSupervisor] Round 1 failed. Notifying caller codex so it can retry_task...
+[TaskSupervisor] thread_delayed_queue_0_completed Round 1 completed with exitCode 0. Updating store...
+[TaskSupervisor] Task thread_delayed_queue_0_deleted was deleted while round 1 was executing.
+[TaskSupervisor] thread_delayed_queue_1_paused Round 1 completed with exitCode 0. Updating store...
+[TaskSupervisor] Round 1 failed. Notifying caller codex so it can retry_task...
+[TaskSupervisor] thread_delayed_queue_1_completed Round 1 completed with exitCode 0. Updating store...
+[TaskSupervisor] Task thread_delayed_queue_1_deleted was deleted while round 1 was executing.
+[TaskSupervisor] thread_delayed_queue_2_paused Round 1 completed with exitCode 0. Updating store...
+[TaskSupervisor] Round 1 failed. Notifying caller codex so it can retry_task...
+[TaskSupervisor] thread_delayed_queue_2_completed Round 1 completed with exitCode 0. Updating store...
+[TaskSupervisor] Task thread_delayed_queue_2_deleted was deleted while round 1 was executing.
+  ✔ a per-agent cap skips only that agent and still starts a different agent candidate (7370.0451ms)
+[TaskSupervisor] Executing thread_a Round 1 on antigravity (isRework: false)...
+[TaskSupervisor] Executing thread_b Round 1 on antigravity (isRework: false)...
+[TaskSupervisor] Executing thread_same Round 1 on antigravity (isRework: false)...
+[TaskSupervisor] thread_a Round 1 completed with exitCode 0. Updating store...
+[TaskSupervisor] Round 1 successful and is latest. Notifying caller codex...
+[TaskSupervisor] thread_b Round 1 completed with exitCode 0. Updating store...
+[TaskSupervisor] Round 1 successful and is latest. Notifying caller codex...
+[TaskSupervisor] thread_same Round 1 completed with exitCode 0. Updating store...
+[TaskSupervisor] Round 1 successful and is latest. Notifying caller codex...
+  ✔ delayed queue marking cannot resurrect deleted or overwrite paused/completed tasks (8773.8234ms)
+✔ AsyncDispatcher - independent task admission (48575.9646ms)
+▶ QueueDrainer - scan every runnable candidate
+  ✔ paused, waiting review, blocked and bootstrap-pending tasks do not hide later candidates (81.485ms)
+  ✔ disabled limits allow all disjoint same-workspace candidates; enabled limits are best-effort admission (49.706ms)
+✔ QueueDrainer - scan every runnable candidate (131.5649ms)
+▶ TaskSupervisor - same-workspace overlap and same-thread exclusion
+  ✔ two disjoint same-workspace tasks run at once; duplicate scheduling starts one thread once (377.6456ms)
+✔ TaskSupervisor - same-workspace overlap and same-thread exclusion (378.1222ms)
+▶ merge gate - pendingMerges
+  ✔ local integration state controls pending results, regardless of MR metadata (0.8042ms)
+✔ merge gate - pendingMerges (1.1092ms)
+▶ ConfigSyncService - single MCP registration per agent
+  ✔ registers one Codex server and cleans up the legacy duplicate (115.9022ms)
+  ✔ registers one server for Claude Code and Antigravity too (31.9268ms)
+  ✔ hands the provider key to every bridge MCP process explicitly (70.5518ms)
+✔ ConfigSyncService - single MCP registration per agent (222.1852ms)
+[ContextCompactor] thread_compact_e74749 round 1: 5000 -> 244 chars (4.9%), source=agent_protocol_envelope
+[ContextCompactor] thread_compact_c2d8a0 round 1: 4025 -> 1620 chars (40.2%), source=deterministic_truncation
+[ContextCompactor] thread_compact_b865a8 round 1: 7500 -> 1625 chars (21.7%), source=deterministic_truncation
+[ContextCompactor] thread_compact_4c3649 round 1: 3000 -> 1620 chars (54.0%), source=deterministic_truncation
+[ContextCompactor] thread_compact_afbb31 round 1: 3000 -> 1620 chars (54.0%), source=deterministic_truncation
+▶ context compaction - protocol and capsule parsing
+  ✔ the protocol is appended only for resumed rounds and names the previous round (3.7851ms)
+  ✔ parses a Chinese capsule emitted inside a normal final answer (4.9884ms)
+  ✔ tolerates an unclosed tag and empty content (1.8262ms)
+  ✔ a plain answer without a structured key still yields a headline (2.3471ms)
+✔ context compaction - protocol and capsule parsing (17.7791ms)
+▶ context compaction - lagged ledger rule
+  ✔ condenses the previous round from the capsule of the current round (100.351ms)
+  ✔ falls back to a deterministic head/tail card when the agent does not comply (39.1003ms)
+  ✔ never replaces a small output with a bigger card (19.0065ms)
+  ✔ a failed previous round is archived too, but its error stays verbatim (39.1775ms)
+  ✔ never condenses the synthetic approval round or a short round (9.0097ms)
+  ✔ an undersized immediate round does not block an older oversized one (9.9369ms)
+  ✔ is idempotent: a second pass does nothing (48.7236ms)
+  ✔ respects the mirrored opt-out policy (30.5835ms)
+  ✔ a failing archive returns a failed outcome instead of throwing (16.03ms)
+  ✔ a stale writer cannot resurrect a compacted round (117.5502ms)
+✔ context compaction - lagged ledger rule (431.381ms)
+▶ context compaction - round log helpers
+  ✔ latest execution log is chosen numerically, not lexicographically (19.3104ms)
+  ✔ paged reads honor offsets and clamp the window (39.3781ms)
+✔ context compaction - round log helpers (59.2355ms)
+▶ DeepSeek Harness - workspace slug encoding
+  ✔ should collapse separator runs into a single dash (2.5123ms)
+✔ DeepSeek Harness - workspace slug encoding (4.9817ms)
+▶ DeepSeek Harness - launcher resolution
+  ✔ should return null for a missing launcher (1.4207ms)
+  ✔ should derive the install root from the profile launcher path (11.1523ms)
+  ✔ should prefer the Electron binary when the packaged layout is present (7.9131ms)
+✔ DeepSeek Harness - launcher resolution (25.907ms)
+▶ DeepSeek Harness - headless command contract
+  ✔ should omit --session-id for a fresh task and close stdin safely (11.2377ms)
+  ✔ should pass --session-id when resuming a rework round (42.004ms)
+✔ DeepSeek Harness - headless command contract (55.4062ms)
+▶ DeepSeek Harness - native session detection
+  ✔ should prefer the session recorded for the requested workspace (34.5211ms)
+  ✔ should return undefined when no session store exists (1.4897ms)
+✔ DeepSeek Harness - native session detection (36.5706ms)
+▶ DeepSeek Harness - profile patch management
+  ✔ should emit a single-server stdio MCP registration block (2.3072ms)
+  ✔ should replace a bare empty-array document rather than append a second root (0.9145ms)
+  ✔ should preserve user patch entries (0.3447ms)
+  ✔ should be idempotent across repeated syncs (0.2939ms)
+  ✔ should replace a stale managed block with the current one (0.3862ms)
+✔ DeepSeek Harness - profile patch management (5.3029ms)
+▶ DeepSeek Harness - run-output parsing
+  ✔ should capture the native session id from the first run event (0.5311ms)
+  ✔ should extract the final answer from the run-event stream (0.5609ms)
+✔ DeepSeek Harness - run-output parsing (1.3384ms)
+▶ DeepSeek Harness - session id validation
+  ✔ should accept native DSH session ids and reject agent identifiers (0.2627ms)
+✔ DeepSeek Harness - session id validation (0.4335ms)
+▶ DeepSeek Harness - configurable model provider
+  ✔ should require every field DSH needs to boot the route (0.3637ms)
+  ✔ should render the provider block without ever embedding the key (0.5978ms)
+  ✔ should keep the MCP and provider blocks independent (0.342ms)
+  ✔ should report the configured provider as the login route (5.5844ms)
+  ✔ should resolve the configured route from disk, for any process (72.3035ms)
+  ✔ should authenticate official route with DEEPSEEK_API_KEY when no custom provider is configured (2.102ms)
+✔ DeepSeek Harness - configurable model provider (82.0449ms)
+▶ DeepSeek Harness - model route resolution
+  ✔ every setting blank keeps the shipped deepseek-official route (0.7241ms)
+  ✔ a URL without a provider derives one, plus its key variable and model (0.3822ms)
+  ✔ a named legacy provider with no URL keeps its shipped endpoint and model (0.2197ms)
+  ✔ explicit values win over every derived one (0.1313ms)
+  ✔ an unknown named provider without a URL stays unroutable rather than guessing (0.107ms)
+✔ DeepSeek Harness - model route resolution (1.9561ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_192451_7365 (Round 1) on claude_code
+[ReworkController] Starting session 5c562220-839a-47d5-92c6-e61561e66f07 for claude_code (Round 1)
+[TaskSupervisor] Executing thread_missing_claude_supervisor Round 1 on claude_code (isRework: false)...
+[TaskSupervisor] thread_missing_claude_supervisor Round 1 completed with exitCode 1. Updating store...
+[TaskSupervisor] Round 1 failed. Notifying caller codex so it can retry_task...
+[AsyncDispatcher] Starting background execution: thread_20261118_192458_b8cc (Round 1) on claude_code
+[AsyncDispatcher] Starting background execution: thread_20261118_192458_b8cc (Round 1) on claude_code
+[AsyncDispatcher] Starting background execution: thread_20261118_192504_2a0c (Round 1) on codex
+[AsyncDispatcher] Starting background execution: thread_20261118_192504_2a0c (Round 1) on codex
+[AsyncDispatcher] Starting background execution: thread_20261118_192509_5b53 (Round 1) on codex
+[AsyncDispatcher] Starting background execution: thread_20261118_192512_de93 (Round 1) on codex
+[AsyncDispatcher] Starting background execution: thread_20261118_192514_8ca7 (Round 1) on claude_code
+▶ AsyncDispatcher and ReworkController Tests
+  ✔ does not capture a Claude session after a silent first-launch failure (4447.2141ms)
+  ✔ rework does not capture a Claude session when its initial launch fails (1372.108ms)
+  ✔ supervisor does not capture a Claude session when its initial launch fails (1367.5408ms)
+  ✔ preserves a captured claude_code session when a later launch fails silently (5447.7654ms)
+  ✔ preserves a captured codex session when a later launch fails silently (5193.6625ms)
+  ✔ should dispatch task asynchronously and create thread with round 1 (3016.5373ms)
+  ✔ default auto in the host mirror keeps resolver and CLI defaults working (4669.1384ms)
+  ✔ refuses a same-agent dispatch while the legacy review flow is active (637.1612ms)
+  ✔ refuses a same-agent dispatch detected from the caller environment (legacy) (617.5095ms)
+[AsyncDispatcher] Task thread_20261118_192509_5b53 was deleted while round 1 was executing.
+[AsyncDispatcher] Task thread_20261118_192512_de93 was deleted while round 1 was executing.
+[AsyncDispatcher] Task thread_20261118_192514_8ca7 was deleted while round 1 was executing.
+[AsyncDispatcher] Starting background execution: thread_20261118_192524_10fb (Round 1) on codex
+  ✔ dedicated flow prepares a reviewer bootstrap instead of starting the developer (2430.3123ms)
+  ✔ dedicated same-agent dispatch rejects an identical reviewer/executor model (2024.6827ms)
+  ✔ dedicated same-agent dispatch requires a configured reviewer model (2207.9946ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_192528_825a (Round 1) on codex
+  ✔ pins the model chosen at dispatch on the task and the runner call (3683.7467ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_192532_b7cc (Round 1) on codex
+  ✔ records the sender-side default separately from the receiver-side default (3656.9354ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_192537_dafd (Round 1) on antigravity
+[AsyncDispatcher] Starting background execution: thread_20261118_192541_4525 (Round 1) on claude_code
+  ✔ ignores a non-default model the caller did not declare as a user request (3441.9378ms)
+  ✔ a declined model switch aborts the dispatch before anything is queued (1886.1551ms)
+  ✔ should treat exit 0 with no actual output as a failed response (3794.6457ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_192545_87c1 (Round 1) on claude_code
+  ✔ refuses a rework that would move a legacy task onto its own reviewer (3743.4886ms)
+[ReworkController] Resuming session 5169c8e2-57ad-4a40-8ccd-f2b37495d61b for claude_code (Round 2)
+[AsyncDispatcher] Starting background execution: thread_20261118_192551_b919 (Round 1) on claude_code
+  ✔ should request rework strictly reusing same receiverSessionId and incrementing round (6778.7325ms)
+[ReworkController] Task thread_20261118_192545_87c1 was deleted while round 2 was executing.
+[ReworkController] Starting session edf5a484-d849-4d3c-bf40-7e212444705f for codex (Round 2)
+[AsyncDispatcher] Starting background execution: thread_20261118_192600_72ad (Round 1) on antigravity
+  ✔ request_rework can move the task to another agent on a fresh session (8083.4091ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_192607_982f (Round 1) on antigravity
+  ✔ should approve task and mark it completed (7284.5757ms)
+[ReworkController] Resuming session 9947f210-3ff3-42bf-82fd-42c183d6552d for antigravity (Round 2)
+[ReworkController] Resuming session 9947f210-3ff3-42bf-82fd-42c183d6552d for antigravity (Round 3)
+[TaskSupervisor] Executing thread_template_supervisor Round 1 on claude_code (isRework: false)...
+[TaskSupervisor] thread_template_supervisor Round 1 completed with exitCode 1. Updating store...
+[TaskSupervisor] Round 1 failed. Notifying caller codex so it can retry_task...
+[AsyncDispatcher] Starting background execution: thread_20261118_192617_c7ba (Round 1) on claude_code
+  ✔ should reject invalid callerSessionId (agent literals) and fallback properly (8919.3799ms)
+  ✔ supervisor injects worker snapshot without changing round prompt (1426.4694ms)
+[ReworkController] Task thread_20261118_192607_982f was deleted while round 3 was executing.
+[ReworkController] Resuming session e1d06bb1-eef3-4038-b127-91e9c58ebf33 for claude_code (Round 2)
+[ReworkController] Resuming session e1d06bb1-eef3-4038-b127-91e9c58ebf33 for claude_code (Round 2)
+[ReworkController] Resuming session e1d06bb1-eef3-4038-b127-91e9c58ebf33 for claude_code (Round 2)
+[AsyncDispatcher] Starting background execution: thread_20261118_192624_5947 (Round 1) on codex
+  ✔ dispatcher rework and retry use the original worker template snapshot (7013.7839ms)
+[ReworkController] Resuming session ea7ecd8b-5ab6-48a1-bf8f-c6e68d05b104 for codex (Round 2)
+[ReworkController] Resuming session ea7ecd8b-5ab6-48a1-bf8f-c6e68d05b104 for codex (Round 2)
+  ✔ should retry failed round preserving original round number and prompt (5268.6836ms)
+✔ AsyncDispatcher and ReworkController Tests (98423.4767ms)
+[ReworkController] Task thread_20261118_192624_5947 was deleted while round 2 was executing.
+▶ TaskExecutionRegistry - observation without mutual exclusion
+  ✔ same-workspace registrations coexist and legacy lock files do not block them (26.1724ms)
+  ✔ end only removes the matching thread registration (29.6549ms)
+  ✔ orphan cancellation targets the registered thread PID only (305.7252ms)
+✔ TaskExecutionRegistry - observation without mutual exclusion (364.1748ms)
+✔ temp execution-registry directories are removed (5.5769ms)
+[CallbackManager] Dropping queued wake for thread_failure_revision round 1: it no longer exists.
+✔ legacy failures and summaries normalize without inventing events (3.631ms)
+✔ legacy review and merge states normalize according to the persisted integration phase (0.816ms)
+✔ failure revisions protect persisted failure and recovered state from stale writers and callbacks (162.2933ms)
+✔ merge failures cannot be archived even without worktree metadata and filters preserve stage (11.8122ms)
+✔ a delayed review outcome cannot overwrite a later failure generation (44.3075ms)
+✔ an old writer cannot restore rounds after archival (88.925ms)
+✔ ordinary execution-failure notifications reject other failure stages (1.8629ms)
+✔ queued failure wake from an old revision cannot wake a new failure (27.1044ms)
+✔ repeated reporting of the same failure does not create a new revision (0.6419ms)
+✔ persisted local merge wins over a stale failure even with a higher control revision (50.0641ms)
+▶ git-probe - attributing a round to the files it changed
+  ✔ reports created, modified and deleted files, and ignores untouched ones (2941.8695ms)
+  ✔ reports files committed by the round itself (2139.4587ms)
+  ✔ reports nothing for a directory that is not a git repository (986.3168ms)
+✔ git-probe - attributing a round to the files it changed (6069.9931ms)
+✔ repository fixtures keep working files, refs and config independent (2759.5172ms)
+✔ multi-stash fixtures preserve stash contents and isolate refs and objects (3176.1311ms)
+✔ POSIX helper command passes its channel path and acknowledges child registration (633.2972ms)
+✔ the mesh lock serializes processes, preserves a live owner, and recovers after a process crash (6704.323ms)
+✔ three processes contend after an owner crash without overlapping lock ownership (10817.9219ms)
+✔ one lock instance keeps child tracking bound to each acquired lease across overlapping waits (8136.6868ms)
+✔ immediate and post-spawn lock cancellation settle in an independent Node process (1270.5451ms)
+✔ cancelling a started lock waiter settles readiness and lets its Node process exit naturally (6912.2042ms)
+✔ POSIX waiter may wait longer than the helper startup budget for the global lock (342.221ms)
+✔ child registration times out, rejects, and removes its pending waiter (1765.8849ms)
+✔ cancelling a same-instance lock waiter leaves the current owner lease intact (3997.6694ms)
+✔ pause cancels an approved merge while it is waiting for the global lock (5264.5728ms)
+✔ forced deletion cancels a queued merge before the global lock is released (5276.681ms)
+✔ an approved task cannot integrate until its reviewer process releases the task role (9161.4219ms)
+✔ a dead reviewer launcher does not permit merge while its native child lives (9816.3933ms)
+✔ a dead lock worker rejects child registration, stops validation, and leaves the target unchanged (5469.3969ms)
+✔ pausing while child registration is pending ends validation without integrating (4162.5342ms)
+✔ pause stops combined validation and forced delete waits for it before cleaning the worktree (12192.3248ms)
+✔ pause and delete terminate a running Git process tree and record cancelled merge attempts (9130.5042ms)
+✔ a merge waiting for a reviewer cannot resume after a rapid pause and resume (2361.3275ms)
+✔ a saved resolution survives a coordinator failure before switching to the advanced target (18760.8652ms)
+✔ a saved resolution can recover when switching the merge workspace is interrupted (19535.8319ms)
+✔ an interrupted resolution merge is replayed in a fresh workspace when the target advances again (20232.9943ms)
+✔ multi-stash cleanup recovers stash_cleanup_started, concurrent=true (15764.8272ms)
+✔ multi-stash cleanup recovers stash_reflog_published, concurrent=true (14994.8863ms)
+✔ multi-stash cleanup recovers before_stash_reflog_published, concurrent=true (13200.3249ms)
+✔ a process crash after stash_created recovers local files and landing (17591.7675ms)
+✔ a process crash after after_reflog_deleted recovers local files and landing (11904.447ms)
+✔ a process crash after before_stash_restored_concurrent recovers local files and landing (13392.6932ms)
+✔ multi-stash cleanup recovers stash_cleanup_started, concurrent=false (15650.3295ms)
+✔ multi-stash cleanup recovers stash_cleanup_prepared, concurrent=true (14339.4242ms)
+✔ multi-stash cleanup recovers before_stash_ref_published, concurrent=true (13356.9761ms)
+✔ multi-stash cleanup recovers before_stash_ref_published, concurrent=false (13789.1383ms)
+✔ a process crash after stash_applied recovers local files and landing (11981.0879ms)
+✔ multi-stash cleanup recovers stash_reflog_published, concurrent=false (16035.5479ms)
+✔ multi-stash cleanup recovers before_stash_reflog_published, concurrent=false (12638.4147ms)
+✔ multi-stash cleanup recovers stash_ref_published, concurrent=false (14075.1901ms)
+✔ multi-stash cleanup recovers hard_stash_reflog_published, concurrent=false (14368.8648ms)
+✔ a process crash after ref_updated recovers local files and landing (14071.7236ms)
+✔ a process crash after before_stash_restored recovers local files and landing (12094.0263ms)
+✔ multi-stash cleanup recovers stash_cleanup_prepared, concurrent=false (15597.3947ms)
+✔ multi-stash cleanup recovers stash_ref_published, concurrent=true (14250.4661ms)
+✔ multi-stash cleanup recovers hard_stash_cleanup_prepared, concurrent=false (14435.866ms)
+✔ multi-stash cleanup recovers hard_stash_ref_published, concurrent=false (12163.7442ms)
+✔ a process crash after checkout_synced recovers local files and landing (12993.7751ms)
+✔ a process crash after before_stash_applied recovers local files and landing (12366.2439ms)
+✔ an unchecked delivery target that is externally rewound after landing stays blocked (8284.4276ms)
+✔ host recovery requeues an interrupted merge until the global lock is available (10350.6421ms)
+✔ recovery syncs the actual latest checkout and reports validation cleanup truthfully (8727.8477ms)
+[TaskStore] Failed to persist thread thread_ledger_crash: Error: injected EIO
+    at Object.<anonymous> (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\test\git-worktree-recovery.test.js:210:27)
+    at TaskStore.persistThread (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\task-store.js:463:16)
+    at TaskStore.upsertTask (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\task-store.js:887:18)
+    at MergeCoordinator.finishMerged (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:1719:20)
+    at async MergeCoordinator.mergeApprovedOnce (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:741:17)
+    at async MergeCoordinator.mergeApproved (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:235:28)
+    at async waitForActual (node:assert:615:5)
+    at async Object.rejects (node:assert:738:25)
+    at async TestContext.<anonymous> (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\test\git-worktree-recovery.test.js:217:9)
+    at async Test.run (node:internal/test_runner/test:1409:7) {
+  code: 'EIO'
+}
+[TaskStore] Failed to persist thread thread_ledger_crash: Error: injected EIO
+    at Object.<anonymous> (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\test\git-worktree-recovery.test.js:210:27)
+    at TaskStore.persistThread (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\task-store.js:463:16)
+    at TaskStore.upsertTask (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\task-store.js:887:18)
+    at MergeCoordinator.recordValidation (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:1421:20)
+    at MergeCoordinator.cleanupValidationWorktree (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:1433:14)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async MergeCoordinator.mergeApprovedOnce (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:782:66)
+    at async MergeCoordinator.mergeApproved (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:235:28)
+    at async waitForActual (node:assert:615:5)
+    at async Object.rejects (node:assert:738:25) {
+  code: 'EIO'
+}
+✔ ref-updated transaction recovers durable ledger failure and ledger_written cannot remerge or regress target (12756.1849ms)
+▶ HostSuspensionGuard
+  ✔ monotonic clock is available and does not jump backwards (2.9114ms)
+  ✔ an on-time heartbeat records no suspension (0.904ms)
+  ✔ a late heartbeat becomes an excluded window (the closed-lid case) (0.4435ms)
+  ✔ overlap math is clamped to the requested interval (0.3074ms)
+  ✔ a blocked event loop is detected as host suspension (532.7787ms)
+  ✔ stop() is idempotent and a stopped guard stops recording (0.751ms)
+✔ HostSuspensionGuard (540.7812ms)
+[ReworkController] Starting session receiver-session-captured-before-pause for claude_code (Round 1)
+▶ dedicated reviewer bootstrap pause/resume lifecycle
+  ✔ resuming a paused pending/launching bootstrap preserves its token and queues bootstrap only (61.1231ms)
+  ✔ a consumed token without a captured reviewer session fails visibly and cannot relaunch (57.371ms)
+  ✔ a captured reviewer handoff resumes the existing receiver session in the same task (320.5081ms)
+✔ dedicated reviewer bootstrap pause/resume lifecycle (441.4581ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_192923_810e (Round 1) on claude_code
+[AsyncDispatcher] Starting background execution: thread_20261118_192941_d24b (Round 1) on claude_code
+▶ MCPServer Protocol Tests
+  ✔ should handle initialize request with proper capabilities (533.6432ms)
+  ✔ client roots resolve only a unique live window and its manual default (2812.2802ms)
+  ✔ linked workspace ID, root and bound context list the dispatch workspace (3855.9877ms)
+  ✔ explicit cross-workspace dispatch keeps caller window on first and later calls (10118.9991ms)
+  ✔ should handle tools/list and return all 18 specified tools (572.1506ms)
+  ✔ list_agent_models reports the receiver and sender defaults separately (561.5281ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_192946_17c5 (Round 1) on claude_code
+[AsyncDispatcher] Starting background execution: thread_20261118_192949_1acb (Round 1) on codex
+[AsyncDispatcher] Starting background execution: thread_20261118_192954_03b8 (Round 1) on codex
+  ✔ get_task_summary survives archival with the read-only digest (5046.4785ms)
+  ✔ serves the reviewer side of a round and reports a missing log honestly (3381.4408ms)
+  ✔ tells the caller to stop and wait, and starves repeated polls (2890.2014ms)
+  ✔ get_thread_details condenses older rounds and get_round_raw_log pages the archive (572.7509ms)
+  ✔ get_merge_log reads bounded pages from the task-owned log (488.8145ms)
+  ✔ get_merge_log resolves decision and legacy file numbers but rejects paths outside the task log (558.8015ms)
+  ✔ merge_failed rejects ordinary controls and retry_merge keeps task identity (576.0085ms)
+  ✔ get_task_token_usage reports task rollup and single-round detail (498.2547ms)
+[ReworkController] Resuming session 7ff88350-6a88-48ee-b8fc-b3f9bcdee08f for codex (Round 2)
+  ✔ should execute dispatch_task, get_thread_details, request_rework, and approve_task via tools/call (7468.5067ms)
+  ✔ should hide forwarding tools and reject them while acting as a task receiver (461.3072ms)
+  ✔ should detect a receiver by the pid of the launched task process when the host scrubs the environment (438.2506ms)
+  ✔ should not treat an unrelated process as a receiver when no execution record matches its pid (401.9216ms)
+  ✔ should never treat a reviewer or bootstrap round as a task receiver (455.9946ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_193006_9127 (Round 1) on codex
+[ReworkController] Starting session 38dd55e1-7640-4389-bdcf-98d2e18609d8 for codex (Round 1)
+[ReworkController] Syncing receiverSessionId from 38dd55e1-7640-4389-bdcf-98d2e18609d8 to actual native ID: session-retry-0001
+[AsyncDispatcher] Starting background execution: thread_20261118_193010_1891 (Round 1) on codex
+[ReworkController] Round 2 of thread_20261118_193010_1891 repeats the instruction of round 1 verbatim; use retry_task to re-run a failed round in place instead of re-sending its prompt.
+  ✔ should execute query_agent_mesh_status and return mesh info (1979.0253ms)
+  ✔ retry_task re-runs the failed round in place instead of creating a duplicate round (4255.5405ms)
+[ReworkController] Resuming session 514fdb2c-026c-4d49-9d87-d1f2466f858c for codex (Round 2)
+[Agent Mesh Bridge] Reviewer bootstrap for thread_bootstrap_host_pid claimed by agent/workspace match: ppid 25444 matched no launch record.
+  ✔ request_rework flags a round whose instruction repeats an earlier one (5039.9734ms)
+  ✔ rejects self-dispatch instead of parking a task that can never be reviewed (439.6334ms)
+  ✔ reviewer bootstrap confirms the prepared task instead of creating a new one (454.1108ms)
+  ✔ reviewer bootstrap still confirms when the host scrubs the MCP server environment (546.68ms)
+✔ MCPServer Protocol Tests (54413.8645ms)
+✔ merge failures count the sixth retry, reset on a different fingerprint and on a new generation (4.6254ms)
+✔ failure fingerprints ignore temporary paths and object ids but retain the failing paths (0.4448ms)
+✔ merge decisions append immutable question and answer records and wake the same session (127.437ms)
+✔ a review decision resumes the same reviewer without creating a development round (63.6477ms)
+✔ retry_merge preserves the task identities and history while starting a new budget (24.7643ms)
+✔ pending stash metadata recovery survives stale writes and pause/resume without waking a reviewer (102.0036ms)
+✔ actual merge reviewer failures consume the budget, but waiting for a wake does not (158.48ms)
+✔ quota deferral does not consume a merge retry (33.7065ms)
+✔ watchdog counts a disappeared launched merge reviewer once, but not an unlaunched wake (50.2911ms)
+✔ restart schedules unlaunched merge reviews without consuming the merge retry budget (521.2778ms)
+✔ an answered merge decision is recovered after a crash before the reviewer starts (94.0103ms)
+✔ a wake accepted before a second crash is recovered without charging an unstarted attempt (73.5665ms)
+✔ an unrecoverable merge review is failed with a recorded review reason (57.8281ms)
+✔ merge reviewer warnings after handoff and user pauses do not consume retry budget (42.5809ms)
+✔ empty reviewer output after a merge handoff blocks integration and records assessment (32.073ms)
+✔ reviewer watchdog interruption is recorded without changing the worker round (23.9086ms)
+✔ nonterminal merge states remain unfinished and are not selected for archive (0.6578ms)
+✔ a ledger full of merge waiting states has no capacity eviction candidate (6.5637ms)
+✔ merge Git and validation registrations do not consume agent concurrency slots (18.258ms)
+✔ task archival includes merge history and complete merge log before cleanup (27.2674ms)
+✔ resident host observes a short-lived MCP approval from disk and merges without restart or polling (8740.8934ms)
+✔ pre-ref merge infrastructure failure returns a concrete error to the original reviewer (4028.024ms)
+[TaskStore] Failed to persist thread thread_resident_ledger_eio: Error: injected EIO
+    at Object.<anonymous> (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\test\merge-resident-host.test.js:177:27)
+    at TaskStore.persistThread (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\task-store.js:463:16)
+    at TaskStore.upsertTask (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\task-store.js:887:18)
+    at MergeCoordinator.finishMerged (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:1719:20)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async MergeCoordinator.mergeApprovedOnce (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:741:17)
+    at async MergeCoordinator.mergeApproved (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:235:28) {
+  code: 'EIO'
+}
+[TaskStore] Failed to persist thread thread_resident_ledger_eio: Error: injected EIO
+    at Object.<anonymous> (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\test\merge-resident-host.test.js:177:27)
+    at TaskStore.persistThread (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\task-store.js:463:16)
+    at TaskStore.upsertTask (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\task-store.js:887:18)
+    at MergeCoordinator.recordValidation (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:1421:20)
+    at MergeCoordinator.cleanupValidationWorktree (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:1433:14)
+    at async MergeCoordinator.mergeApprovedOnce (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:782:66)
+    at async MergeCoordinator.mergeApproved (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:235:28) {
+  code: 'EIO'
+}
+[ReworkController] Target ref is updated for thread_resident_ledger_eio, but its durable ledger record still needs recovery: Could not durably persist task thread_resident_ledger_eio: injected EIO
+✔ a landed ref with repeated ledger EIO is not retried in a loop and recovers after host restart (15263.6202ms)
+[TaskStore] Failed to persist thread thread_resident_pre_ref_eio: Error: injected EIO
+    at Object.<anonymous> (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\test\merge-resident-host.test.js:234:27)
+    at TaskStore.persistThread (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\task-store.js:463:16)
+    at TaskStore.upsertTask (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\task-store.js:887:18)
+    at MergeCoordinator.mergeApprovedOnce (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:326:28)
+    at async MergeCoordinator.mergeApproved (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\merge-coordinator.js:235:28) {
+  code: 'EIO'
+}
+[TaskStore] Failed to persist thread thread_resident_pre_ref_eio: Error: injected EIO
+    at Object.<anonymous> (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\test\merge-resident-host.test.js:234:27)
+    at TaskStore.persistThread (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\task-store.js:463:16)
+    at TaskStore.upsertTask (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\task-store.js:887:18)
+    at E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\rework-controller.js:1254:36 {
+  code: 'EIO'
+}
+[ReworkController] Could not persist merge failure for thread_resident_pre_ref_eio; retrying with backoff: Could not durably persist task thread_resident_pre_ref_eio: injected EIO
+✔ an initial ledger EIO is logged and backed off until the same host can recover (14008.9846ms)
+✔ package.json scripts remain the primary validation strategy (16.5492ms)
+✔ a package.json without compile and test is refused even when a manifest exists (14.0778ms)
+✔ a repository with neither package.json nor manifest is refused (1.9465ms)
+✔ a malformed or empty manifest is refused instead of silently passing (24.9516ms)
+✔ an entry without a command is refused (15.2754ms)
+✔ manifest strings and object entries both resolve to executable steps (13.1541ms)
+✔ a Unity-style repository without package.json integrates through its manifest (8911.3826ms)
+✔ a manifest whose command fails reports the failure and leaves the target unchanged (5671.7132ms)
+▶ annotateConfiguredModel
+  ✔ hoists the configured default to the front and tags it in place (3.5047ms)
+  ✔ keeps an existing hint when tagging (0.4606ms)
+  ✔ prepends a synthetic entry when the probe did not return the default (0.413ms)
+  ✔ leaves the list alone when no default is configured (0.4652ms)
+✔ annotateConfiguredModel (8.4596ms)
+▶ resolveDispatchModel
+  ✔ no requested model -> the configured default (26.1675ms)
+  ✔ requested model equal to the default needs no approval (18.41ms)
+  ✔ a guessed non-default model is ignored in favour of the default (14.5678ms)
+  ✔ an approved user request switches the model and is recorded (21.4271ms)
+  ✔ "use default" keeps the configured default with a notice (21.7882ms)
+  ✔ a cancelled confirmation fails the dispatch closed (20.7602ms)
+  ✔ an unanswered confirmation fails the dispatch closed (18.7947ms)
+  ✔ an unavailable confirmation channel falls back to the default (14.7424ms)
+  ✔ the approval policy can be turned off for a declared user request (17.3187ms)
+✔ resolveDispatchModel (176.3673ms)
+[ModelApproval] Could not publish request model-24269947-252d-4fc2-aadc-0faef3b9da6d: EEXIST: file already exists, mkdir 'C:\Windows\TEMP\agent-bridge-model-approval-TPRL2E\model-approvals'
+▶ model approval file channel
+  ✔ an answered request resolves through the request/decision files (56.8263ms)
+  ✔ an unwritable channel degrades to the configured default (23.4811ms)
+  ✔ expired requests are never handed to the user (25.4349ms)
+✔ model approval file channel (106.5289ms)
+✔ Model catalog - Antigravity output parser (5.3453ms)
+✔ Model catalog - Codex catalog parser tolerates leading noise (0.8534ms)
+✔ Model catalog - OpenAI/Anthropic model list parser (0.6664ms)
+✔ Model catalog - JSON extraction rejects non-JSON payloads (0.3716ms)
+✔ Model catalog - model ids are trimmed and empty means unset (0.3351ms)
+✔ Model catalog - defaults round-trip and drop empty values (41.0489ms)
+✔ Model catalog - receiver and sender defaults are independent and durable (58.274ms)
+✔ Model catalog - resolveConfiguredModel memoizes the saved snapshot (38.0547ms)
+✔ Model catalog - bridge home can be redirected for isolation (2.4393ms)
+✔ Model catalog - missing executables fall back without throwing (10.2984ms)
+✔ Model catalog - cached catalogue is reused between instances (20.9546ms)
+✔ Model catalog - explicit model reaches every agent CLI (144.488ms)
+✔ Model catalog - configured default is used when no model is pinned (68.5442ms)
+✔ Model catalog - DSH runs get a per-run overlay patch (27.6332ms)
+✔ Model catalog - task DSH overlay stays in the fixed task dir across root changes (34.9659ms)
+✔ Model catalog - DSH refuses an overlay when no provider route exists (1.2603ms)
+✔ Model routing - sender model resolution precedence (16.6529ms)
+✔ Model routing - the sender-side default wins over the receiver-side default (35.7881ms)
+✔ Model routing - both ends are summarized for tasks and messages (1.1657ms)
+▶ native conversation cleanup on task deletion
+  ✔ Claude Code: removes the transcript, subagent dir and per-session state (25.5392ms)
+  ✔ Codex: removes the rollout and its session_index entry (42.2693ms)
+  ✔ Antigravity: removes the DB, brain, annotations, implicit record and cache entries (71.9786ms)
+  ✔ DeepSeek Harness: removes the session dir, projcache and workspace references (45.5331ms)
+  ✔ a missing conversation is not an error (2.2772ms)
+  ✔ the caller session is never deleted (8.4392ms)
+  ✔ a dedicated task without a captured reviewer never deletes the requester chat (7.2906ms)
+  ✔ a dedicated task deletes only the captured reviewer, never the requester (9.3588ms)
+  ✔ retarget history cleans the sessions of previously-used agents (11.827ms)
+  ✔ unsafe session ids are rejected before they can reach the file system (1.9105ms)
+  ✔ placeholder receiver ids (never captured) are skipped silently (1.5609ms)
+✔ native conversation cleanup on task deletion (231.2782ms)
+✔ Codex UUID and rollout name share one session write lease (86.9314ms)
+✔ session write lease excludes a separate bridge process (162.7891ms)
+✔ a live owner is never reclaimed from a stale heartbeat (52.818ms)
+✔ concurrent stale-owner recovery grants only one lease across processes (2247.7721ms)
+✔ simultaneous first acquisition publishes exactly one owner (2171.6782ms)
+✔ an unreadable owner publication is never mistaken for a dead session owner (209.6337ms)
+✔ a live pending owner is restored after a crash between owner replacement steps (58.9474ms)
+✔ attachChild replaces the complete owner record atomically while another process reads it (565.5537ms)
+✔ attachChild waits for a live reaper gate and never reports an unpersisted PID as attached (662.1051ms)
+✔ release waits for transient reaper ownership and removes the lease before returning (683.8497ms)
+✔ child binding can abandon a contended gate on cancellation without claiming success (861.2407ms)
+✔ a live child keeps the session locked after its bridge parent exits (226.5544ms)
+▶ Per-agent log directories with worker_log, reviewer_log, Archive
+  ✔ resolves per-agent custom log directories and creates the three subdirectories (18.5802ms)
+  ✔ worker_log stores both raw execution logs and compacted output archives (43.669ms)
+  ✔ reviewer_log stores round review logs and bootstrap logs (40.8027ms)
+  ✔ Archive compresses and packages task logs on completion, preserving archive while pruning active logs (77.4354ms)
+  ✔ maintains seamless backwards compatibility with legacy flat logs/ directory (15.041ms)
+  ✔ finds structured logs written before custom log directories were configured (38.0925ms)
+  ✔ TaskStore.archiveTask creates the compressed archive in Archive/ and retains the digest (90.9176ms)
+✔ Per-agent log directories with worker_log, reviewer_log, Archive (326.7376ms)
+▶ RateLimitTracker & Agent Status Tests
+  ✔ should record exhaustion and calculate recovery time correctly from "retry after" message (20.6816ms)
+  ✔ should record exhaustion and calculate recovery time from "resets at" message (4.951ms)
+  ✔ should clear exhaustion status manually (20.1288ms)
+  ✔ should reflect exhausted status in AgentDetector probeAgent (175.047ms)
+  ✔ should extract appropriate reason without false 429 classification (2.9275ms)
+✔ RateLimitTracker & Agent Status Tests (226.2924ms)
+[CallbackManager] Reviewer prepare paused thread_unknown_native_review: Native session 4ad2498c-215f-4b92-a172-2af983c691f1 could not be proven healthy after operation unknown-op; compression was not replayed.
+▶ Review wake failure policy
+  ✔ waits for the provider reset time when quota exhaustion is reported (3.6245ms)
+  ✔ backs off when the failure carries no reset time (0.8209ms)
+  ✔ stops scheduling after the automatic retry budget is spent (0.5259ms)
+✔ Review wake failure policy (7.2961ms)
+▶ CallbackManager records stalled reviewer wakes
+  ✔ review callback injects only reviewer template instructions (58.4233ms)
+  ✔ a 429 that still exits 0 is a failed review, not a delivered one (46.9269ms)
+  ✔ a dedicated reviewer wake does not launch after prepare pauses an unknown native operation (93.4145ms)
+  ✔ a blocked merge resumes its dedicated reviewer through real preparation and releases leases (184.2371ms)
+  ✔ pause and resume preserve every merge phase and wake the same dedicated reviewer after shutdown (1482.9795ms)
+  ✔ merge decision handoff releases reviewer resources and answers resume the same native session (304.9066ms)
+  ✔ a failed merge reviewer is recorded without treating merging as a successful handoff (28.0119ms)
+[CallbackManager] Wake for thread_merge_empty_live failed: Process exited with code 0 but the stream contained no actual final answer (only status/metadata or no output).; auto retry at 2026-11-18T11:31:00.084Z
+[CallbackManager] Caller session 4ad2498c-215f-4b92-a172-2af983c691f1 is busy; wake for thread_live_reviewer_tail_2 (review, round 1) queued behind it.
+[CallbackManager] Could not bind reviewer child ownership for thread_reviewer_pid_bind: PID bind rejected
+  ✔ a launched merge reviewer with status-only output records EMPTY_OUTPUT (223.4359ms)
+  ✔ a reviewer tail process keeps the native session lease after its role is handed off (189.291ms)
+[CallbackManager] Wake for thread_reviewer_pid_bind failed: Native child ownership failed: PID bind rejected; auto retry at 2026-11-18T11:31:00.331Z
+[CallbackManager] Wake for thread_reviewer_pid_clear failed: Native child ownership failed: PID clear rejected; auto retry at 2026-11-18T11:31:00.452Z
+[CallbackManager] Wake resource release failed for thread_reviewer_pid_clear: release rejected
+[CallbackManager] Reviewer state changed during prepare for thread_prepare_no-lease; launch was cancelled.
+[CallbackManager] Reviewer state changed during prepare for thread_prepare_cancel; launch was cancelled.
+[CallbackManager] Reviewer state changed during prepare for thread_prepare_delete; launch was cancelled.
+[CallbackManager] Reviewer state changed during prepare for thread_prepare_retarget; launch was cancelled.
+  ✔ reviewer launch binding and exit cleanup failures kill or fail safely without escaping callbacks (175.0074ms)
+  ✔ dedicated reviewer launch rechecks cancellation, deletion, retargeting, and missing session lease (133.9947ms)
+  ✔ a rework starts a fresh review budget instead of inheriting the old one (22.5031ms)
+  ✔ a clean exit without a ledger verdict is a retryable no-decision (40.8459ms)
+  ✔ clears the round wake only after a recorded approval, rework, or park (79.4907ms)
+  ✔ does not rewrite paused, archived, deleted, or failure-notification tasks (68.0626ms)
+✔ CallbackManager records stalled reviewer wakes (3133.8265ms)
+▶ ReviewWakeScheduler
+  ✔ re-wakes the same session once the plan is due, and consumes one attempt (44.881ms)
+  ✔ keeps the fifth launch in flight and exhausts only after its recorded outcome (839.041ms)
+  ✔ retries against the newest completed work round, never an approval round (36.0987ms)
+  ✔ does not fire a planned retry while a reviewer is already running (6.9957ms)
+  ✔ does not retry while a sibling task is reviewing the same caller session (28.2009ms)
+  ✔ does not retry while the quota is still cooling down (31.6804ms)
+  ✔ marks the plan as given up once attempts are exhausted (35.1183ms)
+  ✔ drops a failure record that belongs to an older round (34.399ms)
+  ▶ stall watchdog
+    ✔ records a silent review as stalled and then retries it (51.5978ms)
+    ✔ leaves a review alone while its reviewer process is alive (7.7752ms)
+    ✔ leaves a review parked on a live dependency alone (28.7629ms)
+    ✔ turns a park without a dependency id into a visible, terminal stall (42.1805ms)
+    ✔ turns a park on a deleted dependency into a visible, terminal stall (34.8664ms)
+    ✔ heals a pre-existing gave-up wake into the terminal review_failed status (43.1652ms)
+    ✔ does not fire before the stall threshold (17.0064ms)
+  ✔ stall watchdog (226.2049ms)
+✔ ReviewWakeScheduler (1283.4925ms)
+▶ review_failed lifecycle status
+  ✔ records a non-empty cause and releases the task queue slot (0.3948ms)
+  ✔ never downgrades a task that is no longer waiting for review (0.1318ms)
+  ✔ re-opening returns to reviewing and keeps the failure as history (0.1498ms)
+✔ review_failed lifecycle status (0.8113ms)
+[Agent Mesh Bridge] Reviewer bootstrap for thread_sole_pending claimed by agent/workspace match: ppid 25444 matched no launch record.
+▶ dedicated reviewer bootstrap identity
+  ✔ the prompt credential confirms the prepared task (50.1965ms)
+  ✔ a brief-less call claims the only pending bootstrap of its agent (35.7786ms)
+  ✔ a wrong prompt token cannot claim the task (31.383ms)
+  ✔ a paused task cannot be confirmed by a delayed bootstrap and keeps its token (47.2842ms)
+  ✔ without a pending bootstrap a brief-less call is still an ordinary error (137.6291ms)
+✔ dedicated reviewer bootstrap identity (304.7209ms)
+✔ bootstrap token round-trips and clears (23.1443ms)
+✔ a bootstrap is identifiable by the launched reviewer pid, without any env (30.2983ms)
+✔ pid lookup follows the ledger artifactDir after taskDataRoot changes, and keeps legacy records (68.3821ms)
+✔ a stale launch record cannot be claimed by a reused pid (16.692ms)
+✔ the launched reviewer pid is written before the turn runs (89.6647ms)
+✔ pending dedicated task is bootstrapped by a fresh reviewer session (184.8198ms)
+✔ a reviewer turn that never dispatches fails the task without starting a developer (63.8807ms)
+✔ a failed reviewer bootstrap is terminal, not "still starting" (4.6035ms)
+✔ paused and waiting-review tasks do not serialize independent reviewer bootstraps (158.8025ms)
+✔ concurrency: a running task in another workspace does not block a pending bootstrap (87.1393ms)
+✔ the bootstrap prompt carries the one-time credential (1.265ms)
+✔ the last-resort finder answers only when one bootstrap can be meant (49.7156ms)
+✔ a reviewer that never saw dispatch_task is relaunched instead of failed (57.7015ms)
+✔ a reviewer that HAD dispatch_task and ignored it stays terminal (64.4688ms)
+✔ bootstrap attempts are capped so a permanently racy host still terminates (34.3943ms)
+✔ bootstrap includes only the reviewer template snapshot (2.6236ms)
+[CallbackManager] Wake for thread_capture_1 failed: REVIEW_NO_DECISION: reviewer exited successfully without a recorded approve_task, request_rework, or review block; auto retry at 2026-11-18T11:31:01.255Z
+[CallbackManager] Normalising codex session rollout-2026-10-27T19-41-02-02b28e3a-51e1-4854-942a-989ee5fe1f96 -> 02b28e3a-51e1-4854-942a-989ee5fe1f96 in the ledger.
+▶ Reviewer stream capture
+  ✔ tees the caller stdout/stderr into the per-round reviewer log (140.9501ms)
+  ✔ resumes codex with the canonical thread UUID by default (52.7805ms)
+  ✔ uses the rollout name for a legacy CLI but still stores the UUID (53.465ms)
+  ✔ wakes the caller on its sender-side default model, not the receiver default (53.622ms)
+  ✔ dedicated review resumes the reviewer conversation and binds the lock to it (69.1211ms)
+  ✔ a stale wake round is normalised to the newest completed work round (70.736ms)
+✔ Reviewer stream capture (443.2957ms)
+▶ Reviewer log artifact
+  ✔ keeps reviewer logs out of the receiver round-log namespace (5.7985ms)
+  ✔ sanitizes caller-controlled thread ids and rounds (3.665ms)
+  ✔ writes a banner, streams chunks and reports its size (22.1215ms)
+  ✔ appends a new banner when the same round is woken again (28.1572ms)
+  ✔ stops at the byte cap with an explicit truncation marker (19.7508ms)
+  ✔ reads only the tail and flags truncation (21.8679ms)
+  ✔ reports missing logs instead of an empty string (11.0711ms)
+  ✔ lists rounds with a reviewer log, newest first, ignoring receiver logs (18.4948ms)
+  ✔ falls back to the newest reviewer log when the requested round has none (15.0143ms)
+✔ Reviewer log artifact (148.5729ms)
+[ReworkController] Active TaskSupervisor detected. Delegating Round 2 retry to supervisor.
+✔ dedicated bootstrap readiness requires a confirmed captured canonical reviewer session (1.4166ms)
+✔ failed bootstrap retry rejects before retarget or ledger mutation (27.8595ms)
+✔ completed and archived tasks cannot be retried or have output cleared (35.8712ms)
+✔ waiting review cannot retry an older failure behind a newer successful round (20.3731ms)
+✔ latest failed execution round retries in place and retains its receiver session (25.0323ms)
+✔ retry does not revive a task completed during executor approval (36.4131ms)
+✔ dedicated rework cannot rebind reviewer session from params or detector (12.6021ms)
+✔ paused pending bootstrap resumes with its existing token and no developer run (36.3992ms)
+▶ no-op rework guard
+  ✔ rejects a rework that repeats the previous instruction after an empty round (4.4594ms)
+  ✔ allows the same words when the previous round did change files (0.2835ms)
+  ✔ allows genuinely new feedback after an empty round (0.4704ms)
+  ✔ legacy rounds without touchedFiles are never treated as no-ops (0.3024ms)
+✔ no-op rework guard (7.0182ms)
+▶ review block and terminal state
+  ✔ blockReview parks the review without creating a round (31.9485ms)
+  ✔ blockReview refuses a task that is not waiting for review (10.1896ms)
+  ✔ a completed task cannot be resurrected by a late rework (14.3313ms)
+✔ review block and terminal state (57.1442ms)
+[ReworkController] Resuming session receiver-session-0001 for antigravity (Round 2)
+[AutonomousRunner] Agent executable not found for "antigravity". Set "agentMeshBridge.antigravityPath" if it is installed in a non-standard location.
+[ReworkController] Resuming session receiver-session-0001 for antigravity (Round 6)
+[AutonomousRunner] Agent executable not found for "antigravity". Set "agentMeshBridge.antigravityPath" if it is installed in a non-standard location.
+[TaskStore] Refusing to append running round 2 to thread_test_0001: a round is already in flight.
+[TaskSupervisor] Executing thread_test_0001 Round 5 on antigravity (isRework: true)...
+[TaskSupervisor] Repaired 3 overlapping running round(s) in thread_test_0001: kept round 5, finalized [3, 3, 4].
+[TaskSupervisor] thread_test_0001 Round 5 completed with exitCode 0. Updating store...
+[TaskSupervisor] Round 5 successful and is latest. Notifying caller codex...
+[CallbackManager] Thread thread_test_0001 completed round 5, but no valid callerSessionId provided or detected.
+[TaskSupervisor] Executing thread_test_0001 Round 2 on antigravity (isRework: true)...
+[TaskSupervisor] thread_test_0001 Round 2 completed with exitCode 0. Updating store...
+[TaskSupervisor] Round 2 successful and is latest. Notifying caller codex...
+[CallbackManager] Thread thread_test_0001 completed round 2, but no valid callerSessionId provided or detected.
+[TaskSupervisor] Executing thread_test_0001 Round 5 on antigravity (isRework: true)...
+[TaskSupervisor] Repaired 1 overlapping running round(s) in thread_test_0001: kept round 5, finalized [3].
+[TaskSupervisor] thread_test_0001 Round 5 completed with exitCode 0. Updating store...
+[TaskSupervisor] Round 5 successful and is latest. Notifying caller codex...
+[CallbackManager] Thread thread_test_0001 completed round 5, but no valid callerSessionId provided or detected.
+[TaskSupervisor] Refusing unsupported agent for task thread_test_0001: Agent "retired_agent" is no longer supported and cannot run a scheduled task round.
+▶ Round invariant - pure helpers
+  ✔ findInFlightRound returns undefined when the thread is idle (1.1768ms)
+  ✔ findInFlightRound returns the single running round (0.2037ms)
+  ✔ findInFlightRound picks the highest round when several are running (0.1848ms)
+  ✔ findInFlightRound keeps the newest entry when round numbers tie (0.1416ms)
+  ✔ nextRoundNumber is monotonic and never reuses an existing number (0.2043ms)
+✔ Round invariant - pure helpers (3.4246ms)
+▶ Round invariant - ReworkController refuses to overlap rounds
+  ✔ requestRework throws while a round is still running (18.0209ms)
+  ✔ requestRework succeeds once the previous round is finalized (263.5438ms)
+  ✔ requestRework numbers monotonically after a retry rewound currentRound (246.1224ms)
+  ✔ retryFailedRound throws while another round is running (17.8923ms)
+  ✔ approveTask throws while a round is still running (7.8003ms)
+  ✔ approveTask is idempotent once the thread is completed (20.6034ms)
+✔ Round invariant - ReworkController refuses to overlap rounds (574.9528ms)
+▶ Round invariant - TaskStore refuses a second running round
+  ✔ updateRound will not append a running round while one is in flight (7.3324ms)
+  ✔ updateRound updates the newest entry when round numbers are duplicated (20.4179ms)
+✔ Round invariant - TaskStore refuses a second running round (28.0908ms)
+▶ Round invariant - supervisor repairs and guards
+  ✔ normalizeRoundIntegrity keeps the highest running round and finalizes the rest (206.9574ms)
+  ✔ normalizeRoundIntegrity is a no-op for a healthy ledger (209.2479ms)
+  ✔ executeThreadRound refuses to start a round while another is in flight (216.0513ms)
+  ✔ executeThreadRound terminally refuses a historical unsupported agent without executing it (25.7276ms)
+✔ Round invariant - supervisor repairs and guards (658.4181ms)
+[ReworkController] Resuming session session-stable-001 for antigravity (Round 2)
+▶ Running and Reworking Status Merge Tests
+  ✔ read-time normalization: legacy status "reworking" on disk loads as "running" with all metadata preserved (39.7454ms)
+  ✔ statusFilter compatibility alias: "reworking" filters tasks in running status with active rework round (17.1801ms)
+[ReworkController] Resuming session session-stable-001 for antigravity (Round 2)
+  ✔ rework creation and retry/resume lifecycle writes status "running" (429.103ms)
+  ✔ UI task tree status formatter: differentiates Running vs Reworking based on active round type (2.6424ms)
+  ✔ NativeSessionCompactor business success acknowledges rework under running status (33.998ms)
+✔ Running and Reworking Status Merge Tests (524.6957ms)
+[ReworkController] Task thread_lifecycle_test was deleted while round 2 was executing.
+[TaskControlService] Native session cleanup failed: session store is locked
+▶ TaskControlService - pause/delete reasons
+  ✔ pausing a running task records the interruption reason and stops the child (39.7486ms)
+  ✔ deleting a task removes it, stops the child, and writes a tombstone reason (63.9202ms)
+  ✔ deleting a task also records the receiver conversation cleanup (56.5338ms)
+  ✔ a failing native conversation cleanup never blocks the deletion (57.1243ms)
+  ✔ deleting a task stops and waits for its live reviewer child before removing it (221.4596ms)
+[ReworkController] Starting session receiver-session-0001 for antigravity (Round 1)
+[ReworkController] Starting session receiver-session-0001 for antigravity (Round 1)
+  ✔ forced deletion retains the ledger until the registered developer process exits (323.7304ms)
+  ✔ resuming a paused task keeps history and clears the current interruption (203.9622ms)
+  ✔ resuming clears the pause the runner remembered while nothing was running (200.9392ms)
+✔ TaskControlService - pause/delete reasons (1171.3829ms)
+✔ task data root defaults to <storage>/tasks and resolves relative values against the bridge home (36.8302ms)
+✔ a task directory is created with the standard layout and the worktree lives inside it (1759.3628ms)
+✔ archive and cleanup stay inside the task directory and never delete the archive prematurely (78.0032ms)
+✔ TaskStore.deleteTask removes a task directory and its bootstrap credential (28.3997ms)
+[TaskStore] Could not archive thread_archive_overlay_eio; retaining task data: Error: injected overlay EIO
+    at fsModule.readFileSync (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\test\task-data-dir.test.js:308:27)
+    at archiveCompletedTaskLogs (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\task-summary.js:389:61)
+    at TaskStore.archiveTask (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\task-store.js:1121:82)
+    at TestContext.<anonymous> (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\test\task-data-dir.test.js:314:26)
+    at Test.runInAsyncScope (node:async_hooks:226:14)
+    at Test.run (node:internal/test_runner/test:1402:25)
+    at Test.processPendingSubtests (node:internal/test_runner/test:974:18)
+    at Test.postRun (node:internal/test_runner/test:1542:19)
+    at Test.run (node:internal/test_runner/test:1467:12)
+    at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+  code: 'EIO'
+}
+[AsyncDispatcher] Auto-detected caller session for antigravity: 8766595c-8fcd-4c46-99af-80aa7a949419
+[AsyncDispatcher] Starting background execution: thread_20261118_193011_7674 (Round 1) on codex
+✔ delete_task removes the unified directory including its worktree (4942.8148ms)
+✔ legacy threads without artifactDir keep using per-agent log directories (22.3407ms)
+✔ TaskStore.archiveTask keeps overlays, rounds and sessions when an overlay read fails, then retries (147.6997ms)
+✔ dispatch pins the absolute task directory and writes its round log there (3251.1335ms)
+▶ shouldResumeNativeSession after an executor switch
+  ✔ the first round after an agent switch starts a brand-new session (1.2389ms)
+  ✔ once the new session was captured, later rounds resume it (0.5543ms)
+  ✔ a model-only switch keeps the existing session (0.2995ms)
+  ✔ an initial round still needs a captured session to resume (0.2539ms)
+✔ shouldResumeNativeSession after an executor switch (4.029ms)
+▶ TaskRetargetService - switching a task executor
+  ✔ switching the agent drops the native session and keeps the task (32.7998ms)
+  ✔ a model-only switch approved by the user keeps the native session (26.9944ms)
+  ✔ a model the caller did not attribute to the user is ignored (17.9524ms)
+  ✔ the user choosing the default moves the task onto the configured default (27.4047ms)
+  ✔ a declined switch aborts before touching the thread (21.4675ms)
+  ✔ an approval result cannot overwrite a task completed while the dialog was open (29.619ms)
+  ✔ an approval result cannot overwrite a task paused while the dialog was open (31.6314ms)
+  ✔ refuses while a round is still in flight (15.8662ms)
+  ✔ refuses on a completed task and on an unknown thread (15.8891ms)
+  ✔ queued and paused tasks are switchable, and the queue is released (38.3213ms)
+  ✔ refuses to hand a legacy task to its own initiator (self-review deadlock) (17.6094ms)
+✔ TaskRetargetService - switching a task executor (276.7927ms)
+[TaskSupervisor] Executing thread_role_1 Round 1 on deepseek_harness (isRework: false)...
+[TaskSupervisor] thread_role_1 Round 1 completed with exitCode 0. Updating store...
+[TaskSupervisor] Round 1 successful and is latest. Notifying caller codex...
+▶ TaskRoleLock - one role per task
+  ✔ reviewer and developer cannot hold the same task at once (34.6174ms)
+  ✔ a detached reviewer child keeps the role alive after its launcher stops (24.4165ms)
+  ✔ attachChild binds the role to the spawned caller process (31.1259ms)
+  ✔ a stale role lock is reclaimed (29.3163ms)
+✔ TaskRoleLock - one role per task (121.5556ms)
+[CallbackManager] Refusing duplicate reviewer for thread_role_1: reviewer (pid 28348) still owns the task role.
+[CallbackManager] Caller session rollout-role-0001 is busy; wake for thread_role_1 (review, round 1) queued behind it.
+▶ Task role enforcement in execution
+  ✔ developer waits while reviewer owns the task, then starts after handoff (297.6449ms)
+  ✔ a second reviewer wake-up is refused while one is active (28.6082ms)
+✔ Task role enforcement in execution (326.8269ms)
+▶ TaskStore Tests
+  ✔ should initialize with empty store when file does not exist (7.9084ms)
+  ✔ should upsert, retrieve and persist task thread (24.9982ms)
+  ✔ preserves task template snapshot when an old copy is saved after reload (37.7312ms)
+  ✔ should update round and refresh summary accurately (34.01ms)
+  ✔ should persist the caller merge-request handoff (41.0733ms)
+  ✔ newer merge failure revokes approval and stale snapshots cannot restore it (48.4314ms)
+  ✔ should enforce strict 1,000 tasks cap with LRU truncation (36325.3787ms)
+✔ TaskStore Tests (36521.7973ms)
+✔ final summary - completed task keeps verdict, files and MR (8.0119ms)
+✔ final summary - failed task records the terminal error (0.7174ms)
+✔ final summary - review_failed records why no verdict was reached (0.6419ms)
+✔ final summary - only terminal tasks get one (1.2606ms)
+✔ archive - keeps only the digest and metadata (3.2095ms)
+✔ archive policy - newest N stay hot and only terminal tasks are eligible (1.1087ms)
+✔ TaskStore.archiveTask strips rounds, logs and persists the digest (96.6644ms)
+✔ TaskStore does not archive while a native session write lease is active (126.5087ms)
+✔ TaskArchiveService archives terminal tasks beyond the retention window (229.3289ms)
+✔ removeTaskArtifacts removes only that task bridge files (9.0251ms)
+✔ unsafe links are rejected while a normal workspace works (49.2535ms)
+✔ templates are isolated, initialized once, and snapshots survive edits and deletion (82.3103ms)
+✔ invalid, duplicate, oversized and unsafe templates are diagnosed; creation never overwrites (81.6743ms)
+✔ junctions cannot redirect template storage outside the workspace (4.7987ms)
+✔ rejects a changed ancestor before creating a template (36.9109ms)
+✔ registered template commands use clicked workspace rather than active workspace (1509.8128ms)
+✔ test runner prioritizes long files, discovers nested tests and propagates failures (669.4396ms)
+[ContextCompactor] thread_token_b2a770 round 1: 4000 -> 1616 chars (40.4%), source=deterministic_truncation
+▶ token usage - per-agent normalization
+  ✔ DSH: cached prompt tokens are NOT part of inputTokens and must be added (3.8251ms)
+  ✔ Claude: input excludes cache, so prompt = input + cache read + cache write (0.6369ms)
+  ✔ Antigravity: per-step usage is summed and the conversation-total result is ignored (0.6397ms)
+  ✔ Codex: cached and cache-write tokens are subsets of input; reasoning is not added twice (0.3848ms)
+  ✔ interrupted rounds keep native per-step usage but are flagged partial (0.6063ms)
+✔ token usage - per-agent normalization (7.5907ms)
+▶ token usage - fallbacks
+  ✔ no native usage: estimate the output only, never the input (1.0115ms)
+  ✔ nothing measured is unavailable, not free (0.2956ms)
+  ✔ output estimation is a rough mixed-script ratio (0.2961ms)
+  ✔ formatTokenCount keeps numbers readable (0.34ms)
+✔ token usage - fallbacks (2.4699ms)
+▶ token usage - accumulation and rollup
+  ✔ retries add up and record the attempt count (0.6088ms)
+  ✔ an estimate cannot overwrite a native measurement (0.1856ms)
+  ✔ thread rollup sums rounds, splits by agent/model and flags partial data (0.5648ms)
+  ✔ legacy Claude result cost is counted once (0.3795ms)
+  ✔ a reviewer compaction component is counted once and grouped by its own agent/model (0.5921ms)
+  ✔ business attempts after maintenance remain in the durable component rollup (2.5451ms)
+  ✔ a retried round seeds the runner with its previous spend (no overwrite) (2.4636ms)
+✔ token usage - accumulation and rollup (7.8769ms)
+▶ token usage - durability
+  ✔ changing the Codex configured provider invalidates a certified capability identity (17.2912ms)
+  ✔ lagged context compaction keeps the token metadata (55.5276ms)
+  ✔ a stale writer cannot erase the token metadata (22.1022ms)
+  ✔ maintenance and multiple retry attempts survive store reload without re-billing stale snapshots (38.838ms)
+  ✔ TaskStore migrates legacy round usage once before merging a maintenance component (40.5226ms)
+  ✔ a stale task snapshot cannot restore the pre-retarget session cursor (35.9818ms)
+  ✔ runner repeats pending recovery until a carried business turn succeeds and holds one session lease (172.2476ms)
+  ✔ a recovered running maintenance operation becomes unknown and is never replayed (112.2627ms)
+  ✔ unknown compaction uses a same-ID read-only probe and carries recovery without replay (132.6918ms)
+  ✔ auto mode also suppresses compaction after a healthy interrupted-operation probe (79.7662ms)
+  ✔ a delivered unknown recovery can re-enter automatic compaction after four successful turns and reload (184.634ms)
+  ✔ automatic failure probe binds its live PID and cancellation waits for probe exit (337.6682ms)
+  ✔ auto mode compacts at the threshold only with an injected certified capability (151.9522ms)
+  ✔ native automatic compaction events are consumed once and an immediate repeat disables auto maintenance (37.8015ms)
+  ✔ missing maintenance usage is partial and cannot erase an already measured operation (55.639ms)
+✔ token usage - durability (1477.087ms)
+▶ Unified Execution Lifecycle (docs/UNIFIED_EXECUTION_LIFECYCLE_DESIGN.md)
+  ✔ Scenario 1: develop, review, and merge share execution control record and transition through controller (8420.4678ms)
+  ✔ Scenario 2: Active time budget is enforced and output does not extend deadline (5791.4715ms)
+  ✔ Scenario 3: Transient error auto-retries max 2 times; error message change preserves retry count (18348.3595ms)
+  ✔ Scenario 4: Known quota wait sets queued(quota) without consuming retries; unknown reset enters failed(RATE_LIMITED) (2651.1173ms)
+  ✔ Scenario 5: Two approved tasks serialize on global merge lock; only holder is merging (4571.8565ms)
+  ✔ Scenario 6: Between Git commands child is temporarily undefined, probeRun returns alive via owner (10.2306ms)
+  ✔ Scenario 7: Mismatched birthId identifies exited process despite reused PID (7.6772ms)
+  ✔ Scenario 8: Reviewer exit without tool verdict enters NO_VERDICT failure (13.9367ms)
+  ✔ Scenario 9: transitionExecution throws on revision conflict and protects execution state (1923.9962ms)
+  ✔ Scenario 10: requestTaskDecision transitions to wait_decision and submitTaskDecision resumes with budget preserved (5781.9666ms)
+  ✔ Scenario 11: Write failure before spawn aborts execution without spawning child (45.2143ms)
+[ExecutionController] Stale phase outcome ignored for thread_s12: expected run undefined, got 08788da2-49a3-4318-8752-cf032c4d81ee
+  ✔ Scenario 12: Manual retry resets autoRetriesUsed and starts new generation; resume preserves budget (4895.1213ms)
+  ✔ Scenario 13: TaskStore upsertTask preserves execution record and does not overwrite with stale copies (762.1173ms)
+  ✔ Scenario 14: Legacy tasks without execution field retain legacy status semantics (7.0727ms)
+  ✔ Scenario 15: Phase handoff advances directly when resources free; independent reviews are concurrent (2638.5995ms)
+[ExecutionController] Stale phase outcome ignored for thread_s16: expected run undefined, got bdb17717-0786-4fea-acae-d05e21f9b9a4
+  ✔ Scenario 16: retryOperation and resumeOperation restore state to queued/running and clear failures (10980.5475ms)
+  ✔ Scenario 17: submitTaskDecision injects user answer, clears decision, and resumes execution (8267.9581ms)
+[ExecutionController] Stale phase outcome ignored for thread_s18: expected run 6b9e8394-e21c-4838-8fb8-1b50ef39f2a3, got stale-run-999
+  ✔ Scenario 18: Anti-stale protection prevents older run callbacks from overwriting new run state (5192.8395ms)
+  ✔ Scenario 19: MeshFileLock helper holds OS lock until attached child terminates (4374.1971ms)
+[ExecutionController] Stale phase outcome ignored for thread_s20: expected run undefined, got old-generation-run
+  ✔ Scenario 20: Alive run identity preservation and stale callback rejection with empty run (970.0983ms)
+  ✔ Scenario 21: MergeCoordinator lock sharing and external lease avoids self-deadlock (963.3093ms)
+  ✔ Scenario 22: TaskStore CAS Lock mutual exclusion and immune to mtime backdating (3101.2455ms)
+  ✔ Scenario 23: Crash recovery sets failed(OWNER_LOST) without auto-retry and stops orphan child (3859.0282ms)
+[ExecutionController] Stale phase outcome ignored for thread_s24: expected run undefined, got d745fddd-4aca-4c61-95e6-91097ea51a50
+  ✔ Scenario 24: retryOperation, resumeOperation, and submitTaskDecision start directly without queued state (15351.1029ms)
+  ✔ Scenario 25: Stdio MCP decision request persists first and skips self-kill (1440.98ms)
+  ✔ Scenario 26: confirmProcessTreeExit tracks descendant tree and verifies exit with birthId (1977.491ms)
+  ✔ Scenario 27: Crash recovery candidate ref alone must NOT mark completed (4612.6917ms)
+  ✔ Scenario 28: Stop unconfirmed retains run protection and blocks concurrent retry/resume (21053.1633ms)
+  ✔ Scenario 29: approveTask retains Reviewer run until CLI exits and non-zero tail exit does not revoke verdict (14125.8264ms)
+  ✔ Scenario 30: Controlled CAS concurrency on rework and approve rejects stale generation/run/status without wiping out new generation (18855.6732ms)
+  ✔ Scenario 31: recovery CAS cannot clear a concurrently started generation (4989.0492ms)
+✔ Unified Execution Lifecycle (docs/UNIFIED_EXECUTION_LIFECYCLE_DESIGN.md) (175990.5238ms)
+✔ workspace identity resolves aliases and rejects invalid directories (66.8486ms)
+✔ physical file identity distinguishes projects and detects hard links (8.1051ms)
+[Agent Mesh Bridge] Saved workspace could not be restored: Error: WORKSPACE_PATH_INVALID: C:\Windows\Temp\mesh-window-state-kJowF1\project: Error: ENOENT: no such file or directory, realpath 'C:\Windows\Temp\mesh-window-state-kJowF1\project'
+    at physicalDirectory (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\workspace.js:154:15)
+    at new WindowWorkspace (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\bridge\workspace.js:65:17)
+    at TestContext.<anonymous> (E:\agent-space\thread_20261118_100841_0e3f\baseline_worktree\out\test\workspace.test.js:191:25)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async Test.run (node:internal/test_runner/test:1409:7)
+    at async Test.processPendingSubtests (node:internal/test_runner/test:974:7)
+✔ concurrent processes register the same workspace once (182.8398ms)
+✔ window adoption is local, requires successful dispatch, and never replaces a default (30.0447ms)
+✔ execution path must agree with the isolated worktree (0.5288ms)
+✔ workspace selection survives a new host while clear and first-dispatch choices persist (69.2183ms)
+✔ workspace state stays isolated and missing saved directories do not break startup (71.9602ms)
+✔ ledger refuses a missing or changed binding and filters before limiting (77.8158ms)
+✔ legacy aggregate and task files are not loaded or migrated (79.8192ms)
+✔ task detail shows separate escaped task, delivery and cleaned validation locations (10.5822ms)
+✔ legacy worktree detail labels the target checkout as unknown (0.6695ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_193017_3e0b (Round 1) on claude_code
+✔ dispatch creates a separate task branch from committed target state and ignores caller dirt (2750.5341ms)
+✔ explicit delivery branch is pinned and task worktrees pass it to child tasks (2471.2352ms)
+✔ ordinary linked checkouts group with their main workspace without changing the delivery branch (11399.4457ms)
+✔ detached source requires an explicit existing local delivery branch (2347.7964ms)
+[AsyncDispatcher] Starting background execution: thread_20261118_193038_0dd2 (Round 1) on claude_code
+✔ new dispatch creates its worktree while final integration validation holds the mesh lock (4080.327ms)
+✔ non-Git source paths fail instead of dispatching in a shared directory (96.5788ms)
+✔ local merge state, not MR metadata, controls preservation and deletion (1477.035ms)
+✔ an unconfigured bridge keeps the historical worktrees location (3.3915ms)
+✔ an absolute configured root is used verbatim (16.885ms)
+✔ a relative configured root resolves against the bridge home, not the cwd (13.0427ms)
+✔ clearing the setting restores the default root (25.1901ms)
+✔ saving the worktree root does not disturb the other mirrored policy switches (24.983ms)
+✔ a new task worktree is actually created under the configured root (1756.187ms)
+✔ omitting the root keeps creating worktrees under storage (1725.7859ms)
+ℹ tests 680
+ℹ suites 71
+ℹ pass 680
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 516763.3455

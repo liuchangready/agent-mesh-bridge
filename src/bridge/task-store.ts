@@ -32,6 +32,11 @@ import { MeshFileLock } from './mesh-file-lock';
 
 export const MAX_STORED_TASKS = 1000;
 
+export type ExecutionLockFactory = (lockPath: string) => {
+  acquire(onWait?: () => void, cancelled?: () => boolean, timeoutMs?: number): Promise<(() => void) | undefined>;
+  dispose(): void;
+};
+
 function canEvictForCapacity(task: DelegationThread): boolean {
   if (task.status === 'completed') {
     return !task.worktree || task.worktree.integration?.phase === 'merged' || task.worktree.integration?.phase === 'no_changes';
@@ -333,12 +338,14 @@ export class TaskStore extends EventEmitter {
   private isWatching: boolean = false;
   private watchDebounceTimer: NodeJS.Timeout | null = null;
   private lastDirMtimeMs: number = 0;
+  private readonly lockFactory?: ExecutionLockFactory;
 
-  constructor(customStorageDir?: string) {
+  constructor(customStorageDir?: string, options?: { lockFactory?: ExecutionLockFactory }) {
     super();
     this.storageDir = customStorageDir || path.join(os.homedir(), '.agent-mesh-bridge');
     this.storageFile = path.join(this.storageDir, 'delegation_threads.json');
     this.threadsDir = path.join(this.storageDir, THREADS_DIR_NAME);
+    this.lockFactory = options?.lockFactory;
     this.ensureStorageDir();
     this.loadFromDisk();
     this.startWatchFile();
@@ -600,7 +607,7 @@ export class TaskStore extends EventEmitter {
     const lockDir = path.join(this.storageDir, 'execution-locks');
     fs.mkdirSync(lockDir, { recursive: true });
     const lockFile = path.join(lockDir, `${threadId.replace(/[^A-Za-z0-9_-]/g, '_')}.lock`);
-    const lock = new MeshFileLock(lockFile);
+    const lock = this.lockFactory ? this.lockFactory(lockFile) : new MeshFileLock(lockFile);
     const release = await lock.acquire(undefined, undefined, 15_000);
     if (!release) {
       throw new Error(`Timed out acquiring task execution lock for ${threadId}: ${lockFile}`);
@@ -670,6 +677,9 @@ export class TaskStore extends EventEmitter {
       if (fs.existsSync(file)) onDisk = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
     } catch {}
     const inMemory = this.tasks.get(thread.threadId);
+    if (!inMemory && !onDisk && !this.canAcceptTask()) {
+      throw new Error('The task ledger is full and every stored task contains active, unmerged, or otherwise non-evictable work. Merge or explicitly delete retained tasks before dispatching another.');
+    }
     if (onDisk?.archivedAt && !thread.archivedAt) {
       this.tasks.set(thread.threadId, onDisk);
       return;

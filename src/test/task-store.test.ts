@@ -210,10 +210,90 @@ describe('TaskStore Tests', () => {
     assert.equal(persisted.worktree!.integration!.error, 'combined test failed');
   });
 
-  test('should enforce strict 1,000 tasks cap with LRU truncation', () => {
-    // Generate 1050 tasks
+  test('should enforce strict 1,000 tasks cap with LRU truncation preserving active and unmerged worktree tasks', () => {
+    // Pre-seed oldest active task + oldest unmerged worktree task + 993 completed tasks (total 995)
     const baseTime = Date.now();
-    for (let i = 0; i < 1050; i++) {
+    const threadsDir = path.join(tempDir, 'threads');
+    fs.mkdirSync(threadsDir, { recursive: true });
+
+    // 1. Oldest active task (timestamp -100s)
+    const oldestActiveTime = new Date(baseTime - 100_000).toISOString();
+    const oldestActiveTask: DelegationThread = {
+      threadId: 'thread_oldest_active',
+      title: 'Oldest Active Task',
+      initiatorAgent: 'antigravity',
+      targetAgent: 'codex',
+      status: 'running',
+      currentRound: 1,
+      createdAt: oldestActiveTime,
+      updatedAt: oldestActiveTime,
+      receiverSessionId: 'sess_oldest_active',
+      workspace: testWorkspace(tempDir),
+      summary: { lastPromptSnippet: 'oldest active', lastOutputSnippet: 'oldest active', totalDurationMs: 0 },
+      rounds: [],
+    };
+    fs.writeFileSync(path.join(threadsDir, 'thread_oldest_active.json'), JSON.stringify(oldestActiveTask, null, 2), 'utf8');
+
+    // 2. Oldest unmerged worktree task (timestamp -90s, completed but integration.phase = 'waiting')
+    const oldestUnmergedTime = new Date(baseTime - 90_000).toISOString();
+    const oldestUnmergedPath = path.join(tempDir, 'worktree_oldest');
+    const oldestUnmergedTask: DelegationThread = {
+      threadId: 'thread_oldest_unmerged',
+      title: 'Oldest Unmerged Task',
+      initiatorAgent: 'antigravity',
+      targetAgent: 'codex',
+      status: 'completed',
+      currentRound: 1,
+      createdAt: oldestUnmergedTime,
+      updatedAt: oldestUnmergedTime,
+      receiverSessionId: 'sess_oldest_unmerged',
+      workspace: testWorkspace(oldestUnmergedPath),
+      worktree: {
+        path: oldestUnmergedPath,
+        mainPath: tempDir,
+        repositoryPath: tempDir,
+        commonDir: tempDir,
+        targetRef: 'refs/heads/master',
+        taskBranch: 'mesh/task/thread_oldest_unmerged',
+        baseCommit: 'base_sha',
+        headCommit: 'head_sha',
+        integration: { phase: 'waiting', updatedAt: oldestUnmergedTime },
+      },
+      summary: { lastPromptSnippet: 'oldest unmerged', lastOutputSnippet: 'oldest unmerged', totalDurationMs: 0 },
+      rounds: [],
+    };
+    fs.writeFileSync(path.join(threadsDir, 'thread_oldest_unmerged.json'), JSON.stringify(oldestUnmergedTask, null, 2), 'utf8');
+
+    // 3. 993 completed tasks (thread_0 to thread_992, newer timestamps baseTime + i * 1000)
+    for (let i = 0; i < 993; i++) {
+      const timeIso = new Date(baseTime + i * 1000).toISOString();
+      const t: DelegationThread = {
+        threadId: `thread_${i}`,
+        title: `Task #${i}`,
+        initiatorAgent: 'antigravity',
+        targetAgent: 'codex',
+        status: 'completed',
+        currentRound: 1,
+        createdAt: timeIso,
+        updatedAt: timeIso,
+        receiverSessionId: `sess_${i}`,
+        workspace: testWorkspace(tempDir),
+        summary: {
+          lastPromptSnippet: `Prompt ${i}`,
+          lastOutputSnippet: `Output ${i}`,
+          totalDurationMs: 1000,
+        },
+        rounds: [],
+      };
+      fs.writeFileSync(path.join(threadsDir, `thread_${i}.json`), JSON.stringify(t, null, 2), 'utf8');
+    }
+
+    // Load pre-seeded tasks into store (total 2 + 993 = 995)
+    taskStore.loadFromDisk();
+    assert.strictEqual(taskStore.count(), 995);
+
+    // Upsert 55 tasks through real public upsertTask API (from 993 to 1047, total 995 + 55 = 1050)
+    for (let i = 993; i < 1048; i++) {
       const timeIso = new Date(baseTime + i * 1000).toISOString();
       const t: DelegationThread = {
         threadId: `thread_${i}`,
@@ -239,11 +319,138 @@ describe('TaskStore Tests', () => {
     assert.strictEqual(taskStore.count(), MAX_STORED_TASKS);
     assert.strictEqual(taskStore.count(), 1000);
 
-    // Oldest 50 (thread_0 to thread_49) should have been truncated
-    assert.strictEqual(taskStore.getTask('thread_0'), undefined);
-    assert.strictEqual(taskStore.getTask('thread_49'), undefined);
-    // Newest tasks should exist
-    assert.ok(taskStore.getTask('thread_1049'));
-    assert.ok(taskStore.getTask('thread_50'));
+    // Oldest active and unmerged worktree tasks MUST NEVER BE EVICTED despite being the oldest
+    assert.ok(taskStore.getTask('thread_oldest_active'), 'Oldest active task must be preserved');
+    assert.ok(taskStore.getTask('thread_oldest_unmerged'), 'Oldest unmerged worktree task must be preserved');
+
+    // 50 oldest evictable completed tasks (thread_0 to thread_49) should have been evicted
+    assert.strictEqual(taskStore.getTask('thread_0'), undefined, 'thread_0 should be evicted');
+    assert.strictEqual(taskStore.getTask('thread_49'), undefined, 'thread_49 should be evicted');
+
+    // Retained completed tasks
+    assert.ok(taskStore.getTask('thread_50'), 'thread_50 should be retained');
+    assert.ok(taskStore.getTask('thread_1047'), 'thread_1047 should be retained');
+
+    // Verify durable reload persistence with a fresh TaskStore instance
+    const reloaded = new TaskStore(tempDir);
+    assert.strictEqual(reloaded.count(), MAX_STORED_TASKS);
+    assert.ok(reloaded.getTask('thread_oldest_active'));
+    assert.ok(reloaded.getTask('thread_oldest_unmerged'));
+    assert.strictEqual(reloaded.getTask('thread_0'), undefined);
+    assert.strictEqual(reloaded.getTask('thread_49'), undefined);
+    assert.ok(reloaded.getTask('thread_50'));
+    assert.ok(reloaded.getTask('thread_1047'));
+    reloaded.dispose();
+  });
+
+  test('should reject new tasks and preserve ledger when 1,000 non-evictable tasks fill ledger', () => {
+    const fullDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-full-'));
+    try {
+      const threadsDir = path.join(fullDir, 'threads');
+      fs.mkdirSync(threadsDir, { recursive: true });
+      const baseTime = Date.now();
+
+      // Create 1,000 non-evictable tasks:
+      // - 500 active/running tasks
+      // - 500 completed tasks with unmerged worktrees (integration.phase = 'waiting')
+      for (let i = 0; i < 500; i++) {
+        const timeIso = new Date(baseTime + i * 1000).toISOString();
+        const activeTask: DelegationThread = {
+          threadId: `thread_active_${i}`,
+          title: `Active #${i}`,
+          initiatorAgent: 'antigravity',
+          targetAgent: 'codex',
+          status: 'running',
+          currentRound: 1,
+          createdAt: timeIso,
+          updatedAt: timeIso,
+          receiverSessionId: `sess_active_${i}`,
+          workspace: testWorkspace(fullDir),
+          summary: { lastPromptSnippet: 'active', lastOutputSnippet: 'active', totalDurationMs: 0 },
+          rounds: [],
+        };
+        fs.writeFileSync(path.join(threadsDir, `thread_active_${i}.json`), JSON.stringify(activeTask, null, 2), 'utf8');
+      }
+
+      for (let i = 500; i < 1000; i++) {
+        const timeIso = new Date(baseTime + i * 1000).toISOString();
+        const wtPath = path.join(fullDir, `worktree_${i}`);
+        const unmergedTask: DelegationThread = {
+          threadId: `thread_unmerged_${i}`,
+          title: `Unmerged #${i}`,
+          initiatorAgent: 'antigravity',
+          targetAgent: 'codex',
+          status: 'completed',
+          currentRound: 1,
+          createdAt: timeIso,
+          updatedAt: timeIso,
+          receiverSessionId: `sess_unmerged_${i}`,
+          workspace: testWorkspace(wtPath),
+          worktree: {
+            path: wtPath,
+            mainPath: fullDir,
+            repositoryPath: fullDir,
+            commonDir: fullDir,
+            targetRef: 'refs/heads/master',
+            taskBranch: `mesh/task/thread_unmerged_${i}`,
+            baseCommit: 'base_sha',
+            headCommit: 'head_sha',
+            integration: { phase: 'waiting', updatedAt: timeIso },
+          },
+          summary: { lastPromptSnippet: 'unmerged', lastOutputSnippet: 'unmerged', totalDurationMs: 0 },
+          rounds: [],
+        };
+        fs.writeFileSync(path.join(threadsDir, `thread_unmerged_${i}.json`), JSON.stringify(unmergedTask, null, 2), 'utf8');
+      }
+
+      const fullStore = new TaskStore(fullDir);
+      assert.strictEqual(fullStore.count(), 1000);
+      assert.strictEqual(fullStore.canAcceptTask(), false, 'canAcceptTask must return false when all 1,000 tasks are non-evictable');
+
+      // Attempting to upsert a new task must throw and refuse
+      const overflowTask: DelegationThread = {
+        threadId: 'thread_overflow',
+        title: 'Overflow Task',
+        initiatorAgent: 'antigravity',
+        targetAgent: 'codex',
+        status: 'completed',
+        currentRound: 1,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        receiverSessionId: 'sess_overflow',
+        workspace: testWorkspace(fullDir),
+        summary: { lastPromptSnippet: 'overflow', lastOutputSnippet: 'overflow', totalDurationMs: 0 },
+        rounds: [],
+      };
+
+      assert.throws(() => {
+        fullStore.upsertTask(overflowTask);
+      }, /ledger is full/i, 'upsertTask must throw when ledger is full of non-evictable tasks');
+
+      // Ledger must not be corrupted and must not exceed 1000
+      assert.strictEqual(fullStore.count(), 1000);
+      assert.strictEqual(fullStore.getTask('thread_overflow'), undefined);
+
+      // Updating an existing task must still succeed
+      const existing = fullStore.getTask('thread_active_0')!;
+      assert.ok(existing);
+      existing.summary.lastOutputSnippet = 'updated snippet';
+      fullStore.upsertTask(existing);
+      assert.strictEqual(fullStore.getTask('thread_active_0')?.summary.lastOutputSnippet, 'updated snippet');
+      assert.strictEqual(fullStore.count(), 1000);
+
+      // Fresh reload verifies disk integrity
+      const reloaded = new TaskStore(fullDir);
+      assert.strictEqual(reloaded.count(), 1000);
+      assert.strictEqual(reloaded.canAcceptTask(), false);
+      assert.strictEqual(reloaded.getTask('thread_overflow'), undefined);
+      assert.strictEqual(reloaded.getTask('thread_active_0')?.summary.lastOutputSnippet, 'updated snippet');
+      reloaded.dispose();
+      fullStore.dispose();
+    } finally {
+      try {
+        fs.rmSync(fullDir, { recursive: true, force: true });
+      } catch {}
+    }
   });
 });

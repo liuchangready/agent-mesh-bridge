@@ -15,6 +15,7 @@ import { removeTaskWorktree } from './git-worktree';
 import { changedFiles, currentHead } from './git-worktree';
 import { gitOutput } from './git-worktree';
 import { MeshFileLock } from './merge-coordinator';
+import { meshMergeLockPath } from './mesh-file-lock';
 import { TaskRoleLock } from './task-role-lock';
 import { ExecutionController } from './execution-controller';
 import { killPidTree } from './platform';
@@ -73,7 +74,7 @@ export class TaskControlService {
     this.cancellationRegistry = cancellationRegistry || new CancellationRegistry(this.storageDir);
     this.executionRegistry = new TaskExecutionRegistry(this.storageDir);
     this.sessionCleanup = sessionCleanup || ((thread) => cleanupThreadNativeSessions(thread));
-    this.mergeLock = mergeLock || new MeshFileLock();
+    this.mergeLock = mergeLock || new MeshFileLock(meshMergeLockPath(this.storageDir));
   }
 
   /**

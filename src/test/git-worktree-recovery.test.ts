@@ -6,6 +6,7 @@ import * as path from 'path';
 import { createRequire } from 'module';
 import { resolveGitRepository, createTaskWorktree, commitTaskChanges, gitOutput, removeTaskWorktree } from '../bridge/git-worktree';
 import { MergeCoordinator, MeshFileLock } from '../bridge/merge-coordinator';
+import { meshMergeLockPath } from '../bridge/mesh-file-lock';
 import { TaskStore } from '../bridge/task-store';
 import { DelegationThread } from '../bridge/types';
 import { AgentDetector } from '../bridge/agent-detector';
@@ -53,7 +54,7 @@ test('host recovery requeues an interrupted merge until the global lock is avail
   worktree.headCommit = commitTaskChanges(worktree, 'approved');
   const store = new TaskStore(storage); const interrupted = thread('thread_restart_wait', worktree);
   interrupted.status = 'merging'; interrupted.queuePhase = undefined; store.upsertTask(interrupted);
-  const release = await new MeshFileLock().acquire(); assert.ok(release);
+  const release = await new MeshFileLock(meshMergeLockPath(storage)).acquire(); assert.ok(release);
   const detector = new AgentDetector(); const controller = new ReworkController(store, new AutonomousRunner(detector), new CallbackManager(detector, storage), detector, undefined, true);
   t.after(() => { release(); controller.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   assert.equal(store.getTask(interrupted.threadId)?.status, 'queued');

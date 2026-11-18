@@ -59,8 +59,14 @@ describe('MCPServer Protocol Tests', () => {
   let dispatcher: AsyncDispatcher;
   let reworkController: ReworkController;
   let mcpServer: MCPServer;
+  let savedReceiverEnv: string | undefined;
+  let savedThreadIdEnv: string | undefined;
 
   beforeEach(() => {
+    savedReceiverEnv = process.env.MESH_TASK_RECEIVER;
+    savedThreadIdEnv = process.env.MESH_TASK_THREAD_ID;
+    delete process.env.MESH_TASK_RECEIVER;
+    delete process.env.MESH_TASK_THREAD_ID;
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-mcp-test-'));
     const workspace = path.join(tempDir, 'repo');
     fs.mkdirSync(workspace, { recursive: true });
@@ -103,6 +109,16 @@ describe('MCPServer Protocol Tests', () => {
   };
 
   afterEach(() => {
+    if (savedReceiverEnv !== undefined) {
+      process.env.MESH_TASK_RECEIVER = savedReceiverEnv;
+    } else {
+      delete process.env.MESH_TASK_RECEIVER;
+    }
+    if (savedThreadIdEnv !== undefined) {
+      process.env.MESH_TASK_THREAD_ID = savedThreadIdEnv;
+    } else {
+      delete process.env.MESH_TASK_THREAD_ID;
+    }
     process.chdir(originalCwd);
     taskStore.dispose();
     try {

@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
-import { resolveGitRepository, createTaskWorktree, commitTaskChanges } from '../bridge/git-worktree';
+import { resolveGitRepository, createTaskWorktree, commitTaskChanges, removeTaskWorktree } from '../bridge/git-worktree';
 import { MergeCoordinator, MeshFileLock } from '../bridge/merge-coordinator';
 import { TaskStore } from '../bridge/task-store';
 import { git, initRepo, initMultiStashRepo, thread } from './git-worktree-fixture';
@@ -13,15 +13,17 @@ export function testMultiStashRecovery(phase: string, addConcurrent: boolean): v
   test(`multi-stash cleanup recovers ${phase}, concurrent=${addConcurrent}`, async (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-multi-crash-'));
     const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); const { old, extra } = initMultiStashRepo(repository);
-    const id = 'thread_stash_multi_crash'; const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, id, storage);
+    const safePhase = phase.replace(/[^A-Za-z0-9_-]/g, '_');
+    const id = `thread_stash_multi_${safePhase}_${addConcurrent ? 'conc' : 'solo'}`;
+    const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, id, storage);
     fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task\nmiddle\nbeta\n'); worktree.headCommit = commitTaskChanges(worktree, 'task');
     fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
     const store = new TaskStore(storage); store.upsertTask(thread(id, worktree));
-    t.after(() => { store.dispose(); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
+    t.after(() => { store.dispose(); removeTaskWorktree(worktree); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
     const script = `const {TaskStore}=require(process.argv[1]),{MergeCoordinator,MeshFileLock}=require(process.argv[2]);
       const s=new TaskStore(process.argv[3]), c=new MergeCoordinator(s,process.argv[3],new MeshFileLock(process.argv[4]));
       const write=c.writeTransaction.bind(c);c.writeTransaction=(file,tx)=>{const p=process.argv[5];if(p.startsWith('before_')&&tx.phase===p.slice(7))process.exit(71);write(file,tx);if(p.startsWith('hard_')&&tx.phase===p.slice(5))process.kill(process.pid,'SIGKILL');if(tx.phase===p)process.exit(71)};
-      c.mergeApproved('thread_stash_multi_crash').catch(e=>{console.error(e);process.exit(2)});`;
+      c.mergeApproved('${id}').catch(e=>{console.error(e);process.exit(2)});`;
     const child = spawnSync(process.execPath, ['-e', script, require.resolve('../bridge/task-store'), require.resolve('../bridge/merge-coordinator'), storage, path.join(root, 'merge.lock'), phase], { encoding: 'utf8', timeout: 60000, windowsHide: true });
     if (phase.startsWith('hard_')) assert.notEqual(child.status, 0, child.stderr); else assert.equal(child.status, 71, child.stderr);
     const landed = git(repository, 'rev-parse', target.targetRef);
@@ -46,7 +48,9 @@ export function testStashCrashRecovery(crashPhase: string): void {
   test(`a process crash after ${crashPhase} recovers local files and landing`, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-ref-crash-stash-'));
   const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
-  const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, 'thread_ref_crash_stash', storage);
+  const safePhase = crashPhase.replace(/[^A-Za-z0-9_-]/g, '_');
+  const id = `thread_ref_crash_${safePhase}`;
+  const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, id, storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task\nmiddle\nbeta\n'); worktree.headCommit = commitTaskChanges(worktree, 'task');
   let concurrentStash = '';
   if (crashPhase === 'before_stash_restored_concurrent') {
@@ -54,31 +58,31 @@ export function testStashCrashRecovery(crashPhase: string): void {
     concurrentStash = git(repository, 'rev-parse', 'refs/stash'); git(repository, 'stash', 'drop');
   }
   fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
-  const store = new TaskStore(storage); store.upsertTask(thread('thread_ref_crash_stash', worktree));
-  t.after(() => { store.dispose(); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
+  const store = new TaskStore(storage); store.upsertTask(thread(id, worktree));
+  t.after(() => { store.dispose(); removeTaskWorktree(worktree); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
   const script = `const {TaskStore}=require(process.argv[1]),{MergeCoordinator,MeshFileLock}=require(process.argv[2]);
     const s=new TaskStore(process.argv[3]), c=new MergeCoordinator(s,process.argv[3],new MeshFileLock(process.argv[4]));
     if(process.argv[5]==='after_reflog_deleted')c.removeSoleLandingStash=async(id,cwd)=>{require('fs').unlinkSync(require('path').join(cwd,'.git','logs','refs','stash'));process.exit(71)};
     const write=c.writeTransaction.bind(c);c.writeTransaction=(file,tx)=>{if((process.argv[5].startsWith('before_stash_restored')&&tx.phase==='stash_restored')||(process.argv[5]==='before_stash_applied'&&tx.phase==='stash_applied'))process.exit(71);write(file,tx);if(tx.phase===process.argv[5])process.exit(71)};
-    c.mergeApproved('thread_ref_crash_stash').catch(e=>{console.error(e);process.exit(2)});`;
+    c.mergeApproved('${id}').catch(e=>{console.error(e);process.exit(2)});`;
   const child = spawnSync(process.execPath, ['-e', script, require.resolve('../bridge/task-store'), require.resolve('../bridge/merge-coordinator'), storage, path.join(root, 'merge.lock'), crashPhase], { encoding: 'utf8', timeout: 60000, windowsHide: true });
   assert.equal(child.status, 71, child.stderr);
   const landed = git(repository, 'rev-parse', target.targetRef);
   if (concurrentStash) git(repository, 'stash', 'store', '-m', 'concurrent', concurrentStash);
   const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));
-  const result = await coordinator.mergeApproved('thread_ref_crash_stash');
+  const result = await coordinator.mergeApproved(id);
   assert.equal(result.status, 'merged', result.message);
   if (crashPhase !== 'stash_created') assert.equal(git(repository, 'rev-parse', target.targetRef), landed);
   else assert.notEqual(git(repository, 'rev-parse', target.targetRef), landed);
   assert.equal(fs.readFileSync(path.join(repository, 'mine.txt'), 'utf8'), 'mine');
   if (crashPhase === 'before_stash_applied') {
-    assert.equal(store.getTask('thread_ref_crash_stash')!.worktree!.integration!.stashRestore!.status, 'stash_restore_conflict');
-    assert.match(git(repository, 'stash', 'list'), /mesh-landing-thread_ref_crash_stash/);
+    assert.equal(store.getTask(id)!.worktree!.integration!.stashRestore!.status, 'stash_restore_conflict');
+    assert.match(git(repository, 'stash', 'list'), new RegExp(`mesh-landing-${id}`));
   } else if (concurrentStash) {
-    assert.equal(store.getTask('thread_ref_crash_stash')!.worktree!.integration!.stashRestore!.status, 'stash_cleanup_uncertain');
+    assert.equal(store.getTask(id)!.worktree!.integration!.stashRestore!.status, 'stash_cleanup_uncertain');
     assert.equal(git(repository, 'rev-parse', 'refs/stash'), concurrentStash);
   } else {
-    assert.equal(store.getTask('thread_ref_crash_stash')!.worktree!.integration!.stashRestore!.status, 'stash_restored');
+    assert.equal(store.getTask(id)!.worktree!.integration!.stashRestore!.status, 'stash_restored');
     assert.equal(git(repository, 'stash', 'list'), '');
     assert.equal(git(repository, 'for-each-ref', '--format=%(objectname)', 'refs/stash'), '');
   }

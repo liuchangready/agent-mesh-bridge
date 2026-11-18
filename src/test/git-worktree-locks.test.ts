@@ -18,6 +18,42 @@ import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { ReworkController } from '../bridge/rework-controller';
 import { gitExe, git, initRepo, thread, waitFor, waitForExit, waitForProcessExit } from './git-worktree-fixture';
 
+test('unpublished child command files survive helper scans without losing child protection', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-lock-unpublished-'));
+  const lockPath = path.join(root, 'merge.lock');
+  const lock = new MeshFileLock(lockPath);
+  const contender = new MeshFileLock(lockPath);
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
+  let helperPid: number | undefined;
+  t.after(async () => {
+    child.kill('SIGKILL');
+    await waitForExit(child);
+    lock.dispose(); contender.dispose();
+    if (helperPid) await waitForProcessExit(helperPid);
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  const release = await lock.acquire();
+  assert.ok(release);
+  const lease = (lock as any).activeLease;
+  helperPid = lease.helperPid ?? lease.helper.pid;
+  const childTemp = `${lease.channelPath}.command.child.${child.pid}.unpublished.tmp`;
+  const exitTemp = `${lease.channelPath}.command.exit.${child.pid}.unpublished.tmp`;
+  fs.writeFileSync(childTemp, 'CHILD');
+  fs.writeFileSync(exitTemp, 'EXIT');
+  await lock.attachChildPid(child.pid);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.ok(fs.existsSync(childTemp), 'a writer must retain its temporary file until atomic publication');
+  assert.ok(fs.existsSync(exitTemp), 'an unpublished exit command must be ignored');
+  release();
+  const early = await contender.acquire(undefined, undefined, 300);
+  assert.equal(early, undefined, 'the live registered child must still protect the lock');
+  child.kill('SIGKILL');
+  await waitForExit(child);
+  const afterExit = await contender.acquire(undefined, undefined, 5000);
+  assert.ok(afterExit, 'the lock becomes available after the registered child exits');
+  afterExit();
+});
+
 test('POSIX helper command passes its channel path and acknowledges child registration', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-perl-lock-smoke-'));
   const lockPath = path.join(root, 'merge.lock');

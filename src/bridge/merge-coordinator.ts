@@ -17,7 +17,7 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const CHILD_ACK_TIMEOUT_MS = 10_000;
 
 export { buildPosixLockHelperCommand, MeshFileLock } from './mesh-file-lock';
-import { MeshFileLock } from './mesh-file-lock';
+import { MeshFileLock, meshMergeLockPath } from './mesh-file-lock';
 
 export interface MergeResult { status: 'merged' | 'no_changes' | 'conflict' | 'validation_failed' | 'stale' | 'blocked'; message: string; commit?: string; }
 
@@ -113,15 +113,17 @@ export function validationNodeDirs(): string[] {
 
 export class MergeCoordinator {
   private readonly executions: TaskExecutionRegistry;
+  private readonly lock: MeshFileLock;
   private readonly attemptLogs = new Map<string, { id: string; number: number; path: string; candidateTree?: string }>();
   private activeChildPidCallback?: (pid: number) => void;
 
   constructor(
     private readonly store: TaskStore,
     private readonly storageDir: string,
-    private readonly lock = new MeshFileLock(),
+    lock?: MeshFileLock,
     private readonly requestReview?: (thread: DelegationThread) => void,
   ) {
+    this.lock = lock || new MeshFileLock(meshMergeLockPath(storageDir));
     this.executions = new TaskExecutionRegistry(storageDir);
   }
 

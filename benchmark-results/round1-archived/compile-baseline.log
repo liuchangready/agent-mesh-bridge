@@ -1,0 +1,4 @@
+
+> agent-mesh-bridge@1.2.23 compile
+> tsc -p ./
+
