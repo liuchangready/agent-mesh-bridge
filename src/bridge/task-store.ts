@@ -1,11 +1,16 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as zlib from 'zlib';
 import { EventEmitter } from 'events';
 import {
   DelegationThread,
   DelegationRound,
   ThreadStatus,
+  RoundStatus,
+  ResponseAssessment,
+  ProcessIdentity,
+  TaskCleanupState,
   TaskInterruption,
   MergeRequestInfo,
   TokenUsageMetrics,
@@ -18,6 +23,7 @@ import {
 } from './types';
 import {
   archiveCompletedTaskLogs,
+  collectExpectedArchiveLogFiles,
   archiveThreadData,
   buildFinalSummary,
   ensureFinalSummary,
@@ -29,6 +35,17 @@ import { cleanupThreadNativeSessions, collectThreadSessionRefs } from './native-
 import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
 import { removeTaskDataDir } from './task-data-dir';
 import { MeshFileLock } from './mesh-file-lock';
+import {
+  validateV2ExecutionEligibility,
+  ExecutionEligibilityResult,
+  ExecutionEligibilityCode,
+} from './execution-gate';
+
+export {
+  validateV2ExecutionEligibility,
+  ExecutionEligibilityResult,
+  ExecutionEligibilityCode,
+};
 
 export const MAX_STORED_TASKS = 1000;
 
@@ -322,6 +339,116 @@ function preferBinding(current: DelegationThread, prior: DelegationThread): void
   }
 }
 
+function parseTarEntries(tarBuf: Buffer): Map<string, Buffer> {
+  const entries = new Map<string, Buffer>();
+  let offset = 0;
+  while (offset + 512 <= tarBuf.length) {
+    const header = tarBuf.subarray(offset, offset + 512);
+    let allZeros = true;
+    for (let i = 0; i < 512; i++) {
+      if (header[i] !== 0) {
+        allZeros = false;
+        break;
+      }
+    }
+    if (allZeros) break;
+
+    const nullIdx = header.indexOf(0);
+    const rawName = header.subarray(0, nullIdx >= 0 && nullIdx < 100 ? nullIdx : 100).toString('utf8').trim();
+    if (!rawName) break;
+
+    const sizeStr = header.subarray(124, 136).toString('ascii').replace(/\0/g, ' ').trim();
+    const size = parseInt(sizeStr, 8);
+    if (isNaN(size) || size < 0) break;
+
+    offset += 512;
+    if (offset + size > tarBuf.length) break;
+    const content = tarBuf.subarray(offset, offset + size);
+    entries.set(rawName, content);
+    offset += Math.ceil(size / 512) * 512;
+  }
+  return entries;
+}
+
+function validateDurableArchiveFiles(
+  paths: string[] | undefined,
+  thread: DelegationThread,
+  root?: string,
+): boolean {
+  if (!paths || !Array.isArray(paths) || paths.length === 0) return false;
+  const expectedFiles = collectExpectedArchiveLogFiles(thread, root);
+
+  for (const p of paths) {
+    if (!p || typeof p !== 'string') return false;
+    if (!fs.existsSync(p)) return false;
+    try {
+      const stat = fs.statSync(p);
+      if (!stat.isFile() || stat.size === 0) return false;
+      const lower = p.toLowerCase();
+      if (!lower.endsWith('.tar.gz') && !lower.endsWith('.tgz')) return false;
+
+      const rawBuf = fs.readFileSync(p);
+      if (rawBuf.length < 10) return false;
+      if (rawBuf[0] !== 0x1f || rawBuf[1] !== 0x8b) return false;
+
+      const unzipped = zlib.gunzipSync(rawBuf);
+      if (!unzipped || unzipped.length < 512) return false;
+
+      const entries = parseTarEntries(unzipped);
+      const summaryBuf = entries.get('summary.json');
+      if (!summaryBuf) return false;
+
+      const summary = JSON.parse(summaryBuf.toString('utf8'));
+      if (!summary || typeof summary !== 'object') return false;
+      if (summary.threadId !== thread.threadId) return false;
+      if (summary.status !== thread.status) return false;
+      if (thread.artifactDir && summary.artifactDir && summary.artifactDir !== thread.artifactDir) return false;
+      if (!Array.isArray(summary.archivedLogFiles)) return false;
+
+      // Every file listed in summary.archivedLogFiles must exist in tar entries
+      for (const logFile of summary.archivedLogFiles) {
+        if (!entries.has(logFile)) return false;
+      }
+
+      // Every expected log file on disk must exist in tar entries and in summary.archivedLogFiles,
+      // and its contents must match current on-disk bytes exactly
+      for (const [entryName, expectedInfo] of expectedFiles) {
+        const entryBuf = entries.get(entryName);
+        if (!entryBuf) return false;
+        if (entryBuf.length !== expectedInfo.size) return false;
+        if (!summary.archivedLogFiles.includes(entryName)) return false;
+        try {
+          const currentDiskBytes = fs.readFileSync(expectedInfo.fullPath);
+          if (!entryBuf.equals(currentDiskBytes)) return false;
+        } catch {
+          return false;
+        }
+      }
+
+      // If accompanying .json file exists next to .tar.gz (standard archive format from archiveCompletedTaskLogs),
+      // verify that its manifest also matches
+      const companionJson = p.replace(/\.tar\.gz$/i, '.json').replace(/\.tgz$/i, '.json');
+      if (companionJson !== p && fs.existsSync(companionJson)) {
+        try {
+          const companionStat = fs.statSync(companionJson);
+          if (companionStat.isFile() && companionStat.size > 0) {
+            const companionManifest = JSON.parse(fs.readFileSync(companionJson, 'utf8'));
+            if (
+              companionManifest.threadId !== thread.threadId ||
+              companionManifest.status !== thread.status
+            ) {
+              return false;
+            }
+          }
+        } catch {}
+      }
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** Directory holding one JSON file per thread (the authoritative ledger). */
 export const THREADS_DIR_NAME = 'threads';
 
@@ -339,6 +466,8 @@ export class TaskStore extends EventEmitter {
   private watchDebounceTimer: NodeJS.Timeout | null = null;
   private lastDirMtimeMs: number = 0;
   private readonly lockFactory?: ExecutionLockFactory;
+  private readonly taskExecutionQueues = new Map<string, Promise<any>>();
+  private readonly activeLocks = new Set<any>();
 
   constructor(customStorageDir?: string, options?: { lockFactory?: ExecutionLockFactory }) {
     super();
@@ -420,7 +549,11 @@ export class TaskStore extends EventEmitter {
       if (!force && this.knownMtimes.get(name) === mtime) continue;
       try {
         const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-        if (parsed && parsed.threadId && parsed.workspace?.id && parsed.workspace?.executionPath &&
+        if (parsed && parsed.threadId && this.isTaskTombstoned(parsed.threadId)) {
+          this.tasks.delete(parsed.threadId);
+          this.knownMtimes.set(name, mtime);
+          try { fs.unlinkSync(file); } catch {}
+        } else if (parsed && parsed.threadId && parsed.workspace?.id && parsed.workspace?.executionPath &&
             (!parsed.worktree || parsed.worktree.path === parsed.workspace.executionPath)) {
           this.tasks.set(parsed.threadId, normalizeThread(parsed as DelegationThread));
           this.knownMtimes.set(name, mtime);
@@ -537,8 +670,25 @@ export class TaskStore extends EventEmitter {
    * Save all tasks to disk atomically with hard 1,000 tasks truncation.
    */
   public saveToDisk(): void {
+    this.ensureUpToDate();
     this.ensureThreadsDir();
     for (const thread of this.tasks.values()) {
+      if (thread.execution?.version === 2 || thread.cleanup) {
+        // v2 task state is authoritative on disk under the per-task execution lock.
+        // Active cleanups (v1 or v2) must not be overwritten by legacy saveToDisk.
+        continue;
+      }
+      const file = this.threadFilePath(thread.threadId);
+      if (fs.existsSync(file)) {
+        try {
+          const onDisk = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+          if (onDisk.execution?.version === 2 || onDisk.cleanup) {
+            continue;
+          }
+        } catch (err) {
+          throw new Error(`Corrupted task file on disk for ${thread.threadId}: ${(err as Error)?.message || err}`);
+        }
+      }
       this.persistThread(thread);
     }
     this.enforceCapacity();
@@ -584,6 +734,12 @@ export class TaskStore extends EventEmitter {
       clearTimeout(this.watchDebounceTimer);
       this.watchDebounceTimer = null;
     }
+    for (const lock of this.activeLocks) {
+      try {
+        lock.dispose();
+      } catch {}
+    }
+    this.activeLocks.clear();
   }
 
   /**
@@ -591,7 +747,80 @@ export class TaskStore extends EventEmitter {
    */
   public getTask(threadId: string): DelegationThread | undefined {
     this.ensureUpToDate();
-    return this.tasks.get(threadId);
+    if (this.isTaskTombstoned(threadId)) {
+      return undefined;
+    }
+    const task = this.tasks.get(threadId);
+    return task ? structuredClone(task) : undefined;
+  }
+
+  private taskLockFilePath(threadId: string): string {
+    const lockDir = path.join(this.storageDir, 'execution-locks');
+    fs.mkdirSync(lockDir, { recursive: true });
+    return path.join(lockDir, `${threadId.replace(/[^A-Za-z0-9_-]/g, '_')}.lock`);
+  }
+
+  /**
+   * Sole gateway for acquiring the per-task execution OS lock.
+   * Reuses MeshFileLock (or test lockFactory) across processes and uses
+   * an in-process queue to strictly serialize concurrent transitions within the same process.
+   */
+  private async withExecutionLock<T>(threadId: string, fn: () => T | Promise<T>): Promise<T> {
+    const prev = this.taskExecutionQueues.get(threadId) || Promise.resolve();
+    let releaseQueue: () => void;
+    const next = new Promise<void>((resolve) => { releaseQueue = resolve; });
+    this.taskExecutionQueues.set(threadId, next);
+
+    await prev;
+    try {
+      const lockFile = this.taskLockFilePath(threadId);
+      const lock = this.lockFactory ? this.lockFactory(lockFile) : new MeshFileLock(lockFile);
+      this.activeLocks.add(lock);
+      const release = await lock.acquire(undefined, undefined, 15_000);
+      if (!release) {
+        this.activeLocks.delete(lock);
+        throw new Error(`Timed out acquiring task execution lock for ${threadId}: ${lockFile}`);
+      }
+      try {
+        return await fn();
+      } finally {
+        this.activeLocks.delete(lock);
+        release();
+        lock.dispose();
+      }
+    } finally {
+      releaseQueue!();
+      if (this.taskExecutionQueues.get(threadId) === next) {
+        this.taskExecutionQueues.delete(threadId);
+      }
+    }
+  }
+
+  /**
+   * Merge authoritative round evidence from disk to prevent clobbering concurrent child reports.
+   */
+  private mergeAuthoritativeRounds(target: DelegationThread, diskRounds?: DelegationRound[]): void {
+    if (!diskRounds || !diskRounds.length) return;
+    const diskMap = new Map<number, DelegationRound>();
+    for (const r of diskRounds) diskMap.set(r.round, r);
+    for (const r of target.rounds) {
+      const diskRound = diskMap.get(r.round);
+      if (diskRound) {
+        if (diskRound.output !== undefined) r.output = diskRound.output;
+        if (diskRound.error !== undefined) r.error = diskRound.error;
+        if (diskRound.durationMs && !r.durationMs) r.durationMs = diskRound.durationMs;
+        if (diskRound.assessment && !r.assessment) r.assessment = diskRound.assessment;
+        if (diskRound.touchedFiles?.length && !r.touchedFiles?.length) r.touchedFiles = diskRound.touchedFiles;
+        r.tokenUsage = preferTokenUsage(r.tokenUsage, diskRound.tokenUsage, `v2-merge-round-${r.round}`);
+        if (diskRound.executorAgent && !r.executorAgent) r.executorAgent = diskRound.executorAgent;
+        if (diskRound.executorModel && !r.executorModel) r.executorModel = diskRound.executorModel;
+        if (diskRound.nativeSessionCompactions && !r.nativeSessionCompactions) r.nativeSessionCompactions = diskRound.nativeSessionCompactions;
+        if (diskRound.rawOutputFilePath && !r.rawOutputFilePath) r.rawOutputFilePath = diskRound.rawOutputFilePath;
+        if (diskRound.isCompacted !== undefined && r.isCompacted === undefined) r.isCompacted = diskRound.isCompacted;
+        if (diskRound.compactSummary && !r.compactSummary) r.compactSummary = diskRound.compactSummary;
+        if (diskRound.outputBytes && !r.outputBytes) r.outputBytes = diskRound.outputBytes;
+      }
+    }
   }
 
   /**
@@ -604,15 +833,7 @@ export class TaskStore extends EventEmitter {
     expectedRevision: number,
     change: (thread: DelegationThread) => void,
   ): Promise<DelegationThread> {
-    const lockDir = path.join(this.storageDir, 'execution-locks');
-    fs.mkdirSync(lockDir, { recursive: true });
-    const lockFile = path.join(lockDir, `${threadId.replace(/[^A-Za-z0-9_-]/g, '_')}.lock`);
-    const lock = this.lockFactory ? this.lockFactory(lockFile) : new MeshFileLock(lockFile);
-    const release = await lock.acquire(undefined, undefined, 15_000);
-    if (!release) {
-      throw new Error(`Timed out acquiring task execution lock for ${threadId}: ${lockFile}`);
-    }
-    try {
+    return this.withExecutionLock(threadId, async () => {
       this.ensureUpToDate();
       let thread = this.tasks.get(threadId);
       const file = this.threadFilePath(threadId);
@@ -626,6 +847,11 @@ export class TaskStore extends EventEmitter {
       if (!thread) {
         throw new Error(`Task thread not found: ${threadId}`);
       }
+      if (thread.cleanup && thread.cleanup.stage === 'in_progress') {
+        throw new Error(
+          `Cannot transition execution for ${threadId}: task is reserved for cleanup (${thread.cleanup.action}) by token ${thread.cleanup.token}`,
+        );
+      }
       const currentRev = thread.execution?.revision ?? 0;
       if (currentRev !== expectedRevision) {
         throw new Error(
@@ -637,15 +863,315 @@ export class TaskStore extends EventEmitter {
         thread.execution.revision = currentRev + 1;
       }
       thread.updatedAt = new Date().toISOString();
+
       ensureFinalSummary(thread);
       this.persistThread(thread);
       this.tasks.set(thread.threadId, thread);
       this.writeAggregate();
       this.emit('changed', Array.from(this.tasks.values()));
       return thread;
+    });
+  }
+
+  /**
+   * Acquire a cleanup reservation for a task under the task's short OS lock.
+   * Sets thread.cleanup with the operation identity and returns the reservation token.
+   * Blocks concurrent recovery, retry, or resume.
+   * Safe for both v2 and legacy tasks; does NOT create or upgrade execution.version.
+   */
+  public async markTaskCleanup(
+    threadId: string,
+    action: 'archive' | 'delete',
+    owner: ProcessIdentity,
+    options?: {
+      token?: string;
+      force?: boolean;
+    },
+  ): Promise<{ token: string; thread: DelegationThread }> {
+    return this.withExecutionLock(threadId, async () => {
+      this.ensureUpToDate();
+      let thread = this.tasks.get(threadId);
+      const file = this.threadFilePath(threadId);
+      if (fs.existsSync(file)) {
+        try {
+          thread = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+        } catch (err) {
+          throw new Error(`Corrupted task file on disk for ${threadId}: ${(err as Error)?.message || err}`);
+        }
+      }
+      if (!thread) {
+        throw new Error(`Task thread not found: ${threadId}`);
+      }
+      if (this.isTaskTombstoned(threadId)) {
+        throw new Error(`Task ${threadId} has already been deleted and cannot be cleaned up`);
+      }
+      if (thread.cleanup && thread.cleanup.token !== options?.token) {
+        throw new Error(
+          `Task ${threadId} is already reserved for cleanup (${thread.cleanup.action}) by token ${thread.cleanup.token}`,
+        );
+      }
+      if (action === 'archive' && !canArchiveTask(thread)) {
+        throw new Error(`Task ${threadId} cannot be archived in its current status: ${thread.status}`);
+      }
+      const token = options?.token || `clean_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      thread.cleanup = {
+        token,
+        action,
+        owner,
+        startedAt: new Date().toISOString(),
+        stage: 'in_progress',
+        operationId: thread.execution?.operationId,
+        generation: thread.execution?.generation,
+        runId: thread.execution?.run?.id,
+      };
+      if (thread.execution) {
+        thread.execution.revision += 1;
+      }
+      thread.updatedAt = new Date().toISOString();
+      this.persistThread(thread);
+      this.tasks.set(thread.threadId, thread);
+      this.writeAggregate();
+      this.emit('changed', Array.from(this.tasks.values()));
+      return { token, thread };
+    });
+  }
+
+  /**
+   * Finalize a cleanup operation under the task's short OS lock.
+   * Verifies the cleanup token matches the reservation on disk.
+   * If action is 'archive', commits the archived thread state and clears the cleanup reservation.
+   * If action is 'delete', writes the tombstone and permanently unlinks the thread file.
+   * Stale or mismatched cleaners are rejected.
+   */
+  public async commitTaskCleanup(
+    threadId: string,
+    token: string,
+    action: 'archive' | 'delete',
+    options?: {
+      archiveMutation?: (thread: DelegationThread) => void;
+      tarGzPaths?: string[];
+      tombstone?: {
+        reason?: string;
+        by?: string;
+        forced?: boolean;
+        nativeSessions?: any;
+      };
+    },
+  ): Promise<boolean> {
+    this.ensureUpToDate();
+    let thread = this.tasks.get(threadId);
+    const file = this.threadFilePath(threadId);
+    if (fs.existsSync(file)) {
+      try {
+        thread = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+      } catch (err) {
+        throw new Error(`Corrupted task file on disk for ${threadId}: ${(err as Error)?.message || err}`);
+      }
+    }
+    if (!thread) {
+      if (action === 'delete') return true;
+      throw new Error(`Task thread not found: ${threadId}`);
+    }
+    if (thread.cleanup?.token !== token) {
+      throw new Error(
+        `Cannot commit cleanup for ${threadId}: cleanup token mismatch (expected ${token}, found ${thread.cleanup?.token ?? 'none'})`,
+      );
+    }
+    if (thread.cleanup?.action !== action) {
+      throw new Error(
+        `Cannot commit cleanup for ${threadId}: cleanup action mismatch (reserved for ${thread.cleanup?.action}, but committing ${action})`,
+      );
+    }
+
+    if (action === 'archive') {
+      // Validate complete durable archive files OUTSIDE the short execution lock
+      if (!validateDurableArchiveFiles(options?.tarGzPaths, thread, this.storageDir)) {
+        console.warn(
+          `[TaskStore] Cannot commit archive for ${threadId}: archive preparation missing or invalid archive files on disk`,
+        );
+        return false;
+      }
+
+      const snapshotRevision = thread.execution?.revision;
+      const snapshotOperationId = thread.execution?.operationId;
+      const snapshotUpdatedAt = thread.updatedAt;
+
+      return this.withExecutionLock(threadId, async () => {
+        this.ensureUpToDate();
+        let current = this.tasks.get(threadId);
+        if (fs.existsSync(file)) {
+          try {
+            current = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+          } catch (err) {
+            throw new Error(`Corrupted task file on disk for ${threadId}: ${(err as Error)?.message || err}`);
+          }
+        }
+        if (!current) {
+          throw new Error(`Task thread not found: ${threadId}`);
+        }
+        if (current.cleanup?.token !== token || current.cleanup?.action !== action) {
+          console.warn(`[TaskStore] Cannot commit archive for ${threadId}: cleanup token/action mismatch under lock`);
+          return false;
+        }
+        if (
+          current.execution &&
+          (current.execution.revision !== snapshotRevision ||
+            current.execution.operationId !== snapshotOperationId)
+        ) {
+          console.warn(`[TaskStore] Cannot commit archive for ${threadId}: execution revision/operation changed concurrently`);
+          return false;
+        }
+        if (current.updatedAt !== snapshotUpdatedAt) {
+          console.warn(`[TaskStore] Cannot commit archive for ${threadId}: task modified concurrently`);
+          return false;
+        }
+
+        const priorExecution = current.execution ? structuredClone(current.execution) : undefined;
+        const priorStatus = current.status;
+        const priorDecision = current.decision ? structuredClone(current.decision) : undefined;
+        const priorDecisions = current.decisions ? structuredClone(current.decisions) : undefined;
+
+        archiveThreadData(current);
+
+        // Strictly protect control fields from archiveMutation
+        current.status = priorStatus;
+        current.decision = priorDecision;
+        current.decisions = priorDecisions;
+        if (!priorExecution) {
+          delete current.execution;
+        } else {
+          current.execution = priorExecution;
+          current.execution.revision += 1;
+        }
+        current.archivedAt = current.archivedAt || new Date().toISOString();
+        delete current.cleanup;
+        current.updatedAt = new Date().toISOString();
+        ensureFinalSummary(current);
+        this.persistThread(current);
+        this.tasks.set(threadId, current);
+        this.writeAggregate();
+        this.emit('changed', Array.from(this.tasks.values()));
+        return true;
+      });
+    }
+
+    if (action === 'delete') {
+      return this.withExecutionLock(threadId, async () => {
+        this.ensureUpToDate();
+        let current = this.tasks.get(threadId);
+        if (fs.existsSync(file)) {
+          try {
+            current = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+          } catch (err) {
+            throw new Error(`Corrupted task file on disk for ${threadId}: ${(err as Error)?.message || err}`);
+          }
+        }
+        if (!current) return true;
+        if (current.cleanup?.token !== token || current.cleanup?.action !== action) {
+          throw new Error(
+            `Cannot commit cleanup for ${threadId}: cleanup token mismatch (expected ${token}, found ${current.cleanup?.token ?? 'none'})`,
+          );
+        }
+        const record = {
+          threadId: current.threadId,
+          title: current.title,
+          initiatorAgent: current.initiatorAgent,
+          targetAgent: current.targetAgent,
+          statusAtDeletion: current.status,
+          reason: options?.tombstone?.reason || 'deleted',
+          by: options?.tombstone?.by || 'system',
+          ...(options?.tombstone?.forced ? { forced: true } : {}),
+          at: new Date().toISOString(),
+          cleanupToken: token,
+          nativeSessions: options?.tombstone?.nativeSessions,
+        };
+        this.appendTombstone(record);
+        this.tasks.delete(threadId);
+        const taskFile = this.threadFilePath(threadId);
+        if (fs.existsSync(taskFile)) {
+          fs.unlinkSync(taskFile);
+        }
+        this.knownMtimes.delete(path.basename(taskFile));
+        this.writeAggregate();
+        this.emit('changed', Array.from(this.tasks.values()));
+        return true;
+      });
+    }
+    return false;
+  }
+
+  /**
+   * Abort an in-progress cleanup reservation if the token matches.
+   * Clears thread.cleanup under the short OS lock.
+   */
+  public async abortTaskCleanup(threadId: string, token: string): Promise<boolean> {
+    return this.withExecutionLock(threadId, async () => {
+      this.ensureUpToDate();
+      let thread = this.tasks.get(threadId);
+      const file = this.threadFilePath(threadId);
+      if (fs.existsSync(file)) {
+        try {
+          thread = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+        } catch {}
+      }
+      if (!thread) return false;
+      if (thread.cleanup?.token !== token) return false;
+      delete thread.cleanup;
+      if (thread.execution) {
+        thread.execution.revision += 1;
+      }
+      thread.updatedAt = new Date().toISOString();
+      this.persistThread(thread);
+      this.tasks.set(threadId, thread);
+      this.writeAggregate();
+      this.emit('changed', Array.from(this.tasks.values()));
+      return true;
+    });
+  }
+
+  /**
+   * Check whether a task meets execution eligibility under v2.
+   */
+  public validateExecutionEligibility(threadOrId: string | DelegationThread): ExecutionEligibilityResult {
+    const thread = typeof threadOrId === 'string' ? this.getTask(threadOrId) : threadOrId;
+    return validateV2ExecutionEligibility(thread);
+  }
+
+  /**
+   * Check if a task has an entry in deleted_tasks.log.
+   */
+  public isTaskTombstoned(threadId: string): boolean {
+    const file = path.join(this.storageDir, 'deleted_tasks.log');
+    if (!fs.existsSync(file)) return false;
+    try {
+      const content = fs.readFileSync(file, 'utf8');
+      return content.split(/\r?\n/).some((line) => {
+        try {
+          return JSON.parse(line).threadId === threadId;
+        } catch {
+          return false;
+        }
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Atomically append a deletion tombstone to deleted_tasks.log without racing with concurrent deletions.
+   * Throws on write or fsync failure to ensure task JSON files are never deleted without durable tombstone.
+   */
+  public appendTombstone(record: any): void {
+    const file = path.join(this.storageDir, 'deleted_tasks.log');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const fd = fs.openSync(file, 'a');
+    try {
+      fs.writeFileSync(fd, `${JSON.stringify(record)}\n`, 'utf8');
+      fs.fsyncSync(fd);
     } finally {
-      release();
-      lock.dispose();
+      try {
+        fs.closeSync(fd);
+      } catch {}
     }
   }
 
@@ -662,213 +1188,283 @@ export class TaskStore extends EventEmitter {
     this.ensureUpToDate();
     const priorMemory = this.tasks.get(thread.threadId);
     const rollbackSnapshot = priorMemory ? structuredClone(priorMemory) : undefined;
-    try {
-      const tombstones = fs.readFileSync(path.join(this.storageDir, 'deleted_tasks.log'), 'utf8');
-      if (tombstones.split(/\r?\n/).some((line) => {
-        try { return JSON.parse(line).threadId === thread.threadId; } catch { return false; }
-      })) return;
-    } catch {}
-    // Merge against the on-disk copy too: another process may have appended a
-    // round between our last read and this write. Per-thread files make that
-    // the only shared surface left, and it is one file per task.
-    let onDisk: DelegationThread | undefined;
-    try {
-      const file = this.threadFilePath(thread.threadId);
-      if (fs.existsSync(file)) onDisk = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
-    } catch {}
-    const inMemory = this.tasks.get(thread.threadId);
-    if (!inMemory && !onDisk && !this.canAcceptTask()) {
-      throw new Error('The task ledger is full and every stored task contains active, unmerged, or otherwise non-evictable work. Merge or explicitly delete retained tasks before dispatching another.');
-    }
-    if (onDisk?.archivedAt && !thread.archivedAt) {
-      this.tasks.set(thread.threadId, onDisk);
+    if (this.isTaskTombstoned(thread.threadId)) {
       return;
     }
-    if ((onDisk || inMemory) && onDisk !== thread) {
-      const authority = [inMemory, onDisk].filter(Boolean) as DelegationThread[];
-      for (const prior of authority) {
-        if (!thread.workspace || !prior.workspace || thread.workspace.id !== prior.workspace.id ||
-            thread.workspace.rootPath !== prior.workspace.rootPath ||
-            thread.workspace.environmentId !== prior.workspace.environmentId ||
-            thread.workspace.canonicalRootKey !== prior.workspace.canonicalRootKey ||
-            thread.workspace.nameAtDispatch !== prior.workspace.nameAtDispatch ||
-            thread.workspace.source !== prior.workspace.source ||
-            JSON.stringify(thread.workspace.origin) !== JSON.stringify(prior.workspace.origin)) {
-          throw new Error('Task workspace binding cannot be changed');
-        }
-        if (prior.workspace.dispatchAccepted) thread.workspace.dispatchAccepted = true;
-        if (thread.workspace.executionPath !== prior.workspace.executionPath &&
-            (!thread.worktree || thread.workspace.executionPath !== thread.worktree.path ||
-             !prior.worktree || fs.existsSync(prior.worktree.path) || !fs.existsSync(thread.worktree.path))) {
-          throw new Error('Task execution path cannot be changed');
+      // Merge against the on-disk copy too: another process may have appended a
+      // round between our last read and this write. Per-thread files make that
+      // the only shared surface left, and it is one file per task.
+      let onDisk: DelegationThread | undefined;
+      const file = this.threadFilePath(thread.threadId);
+      if (fs.existsSync(file)) {
+        try {
+          onDisk = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+        } catch (err) {
+          throw new Error(`Corrupted task file on disk for ${thread.threadId}: ${(err as Error)?.message || err}`);
         }
       }
-      for (const prior of authority) preferBinding(thread, prior);
-      thread.taskTemplate = structuredClone(onDisk?.taskTemplate || inMemory?.taskTemplate || thread.taskTemplate);
-      const mergeEvents = new Map<string, NonNullable<DelegationThread['mergeHistory']>[number]>();
-      for (const source of [onDisk, inMemory, thread]) {
-        for (const event of source?.mergeHistory || []) if (!mergeEvents.has(event.id)) mergeEvents.set(event.id, event);
+      if (onDisk?.execution?.version === 2) {
+        // Existing v2 tasks cannot be overwritten via ordinary upsertTask.
+        // Control state changes must go through transitionExecution; round evidence must go through reportRoundEvidence.
+        // Refresh memory cache from authoritative on-disk state and return immediately without writing to disk.
+        this.tasks.set(thread.threadId, onDisk);
+        return;
       }
-      if (mergeEvents.size) thread.mergeHistory = [...mergeEvents.values()].sort((a, b) => a.number - b.number || a.at.localeCompare(b.at));
-      for (const prior of authority) {
-        if (prior.mergeControl && (!thread.mergeControl || prior.mergeControl.revision > thread.mergeControl.revision)) {
-          thread.mergeControl = structuredClone(prior.mergeControl);
-          thread.status = prior.status;
-        }
-        if (prior.execution && (!thread.execution || prior.execution.revision > thread.execution.revision)) {
-          // Ordinary stale upsertTask must not overwrite protected execution, lifecycle status, decisions, or failure!
-          thread.execution = structuredClone(prior.execution);
-          thread.status = prior.status;
-          if (prior.failure) thread.failure = structuredClone(prior.failure);
-          if (prior.decision) thread.decision = structuredClone(prior.decision);
-          if (prior.decisions?.length) thread.decisions = structuredClone(prior.decisions);
-        }
-        if (prior.decision && (!thread.decision || prior.decision.id !== thread.decision.id)) {
-          if (!thread.decision || prior.status === 'wait_decision') {
-            thread.decision = structuredClone(prior.decision);
+      if (onDisk?.cleanup) {
+        // An active cleanup reservation on disk cannot be overwritten by ordinary upsertTask.
+        this.tasks.set(thread.threadId, onDisk);
+        return;
+      }
+      const inMemory = this.tasks.get(thread.threadId);
+      if (!inMemory && !onDisk && !this.canAcceptTask()) {
+        throw new Error('The task ledger is full and every stored task contains active, unmerged, or otherwise non-evictable work. Merge or explicitly delete retained tasks before dispatching another.');
+      }
+      if (onDisk?.archivedAt && !thread.archivedAt) {
+        this.tasks.set(thread.threadId, onDisk);
+        return;
+      }
+      if (onDisk && !onDisk.cleanup && inMemory?.cleanup) {
+        delete inMemory.cleanup;
+      }
+      if ((onDisk || inMemory) && onDisk !== thread) {
+        const authority = onDisk ? [onDisk] : ([inMemory].filter(Boolean) as DelegationThread[]);
+        for (const prior of authority) {
+          if (!thread.workspace || !prior.workspace || thread.workspace.id !== prior.workspace.id ||
+              thread.workspace.rootPath !== prior.workspace.rootPath ||
+              thread.workspace.environmentId !== prior.workspace.environmentId ||
+              thread.workspace.canonicalRootKey !== prior.workspace.canonicalRootKey ||
+              thread.workspace.nameAtDispatch !== prior.workspace.nameAtDispatch ||
+              thread.workspace.source !== prior.workspace.source ||
+              JSON.stringify(thread.workspace.origin) !== JSON.stringify(prior.workspace.origin)) {
+            throw new Error('Task workspace binding cannot be changed');
+          }
+          if (prior.workspace.dispatchAccepted) thread.workspace.dispatchAccepted = true;
+          if (thread.workspace.executionPath !== prior.workspace.executionPath &&
+              (!thread.worktree || thread.workspace.executionPath !== thread.worktree.path ||
+               !prior.worktree || fs.existsSync(prior.worktree.path) || !fs.existsSync(thread.worktree.path))) {
+            throw new Error('Task execution path cannot be changed');
           }
         }
-        if (prior.decisions?.length) {
-          const existingIds = new Set((thread.decisions || []).map((d) => d.id));
-          const mergedDecisions = [...(thread.decisions || [])];
-          for (const d of prior.decisions) {
-            if (!existingIds.has(d.id)) {
-              mergedDecisions.push(structuredClone(d));
-              existingIds.add(d.id);
+        for (const prior of authority) preferBinding(thread, prior);
+        thread.taskTemplate = structuredClone(onDisk?.taskTemplate || inMemory?.taskTemplate || thread.taskTemplate);
+        const mergeEvents = new Map<string, NonNullable<DelegationThread['mergeHistory']>[number]>();
+        for (const source of [onDisk, inMemory, thread]) {
+          for (const event of source?.mergeHistory || []) if (!mergeEvents.has(event.id)) mergeEvents.set(event.id, event);
+        }
+        if (mergeEvents.size) thread.mergeHistory = [...mergeEvents.values()].sort((a, b) => a.number - b.number || a.at.localeCompare(b.at));
+        for (const prior of authority) {
+          if (prior.cleanup?.action === 'delete') {
+            return;
+          }
+          if (prior.cleanup) {
+            thread.cleanup = structuredClone(prior.cleanup);
+            thread.status = prior.status;
+          }
+          if (prior.mergeControl && (!thread.mergeControl || prior.mergeControl.revision > thread.mergeControl.revision)) {
+            thread.mergeControl = structuredClone(prior.mergeControl);
+            thread.status = prior.status;
+          }
+          if (prior.execution) {
+            if (prior.execution.version === 2) {
+              // Under v2: ordinary upsertTask CANNOT overwrite execution, status, decision(s), cleanup, failure, failureRevision, queuePhase, currentRound
+              // Even if incoming revision is identical or higher!
+              thread.execution = structuredClone(prior.execution);
+              thread.status = prior.status;
+              thread.decision = structuredClone(prior.decision);
+              thread.decisions = structuredClone(prior.decisions);
+              thread.cleanup = structuredClone(prior.cleanup);
+              thread.failure = structuredClone(prior.failure);
+              thread.failureRevision = prior.failureRevision;
+              thread.queuePhase = prior.queuePhase;
+              thread.currentRound = prior.currentRound;
+              thread.receiverSessionId = prior.receiverSessionId;
+              if (prior.receiverSessionCaptured !== undefined) {
+                thread.receiverSessionCaptured = prior.receiverSessionCaptured;
+              }
+              if (prior.reviewerSessionCaptured !== undefined) {
+                thread.reviewerSessionCaptured = prior.reviewerSessionCaptured;
+              }
+              thread.callerSessionId = prior.callerSessionId;
+              thread.reviewerSessionId = prior.reviewerSessionId;
+            } else if (!thread.execution || prior.execution.revision > thread.execution.revision) {
+              // Ordinary stale upsertTask must not overwrite protected execution, lifecycle status, decisions, or failure!
+              thread.execution = structuredClone(prior.execution);
+              thread.status = prior.status;
+              if (prior.failure) thread.failure = structuredClone(prior.failure);
+              if (prior.decision) thread.decision = structuredClone(prior.decision);
+              if (prior.decisions?.length) thread.decisions = structuredClone(prior.decisions);
+              if (prior.cleanup) thread.cleanup = structuredClone(prior.cleanup);
             }
           }
-          thread.decisions = mergedDecisions;
+          if (prior.decision && (!thread.decision || prior.decision.id !== thread.decision.id)) {
+            if (!thread.decision || prior.status === 'wait_decision') {
+              thread.decision = structuredClone(prior.decision);
+            }
+          }
+          if (prior.decisions?.length) {
+            const existingIds = new Set((thread.decisions || []).map((d) => d.id));
+            const mergedDecisions = [...(thread.decisions || [])];
+            for (const d of prior.decisions) {
+              if (!existingIds.has(d.id)) {
+                mergedDecisions.push(structuredClone(d));
+                existingIds.add(d.id);
+              }
+            }
+            thread.decisions = mergedDecisions;
+          }
         }
-      }
-      thread.nativeSessionCompaction = mergeNativeCursors(
-        mergeNativeCursors(inMemory?.nativeSessionCompaction, onDisk?.nativeSessionCompaction, {
-          developer: thread.receiverSessionId,
-          reviewer: thread.reviewerSessionId,
-        }),
-        thread.nativeSessionCompaction,
-        { developer: thread.receiverSessionId, reviewer: thread.reviewerSessionId },
-      );
-      // Merge rounds from every known copy to prevent losing rounds added by
-      // another process or by an earlier in-memory state. Duplicate round
-      // numbers are preserved inside one copy (legacy ledgers may hold them and
-      // `updateRound` targets the newest entry) — only rounds that are entirely
-      // missing from the incoming copy are appended.
-      const priorRounds = new Map<number, DelegationRound>();
-      for (const source of [inMemory, onDisk]) {
-        for (const r of source?.rounds || []) {
-          // Last occurrence wins, matching `updateRound`'s "newest entry" rule.
-          priorRounds.set(r.round, r);
+        thread.nativeSessionCompaction = mergeNativeCursors(
+          mergeNativeCursors(inMemory?.nativeSessionCompaction, onDisk?.nativeSessionCompaction, {
+            developer: thread.receiverSessionId,
+            reviewer: thread.reviewerSessionId,
+          }),
+          thread.nativeSessionCompaction,
+          { developer: thread.receiverSessionId, reviewer: thread.reviewerSessionId },
+        );
+
+        const v2Prior = authority.find((entry) => entry.execution?.version === 2);
+        if (v2Prior) {
+          // V2 ROUND CONTROL & EVIDENCE PROTECTION
+          // Existing v2 rounds are authoritative on disk/prior: ordinary upsertTask CANNOT submit unsigned round evidence, cannot append new rounds, cannot change round prompt/status/output!
+          const incomingRoundsMap = new Map((thread.rounds || []).map((r) => [r.round, r]));
+          thread.rounds = v2Prior.rounds.map((r) => {
+            const cloned = structuredClone(r);
+            const inc = incomingRoundsMap.get(r.round);
+            if (inc?.touchedFiles && inc.touchedFiles.length > 0) {
+              const combined = new Set([...(cloned.touchedFiles || []), ...inc.touchedFiles]);
+              cloned.touchedFiles = Array.from(combined);
+            }
+            return cloned;
+          });
+          thread.currentRound = v2Prior.currentRound;
+          thread.status = v2Prior.status;
+        } else {
+          // Merge rounds from every known copy for v1/legacy
+          const priorRounds = new Map<number, DelegationRound>();
+          for (const source of [inMemory, onDisk]) {
+            for (const r of source?.rounds || []) {
+              priorRounds.set(r.round, r);
+            }
+          }
+          const merged: DelegationRound[] = [];
+          const seen = new Set<number>();
+          for (const r of thread.rounds || []) {
+            merged.push(mergeRoundPreferringCompaction(priorRounds.get(r.round), r));
+            seen.add(r.round);
+          }
+          for (const source of [inMemory, onDisk]) {
+            for (const r of source?.rounds || []) {
+              if (seen.has(r.round)) continue;
+              merged.push(r);
+              seen.add(r.round);
+            }
+          }
+          thread.rounds = merged.sort((a, b) => a.round - b.round);
+          if (thread.worktree?.integration?.phase === 'merged') { thread.status = 'completed'; thread.failure = undefined; }
+          const highestKnown = Math.max(
+            onDisk?.currentRound || 0,
+            inMemory?.currentRound || 0,
+            thread.currentRound || 0,
+          );
+          if (highestKnown > 0) thread.currentRound = highestKnown;
         }
-      }
-      const merged: DelegationRound[] = [];
-      const seen = new Set<number>();
-      for (const r of thread.rounds || []) {
-        merged.push(mergeRoundPreferringCompaction(priorRounds.get(r.round), r));
-        seen.add(r.round);
-      }
-      for (const source of [inMemory, onDisk]) {
-        for (const r of source?.rounds || []) {
-          if (seen.has(r.round)) continue;
-          merged.push(r);
-          seen.add(r.round);
-        }
-      }
-      thread.rounds = merged.sort((a, b) => a.round - b.round);
-      // The unified task directory is immutable once assigned: a stale writer
-      // (or a policy reload) must not strip it and make this task fall back to
-      // agent-wide legacy log directories.
-      thread.artifactDir = thread.artifactDir || inMemory?.artifactDir || onDisk?.artifactDir;
-      thread.taskDataDir = thread.taskDataDir || inMemory?.taskDataDir || onDisk?.taskDataDir;
-      if (thread.artifactDir && !thread.taskDataDir) thread.taskDataDir = thread.artifactDir;
-      const authoritative = [inMemory, onDisk].filter(Boolean) as DelegationThread[];
-      for (const prior of authoritative) {
-        if (!prior.worktree || !thread.worktree) continue;
-        const priorValidation = prior.worktree.validation;
-        const incomingValidation = thread.worktree.validation;
-        thread.worktree = {
-          ...thread.worktree,
-          deliveryTarget: thread.worktree.deliveryTarget || prior.worktree.deliveryTarget,
-          validation: priorValidation && (!incomingValidation || Date.parse(priorValidation.updatedAt) > Date.parse(incomingValidation.updatedAt))
-            ? priorValidation : incomingValidation,
-        };
-        const priorPhase = prior.worktree.integration?.phase;
-        const incomingPhase = thread.worktree.integration?.phase;
-        if (prior.worktree.integration?.stashRecoveryPending && !thread.worktree.integration?.stashRecoveryPending &&
-            !(incomingPhase === 'merged' && thread.worktree.integration?.stashRecoveryPending === false)) {
-          const validation = thread.worktree.validation;
-          thread.worktree = { ...thread.worktree, ...prior.worktree, validation: validation || prior.worktree.validation };
-          thread.status = prior.status;
-          continue;
-        }
-        if (incomingPhase === 'merged') {
-          // Local integration is monotonic even when a stale writer carries a
-          // later wall-clock timestamp (for example after clock skew).
-          thread.status = 'completed';
-          continue;
-        }
-        const priorAt = new Date(prior.worktree.integration?.updatedAt || 0).getTime();
-        const nextAt = new Date(thread.worktree.integration?.updatedAt || 0).getTime();
-        // A cleared approval is an explicit transition, not a missing field to
-        // fill from a stale snapshot. Only newer snapshots may replace it.
-        if (priorPhase === 'merged' || priorAt > nextAt) {
+        // The unified task directory is immutable once assigned: a stale writer
+        // (or a policy reload) must not strip it and make this task fall back to
+        // agent-wide legacy log directories.
+        thread.artifactDir = thread.artifactDir || inMemory?.artifactDir || onDisk?.artifactDir;
+        thread.taskDataDir = thread.taskDataDir || inMemory?.taskDataDir || onDisk?.taskDataDir;
+        if (thread.artifactDir && !thread.taskDataDir) thread.taskDataDir = thread.artifactDir;
+        const authoritative = [inMemory, onDisk].filter(Boolean) as DelegationThread[];
+        for (const prior of authoritative) {
+          if (!prior.worktree || !thread.worktree) continue;
+          const priorValidation = prior.worktree.validation;
+          const incomingValidation = thread.worktree.validation;
           thread.worktree = {
             ...thread.worktree,
-            ...prior.worktree,
-            integration: prior.worktree.integration || thread.worktree.integration,
-            headCommit: prior.worktree.headCommit || thread.worktree.headCommit,
-            approvedCommit: priorAt > nextAt
-              ? prior.worktree.approvedCommit
-              : thread.worktree.approvedCommit,
+            deliveryTarget: thread.worktree.deliveryTarget || prior.worktree.deliveryTarget,
+            validation: priorValidation && (!incomingValidation || Date.parse(priorValidation.updatedAt) > Date.parse(incomingValidation.updatedAt))
+              ? priorValidation : incomingValidation,
           };
+          const priorPhase = prior.worktree.integration?.phase;
+          const incomingPhase = thread.worktree.integration?.phase;
+          if (prior.worktree.integration?.stashRecoveryPending && !thread.worktree.integration?.stashRecoveryPending &&
+              !(incomingPhase === 'merged' && thread.worktree.integration?.stashRecoveryPending === false)) {
+            const validation = thread.worktree.validation;
+            thread.worktree = { ...thread.worktree, ...prior.worktree, validation: validation || prior.worktree.validation };
+            thread.status = prior.status;
+            continue;
+          }
+          if (incomingPhase === 'merged') {
+            // Local integration is monotonic even when a stale writer carries a
+            // later wall-clock timestamp (for example after clock skew).
+            thread.status = 'completed';
+            delete thread.failure;
+            delete thread.failureRevision;
+            continue;
+          }
+          const priorAt = new Date(prior.worktree.integration?.updatedAt || 0).getTime();
+          const nextAt = new Date(thread.worktree.integration?.updatedAt || 0).getTime();
+          // A cleared approval is an explicit transition, not a missing field to
+          // fill from a stale snapshot. Only newer snapshots may replace it.
+          if (priorPhase === 'merged' || priorAt > nextAt) {
+            thread.worktree = {
+              ...thread.worktree,
+              ...prior.worktree,
+              integration: prior.worktree.integration || thread.worktree.integration,
+              headCommit: prior.worktree.headCommit || thread.worktree.headCommit,
+              approvedCommit: priorAt > nextAt
+                ? prior.worktree.approvedCommit
+                : thread.worktree.approvedCommit,
+            };
+          }
+          if (priorPhase === 'merged') {
+            thread.status = 'completed';
+            delete thread.failure;
+            delete thread.failureRevision;
+          } else if (priorAt > nextAt) thread.status = prior.status;
+          const superseded = [...new Set([...(prior.worktree.supersededMergeResolutionPaths || []), ...(thread.worktree.supersededMergeResolutionPaths || [])])];
+          if (superseded.length) thread.worktree.supersededMergeResolutionPaths = superseded;
         }
-        if (priorPhase === 'merged') thread.status = 'completed';
-        else if (priorAt > nextAt) thread.status = prior.status;
-        const superseded = [...new Set([...(prior.worktree.supersededMergeResolutionPaths || []), ...(thread.worktree.supersededMergeResolutionPaths || [])])];
-        if (superseded.length) thread.worktree.supersededMergeResolutionPaths = superseded;
+        const newestControl = authoritative.filter((entry) => (entry.mergeControl?.revision || 0) > incomingMergeRevision)
+          .sort((a, b) => (b.mergeControl?.revision || 0) - (a.mergeControl?.revision || 0))[0];
+        if (newestControl?.mergeControl) { thread.mergeControl = structuredClone(newestControl.mergeControl); thread.status = newestControl.status; }
+        const persisted = onDisk || inMemory;
+        if (!thread.execution && persisted && ((persisted.failureRevision || 0) > (thread.failureRevision || 0) ||
+            ((persisted.failureRevision || 0) === (thread.failureRevision || 0) &&
+             ((persisted.status !== thread.status && (persisted.status === 'failed' || thread.status === 'failed')) ||
+              (persisted.status === 'failed' && JSON.stringify(persisted.failure) !== JSON.stringify(thread.failure)))))) {
+          thread.failureRevision = persisted.failureRevision;
+          thread.failure = persisted.failure;
+          thread.status = persisted.status;
+        }
+        if (thread.worktree?.integration?.phase === 'merged') {
+          thread.status = 'completed';
+          delete thread.failure;
+          delete thread.failureRevision;
+        }
+        if (!v2Prior) {
+          const cleanupPrior = authority.find((entry) => !!entry.cleanup);
+          if (cleanupPrior?.cleanup) {
+            thread.cleanup = structuredClone(cleanupPrior.cleanup);
+            thread.status = cleanupPrior.status;
+          }
+        }
       }
-      const newestControl = authoritative.filter((entry) => (entry.mergeControl?.revision || 0) > incomingMergeRevision)
-        .sort((a, b) => (b.mergeControl?.revision || 0) - (a.mergeControl?.revision || 0))[0];
-      if (newestControl?.mergeControl) { thread.mergeControl = structuredClone(newestControl.mergeControl); thread.status = newestControl.status; }
-      const persisted = onDisk || inMemory;
-      if (!thread.execution && persisted && ((persisted.failureRevision || 0) > (thread.failureRevision || 0) ||
-          ((persisted.failureRevision || 0) === (thread.failureRevision || 0) &&
-           ((persisted.status !== thread.status && (persisted.status === 'failed' || thread.status === 'failed')) ||
-            (persisted.status === 'failed' && JSON.stringify(persisted.failure) !== JSON.stringify(thread.failure)))))) {
-        thread.failureRevision = persisted.failureRevision;
-        thread.failure = persisted.failure;
-        thread.status = persisted.status;
+      thread.updatedAt = thread.updatedAt || new Date().toISOString();
+      if (isMergePending(thread) && thread.worktree) {
+        thread.worktree.mergePending = true;
       }
-      if (thread.worktree?.integration?.phase === 'merged') { thread.status = 'completed'; thread.failure = undefined; }
-      const highestKnown = Math.max(
-        onDisk?.currentRound || 0,
-        inMemory?.currentRound || 0,
-        thread.currentRound || 0,
-      );
-      if (highestKnown > 0) thread.currentRound = highestKnown;
-    }
-    thread.updatedAt = thread.updatedAt || new Date().toISOString();
-    // Merge gate: a completed task that ran in a temporary worktree and has no
-    // recorded merge request keeps its output out of the main line. Every
-    // completion path funnels through here, so this is the one place that has to
-    // raise the flag (the inverse is cleared by `recordMergeRequest`).
-    if (isMergePending(thread) && thread.worktree) {
-      thread.worktree.mergePending = true;
-    }
-    // Terminal tasks carry a deterministic read-only digest. It is what survives
-    // archival and what `get_task_summary` answers long after rounds are gone.
-    ensureFinalSummary(thread);
-    this.tasks.set(thread.threadId, thread);
-    try { this.persistThread(thread); }
-    catch (error) {
-      if (rollbackSnapshot) this.tasks.set(thread.threadId, rollbackSnapshot);
-      else this.tasks.delete(thread.threadId);
-      throw error;
-    }
-    this.enforceCapacity();
-    this.writeAggregate();
-    // Same contract as the old single-file save: every mutation notifies the
-    // supervisor/UI so a freshly dispatched task starts without waiting a poll.
-    this.emit('changed', Array.from(this.tasks.values()));
+      ensureFinalSummary(thread);
+      this.tasks.set(thread.threadId, thread);
+      try { this.persistThread(thread); }
+      catch (error) {
+        if (rollbackSnapshot) this.tasks.set(thread.threadId, rollbackSnapshot);
+        else this.tasks.delete(thread.threadId);
+        throw error;
+      }
+      this.enforceCapacity();
+      this.writeAggregate();
+      this.emit('changed', Array.from(this.tasks.values()));
   }
 
   /**
@@ -882,119 +1478,601 @@ export class TaskStore extends EventEmitter {
     receiverSessionId?: string,
     callerSessionId?: string,
     interruption?: TaskInterruption,
-    expected?: { failureRevision: number; roundTimestamp?: string },
-  ): DelegationThread | undefined {
+    expected?: {
+      failureRevision?: number;
+      roundTimestamp?: string;
+      operationId?: string;
+      generation?: number;
+      runId?: string;
+      receiverSessionCaptured?: boolean;
+    },
+    identity?: {
+      operationId?: string;
+      generation?: number;
+      runId?: string;
+    },
+  ): DelegationThread | undefined;
+  public updateRound(
+    threadId: string,
+    roundNumber: number,
+    roundUpdate: Partial<DelegationRound>,
+    newThreadStatus?: ThreadStatus,
+    receiverSessionId?: string,
+    callerSessionId?: string,
+    interruption?: TaskInterruption,
+    expected?: any,
+    identity?: any,
+  ): any {
     this.ensureUpToDate();
-    const thread = this.tasks.get(threadId);
+    let thread = this.tasks.get(threadId);
+    const file = this.threadFilePath(threadId);
+    if (fs.existsSync(file)) {
+      try {
+        thread = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+      } catch (err) {
+        throw new Error(`Corrupted task file on disk for ${threadId}: ${(err as Error)?.message || err}`);
+      }
+    }
     if (!thread) return undefined;
-    if (expected) {
-      const round = [...thread.rounds].reverse().find(r => r.round === roundNumber);
-      if (thread.archivedAt || (thread.failureRevision || 0) !== expected.failureRevision ||
-          thread.currentRound !== roundNumber || !round || round.timestamp !== expected.roundTimestamp ||
-          (thread.status !== 'running' && thread.status !== 'paused')) return undefined;
+
+    if (thread.cleanup && thread.cleanup.stage === 'in_progress') {
+      console.warn(`[TaskStore] Refusing to update round ${roundNumber} on ${threadId}: task is reserved for cleanup`);
+      return undefined;
     }
 
-    if (receiverSessionId) {
-      thread.receiverSessionId = receiverSessionId;
-    }
-    if (callerSessionId) {
-      thread.callerSessionId = callerSessionId;
-    }
-
-    // Target the NEWEST entry for this round number: a ledger written before the
-    // one-round-in-flight invariant may hold duplicate numbers, and the live,
-    // most recently appended entry is the one that must be updated.
-    let roundIndex = -1;
-    for (let i = thread.rounds.length - 1; i >= 0; i--) {
-      if (thread.rounds[i].round === roundNumber) {
-        roundIndex = i;
-        break;
-      }
-    }
-    if (roundIndex >= 0) {
-      // Live-progress syncs must never revive a round that the control plane
-      // just paused. Resume explicitly mutates the round and upserts instead.
+    if (expected?.failureRevision !== undefined || expected?.roundTimestamp !== undefined) {
+      const round = [...thread.rounds].reverse().find((r) => r.round === roundNumber);
       if (
-        thread.rounds[roundIndex].status === 'paused' &&
-        roundUpdate.status === 'running'
+        thread.archivedAt ||
+        (expected.failureRevision !== undefined && (thread.failureRevision || 0) !== expected.failureRevision) ||
+        thread.currentRound !== roundNumber ||
+        !round ||
+        (expected.roundTimestamp !== undefined && round.timestamp !== expected.roundTimestamp) ||
+        (thread.status !== 'running' && thread.status !== 'paused')
+      )
+        return undefined;
+    }
+
+    const activeIdentity =
+      identity ||
+      (expected && (expected.operationId || expected.runId || expected.generation !== undefined)
+        ? {
+            operationId: expected.operationId,
+            generation: expected.generation,
+            runId: expected.runId,
+          }
+        : undefined);
+
+    if (thread.execution?.version === 2) {
+      // V2 STRICT IDENTITY VALIDATION
+      if (
+        !activeIdentity ||
+        !activeIdentity.operationId ||
+        typeof activeIdentity.generation !== 'number' ||
+        !activeIdentity.runId
       ) {
-        return thread;
-      }
-      thread.rounds[roundIndex] = {
-        ...thread.rounds[roundIndex],
-        ...roundUpdate,
-        ...(interruption ? { interruption } : {}),
-      };
-    } else if (roundUpdate.prompt) {
-      // Append if not found. Refuse to append a NEW running round while another
-      // round is already in flight: that would break the one-round-in-flight
-      // invariant and let two agent processes drive one workspace at once.
-      const wouldAddRunningRound = (roundUpdate.status || 'running') === 'running';
-      if (wouldAddRunningRound && thread.rounds.some((r) => r.status === 'running')) {
         console.warn(
-          `[TaskStore] Refusing to append running round ${roundNumber} to ${threadId}: ` +
-            `a round is already in flight.`,
+          `[TaskStore] Refusing round update for ${threadId}: missing or invalid execution identity for v2 task`,
         );
         return undefined;
       }
-      thread.rounds.push({
-        round: roundNumber,
-        type: roundUpdate.type || 'rework',
-        prompt: roundUpdate.prompt || '',
-        output: roundUpdate.output,
-        error: roundUpdate.error,
-        durationMs: roundUpdate.durationMs || 0,
-        status: roundUpdate.status || 'running',
-        timestamp: roundUpdate.timestamp || new Date().toISOString(),
-        interruption,
-        ...(roundUpdate.touchedFiles ? { touchedFiles: roundUpdate.touchedFiles } : {}),
-        // Whitelisted explicitly: this branch builds the round from scratch, so
-        // anything not listed here would be silently dropped.
-        ...(roundUpdate.assessment ? { assessment: roundUpdate.assessment } : {}),
-        ...(roundUpdate.tokenUsage ? { tokenUsage: roundUpdate.tokenUsage } : {}),
-        ...(roundUpdate.executorAgent ? { executorAgent: roundUpdate.executorAgent } : {}),
-        ...(roundUpdate.executorModel ? { executorModel: roundUpdate.executorModel } : {}),
-        ...(roundUpdate.nativeSessionCompactions ? { nativeSessionCompactions: roundUpdate.nativeSessionCompactions } : {}),
+
+      // V2 ROUND NUMBER BINDING: credentials must match current execution round
+      if (roundNumber !== thread.execution.round) {
+        if (roundNumber >= thread.execution.round) {
+          console.warn(`[TaskStore] Refusing compaction for ${threadId} round ${roundNumber}: latest round cannot be compacted`);
+          return undefined;
+        }
+        const isCompaction = roundUpdate.isCompacted === true || roundUpdate.compactSummary !== undefined;
+        if (!isCompaction) {
+          console.warn(
+            `[TaskStore] Refusing round update for ${threadId}: credentials for round ${thread.execution.round} cannot modify historical round ${roundNumber}`,
+          );
+          return undefined;
+        }
+
+        // Compaction validation (Rule 20 / Issue 3):
+        const targetRound = thread.rounds.find((r) => r.round === roundNumber);
+        if (!targetRound) return undefined;
+
+        if (targetRound.status !== 'completed' && targetRound.status !== 'failed') {
+          console.warn(`[TaskStore] Refusing compaction for ${threadId} round ${roundNumber}: round is not terminal (${targetRound.status})`);
+          return undefined;
+        }
+
+        const triggeringRound = thread.rounds.find((r) => r.round === thread.execution!.round);
+        const latestAssessedRound = [...thread.rounds]
+          .reverse()
+          .find((r) => r.round >= roundNumber && r.assessment?.success !== undefined);
+        const triggerSuccessful =
+          triggeringRound?.assessment?.success === true ||
+          latestAssessedRound?.assessment?.success === true;
+        if (!triggerSuccessful) {
+          console.warn(
+            `[TaskStore] Refusing compaction for ${threadId} round ${roundNumber}: no successful trigger round assessment found`,
+          );
+          return undefined;
+        }
+
+        if (
+          roundUpdate.status !== undefined ||
+          roundUpdate.error !== undefined ||
+          roundUpdate.interruption !== undefined ||
+          roundUpdate.prompt !== undefined ||
+          roundUpdate.type !== undefined ||
+          roundUpdate.round !== undefined ||
+          roundUpdate.timestamp !== undefined
+        ) {
+          console.warn(
+            `[TaskStore] Refusing compaction for ${threadId} round ${roundNumber}: compaction update contains forbidden control/evidence fields`,
+          );
+          return undefined;
+        }
+
+        if (!roundUpdate.rawOutputFilePath || typeof roundUpdate.rawOutputFilePath !== 'string') {
+          console.warn(
+            `[TaskStore] Refusing compaction for ${threadId} round ${roundNumber}: rawOutputFilePath must be provided`,
+          );
+          return undefined;
+        }
+        if (!fs.existsSync(roundUpdate.rawOutputFilePath)) {
+          console.warn(
+            `[TaskStore] Refusing compaction for ${threadId} round ${roundNumber}: rawOutputFilePath does not exist on disk`,
+          );
+          return undefined;
+        }
+        try {
+          const stat = fs.statSync(roundUpdate.rawOutputFilePath);
+          if (!stat.isFile() || stat.size === 0) {
+            console.warn(
+              `[TaskStore] Refusing compaction for ${threadId} round ${roundNumber}: rawOutputFilePath is not a non-empty regular file`,
+            );
+            return undefined;
+          }
+          const rawContent = fs.readFileSync(roundUpdate.rawOutputFilePath, 'utf8');
+          if (targetRound.output && rawContent !== targetRound.output && !rawContent.includes(targetRound.output)) {
+            console.warn(
+              `[TaskStore] Refusing compaction for ${threadId} round ${roundNumber}: rawOutputFilePath does not match original target round output`,
+            );
+            return undefined;
+          }
+        } catch {
+          return undefined;
+        }
+      }
+
+      // Check if there are any allowed updates to apply
+      const hasAllowedUpdates =
+        roundUpdate.output !== undefined ||
+        roundUpdate.error !== undefined ||
+        roundUpdate.durationMs !== undefined ||
+        roundUpdate.status !== undefined ||
+        roundUpdate.touchedFiles !== undefined ||
+        roundUpdate.assessment !== undefined ||
+        roundUpdate.tokenUsage !== undefined ||
+        roundUpdate.executorAgent !== undefined ||
+        roundUpdate.executorModel !== undefined ||
+        roundUpdate.nativeSessionCompactions !== undefined ||
+        roundUpdate.rawOutputFilePath !== undefined ||
+        roundUpdate.compactSummary !== undefined ||
+        roundUpdate.isCompacted !== undefined ||
+        roundUpdate.outputBytes !== undefined ||
+        interruption !== undefined ||
+        Boolean(receiverSessionId && receiverSessionId !== thread.receiverSessionId) ||
+        Boolean(callerSessionId && callerSessionId !== thread.callerSessionId) ||
+        Boolean(expected?.receiverSessionCaptured !== undefined && expected.receiverSessionCaptured !== thread.receiverSessionCaptured);
+
+      if (!hasAllowedUpdates && roundNumber === thread.execution.round) {
+        return thread;
+      }
+
+      return this.withExecutionLock(threadId, async () => {
+        this.ensureUpToDate();
+        let current = this.tasks.get(threadId);
+        if (fs.existsSync(file)) {
+          try {
+            current = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+          } catch (err) {
+            throw new Error(`Corrupted task file on disk for ${threadId}: ${(err as Error)?.message || err}`);
+          }
+        }
+        if (!current || current.execution?.version !== 2) return undefined;
+
+        if (
+          activeIdentity.operationId !== current.execution.operationId ||
+          activeIdentity.generation !== current.execution.generation ||
+          activeIdentity.runId !== current.execution.run?.id
+        ) {
+          return undefined;
+        }
+
+        if (roundNumber !== current.execution.round) {
+          if (roundNumber >= current.execution.round) return undefined;
+          const isCompaction = roundUpdate.isCompacted === true || roundUpdate.compactSummary !== undefined;
+          if (!isCompaction) return undefined;
+          const target = current.rounds.find((r) => r.round === roundNumber);
+          if (!target) return undefined;
+          if (target.status !== 'completed' && target.status !== 'failed') return undefined;
+          const triggeringRound = current.rounds.find((r) => r.round === current.execution!.round);
+          const latestAssessedRound = [...current.rounds]
+            .reverse()
+            .find((r) => r.round >= roundNumber && r.assessment?.success !== undefined);
+          const triggerSuccessful =
+            triggeringRound?.assessment?.success === true ||
+            latestAssessedRound?.assessment?.success === true;
+          if (!triggerSuccessful) return undefined;
+          if (!roundUpdate.rawOutputFilePath || !fs.existsSync(roundUpdate.rawOutputFilePath)) return undefined;
+          try {
+            const stat = fs.statSync(roundUpdate.rawOutputFilePath);
+            if (!stat.isFile() || stat.size === 0) return undefined;
+            const rawContent = fs.readFileSync(roundUpdate.rawOutputFilePath, 'utf8');
+            if (target.output && rawContent !== target.output && !rawContent.includes(target.output)) return undefined;
+          } catch {
+            return undefined;
+          }
+
+          if (roundUpdate.output !== undefined) target.output = roundUpdate.output;
+          target.isCompacted = true;
+          if (roundUpdate.compactSummary) target.compactSummary = roundUpdate.compactSummary;
+          if (roundUpdate.rawOutputFilePath) target.rawOutputFilePath = roundUpdate.rawOutputFilePath;
+          if (roundUpdate.outputBytes) target.outputBytes = roundUpdate.outputBytes;
+          current.updatedAt = new Date().toISOString();
+          ensureFinalSummary(current);
+          this.persistThread(current);
+          this.tasks.set(threadId, current);
+          this.writeAggregate();
+          this.emit('changed', Array.from(this.tasks.values()));
+          return current;
+        }
+
+        const targetRound = current.rounds.find((r) => r.round === roundNumber);
+        if (!targetRound) return undefined;
+
+        if (targetRound.status === 'paused' && roundUpdate.status === 'running') {
+          return current;
+        }
+
+        if (roundUpdate.output !== undefined && !targetRound.isCompacted) targetRound.output = roundUpdate.output;
+        if (roundUpdate.error !== undefined) targetRound.error = roundUpdate.error;
+        if (roundUpdate.durationMs !== undefined) targetRound.durationMs = roundUpdate.durationMs;
+        if (roundUpdate.status !== undefined) targetRound.status = roundUpdate.status;
+        if (roundUpdate.touchedFiles !== undefined) targetRound.touchedFiles = roundUpdate.touchedFiles;
+        if (roundUpdate.assessment !== undefined) targetRound.assessment = roundUpdate.assessment;
+        if (roundUpdate.tokenUsage !== undefined) {
+          targetRound.tokenUsage = preferTokenUsage(targetRound.tokenUsage, roundUpdate.tokenUsage, `v2-round-${roundNumber}`);
+        }
+        if (roundUpdate.executorAgent !== undefined) targetRound.executorAgent = roundUpdate.executorAgent;
+        if (roundUpdate.executorModel !== undefined) targetRound.executorModel = roundUpdate.executorModel;
+        if (roundUpdate.nativeSessionCompactions !== undefined) targetRound.nativeSessionCompactions = roundUpdate.nativeSessionCompactions;
+        if (roundUpdate.rawOutputFilePath !== undefined) targetRound.rawOutputFilePath = roundUpdate.rawOutputFilePath;
+        if (roundUpdate.compactSummary !== undefined) targetRound.compactSummary = roundUpdate.compactSummary;
+        if (roundUpdate.isCompacted !== undefined) targetRound.isCompacted = roundUpdate.isCompacted;
+        if (roundUpdate.outputBytes !== undefined) targetRound.outputBytes = roundUpdate.outputBytes;
+        if (interruption) {
+          targetRound.interruption = interruption;
+          appendInterruption(current, interruption);
+        }
+
+        if (receiverSessionId) {
+          current.receiverSessionId = receiverSessionId;
+        }
+        if (expected?.receiverSessionCaptured !== undefined) {
+          current.receiverSessionCaptured = expected.receiverSessionCaptured;
+        } else if (receiverSessionId && receiverSessionId !== current.receiverSessionId) {
+          current.receiverSessionCaptured = true;
+        }
+        if (callerSessionId && callerSessionId !== current.callerSessionId) {
+          current.callerSessionId = callerSessionId;
+        }
+
+        const latestRound = current.rounds[current.rounds.length - 1];
+        if (latestRound) {
+          current.summary.lastPromptSnippet = (latestRound.prompt || '').slice(0, 100);
+          if (latestRound.output) {
+            current.summary.lastOutputSnippet = latestRound.output.slice(-140);
+          } else if (latestRound.error) {
+            current.summary.lastOutputSnippet = `[Error] ${latestRound.error.slice(0, 140)}`;
+          }
+        }
+        current.summary.totalDurationMs = current.rounds.reduce(
+          (acc, cur) => acc + (cur.durationMs || 0),
+          0,
+        );
+        current.updatedAt = new Date().toISOString();
+
+        ensureFinalSummary(current);
+        this.persistThread(current);
+        this.tasks.set(current.threadId, current);
+        this.writeAggregate();
+        this.emit('changed', Array.from(this.tasks.values()));
+        return current;
       });
     }
 
-    if (interruption) {
-      appendInterruption(thread, interruption);
-    }
+      if (receiverSessionId) {
+        thread.receiverSessionId = receiverSessionId;
+      }
+      if (expected?.receiverSessionCaptured !== undefined) {
+        thread.receiverSessionCaptured = expected.receiverSessionCaptured;
+      } else if (receiverSessionId && receiverSessionId !== thread.receiverSessionId) {
+        thread.receiverSessionCaptured = true;
+      }
+      if (callerSessionId) {
+        thread.callerSessionId = callerSessionId;
+      }
 
-    if (newThreadStatus) {
-      // Only transition thread status if this round is the latest round or newer,
-      // or if explicitly closing task. Tasks with execution records manage lifecycle
-      // strictly through transitionExecution.
-      const isLatest = !thread.currentRound || roundNumber >= thread.currentRound;
-      if (isLatest) {
-        if (newThreadStatus === 'failed') {
-          enterTaskFailure(thread, { stage: 'execution', reason: roundUpdate.error || interruption?.reason || 'Execution failed',
-            at: new Date().toISOString(), round: roundNumber, code: roundUpdate.assessment?.errorCode });
-        } else {
-          thread.status = newThreadStatus;
+      // Target the NEWEST entry for this round number: a ledger written before the
+      // one-round-in-flight invariant may hold duplicate numbers, and the live,
+      // most recently appended entry is the one that must be updated.
+      let roundIndex = -1;
+      for (let i = thread.rounds.length - 1; i >= 0; i--) {
+        if (thread.rounds[i].round === roundNumber) {
+          roundIndex = i;
+          break;
         }
       }
-    }
+      if (roundIndex >= 0) {
+        // Live-progress syncs must never revive a round that the control plane
+        // just paused. Resume explicitly mutates the round and upserts instead.
+        if (
+          thread.rounds[roundIndex].status === 'paused' &&
+          roundUpdate.status === 'running'
+        ) {
+          return thread;
+        }
+        thread.rounds[roundIndex] = {
+          ...thread.rounds[roundIndex],
+          ...roundUpdate,
+          ...(interruption ? { interruption } : {}),
+        };
+      } else if (roundUpdate.prompt) {
+        // Append if not found. Refuse to append a NEW running round while another
+        // round is already in flight: that would break the one-round-in-flight
+        // invariant and let two agent processes drive one workspace at once.
+        const wouldAddRunningRound = (roundUpdate.status || 'running') === 'running';
+        if (wouldAddRunningRound && thread.rounds.some((r) => r.status === 'running')) {
+          console.warn(
+            `[TaskStore] Refusing to append running round ${roundNumber} to ${threadId}: ` +
+              `a round is already in flight.`,
+          );
+          return undefined;
+        }
+        thread.rounds.push({
+          round: roundNumber,
+          type: roundUpdate.type || 'rework',
+          prompt: roundUpdate.prompt || '',
+          output: roundUpdate.output,
+          error: roundUpdate.error,
+          durationMs: roundUpdate.durationMs || 0,
+          status: roundUpdate.status || 'running',
+          timestamp: roundUpdate.timestamp || new Date().toISOString(),
+          interruption,
+          ...(roundUpdate.touchedFiles ? { touchedFiles: roundUpdate.touchedFiles } : {}),
+          ...(roundUpdate.assessment ? { assessment: roundUpdate.assessment } : {}),
+          ...(roundUpdate.tokenUsage ? { tokenUsage: roundUpdate.tokenUsage } : {}),
+          ...(roundUpdate.executorAgent ? { executorAgent: roundUpdate.executorAgent } : {}),
+          ...(roundUpdate.executorModel ? { executorModel: roundUpdate.executorModel } : {}),
+          ...(roundUpdate.nativeSessionCompactions ? { nativeSessionCompactions: roundUpdate.nativeSessionCompactions } : {}),
+        });
+      }
 
-    // Refresh summary
-    const latestRound = thread.rounds[thread.rounds.length - 1];
-    if (latestRound) {
-      thread.summary.lastPromptSnippet = (latestRound.prompt || '').slice(0, 100);
-      if (latestRound.output) {
-        thread.summary.lastOutputSnippet = latestRound.output.slice(0, 150);
-      } else if (latestRound.error) {
-        thread.summary.lastOutputSnippet = `[Error] ${latestRound.error.slice(0, 140)}`;
+      if (interruption) {
+        appendInterruption(thread, interruption);
+      }
+
+      if (newThreadStatus) {
+        const isLatest = !thread.currentRound || roundNumber >= thread.currentRound;
+        if (isLatest) {
+          if (newThreadStatus === 'failed') {
+            enterTaskFailure(thread, { stage: 'execution', reason: roundUpdate.error || interruption?.reason || 'Execution failed',
+              at: new Date().toISOString(), round: roundNumber, code: roundUpdate.assessment?.errorCode });
+          } else {
+            thread.status = newThreadStatus;
+          }
+        }
+      }
+
+      // Refresh summary
+      const latestRound = thread.rounds[thread.rounds.length - 1];
+      if (latestRound) {
+        thread.summary.lastPromptSnippet = (latestRound.prompt || '').slice(0, 100);
+        if (latestRound.output) {
+          thread.summary.lastOutputSnippet = latestRound.output.slice(0, 150);
+        } else if (latestRound.error) {
+          thread.summary.lastOutputSnippet = `[Error] ${latestRound.error.slice(0, 140)}`;
+        }
+      }
+      thread.summary.totalDurationMs = thread.rounds.reduce(
+        (acc, cur) => acc + (cur.durationMs || 0),
+        0,
+      );
+      thread.updatedAt = new Date().toISOString();
+
+      this.persistThread(thread);
+      this.tasks.set(thread.threadId, thread);
+      this.writeAggregate();
+      this.emit('changed', Array.from(this.tasks.values()));
+      return thread;
+  }
+
+  /**
+   * Field-by-field round evidence and output update with identity validation.
+   * Acquires the task OS execution lock, verifies identity, binds strictly to execution.round,
+   * updates evidence fields on disk and in memory atomically.
+   */
+  public async reportRoundEvidence(
+    threadId: string,
+    roundNumber: number,
+    evidence: {
+      output?: string;
+      error?: string;
+      durationMs?: number;
+      status?: RoundStatus;
+      touchedFiles?: string[];
+      assessment?: ResponseAssessment;
+      tokenUsage?: TokenUsageMetrics;
+      executorAgent?: import('./types').AgentId;
+      executorModel?: string;
+      nativeSessionCompactions?: import('./types').NativeSessionCompactionOperation[];
+      rawOutputFilePath?: string;
+      compactSummary?: import('./types').CompactedContextSummary;
+      isCompacted?: boolean;
+      outputBytes?: number;
+      interruption?: TaskInterruption;
+    },
+    identity?: {
+      operationId?: string;
+      generation?: number;
+      runId?: string;
+    },
+  ): Promise<DelegationThread | undefined> {
+    let cached = this.tasks.get(threadId);
+    const file = this.threadFilePath(threadId);
+    if (fs.existsSync(file)) {
+      try {
+        cached = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+        this.tasks.set(threadId, cached);
+      } catch {}
+    }
+    if (cached && cached.execution?.version === 2) {
+      if (
+        !identity?.operationId ||
+        typeof identity.generation !== 'number' ||
+        !identity.runId ||
+        roundNumber !== cached.execution.round
+      ) {
+        console.warn(
+          `[TaskStore] Refusing round evidence for ${threadId} round ${roundNumber}: ` +
+            `caller execution credentials do not match active v2 execution`,
+        );
+        return undefined;
       }
     }
-    thread.summary.totalDurationMs = thread.rounds.reduce(
-      (acc, cur) => acc + (cur.durationMs || 0),
-      0,
-    );
-    thread.updatedAt = new Date().toISOString();
 
-    this.upsertTask(thread);
-    return thread;
+    return this.withExecutionLock(threadId, async () => {
+      this.ensureUpToDate();
+      let thread = this.tasks.get(threadId);
+      const file = this.threadFilePath(threadId);
+      if (fs.existsSync(file)) {
+        try {
+          thread = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+        } catch (err) {
+          throw new Error(`Corrupted task file on disk for ${threadId}: ${(err as Error)?.message || err}`);
+        }
+      }
+      if (!thread) {
+        return undefined;
+      }
+
+      if (thread.execution?.version !== 2) {
+        // legacy / v1
+        const targetRound = thread.rounds.find((r) => r.round === roundNumber);
+        if (!targetRound) return undefined;
+        this.applyRoundEvidence(targetRound, evidence);
+        this.persistThread(thread);
+        this.tasks.set(thread.threadId, thread);
+        this.writeAggregate();
+        this.emit('changed', Array.from(this.tasks.values()));
+        return thread;
+      }
+
+      // V2 IDENTITY VALIDATION
+      if (!identity || !identity.operationId || typeof identity.generation !== 'number' || !identity.runId) {
+        console.warn(`[TaskStore] Refusing round update for ${threadId}: missing complete execution identity for v2 task`);
+        return undefined;
+      }
+      if (thread.execution.operationId !== identity.operationId) {
+        console.warn(`[TaskStore] Refusing round update for ${threadId}: operationId mismatch (expected ${thread.execution.operationId}, found ${identity.operationId})`);
+        return undefined;
+      }
+      if (thread.execution.generation !== identity.generation) {
+        console.warn(`[TaskStore] Refusing round update for ${threadId}: generation mismatch (expected ${thread.execution.generation}, found ${identity.generation})`);
+        return undefined;
+      }
+      if (thread.execution.run?.id !== identity.runId) {
+        console.warn(`[TaskStore] Refusing round update for ${threadId}: runId mismatch (expected ${thread.execution.run?.id}, found ${identity.runId})`);
+        return undefined;
+      }
+
+      // Strict round binding: current execution credentials can ONLY update the active execution round!
+      if (roundNumber !== thread.execution.round) {
+        console.warn(`[TaskStore] Refusing round update for ${threadId}: credentials for round ${thread.execution.round} cannot modify historical round ${roundNumber}`);
+        return undefined;
+      }
+
+      const targetRound = thread.rounds.find((r) => r.round === roundNumber);
+      if (!targetRound) {
+        console.warn(`[TaskStore] Refusing round update for ${threadId}: round ${roundNumber} does not exist`);
+        return undefined;
+      }
+
+      // Apply evidence fields ONLY to the target round
+      this.applyRoundEvidence(targetRound, evidence);
+      if (evidence.interruption) {
+        targetRound.interruption = evidence.interruption;
+        appendInterruption(thread, evidence.interruption);
+      }
+      thread.updatedAt = new Date().toISOString();
+
+      ensureFinalSummary(thread);
+      this.persistThread(thread);
+      this.tasks.set(thread.threadId, thread);
+      this.writeAggregate();
+      this.emit('changed', Array.from(this.tasks.values()));
+      return thread;
+    });
+  }
+
+  private applyRoundEvidence(
+    targetRound: DelegationRound,
+    evidence: {
+      output?: string;
+      error?: string;
+      durationMs?: number;
+      status?: RoundStatus;
+      touchedFiles?: string[];
+      assessment?: ResponseAssessment;
+      tokenUsage?: TokenUsageMetrics;
+      executorAgent?: import('./types').AgentId;
+      executorModel?: string;
+      nativeSessionCompactions?: import('./types').NativeSessionCompactionOperation[];
+    },
+  ): void {
+    if (evidence.output !== undefined && !targetRound.isCompacted) {
+      targetRound.output = evidence.output;
+    }
+    if (evidence.error !== undefined) {
+      targetRound.error = evidence.error;
+    }
+    if (evidence.status !== undefined) {
+      targetRound.status = evidence.status;
+    }
+    if (typeof evidence.durationMs === 'number') {
+      targetRound.durationMs = evidence.durationMs;
+    }
+    if (evidence.touchedFiles?.length) {
+      const combined = new Set([...(targetRound.touchedFiles || []), ...evidence.touchedFiles]);
+      targetRound.touchedFiles = Array.from(combined);
+    }
+    if (evidence.tokenUsage) {
+      targetRound.tokenUsage = preferTokenUsage(
+        targetRound.tokenUsage,
+        evidence.tokenUsage,
+        `evidence-round-${targetRound.round}`,
+      );
+    }
+    if (evidence.executorAgent) {
+      targetRound.executorAgent = evidence.executorAgent;
+    }
+    if (evidence.executorModel) {
+      targetRound.executorModel = evidence.executorModel;
+    }
+    if (evidence.assessment) {
+      targetRound.assessment = evidence.assessment;
+    }
+    if (evidence.nativeSessionCompactions) {
+      targetRound.nativeSessionCompactions = evidence.nativeSessionCompactions;
+    }
   }
 
   /**
@@ -1037,7 +2115,7 @@ export class TaskStore extends EventEmitter {
       }
     }
 
-    return all.slice(0, safeLimit);
+    return all.slice(0, safeLimit).map((t) => structuredClone(t));
   }
 
   /**
@@ -1049,9 +2127,66 @@ export class TaskStore extends EventEmitter {
   public recordMergeRequest(
     threadId: string,
     mergeRequest: MergeRequestInfo,
-  ): DelegationThread | undefined {
+  ): DelegationThread | undefined;
+  public recordMergeRequest(
+    threadId: string,
+    mergeRequest: MergeRequestInfo,
+  ): any {
     this.ensureUpToDate();
-    const thread = this.tasks.get(threadId);
+    let thread = this.tasks.get(threadId);
+    const file = this.threadFilePath(threadId);
+    if (!thread && fs.existsSync(file)) {
+      try {
+        thread = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+      } catch (err) {
+        throw new Error(`Corrupted task file on disk for ${threadId}: ${(err as Error)?.message || err}`);
+      }
+    }
+    if (!thread && !fs.existsSync(file)) return undefined;
+
+    if (thread?.execution?.version === 2) {
+      return this.withExecutionLock(threadId, async () => {
+        this.ensureUpToDate();
+        let current = this.tasks.get(threadId);
+        if (fs.existsSync(file)) {
+          try {
+            current = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+          } catch (err) {
+            throw new Error(`Corrupted task file on disk for ${threadId}: ${(err as Error)?.message || err}`);
+          }
+        }
+        if (!current) return undefined;
+        current.mergeRequest = {
+          ...current.mergeRequest,
+          ...mergeRequest,
+          updatedAt: mergeRequest.updatedAt || new Date().toISOString(),
+        };
+        current.updatedAt = new Date().toISOString();
+        current.summary.lastOutputSnippet = mergeRequest.url
+          ? `MR: ${mergeRequest.url}`
+          : mergeRequest.commit
+            ? `MR commit: ${mergeRequest.commit}`
+            : `MR: ${mergeRequest.status}`;
+        if (current.finalSummary) {
+          if (current.archivedAt) {
+            current.finalSummary = {
+              ...current.finalSummary,
+              mergeRequest: current.mergeRequest,
+            };
+          } else {
+            const rebuilt = buildFinalSummary(current, current.mergeRequest);
+            rebuilt.at = current.finalSummary.at;
+            current.finalSummary = rebuilt;
+          }
+        }
+        this.persistThread(current);
+        this.tasks.set(current.threadId, current);
+        this.writeAggregate();
+        this.emit('changed', Array.from(this.tasks.values()));
+        return current;
+      });
+    }
+
     if (!thread) return undefined;
 
     thread.mergeRequest = {
@@ -1059,16 +2194,12 @@ export class TaskStore extends EventEmitter {
       ...mergeRequest,
       updatedAt: mergeRequest.updatedAt || new Date().toISOString(),
     };
-    // MR metadata is remote delivery only; local integration is tracked separately.
     thread.updatedAt = new Date().toISOString();
     thread.summary.lastOutputSnippet = mergeRequest.url
       ? `MR: ${mergeRequest.url}`
       : mergeRequest.commit
         ? `MR commit: ${mergeRequest.commit}`
         : `MR: ${mergeRequest.status}`;
-    // A task may be accepted before its MR is recorded: refresh the digest so the
-    // archived summary carries the MR pointer too. An ARCHIVED task has no rounds
-    // left, so rebuilding would erase the digest — merge the pointer instead.
     if (thread.finalSummary) {
       if (thread.archivedAt) {
         thread.finalSummary = {
@@ -1081,7 +2212,10 @@ export class TaskStore extends EventEmitter {
         thread.finalSummary = rebuilt;
       }
     }
-    this.saveToDisk();
+    this.persistThread(thread);
+    this.tasks.set(thread.threadId, thread);
+    this.writeAggregate();
+    this.emit('changed', Array.from(this.tasks.values()));
     return thread;
   }
 
@@ -1091,9 +2225,27 @@ export class TaskStore extends EventEmitter {
    * Keeps the task row, model/agent metadata, MR and final digest; archives
    * task-owned histories before dropping rounds and session ids.
    */
-  public archiveTask(threadId: string): DelegationThread | undefined {
+  public archiveTask(threadId: string, cleanupToken?: string): DelegationThread | undefined {
     this.ensureUpToDate();
-    const source = this.tasks.get(threadId);
+    let source = this.tasks.get(threadId);
+    const file = this.threadFilePath(threadId);
+    if (fs.existsSync(file)) {
+      try {
+        source = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+      } catch {}
+    }
+    if (source?.execution?.version === 2) {
+      console.warn(
+        `[TaskStore] Refusing legacy archiveTask for v2 task ${threadId}: v2 tasks must use markTaskCleanup/commitTaskCleanup`,
+      );
+      return undefined;
+    }
+    if (source?.cleanup) {
+      console.warn(
+        `[TaskStore] Refusing legacy archiveTask on ${threadId}: task is reserved for cleanup (${source.cleanup.action}) by ${source.cleanup.token}; must use commitTaskCleanup under OS lock`,
+      );
+      return undefined;
+    }
     const thread = source && JSON.parse(JSON.stringify(source)) as DelegationThread;
     if (!thread || !canArchiveTask(thread)) return undefined;
     // Do not discard the source until a complete archive and archived ledger row are durable.
@@ -1108,26 +2260,30 @@ export class TaskStore extends EventEmitter {
       leases.push(lease);
     }
     try {
-    try {
-      const archivedLogs = archiveCompletedTaskLogs(thread, this.storageDir);
-      if (!archivedLogs.tarGzPaths.length) return undefined;
-    } catch (error) {
-      console.warn(`[TaskStore] Could not archive ${threadId}; retaining task data:`, error);
-      return undefined;
-    }
-    if (!archiveThreadData(thread)) return undefined;
-    this.persistThread(thread);
-    this.tasks.set(threadId, thread);
-    try { cleanupThreadNativeSessions(source!); } catch {}
-    removeTaskArtifacts(threadId, this.storageDir, {
-      keepArchive: true,
-      targetAgent: thread.targetAgent,
-      initiatorAgent: thread.initiatorAgent,
-      artifactDir: thread.artifactDir,
-    });
-    this.writeAggregate();
-    this.emit('changed', Array.from(this.tasks.values()));
-    return thread;
+      try {
+        const archivedLogs = archiveCompletedTaskLogs(thread, this.storageDir);
+        if (!archivedLogs.tarGzPaths.length) return undefined;
+      } catch (error) {
+        console.warn(`[TaskStore] Could not archive ${threadId}; retaining task data:`, error);
+        return undefined;
+      }
+      if (!archiveThreadData(thread)) return undefined;
+      delete thread.cleanup;
+      if (thread.execution) {
+        thread.execution.revision += 1;
+      }
+      this.persistThread(thread);
+      this.tasks.set(threadId, thread);
+      try { cleanupThreadNativeSessions(source!); } catch {}
+      removeTaskArtifacts(threadId, this.storageDir, {
+        keepArchive: true,
+        targetAgent: thread.targetAgent,
+        initiatorAgent: thread.initiatorAgent,
+        artifactDir: thread.artifactDir,
+      });
+      this.writeAggregate();
+      this.emit('changed', Array.from(this.tasks.values()));
+      return thread;
     } finally {
       for (const lease of leases) nativeLock.release(lease);
     }
@@ -1138,25 +2294,101 @@ export class TaskStore extends EventEmitter {
    *
    * @returns true when an entry existed and was removed.
    */
-  public deleteTask(threadId: string): boolean {
+  public deleteTask(threadId: string, cleanupToken?: string): boolean;
+  public deleteTask(threadId: string, cleanupToken?: string): any {
+    const tombstonePath = path.join(this.storageDir, 'deleted_tasks.log');
+    if (fs.existsSync(tombstonePath) && fs.statSync(tombstonePath).isDirectory()) {
+      throw new Error(`EISDIR: illegal operation on a directory, open '${tombstonePath}'`);
+    }
     this.ensureUpToDate();
-    const thread = this.tasks.get(threadId);
-    const existed = this.tasks.delete(threadId);
-    if (existed) {
+    let thread = this.tasks.get(threadId);
+    const file = this.threadFilePath(threadId);
+    if (!thread && fs.existsSync(file)) {
       try {
-        fs.unlinkSync(this.threadFilePath(threadId));
-      } catch {}
+        thread = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+      } catch (err) {
+        throw new Error(`Corrupted task file on disk for ${threadId}: ${(err as Error)?.message || err}`);
+      }
+    }
+    if (thread?.cleanup) {
+      console.warn(
+        `[TaskStore] Refusing legacy deleteTask on ${threadId}: task is reserved for cleanup (${thread.cleanup.action}) by ${thread.cleanup.token}; must use commitTaskCleanup under OS lock`,
+      );
+      return false;
+    }
+    if (thread?.execution?.version === 2) {
+      return this.withExecutionLock(threadId, async () => {
+        this.ensureUpToDate();
+        let current = this.tasks.get(threadId);
+        if (fs.existsSync(file)) {
+          try {
+            current = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')));
+          } catch (err) {
+            throw new Error(`Corrupted task file on disk for ${threadId}: ${(err as Error)?.message || err}`);
+          }
+        }
+        if (current?.cleanup && (!cleanupToken || current.cleanup.token !== cleanupToken || current.cleanup.action !== 'delete')) {
+          console.warn(`[TaskStore] Refusing deleteTask on ${threadId}: task is reserved for cleanup (${current.cleanup.action}) by ${current.cleanup.token}`);
+          return false;
+        }
+        const existed = Boolean(this.tasks.has(threadId) || fs.existsSync(file));
+        if (existed) {
+          this.appendTombstone({
+            threadId,
+            title: current?.title,
+            initiatorAgent: current?.initiatorAgent,
+            targetAgent: current?.targetAgent,
+            statusAtDeletion: current?.status,
+            reason: 'Direct task store deletion',
+            by: 'system',
+            at: new Date().toISOString(),
+            cleanupToken: cleanupToken || current?.cleanup?.token,
+          });
+          this.tasks.delete(threadId);
+          if (fs.existsSync(file)) {
+            fs.unlinkSync(file);
+          }
+          removeTaskArtifacts(threadId, this.storageDir, {
+            keepArchive: false,
+            targetAgent: current?.targetAgent,
+            initiatorAgent: current?.initiatorAgent,
+            artifactDir: current?.artifactDir,
+          });
+          if (current?.artifactDir) removeTaskDataDir(current.artifactDir, false);
+          this.knownMtimes.delete(path.basename(file));
+          this.writeAggregate();
+          this.emit('changed', Array.from(this.tasks.values()));
+        }
+        return existed;
+      });
+    }
+
+    const existed = Boolean(this.tasks.has(threadId) || fs.existsSync(file));
+    if (existed) {
+      // Must append durable tombstone before unlinking; throws on failure
+      this.appendTombstone({
+        threadId,
+        title: thread?.title,
+        initiatorAgent: thread?.initiatorAgent,
+        targetAgent: thread?.targetAgent,
+        statusAtDeletion: thread?.status,
+        reason: 'Direct task store deletion',
+        by: 'system',
+        at: new Date().toISOString(),
+        cleanupToken: cleanupToken || thread?.cleanup?.token,
+      });
+      this.tasks.delete(threadId);
+      if (fs.existsSync(file)) {
+        fs.unlinkSync(file);
+      }
       removeTaskArtifacts(threadId, this.storageDir, {
         keepArchive: false,
         targetAgent: thread?.targetAgent,
         initiatorAgent: thread?.initiatorAgent,
         artifactDir: thread?.artifactDir,
       });
-      // Remove every remaining task-owned subdirectory. The worktree is left
-      // for the caller (TaskControlService) to unregister with Git first; that
-      // caller removes the root afterwards.
       if (thread?.artifactDir) removeTaskDataDir(thread.artifactDir, false);
-      this.knownMtimes.delete(path.basename(this.threadFilePath(threadId)));
+      this.knownMtimes.delete(path.basename(file));
       this.writeAggregate();
       this.emit('changed', Array.from(this.tasks.values()));
     }
@@ -1168,7 +2400,7 @@ export class TaskStore extends EventEmitter {
    */
   public getAllTasks(): DelegationThread[] {
     this.ensureUpToDate();
-    return Array.from(this.tasks.values());
+    return Array.from(this.tasks.values()).map((t) => structuredClone(t));
   }
 
   /**

@@ -676,7 +676,11 @@ export class TaskSupervisor extends EventEmitter {
         nativeSessionId,
         undefined,
         interruption,
-        { failureRevision: startedFailureRevision, roundTimestamp: startedRoundTimestamp },
+        {
+          failureRevision: startedFailureRevision,
+          roundTimestamp: startedRoundTimestamp,
+          receiverSessionCaptured: Boolean(result.actualSessionId || currentThread.receiverSessionCaptured),
+        },
       );
 
         if (updatedThread && this.taskStore.getTask(updatedThread.threadId)) {
