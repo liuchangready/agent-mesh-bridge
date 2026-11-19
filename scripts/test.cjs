@@ -70,6 +70,7 @@ const LAYER_MAPPING = {
     'task-role-lock.test.js',
     'task-store.test.js',
     'unified-execution-boundary.test.js',
+    'unified-state-writing.test.js',
     'workspace.test.js',
     'worktree-root.test.js',
   ]),

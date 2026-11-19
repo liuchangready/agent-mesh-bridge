@@ -43,8 +43,51 @@ export interface ProcessIdentity {
   birthId?: string;
 }
 
+export type ExecutionVersion = 1 | 2;
+
+export interface ExecutionRun {
+  id: string;
+  owner: ProcessIdentity;
+  child?: ProcessIdentity;
+  step: string;
+  state: 'starting' | 'active' | 'stopping';
+  startedAt: string;
+  role?: 'developer' | 'reviewer';
+}
+
+export interface ExecutionNext {
+  phase: ExecutionPhase;
+  round: number;
+  purpose?: 'bootstrap' | 'merge_resolution';
+  sourceRunId?: string;
+}
+
+export interface ExecutionQueue {
+  reason:
+    | 'role'
+    | 'session'
+    | 'merge_lock'
+    | 'capacity'
+    | 'backoff'
+    | 'quota'
+    | 'dependency';
+  notBefore?: string;
+  enteredAt?: string;
+}
+
+export interface TaskCleanupState {
+  token: string;
+  action: 'archive' | 'delete';
+  owner: ProcessIdentity;
+  startedAt: string;
+  stage?: 'marking' | 'in_progress' | 'completed';
+  operationId?: string;
+  generation?: number;
+  runId?: string;
+}
+
 export interface ExecutionControl {
-  version: 1;
+  version: ExecutionVersion;
   revision: number;
   operationId: string;
   phase: ExecutionPhase;
@@ -53,19 +96,9 @@ export interface ExecutionControl {
   generation: number;
   attempt: number;
   autoRetriesUsed: number;
-  queue?: {
-    reason: 'role' | 'session' | 'merge_lock' |
-      'capacity' | 'backoff' | 'quota';
-    notBefore?: string;
-  };
-  run?: {
-    id: string;
-    owner: ProcessIdentity;
-    child?: ProcessIdentity;
-    step: string;
-    state: 'starting' | 'active' | 'stopping';
-    startedAt: string;
-  };
+  queue?: ExecutionQueue;
+  run?: ExecutionRun;
+  next?: ExecutionNext;
   budget: {
     limitMs: number;
     spentActiveMs: number;
@@ -789,6 +822,7 @@ export interface DelegationThread {
   failure?: TaskFailure;
   failureRevision?: number;
   execution?: ExecutionControl;
+  cleanup?: TaskCleanupState;
   decision?: TaskDecisionRecord;
   decisions?: TaskDecisionRecord[];
   taskTemplate?: import('./task-templates').TaskTemplate;

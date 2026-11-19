@@ -732,7 +732,11 @@ export class AsyncDispatcher {
         nativeSessionId,
         undefined,
         interruption,
-        { failureRevision: startedFailureRevision, roundTimestamp: startedRoundTimestamp },
+        {
+          failureRevision: startedFailureRevision,
+          roundTimestamp: startedRoundTimestamp,
+          receiverSessionCaptured: Boolean(result.actualSessionId || latest.receiverSessionCaptured),
+        },
       );
 
       if (updatedThread && this.taskStore.getTask(updatedThread.threadId)) {

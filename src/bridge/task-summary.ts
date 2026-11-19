@@ -280,6 +280,111 @@ export function createTarGzBuffer(
  *   - <threadId>_archive.tar.gz (compressed tar containing worker_log, reviewer_log, and summary.json)
  *   - <threadId>_archive.json (summary metadata and archive manifest)
  */
+/**
+ * Enumerate all expected worker/reviewer/merge/overlay log files for a task from disk.
+ * Returns a Map of entry name (e.g. 'worker_log/review_test_round_1.log') to file info.
+ */
+export function collectExpectedArchiveLogFiles(
+  thread: DelegationThread,
+  root?: string,
+): Map<string, { fullPath: string; size: number }> {
+  const safe = String(thread.threadId || '').replace(/[^A-Za-z0-9_.-]/g, '_');
+  const artifactDir = thread.artifactDir;
+  const expected = new Map<string, { fullPath: string; size: number }>();
+  const foundFilenames = new Set<string>();
+
+  // 1. Gather worker logs
+  const workerDirs = artifactDir
+    ? [taskWorkerLogDir(artifactDir)]
+    : Array.from(
+        new Set([
+          getWorkerLogDir(thread.targetAgent, root),
+          getWorkerLogDir(undefined, root),
+          bridgeLogsDir(root),
+        ]),
+      );
+  for (const dir of workerDirs) {
+    if (!fs.existsSync(dir)) continue;
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.startsWith(`${safe}_round_`)) continue;
+      if (!name.endsWith('.log') && !name.endsWith('.output.md') && !name.endsWith('.recovery.json')) continue;
+      if (foundFilenames.has(name)) continue;
+      const full = path.join(dir, name);
+      try {
+        const stat = fs.statSync(full);
+        if (stat.isFile()) {
+          expected.set(`worker_log/${name}`, { fullPath: full, size: stat.size });
+          foundFilenames.add(name);
+        }
+      } catch {}
+    }
+  }
+
+  // 2. Gather reviewer logs
+  const reviewerDirs = artifactDir
+    ? [taskReviewerLogDir(artifactDir)]
+    : Array.from(
+        new Set([
+          getReviewerLogDir(thread.initiatorAgent, root),
+          getReviewerLogDir(undefined, root),
+          bridgeLogsDir(root),
+        ]),
+      );
+  for (const dir of reviewerDirs) {
+    if (!fs.existsSync(dir)) continue;
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.startsWith(`${safe}_round_`) && !name.startsWith(`${safe}_bootstrap.log`)) continue;
+      if (!name.endsWith('.reviewer.log') && !name.endsWith('_bootstrap.log') && !name.endsWith('.recovery.json')) continue;
+      if (foundFilenames.has(name)) continue;
+      const full = path.join(dir, name);
+      try {
+        const stat = fs.statSync(full);
+        if (stat.isFile()) {
+          expected.set(`reviewer_log/${name}`, { fullPath: full, size: stat.size });
+          foundFilenames.add(name);
+        }
+      } catch {}
+    }
+  }
+
+  // 3. Merge logs
+  const mergeDir = artifactDir ? path.join(artifactDir, 'merge_log') : path.join(bridgeHomeDir(root), 'merge-logs', safe, 'merge_log');
+  if (fs.existsSync(mergeDir)) {
+    for (const name of fs.readdirSync(mergeDir)) {
+      if (!name.startsWith(`${safe}_merge_`) || !name.endsWith('.log')) continue;
+      const full = path.join(mergeDir, name);
+      try {
+        const stat = fs.statSync(full);
+        if (stat.isFile()) {
+          expected.set(`merge_log/${name}`, { fullPath: full, size: stat.size });
+        }
+      } catch {}
+    }
+  }
+
+  // 4. Bridge-generated one-run model overlays (currently DSH patches).
+  if (artifactDir) {
+    const overlayDir = taskModelOverlayDir(artifactDir);
+    if (fs.existsSync(overlayDir)) {
+      for (const name of fs.readdirSync(overlayDir)) {
+        const full = path.join(overlayDir, name);
+        try {
+          const stat = fs.statSync(full);
+          if (stat.isFile()) {
+            const entryName = `model-overlays/${name}`;
+            if (!foundFilenames.has(entryName)) {
+              expected.set(entryName, { fullPath: full, size: stat.size });
+              foundFilenames.add(entryName);
+            }
+          }
+        } catch {}
+      }
+    }
+  }
+
+  return expected;
+}
+
 export function archiveCompletedTaskLogs(
   thread: DelegationThread,
   root?: string,
@@ -305,83 +410,11 @@ export function archiveCompletedTaskLogs(
   }
 
   const entries: Array<{ name: string; content: Buffer | string; mtime?: Date }> = [];
-  const foundFilenames = new Set<string>();
-
-  // 1. Gather worker logs
-  const workerDirs = artifactDir
-    ? [taskWorkerLogDir(artifactDir)]
-    : Array.from(
-        new Set([
-          getWorkerLogDir(thread.targetAgent, root),
-          getWorkerLogDir(undefined, root),
-          bridgeLogsDir(root),
-        ]),
-      );
-  for (const dir of workerDirs) {
-    if (!fs.existsSync(dir)) continue;
-    for (const name of fs.readdirSync(dir)) {
-      if (!name.startsWith(`${safe}_round_`)) continue;
-      if (!name.endsWith('.log') && !name.endsWith('.output.md') && !name.endsWith('.recovery.json')) continue;
-      if (foundFilenames.has(name)) continue;
-      const full = path.join(dir, name);
-      const content = fs.readFileSync(full);
-      const stat = fs.statSync(full);
-      entries.push({ name: `worker_log/${name}`, content, mtime: stat.mtime });
-      foundFilenames.add(name);
-    }
-  }
-
-  // 2. Gather reviewer logs
-  const reviewerDirs = artifactDir
-    ? [taskReviewerLogDir(artifactDir)]
-    : Array.from(
-        new Set([
-          getReviewerLogDir(thread.initiatorAgent, root),
-          getReviewerLogDir(undefined, root),
-          bridgeLogsDir(root),
-        ]),
-      );
-  for (const dir of reviewerDirs) {
-    if (!fs.existsSync(dir)) continue;
-    for (const name of fs.readdirSync(dir)) {
-      if (!name.startsWith(`${safe}_round_`) && !name.startsWith(`${safe}_bootstrap.log`)) continue;
-      if (!name.endsWith('.reviewer.log') && !name.endsWith('_bootstrap.log') && !name.endsWith('.recovery.json')) continue;
-      if (foundFilenames.has(name)) continue;
-      const full = path.join(dir, name);
-      const content = fs.readFileSync(full);
-      const stat = fs.statSync(full);
-      entries.push({ name: `reviewer_log/${name}`, content, mtime: stat.mtime });
-      foundFilenames.add(name);
-    }
-  }
-
-  const mergeDir = artifactDir ? path.join(artifactDir, 'merge_log') : path.join(bridgeHomeDir(root), 'merge-logs', safe, 'merge_log');
-  if (fs.existsSync(mergeDir)) {
-    for (const name of fs.readdirSync(mergeDir)) {
-      if (!name.startsWith(`${safe}_merge_`) || !name.endsWith('.log')) continue;
-      const full = path.join(mergeDir, name);
-      const stat = fs.statSync(full);
-      if (stat.isFile()) entries.push({ name: `merge_log/${name}`, content: fs.readFileSync(full), mtime: stat.mtime });
-    }
-  }
-
-  // 3. Bridge-generated one-run model overlays (currently DSH patches).
-  if (artifactDir) {
-    const overlayDir = taskModelOverlayDir(artifactDir);
-    if (fs.existsSync(overlayDir)) {
-      for (const name of fs.readdirSync(overlayDir)) {
-        const full = path.join(overlayDir, name);
-        const stat = fs.statSync(full);
-        if (!stat.isFile()) continue;
-        const entryName = `model-overlays/${name}`;
-        if (foundFilenames.has(entryName)) continue;
-        // I/O errors here must propagate: TaskStore.archiveTask only clears the
-        // source after a complete archive. Swallowing a read error and then
-        // deleting the overlay would silently lose a task product.
-        entries.push({ name: entryName, content: fs.readFileSync(full), mtime: stat.mtime });
-        foundFilenames.add(entryName);
-      }
-    }
+  const expectedFiles = collectExpectedArchiveLogFiles(thread, root);
+  for (const [entryName, info] of expectedFiles) {
+    const content = fs.readFileSync(info.fullPath);
+    const stat = fs.statSync(info.fullPath);
+    entries.push({ name: entryName, content, mtime: stat.mtime });
   }
 
   // 4. Manifest / summary entry
