@@ -2,7 +2,7 @@
   "name": "agent-mesh-bridge",
   "displayName": "Agent Mesh Bridge",
   "description": "Agent Mesh Bridge for Antigravity, Codex, Claude Code and DeepSeek Harness",
-  "version": "1.2.23",
+  "version": "1.2.32",
   "publisher": "agent-mesh",
   "author": "Antigravity Team",
   "license": "MIT",
@@ -197,52 +197,52 @@
         },
         {
           "command": "agent-mesh-bridge.openTaskDetail",
-          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "when": "viewItem != workspace_group && (view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks)",
           "group": "inline"
         },
         {
           "command": "agent-mesh-bridge.printRecentLogs",
-          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge",
+          "when": "viewItem != workspace_group && ((view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge)",
           "group": "inline"
         },
         {
           "command": "agent-mesh-bridge.approveTask",
-          "when": "view == agent-mesh-bridge.active-tasks && viewItem != failed_merge && viewItem != wait_decision",
+          "when": "viewItem != workspace_group && (view == agent-mesh-bridge.active-tasks && viewItem != failed_merge && viewItem != wait_decision)",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.requestRework",
-          "when": "view == agent-mesh-bridge.active-tasks && viewItem != failed_merge && viewItem != wait_decision",
+          "when": "viewItem != workspace_group && (view == agent-mesh-bridge.active-tasks && viewItem != failed_merge && viewItem != wait_decision)",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.resumeTask",
-          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge && viewItem != failed_bootstrap && viewItem != wait_decision",
+          "when": "viewItem != workspace_group && ((view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge && viewItem != failed_bootstrap && viewItem != wait_decision)",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.pauseTask",
-          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge && viewItem != failed_review && viewItem != failed_execution && viewItem != failed_bootstrap && viewItem != wait_decision",
+          "when": "viewItem != workspace_group && ((view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge && viewItem != failed_review && viewItem != failed_execution && viewItem != failed_bootstrap && viewItem != wait_decision)",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.retargetTask",
-          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge && viewItem != wait_decision",
+          "when": "viewItem != workspace_group && ((view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge && viewItem != wait_decision)",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.deleteTask",
-          "when": "view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks",
+          "when": "viewItem != workspace_group && (view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks)",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.deleteTaskForce",
-          "when": "(view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge",
+          "when": "viewItem != workspace_group && ((view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge)",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.wakeUpCaller",
-          "when": "(viewItem == reviewing_stalled || viewItem == reviewing_blocked || viewItem == failed_review) && (view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks)",
+          "when": "viewItem != workspace_group && ((viewItem == reviewing_stalled || viewItem == reviewing_blocked || viewItem == failed_review) && (view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks))",
           "group": "1_actions"
         }
       ]

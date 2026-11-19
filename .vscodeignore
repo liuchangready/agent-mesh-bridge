@@ -24,3 +24,10 @@ eslint.config.mjs
 .prettierrc
 .prettierignore
 *.vsix
+
+# Task measurement artifacts committed by a task's approved snapshot; the
+# extension never reads them at runtime.
+benchmark.json
+benchmark-results/**
+.agent_bridge/**
+

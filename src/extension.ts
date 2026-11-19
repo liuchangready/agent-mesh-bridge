@@ -910,9 +910,18 @@ export function activate(context: vscode.ExtensionContext) {
 
         if (threadId) {
           TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
-        } else {
-          vscode.window.showErrorMessage('No task selected to view.');
+          return;
         }
+        // A workspace group row owns no task. The menu already hides this
+        // command there, so reaching it means the user invoked it another way:
+        // say what the row is instead of reporting a missing selection.
+        if (typeof itemOrThreadId !== 'string' && itemOrThreadId?.workspaceId) {
+          vscode.window.showInformationMessage(
+            `【${itemOrThreadId.label}】是工作区分组，请展开后选择具体任务再查看详情。`,
+          );
+          return;
+        }
+        vscode.window.showErrorMessage('No task selected to view.');
       },
     ),
 
