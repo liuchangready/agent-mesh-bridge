@@ -86,7 +86,15 @@ export class TaskRoleLock {
     role: TaskRole,
     conversationId?: string,
   ): TaskRoleLease | null {
-    if (this.activeLeases.has(threadId)) return null;
+    const held = this.activeLeases.get(threadId);
+    if (held) {
+      // Re-entrant call from the same process: this turn already owns the role.
+      // Reporting "busy" here would make the caller treat its own live
+      // execution as another process's and park the task in `queued(role)`
+      // while the agent keeps running, so the status would never match reality.
+      if (held.lease.role === role) return held.lease;
+      return null;
+    }
 
     // Old dedicated-reviewer builds used conv_<hash>.json. Check those records
     // before taking the canonical thread lock, then write only the canonical

@@ -254,4 +254,24 @@ describe('Task role enforcement in execution', () => {
       } catch {}
     }
   });
+
+  test('re-acquiring the role this process already holds returns the live lease', () => {
+    // A phase handoff re-enters startExecution while this turn still owns the
+    // role. Treating that as "busy" parked the task in queued(role) while the
+    // agent kept running, so the reported status never matched reality.
+    const lock = new TaskRoleLock();
+    const first = lock.tryAcquire('thread_role_reentrant', 'reviewer');
+    assert.ok(first, 'first acquisition must succeed');
+
+    try {
+      const again = lock.tryAcquire('thread_role_reentrant', 'reviewer');
+      assert.ok(again, 're-entrant acquisition must not report the role as busy');
+      assert.strictEqual(again!.token, first!.token, 'the live lease must be returned unchanged');
+
+      const conflicting = lock.tryAcquire('thread_role_reentrant', 'developer');
+      assert.strictEqual(conflicting, null, 'a different role must still be refused');
+    } finally {
+      lock.release(first!);
+    }
+  });
 });
