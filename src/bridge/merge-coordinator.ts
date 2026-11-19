@@ -115,7 +115,7 @@ export class MergeCoordinator {
   private readonly executions: TaskExecutionRegistry;
   private readonly lock: MeshFileLock;
   private readonly attemptLogs = new Map<string, { id: string; number: number; path: string; candidateTree?: string }>();
-  private activeChildPidCallback?: (pid: number) => void;
+  private activeChildPidCallback?: (pid: number) => void | Promise<void>;
 
   constructor(
     private readonly store: TaskStore,
@@ -140,7 +140,6 @@ export class MergeCoordinator {
     let child: ReturnType<typeof spawn>;
     try { child = spawn(gitExecutable(), args, { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }); }
     catch (error) { this.executions.end(registration); throw error; }
-    if (child.pid) this.activeChildPidCallback?.(child.pid);
     let stdout = ''; let stderr = ''; let trackingError: Error | undefined;
     try { this.executions.attachChildPid(child.pid, registration); }
     catch (error) { trackingError = error as Error; killProcessTree(child); }
@@ -155,9 +154,17 @@ export class MergeCoordinator {
     const completion = new Promise<{ code: number | null; error?: Error }>((resolve) => { resolveResult = resolve; });
     const timer = setTimeout(() => killProcessTree(child), 30_000);
     timer.unref?.();
-    child.once('error', (error) => resolveResult({ code: null, error }));
-    child.once('close', (code) => resolveResult({ code }));
+    // An `error` event reports a failed spawn/pipe, not that the process is gone:
+    // resolving on it would end the registration and detach the lock while a
+    // spawned tree is still running. Record it and settle on `close` only.
+    let childError: Error | undefined;
+    child.once('error', (error) => { childError = error; });
+    child.once('close', (code) => resolveResult({ code, error: childError }));
     try {
+      // The child is already spawned: a rejected identity binding must stop this
+      // subtree and be surfaced, never skip straight to the cleanup in `finally`.
+      try { if (child.pid) await this.activeChildPidCallback?.(child.pid); }
+      catch (error) { trackingError = error as Error; killProcessTree(child); }
       try { if (!trackingError) await this.lock.attachChildPid(child.pid, () => !this.isMergeStillAllowed(threadId, thread?.worktree?.approvedCommit || '')); }
       catch (error) { trackingError = error as Error; killProcessTree(child); }
       const result = await completion;
@@ -867,7 +874,6 @@ export class MergeCoordinator {
     let child: ReturnType<typeof spawn>;
     try { child = spawn(gitExecutable(), ['update-ref', '--stdin'], { cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }); }
     catch (failure) { this.executions.end(registration); throw failure; }
-    if (child.pid) this.activeChildPidCallback?.(child.pid);
     let output = ''; let error = ''; let prepared = false; let committed = false;
     const completion = new Promise<boolean>((resolve) => {
       child.stdin!.on('error', (failure) => { error += failure.message; });
@@ -893,14 +899,18 @@ export class MergeCoordinator {
         }
       });
       child.stderr!.on('data', (chunk: Buffer) => { error += chunk.toString(); });
-      child.once('error', (failure) => { error += failure.message; resolve(false); });
+      // A failed helper start is not a completed removal: keep the outcome
+      // pending until the process actually closes.
+      child.once('error', (failure) => { error += failure.message; });
       child.once('close', (code) => resolve(code === 0 && committed && output.includes('commit: ok')));
     });
     const timer = setTimeout(() => killProcessTree(child), 30_000);
     timer.unref?.();
     try {
+      if (!child.pid) throw new Error('Git stash cleanup process has no PID.');
       this.executions.attachChildPid(child.pid, registration);
       await this.lock.attachChildPid(child.pid);
+      await this.activeChildPidCallback?.(child.pid);
       child.stdin!.write(`start\noption no-deref\ndelete refs/stash ${sha}\nprepare\n`);
       const removed = await completion;
       if (!removed && error) {
@@ -1130,7 +1140,6 @@ export class MergeCoordinator {
       const logPath = this.attemptLogs.get(threadId)?.path;
       if (logPath) fs.appendFileSync(logPath, `\n$ ${step.command} ${step.args.join(' ')}\n`, 'utf8');
       const child = spawn(step.command, step.args, { cwd, env, windowsHide: true, shell: step.needsShell });
-      if (child.pid) this.activeChildPidCallback?.(child.pid);
       let output = '';
       let trackingError: Error | undefined;
       try { this.executions.attachChildPid(child.pid, registration); }
@@ -1149,8 +1158,15 @@ export class MergeCoordinator {
       }, 20 * 60 * 1000);
       timer.unref?.();
       child.on('close', (code) => { clearTimeout(timer); this.lock.detachChildPid(child.pid); resolveResult({ code: trackingError ? -1 : code, output: trackingError?.message || output }); });
-      child.on('error', (error) => { clearTimeout(timer); this.lock.detachChildPid(child.pid); resolveResult({ code: -1, output: error.message }); });
+      // Spawn/pipe failure is not proof of exit: stop the tree and let `close`
+      // settle the result so the lock is not detached under a live process.
+      child.on('error', (error) => {
+        if (!trackingError) trackingError = error;
+        killProcessTree(child);
+      });
       try { if (!trackingError) await this.lock.attachChildPid(child.pid, () => !this.isMergeStillAllowed(threadId, sourceCommit)); }
+      catch (error) { trackingError = error as Error; killProcessTree(child); }
+      try { if (child.pid) await this.activeChildPidCallback?.(child.pid); }
       catch (error) { trackingError = error as Error; killProcessTree(child); }
       const result = await resultPromise;
       if (logPath) fs.appendFileSync(logPath, `\n${step.label} ${result.code === 0 ? 'passed' : `failed (exit ${result.code})`}\n`, 'utf8');

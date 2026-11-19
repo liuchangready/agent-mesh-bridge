@@ -632,7 +632,7 @@ export class CallbackManager extends EventEmitter {
 
   public async launchReviewerBootstrap(
     thread: DelegationThread,
-    onChildPid?: (pid: number) => void,
+    onChildPid?: (pid: number) => void | Promise<void>,
   ): Promise<{ confirmed: boolean; error?: string; transient?: boolean }> {
     assertCanExecute(thread.initiatorAgent, 'bootstrap as a reviewer', 'initiator');
     const store = this.taskStore;
@@ -668,9 +668,9 @@ export class CallbackManager extends EventEmitter {
         MESH_REVIEW_THREAD_ID: thread.threadId,
         MESH_CALLER_AGENT: thread.initiatorAgent,
       },
-      onChildPid: (pid) => {
+      onChildPid: async (pid) => {
         if (pid && root) recordReviewerBootstrapHostPid(thread.threadId, pid, root, thread.artifactDir);
-        if (pid) onChildPid?.(pid);
+        if (pid) await onChildPid?.(pid);
       },
     });
 
@@ -704,7 +704,7 @@ export class CallbackManager extends EventEmitter {
   public launchCaller(
     thread: DelegationThread,
     round: DelegationRound,
-    onChildPid?: (pid: number) => void,
+    onChildPid?: (pid: number) => void | Promise<void>,
   ): Promise<{ success: boolean; error?: string; exitCode?: number }>;
   public launchCaller(
     thread: DelegationThread,
@@ -713,7 +713,7 @@ export class CallbackManager extends EventEmitter {
     round: DelegationRound,
     wakeKind: 'review' | 'failure',
     release: () => void,
-    onChildPid?: (pid: number | undefined) => void,
+    onChildPid?: (pid: number | undefined) => void | Promise<void>,
     recoveryVersion?: string,
     mergeWakeId?: string,
     roleToken?: string,
@@ -721,11 +721,11 @@ export class CallbackManager extends EventEmitter {
   public launchCaller(
     thread: DelegationThread,
     callerSessionIdOrRound: string | DelegationRound,
-    promptMessageOrOnChildPid?: string | ((pid: number) => void),
+    promptMessageOrOnChildPid?: string | ((pid: number) => void | Promise<void>),
     roundParam?: DelegationRound,
     wakeKind?: 'review' | 'failure',
     release?: () => void,
-    onChildPid?: (pid: number | undefined) => void,
+    onChildPid?: (pid: number | undefined) => void | Promise<void>,
     recoveryVersion?: string,
     mergeWakeId?: string,
     roleToken?: string,
@@ -897,10 +897,9 @@ export class CallbackManager extends EventEmitter {
         try { child.stdin.end(); } catch {}
       }
 
-      if (child.pid) {
-        onChildPid?.(child.pid);
-      }
-
+      const childPid = child.pid;
+      let bindingError: string | undefined;
+      let childError: string | undefined;
       let stdoutOutput = '';
       let stderrOutput = '';
       child.stdout?.on('data', (chunk: Buffer) => {
@@ -915,20 +914,30 @@ export class CallbackManager extends EventEmitter {
         reviewerLog.write(text);
       });
 
+      // A spawn/pipe failure is not proof the process is gone: record it and let
+      // the real `close` event settle the wake-up.
       child.once('error', (err) => {
-        reviewerLog.writeOutcome({ error: err.message });
-        reviewerLog.close();
-        resolve({ success: false, error: err.message, exitCode: -1 });
+        childError = err.message;
       });
 
       child.once('close', (code) => {
-        reviewerLog.writeOutcome({ exitCode: code ?? undefined });
-        reviewerLog.close();
-        resolve({
-          success: code === 0,
-          exitCode: code ?? undefined,
-          error: code === 0 ? undefined : stderrOutput || stdoutOutput || `Reviewer process exited with code ${code}`,
+        // Wait for the durable child binding before reporting: a rejected bind
+        // must be reported as a failure, never as a started reviewer.
+        bindingPromise.then(() => undefined, () => undefined).then(() => {
+          const error = bindingError || childError;
+          reviewerLog.writeOutcome({ exitCode: code ?? undefined });
+          reviewerLog.close();
+          resolve({ success: !error && code === 0, exitCode: error ? -1 : code ?? undefined,
+            error: error || (code === 0 ? undefined : stderrOutput || stdoutOutput || `Reviewer process exited with code ${code}`) });
         });
+      });
+
+      // Attach rejection handling immediately: a failed durable bind must stop
+      // the child now, while finalization still waits for the real close event.
+      const bindingPromise = childPid ? Promise.resolve().then(() => onChildPid?.(childPid)) : Promise.resolve();
+      void bindingPromise.catch((err: any) => {
+        bindingError = String(err?.message || err);
+        try { child.kill(); } catch {}
       });
     });
   }
@@ -947,7 +956,7 @@ export class CallbackManager extends EventEmitter {
     round: DelegationRound,
     wakeKind: 'review' | 'failure',
     release: () => void,
-    onChildPid?: (pid: number | undefined) => void,
+    onChildPid?: (pid: number | undefined) => void | Promise<void>,
     recoveryVersion?: string,
     mergeWakeId?: string,
     roleToken?: string,
@@ -1124,12 +1133,30 @@ export class CallbackManager extends EventEmitter {
       child.stdout?.on('data', (chunk: Buffer) => tee(chunk, true));
       child.stderr?.on('data', (chunk: Buffer) => tee(chunk, false));
       child.once('close', (code) => {
+        const finish = () => {
+          const error = bindingError || cleanupError || spawnError;
+          settle({ exitCode: error ? -1 : (code ?? exitCode ?? undefined), ...(error ? { error: `Native child ownership failed: ${error}` } : {}) });
+        };
         if (child.pid) {
-          try { onChildPid?.(undefined); }
-          catch (error: any) { cleanupError = String(error?.message || error); }
+          // Release the child binding when the process is gone. A synchronous
+          // handler finishes the wake-up immediately; an asynchronous one must be
+          // awaited so a rejected bind surfaces instead of being swallowed, and a
+          // late durable PID write cannot resurrect an identity that is gone.
+          try {
+            const released: unknown = bindingError ? undefined : onChildPid?.(undefined);
+            if (released && typeof (released as Promise<unknown>).then === 'function') {
+              (released as Promise<unknown>).catch((error: any) => {
+                cleanupError = String(error?.message || error);
+              }).finally(finish);
+              return;
+            }
+          } catch (error: any) {
+            cleanupError = String(error?.message || error);
+          }
+          finish();
+          return;
         }
-        const error = bindingError || cleanupError || spawnError;
-        settle({ exitCode: error ? -1 : (code ?? exitCode ?? undefined), ...(error ? { error: `Native child ownership failed: ${error}` } : {}) });
+        finish();
       });
 
       child.on('error', (err) => {
@@ -1158,12 +1185,14 @@ export class CallbackManager extends EventEmitter {
       // Install exit handlers before binding so a failed durable PID write can
       // kill this writer and still finish cleanup after the real close event.
       if (child.pid) {
-        try { onChildPid?.(child.pid); }
-        catch (error: any) {
+        const childPid = child.pid;
+        // Consume the binding Promise immediately: a rejected durable PID write
+        // must stop this writer now, while `close` still finishes the cleanup.
+        void Promise.resolve().then(() => onChildPid?.(childPid)).catch((error: any) => {
           bindingError = String(error?.message || error);
           console.error(`[CallbackManager] Could not bind reviewer child ownership for ${thread.threadId}: ${bindingError}`);
           try { child.kill(); } catch {}
-        }
+        });
       }
       child.unref();
     };
