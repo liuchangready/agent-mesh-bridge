@@ -533,33 +533,44 @@ export class TaskStore extends EventEmitter {
     this.syncFromThreads(true);
   }
 
-  /** Re-parse only the thread files whose mtime changed, and drop vanished ones. */
-  private syncFromThreads(force: boolean): void {
+  /**
+   * Re-parse only the thread files whose mtime changed, and drop vanished ones.
+   *
+   * Returns the thread ids whose in-memory entry actually changed, so a caller
+   * refreshing a tree can repaint just those rows instead of the whole view.
+   */
+  private syncFromThreads(force: boolean): string[] {
     this.ensureThreadsDir();
+    const changed: string[] = [];
     let names: string[];
     try {
       names = fs.readdirSync(this.threadsDir).filter((n) => n.endsWith('.json'));
     } catch {
-      return;
+      return changed;
     }
     const seen = new Set(names);
     for (const name of names) {
       const file = path.join(this.threadsDir, name);
       const mtime = this.fileMtimeMs(file);
       if (!force && this.knownMtimes.get(name) === mtime) continue;
+      const id = name.slice(0, -'.json'.length);
+      const existed = this.tasks.has(id);
       try {
         const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
         if (parsed && parsed.threadId && this.isTaskTombstoned(parsed.threadId)) {
           this.tasks.delete(parsed.threadId);
           this.knownMtimes.set(name, mtime);
           try { fs.unlinkSync(file); } catch {}
+          if (existed) changed.push(id);
         } else if (parsed && parsed.threadId && parsed.workspace?.id && parsed.workspace?.executionPath &&
             (!parsed.worktree || parsed.worktree.path === parsed.workspace.executionPath)) {
           this.tasks.set(parsed.threadId, normalizeThread(parsed as DelegationThread));
           this.knownMtimes.set(name, mtime);
+          changed.push(id);
         } else {
-          this.tasks.delete(name.slice(0, -'.json'.length));
+          this.tasks.delete(id);
           this.knownMtimes.set(name, mtime);
+          if (existed) changed.push(id);
         }
       } catch {
         // Writes go through rename, so a half-written file cannot happen; a
@@ -568,19 +579,25 @@ export class TaskStore extends EventEmitter {
     }
     for (const name of Array.from(this.knownMtimes.keys())) {
       if (seen.has(name)) continue;
-      this.tasks.delete(name.slice(0, -'.json'.length));
+      const id = name.slice(0, -'.json'.length);
+      this.tasks.delete(id);
       this.knownMtimes.delete(name);
+      changed.push(id);
     }
     this.lastDirMtimeMs = this.fileMtimeMs(this.threadsDir);
+    return changed;
   }
 
   /**
    * Ensures in-memory cache reflects any external file modifications on disk.
+   *
+   * Returns the thread ids that were re-read, or an empty array when nothing
+   * changed on disk.
    */
-  public ensureUpToDate(): void {
+  public ensureUpToDate(): string[] {
     const dirMtime = this.fileMtimeMs(this.threadsDir);
-    if (dirMtime <= this.lastDirMtimeMs) return;
-    this.syncFromThreads(false);
+    if (dirMtime <= this.lastDirMtimeMs) return [];
+    return this.syncFromThreads(false);
   }
 
   /** Atomic single-thread write: `rename` is the only step readers can observe. */
@@ -672,6 +689,7 @@ export class TaskStore extends EventEmitter {
   public saveToDisk(): void {
     this.ensureUpToDate();
     this.ensureThreadsDir();
+    const saved: string[] = [];
     for (const thread of this.tasks.values()) {
       if (thread.execution?.version === 2 || thread.cleanup) {
         // v2 task state is authoritative on disk under the per-task execution lock.
@@ -690,14 +708,20 @@ export class TaskStore extends EventEmitter {
         }
       }
       this.persistThread(thread);
+      saved.push(thread.threadId);
     }
     this.enforceCapacity();
     this.writeAggregate();
-    this.emit('changed', Array.from(this.tasks.values()));
+    if (saved.length) this.emit('changed', Array.from(this.tasks.values()), saved);
   }
 
   /**
    * File watcher with debounce to detect external changes (e.g. MCP daemon update).
+   *
+   * `fs.watchFile` is a stat poller, so the interval is the background cost of
+   * noticing another process's ledger write. A 30s fallback still catches a
+   * missed change without paying a per-second stat while a task is running;
+   * callers that need current data call {@link ensureUpToDate} directly.
    */
   private startWatchFile(): void {
     if (this.isWatching) return;
@@ -707,13 +731,14 @@ export class TaskStore extends EventEmitter {
           clearTimeout(this.watchDebounceTimer);
         }
         this.watchDebounceTimer = setTimeout(() => {
-          this.ensureUpToDate();
-          this.emit('changed', Array.from(this.tasks.values()));
+          const changed = this.ensureUpToDate();
+          // An empty list means nothing changed on disk; do not repaint.
+          if (changed.length) this.emit('changed', Array.from(this.tasks.values()), changed);
         }, 300);
         this.watchDebounceTimer.unref?.();
       };
       this.ensureThreadsDir();
-      const watcher = fs.watchFile(this.threadsDir, { interval: 1000 }, (curr, prev) => {
+      const watcher = fs.watchFile(this.threadsDir, { interval: 30_000 }, (curr, prev) => {
         if (curr.mtimeMs !== prev.mtimeMs) onChange();
       });
       (watcher as any)?.unref?.();
@@ -868,7 +893,7 @@ export class TaskStore extends EventEmitter {
       this.persistThread(thread);
       this.tasks.set(thread.threadId, thread);
       this.writeAggregate();
-      this.emit('changed', Array.from(this.tasks.values()));
+      this.emit('changed', Array.from(this.tasks.values()), [thread.threadId]);
       return thread;
     });
   }
@@ -931,7 +956,7 @@ export class TaskStore extends EventEmitter {
       this.persistThread(thread);
       this.tasks.set(thread.threadId, thread);
       this.writeAggregate();
-      this.emit('changed', Array.from(this.tasks.values()));
+      this.emit('changed', Array.from(this.tasks.values()), [thread.threadId]);
       return { token, thread };
     });
   }
@@ -1050,7 +1075,7 @@ export class TaskStore extends EventEmitter {
         this.persistThread(current);
         this.tasks.set(threadId, current);
         this.writeAggregate();
-        this.emit('changed', Array.from(this.tasks.values()));
+        this.emit('changed', Array.from(this.tasks.values()), [threadId]);
         return true;
       });
     }
@@ -1093,7 +1118,7 @@ export class TaskStore extends EventEmitter {
         }
         this.knownMtimes.delete(path.basename(taskFile));
         this.writeAggregate();
-        this.emit('changed', Array.from(this.tasks.values()));
+        this.emit('changed', Array.from(this.tasks.values()), [threadId]);
         return true;
       });
     }
@@ -1124,7 +1149,7 @@ export class TaskStore extends EventEmitter {
       this.persistThread(thread);
       this.tasks.set(threadId, thread);
       this.writeAggregate();
-      this.emit('changed', Array.from(this.tasks.values()));
+      this.emit('changed', Array.from(this.tasks.values()), [threadId]);
       return true;
     });
   }
@@ -1464,7 +1489,7 @@ export class TaskStore extends EventEmitter {
       }
       this.enforceCapacity();
       this.writeAggregate();
-      this.emit('changed', Array.from(this.tasks.values()));
+      this.emit('changed', Array.from(this.tasks.values()), [thread.threadId]);
   }
 
   /**
@@ -1721,7 +1746,7 @@ export class TaskStore extends EventEmitter {
           this.persistThread(current);
           this.tasks.set(threadId, current);
           this.writeAggregate();
-          this.emit('changed', Array.from(this.tasks.values()));
+          this.emit('changed', Array.from(this.tasks.values()), [threadId]);
           return current;
         }
 
@@ -1784,7 +1809,7 @@ export class TaskStore extends EventEmitter {
         this.persistThread(current);
         this.tasks.set(current.threadId, current);
         this.writeAggregate();
-        this.emit('changed', Array.from(this.tasks.values()));
+        this.emit('changed', Array.from(this.tasks.values()), [current.threadId]);
         return current;
       });
     }
@@ -1891,7 +1916,7 @@ export class TaskStore extends EventEmitter {
       this.persistThread(thread);
       this.tasks.set(thread.threadId, thread);
       this.writeAggregate();
-      this.emit('changed', Array.from(this.tasks.values()));
+      this.emit('changed', Array.from(this.tasks.values()), [thread.threadId]);
       return thread;
   }
 
@@ -1972,7 +1997,7 @@ export class TaskStore extends EventEmitter {
         this.persistThread(thread);
         this.tasks.set(thread.threadId, thread);
         this.writeAggregate();
-        this.emit('changed', Array.from(this.tasks.values()));
+        this.emit('changed', Array.from(this.tasks.values()), [thread.threadId]);
         return thread;
       }
 
@@ -2018,7 +2043,7 @@ export class TaskStore extends EventEmitter {
       this.persistThread(thread);
       this.tasks.set(thread.threadId, thread);
       this.writeAggregate();
-      this.emit('changed', Array.from(this.tasks.values()));
+      this.emit('changed', Array.from(this.tasks.values()), [thread.threadId]);
       return thread;
     });
   }
@@ -2182,7 +2207,7 @@ export class TaskStore extends EventEmitter {
         this.persistThread(current);
         this.tasks.set(current.threadId, current);
         this.writeAggregate();
-        this.emit('changed', Array.from(this.tasks.values()));
+        this.emit('changed', Array.from(this.tasks.values()), [current.threadId]);
         return current;
       });
     }
@@ -2215,7 +2240,7 @@ export class TaskStore extends EventEmitter {
     this.persistThread(thread);
     this.tasks.set(thread.threadId, thread);
     this.writeAggregate();
-    this.emit('changed', Array.from(this.tasks.values()));
+    this.emit('changed', Array.from(this.tasks.values()), [thread.threadId]);
     return thread;
   }
 
@@ -2282,7 +2307,7 @@ export class TaskStore extends EventEmitter {
         artifactDir: thread.artifactDir,
       });
       this.writeAggregate();
-      this.emit('changed', Array.from(this.tasks.values()));
+      this.emit('changed', Array.from(this.tasks.values()), [threadId]);
       return thread;
     } finally {
       for (const lease of leases) nativeLock.release(lease);
@@ -2357,7 +2382,7 @@ export class TaskStore extends EventEmitter {
           if (current?.artifactDir) removeTaskDataDir(current.artifactDir, false);
           this.knownMtimes.delete(path.basename(file));
           this.writeAggregate();
-          this.emit('changed', Array.from(this.tasks.values()));
+          this.emit('changed', Array.from(this.tasks.values()), [threadId]);
         }
         return existed;
       });
@@ -2390,7 +2415,7 @@ export class TaskStore extends EventEmitter {
       if (thread?.artifactDir) removeTaskDataDir(thread.artifactDir, false);
       this.knownMtimes.delete(path.basename(file));
       this.writeAggregate();
-      this.emit('changed', Array.from(this.tasks.values()));
+      this.emit('changed', Array.from(this.tasks.values()), [threadId]);
     }
     return existed;
   }

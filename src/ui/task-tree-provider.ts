@@ -14,19 +14,59 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
   private taskStore: TaskStore;
   private mode: 'active' | 'all';
   private readonly selectedWorkspace: () => string | undefined;
+  /**
+   * Token totals per thread, keyed by the ledger execution revision.
+   *
+   * The tree rebuilds on every ledger change and each row aggregates its rounds.
+   * A revision only advances on a protected write, so an unchanged revision
+   * means the rounds (and therefore the totals) are unchanged too.
+   */
+  private readonly tokenCache = new Map<string, { revision: number; total: number; partial: boolean }>();
 
   constructor(taskStore: TaskStore, mode: 'active' | 'all', selectedWorkspace: () => string | undefined = () => undefined) {
     this.taskStore = taskStore;
     this.mode = mode;
     this.selectedWorkspace = selectedWorkspace;
 
-    this.taskStore.on('changed', () => {
-      this.refresh();
+    // Repaint only the rows the store reports as changed; a ledger write that
+    // touches one task must not rebuild the whole tree.
+    this.taskStore.on('changed', (_tasks: DelegationThread[], changedIds?: string[]) => {
+      if (!changedIds || changedIds.length === 0) {
+        this.refresh();
+        return;
+      }
+      for (const threadId of changedIds) {
+        const task = this.taskStore.getTask(threadId);
+        if (task) this._onDidChangeTreeData.fire(this.taskItemFor(task));
+      }
     });
   }
 
   public refresh(): void {
+    this.tokenCache.clear();
     this._onDidChangeTreeData.fire();
+  }
+
+  /**
+   * Build a throwaway item for a single thread so VS Code can repaint just it.
+   *
+   * The identity of the element is the thread, so a fresh item with the same
+   * thread repaints the existing row rather than adding one.
+   */
+  private taskItemFor(thread: DelegationThread): TaskTreeItem {
+    return this.createTaskTreeItem(thread);
+  }
+
+  /** Aggregated token totals for a thread, recomputed only when its revision moves. */
+  private tokenTotals(thread: DelegationThread): { total: number; partial: boolean } {
+    const revision = thread.execution?.revision ?? 0;
+    const cached = this.tokenCache.get(thread.threadId);
+    if (cached && cached.revision === revision) return cached;
+
+    const summary = aggregateThreadTokenUsage(thread.rounds || []);
+    const entry = { revision, total: summary.totalTokens, partial: summary.isPartialOrEstimated };
+    this.tokenCache.set(thread.threadId, entry);
+    return entry;
   }
 
   getTreeItem(element: TaskTreeItem): vscode.TreeItem {
@@ -43,6 +83,9 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
 
     return Promise.resolve(groupWorkspaceTasks(tasks).map((threads) => {
       const group = new TaskTreeItem(threads[0].workspace.nameAtDispatch, vscode.TreeItemCollapsibleState.Expanded);
+      // Stable ids are required once any row uses one; key the group by its
+      // workspace so it never collides with a thread id.
+      group.id = `workspace:${threads[0].workspace.id}:${this.mode}`;
       group.workspaceId = threads[0].workspace.id;
       group.tooltip = threads[0].workspace.rootPath;
       group.iconPath = new vscode.ThemeIcon('folder');
@@ -130,16 +173,20 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
         : '';
 
     // Derived from the rounds (never a stored aggregate): cheap, and cannot go
-    // stale after another process finalizes a round.
-    const tokenSummary = aggregateThreadTokenUsage(thread.rounds || []);
+    // stale after another process finalizes a round. Cached per revision so an
+    // unrelated ledger write does not re-sum every round of every task.
+    const tokenTotals = this.tokenTotals(thread);
     const tokenBadge =
-      tokenSummary.measuredRounds > 0
-        ? ` · ${tokenSummary.isPartialOrEstimated ? '~' : ''}${formatTokenCount(tokenSummary.totalTokens)} tok`
+      tokenTotals.total > 0
+        ? ` · ${tokenTotals.partial ? '~' : ''}${formatTokenCount(tokenTotals.total)} tok`
         : '';
 
     const description = `${statusLabel} · ${durationText}${modelBadge}${flowBadge}${archiveBadge}${tokenBadge}${repeatBadge}${reviewBadge}${blockedBadge}${reviewFailureBadge}`;
 
     const item = new TaskTreeItem(label, vscode.TreeItemCollapsibleState.Collapsed, thread);
+    // A stable id lets a targeted `fire(item)` repaint this row in place; without
+    // one VS Code compares object identity and a rebuilt item never matches.
+    item.id = thread.threadId;
     item.description = description;
     item.iconPath = new vscode.ThemeIcon(iconName);
     item.contextValue =
