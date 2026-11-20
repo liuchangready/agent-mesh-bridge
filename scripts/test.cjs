@@ -52,6 +52,7 @@ const LAYER_MAPPING = {
   ]),
   boundary: new Set([
     'controller-start-admission.test.js',
+    'failed-round-recovery.test.js',
     'task-store-atomic-write.test.js',
     'autonomous-runner.test.js',
     'callback-failure.test.js',

@@ -90,3 +90,5 @@ code --install-extension "./agent-mesh-bridge-$version.vsix" --force
 测试会在仓库 `.vscode-test/` 下使用临时 VS Code 用户数据、扩展目录和桥接数据目录，并在临时设置中关闭 `agentMeshBridge.autoSyncMcp`，避免更改开发者的 VS Code 配置或外部 Agent MCP 配置。VS Code 测试实例缓存在同一目录；该目录已被 Git 和 VSIX 忽略。首次运行需要下载 VS Code，之后可复用缓存。可通过 `VSCODE_TEST_VERSION` 指定测试版本，默认使用 stable；版本应满足 `package.json` 中的 `engines.vscode`。
 
 这个命令和 `npm test` 是两条独立验证：前者验证 VSIX 在真实 Extension Host 中能加载，后者运行不启动 VS Code 的 Node.js 测试。Microsoft 的 [Extension Testing 指南](https://code.visualstudio.com/api/working-with-extensions/testing-extension)说明了 Extension Host 测试机制；本项目用自定义 runner 先安装 VSIX，再检查已安装扩展，避免只测开发源码目录。
+
+Windows 输入法可能在测试宿主退出后仍占用隔离用户目录中的日志。清理会验证实际路径并有界重试；持续 `EBUSY` 时输出警告并保留临时文件，不影响已完成的宿主断言。其他清理错误仍会使命令失败。

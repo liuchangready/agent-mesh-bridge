@@ -419,12 +419,49 @@ export class ReworkController {
     };
   }
 
-  /**
-   * Retries the failed round in-place within the EXACT SAME native session,
-   * preserving the original prompt and avoiding creating duplicate or generic rounds.
-   *
-   * `overrides` may move the retry to another agent/model first (fresh session).
-   */
+  private async reconcileFailedPreparationRound(thread: DelegationThread): Promise<DelegationThread> {
+    if (thread.status !== 'failed' || thread.failure?.stage !== 'execution' || !findInFlightRound(thread)) return thread;
+    const failure = thread.failure;
+    const validate = (fresh: DelegationThread) => {
+      const round = latestWorkRound(fresh);
+      // Only the known pre-spawn v1 failure is recoverable without a surviving run.
+      if (fresh.status !== 'failed' || fresh.archivedAt || fresh.cleanup || fresh.execution?.version !== 1 ||
+          fresh.execution.phase !== 'develop' || fresh.execution.run || fresh.failure?.stage !== 'execution' ||
+          fresh.failure.code !== 'EXECUTION_ERROR' || fresh.failure.reason !== 'The task role lease is not held during native-session preparation.' ||
+          fresh.failure.at !== failure.at || !round || round.status !== 'running' || round.output || round.durationMs ||
+          round.round !== fresh.currentRound || round.round !== fresh.execution.round || round.round !== fresh.failure.round ||
+          fresh.rounds.filter(item => item.status === 'running').length !== 1 || !fresh.receiverSessionCaptured || !fresh.receiverSessionId) {
+        throw new Error('Cannot reconcile failed round: execution ownership or pre-spawn failure evidence is unverified.');
+      }
+      const record = path.join(this.storageDir, 'executions', `${fresh.threadId.replace(/[^A-Za-z0-9_.-]/g, '_')}.json`);
+      if (fs.existsSync(record)) throw new Error('Cannot reconcile failed round: an execution registration still exists.');
+      return round;
+    };
+    validate(thread);
+    const roleLock = new TaskRoleLock(this.storageDir);
+    const roleLease = roleLock.tryAcquire(thread.threadId, 'developer');
+    if (!roleLease) throw new Error('Cannot reconcile failed round: task role is still occupied.');
+    const sessionLock = new NativeSessionLock(this.storageDir);
+    let sessionLease: ReturnType<NativeSessionLock['acquire']>;
+    try {
+      sessionLease = sessionLock.acquire(thread.targetAgent, thread.receiverSessionId!);
+      if (!sessionLease) throw new Error('Cannot reconcile failed round: native session ownership is unverified or occupied.');
+      return await this.taskStore.transitionExecution(thread.threadId, thread.execution!.revision, fresh => {
+        const round = validate(fresh);
+        if (fresh.targetAgent !== thread.targetAgent || fresh.receiverSessionId !== thread.receiverSessionId ||
+            fresh.targetModel !== thread.targetModel || roleLock.getOwner(thread.threadId)?.token !== roleLease.token) {
+          throw new Error('Cannot reconcile failed round: task binding changed.');
+        }
+        round.status = 'failed';
+        round.error = fresh.failure!.reason;
+      });
+    } finally {
+      if (sessionLease) sessionLock.release(sessionLease);
+      roleLock.release(roleLease);
+    }
+  }
+
+  /** Retry the current failed round in its original session, unless explicitly retargeted. */
   public async retryFailedRound(
     threadId: string,
     overrides: ExecutorOverride = {},
@@ -440,6 +477,7 @@ export class ReworkController {
     if (thread.archivedAt || thread.status === 'completed') {
       throw new Error(`Cannot retry task ${threadId}: completed or archived tasks are immutable.`);
     }
+    thread = await this.reconcileFailedPreparationRound(thread);
     const inFlightBeforeRetarget = findInFlightRound(thread);
     if (inFlightBeforeRetarget) {
       throw new Error(`Cannot retry round: ${describeRoundInFlight(thread, inFlightBeforeRetarget)}`);

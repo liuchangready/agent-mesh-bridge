@@ -114,3 +114,4 @@ npm run test:integration
 - 首轮占位 session ID 尚未捕获时，不预先持有其原生租约；实际 ID 的捕获和生命周期继续由真实 runner 管理，避免续轮被首轮留下的占用阻塞。
 - 合入协调器已落账 completed 时，控制器允许在匹配 run 和已落地合入证据下完成自身收尾；旧 run 回调仍被拒绝。
 - Windows 原子账本替换遇到短暂 EPERM/EACCES/EBUSY，最多尝试 20 次、间隔 10ms，只重试同一临时文件的发布，不重放业务、不先删除旧记录；持续失败保持报错并保留旧耐久记录。
+- 执行准备抛异常时，同一 CAS 将线程和当前工作轮都置为 failed。显式 retry 可修复旧 v1 的已知角色租约准备错误：仅在无 run、无执行登记、无 cleanup 且角色和原生会话可取得时，将残留 running 轮落为 failed 后沿用原轮重试。未知错误、v2、其他在飞轮次、占用及版本竞争均拒绝恢复；不直接编辑生产账本。专项为 `failed-round-recovery.test.ts`。

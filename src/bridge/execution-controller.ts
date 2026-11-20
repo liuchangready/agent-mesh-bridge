@@ -2212,6 +2212,13 @@ export class ExecutionController {
         at: new Date().toISOString(),
         round: t.currentRound || 1,
       });
+      if (failureStage === 'execution') {
+        const failedRound = t.rounds.find(round => round.round === (t.execution?.round || t.currentRound));
+        if (failedRound?.status === 'running') {
+          failedRound.status = 'failed';
+          failedRound.error = reason || code;
+        }
+      }
       if (failureStage === 'bootstrap') {
         t.reviewBootstrap = { ...(t.reviewBootstrap || { attempts: 0 }), phase: 'failed', lastError: reason || code };
         const placeholder = t.rounds.find(round => round.round === t.currentRound);
@@ -2441,6 +2448,12 @@ export class ExecutionController {
     const phase: ExecutionPhase = thread.execution?.phase || 'develop';
     const nextGen = (thread.execution?.generation || 1) + 1;
     const updated = await this.transitionTask(threadId, (t) => {
+      if (phase === 'develop') {
+        const round = t.rounds.find(item => item.round === t.currentRound && item.type !== 'approval');
+        if (!round) throw new Error('Cannot retry execution: current work round is missing.');
+        round.status = 'running';
+        round.error = undefined;
+      }
       clearTaskFailure(t);
       if (t.execution) {
         t.execution.generation = nextGen;

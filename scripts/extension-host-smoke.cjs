@@ -1,4 +1,5 @@
 'use strict';
+/* global require, process, __dirname, console */
 
 const fs = require('node:fs/promises');
 const os = require('node:os');
@@ -21,6 +22,19 @@ function assertExitOk(result, description) {
   if (result.error) throw result.error;
   if (result.status !== 0) {
     throw new Error(`${description} exited with code ${result.status ?? 'unknown'}`);
+  }
+}
+
+async function cleanupSmoke(tempRoot, smokeCache) {
+  const realTempRoot = await fs.realpath(tempRoot);
+  const realCache = `${await fs.realpath(smokeCache)}${path.sep}`;
+  if (!realTempRoot.startsWith(realCache)) throw new Error(`Unsafe smoke cleanup path: ${realTempRoot}`);
+  try {
+    await fs.rm(realTempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
+  } catch (error) {
+    // Windows IMEs may retain profile log handles after the test host exits.
+    if (error.code !== 'EBUSY') throw error;
+    console.warn(`Smoke cleanup retained busy temporary files at ${realTempRoot}: ${error.message}`);
   }
 }
 
@@ -122,7 +136,7 @@ async function main() {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
-    await fs.rm(tempRoot, { recursive: true, force: true });
+    await cleanupSmoke(tempRoot, smokeCache);
   }
 }
 
