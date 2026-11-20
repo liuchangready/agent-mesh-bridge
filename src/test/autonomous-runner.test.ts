@@ -345,37 +345,64 @@ describe('AutonomousRunner Tests', () => {
     );
   });
 
-  test('fails the real child when native PID binding fails and waits for close', async (t) => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-native-pid-binding-'));
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const ready = path.join(root, 'output-ready');
+  test('waits for the real child close and PID-binding ACK before settling', async (t) => {
     const output = JSON.stringify({ type: 'result', subtype: 'success', result: 'business completed' }) + '\n';
     const local = new AutonomousRunner(detector);
     local.buildCommand = () => ({
       command: process.execPath,
-      args: ['-e', `process.stdout.write(${JSON.stringify(output)},()=>require('fs').writeFileSync(${JSON.stringify(ready)},'ready'));setInterval(()=>{},1000)`],
+      args: ['-e', `process.stdout.write(${JSON.stringify(output)});setInterval(()=>{},1000)`],
       useShell: false,
     });
+
+    let child: import('child_process').ChildProcess | undefined;
     let pid: number | undefined;
     let cleared = false;
-    const result = await local.executeOnce({
+    let settled = false;
+    let releaseRegistrationAck!: () => void;
+    const registrationAck = new Promise<void>((resolve) => { releaseRegistrationAck = resolve; });
+    let resolvePidCallback!: () => void;
+    const pidCallback = new Promise<void>((resolve) => { resolvePidCallback = resolve; });
+    let resolveOutput!: () => void;
+    const outputSeen = new Promise<void>((resolve) => { resolveOutput = resolve; });
+    let resolveClose!: () => void;
+    const childClosed = new Promise<void>((resolve) => { resolveClose = resolve; });
+
+    const resultPromise = local.executeOnce({
       agent: 'claude_code', prompt: 'temporary child only', isRework: false,
       receiverSessionId: 'temp-native-pid-binding', timeoutMs: 10_000, silenceTimeoutMs: 10_000,
-      onChildPid: (value) => {
+      onStdoutChunk: (chunk) => { if (chunk.includes('business completed')) resolveOutput(); },
+      onChildPid: async (value, childProcess) => {
         if (value) {
           pid = value;
-          // Binding is synchronous; wait for real output before injecting its failure.
-          const deadline = performance.now() + 5_000;
-          const wait = new Int32Array(new SharedArrayBuffer(4));
-          while (!fs.existsSync(ready) && performance.now() < deadline) Atomics.wait(wait, 0, 0, 10);
+          child = childProcess;
+          childProcess?.once('close', () => resolveClose());
+          resolvePidCallback();
+          await registrationAck;
           throw new Error('Could not acquire the native-session owner gate to persist the child PID.');
         }
         cleared = true;
       },
     });
-    assert.ok(fs.existsSync(ready), 'the child flushed output before the binding failure');
-    assert.ok(pid, 'the test child was started');
-    assert.equal(cleared, true, 'PID cleanup runs after the actual close event');
+    resultPromise.then(() => { settled = true; });
+    t.after(() => {
+      releaseRegistrationAck();
+      try { child?.kill(); } catch {}
+    });
+
+    await Promise.all([pidCallback, outputSeen]);
+    assert.ok(pid, 'the real child PID was reported');
+    assert.ok(child, 'the ChildProcess handle was reported');
+
+    // Close the real process while its durable PID-registration callback remains
+    // deliberately blocked. The runner must still be waiting for that ACK.
+    child!.kill();
+    await childClosed;
+    assert.equal(settled, false, 'worker cannot settle before registration ACK');
+
+    releaseRegistrationAck();
+    const result = await resultPromise;
+    assert.equal(settled, true, 'worker settles after registration ACK is released');
+    assert.equal(cleared, true, 'PID cleanup runs after the registration callback and close');
     assert.equal(result.exitCode, -1);
     assert.equal(result.assessment?.success, false);
     assert.match(result.error || '', /native child ownership/i);

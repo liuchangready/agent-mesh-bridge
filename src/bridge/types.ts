@@ -53,6 +53,9 @@ export interface ExecutionRun {
   state: 'starting' | 'active' | 'stopping';
   startedAt: string;
   role?: 'developer' | 'reviewer';
+  spawnIntentAt?: string;
+  registeredAt?: string;
+  unconfirmed?: boolean;
 }
 
 export interface ExecutionNext {
