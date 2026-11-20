@@ -589,6 +589,10 @@ export class ExecutionController {
             childPid = pid;
             childBirthId = getProcessBirthId(pid);
             this.executionRegistry.attachChildPid(pid, registration);
+            // Bind the child to the role lease exactly like the review path does:
+            // native-session preparation re-reads this record, and a lease without
+            // its child reads as "role not held" and parks the task in queued(role).
+            this.roleLock.attachChild(roleLease, pid);
             void this.updateRunChild(threadId, runId, pid, childBirthId);
           },
           { operationId, generation },

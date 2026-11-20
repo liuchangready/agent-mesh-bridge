@@ -72,6 +72,13 @@ export class AgentDetector {
 
   /**
    * Find candidate paths for Claude Code (claude).
+   *
+   * The Anthropic extension ships its CLI at `resources/native-binary/claude`
+   * inside the extension directory. A bridge MCP process cannot read the VS Code
+   * `agentMeshBridge.claudeCodePath` setting (it has no vscode API), so scanning
+   * the extension roots is the only way it finds an installation that was never
+   * added to PATH. Every versioned directory is probed because the extension
+   * replaces its folder on each update.
    */
   public getClaudeCandidatePaths(): string[] {
     const candidates: string[] = [];
@@ -80,6 +87,25 @@ export class AgentDetector {
     }
 
     const home = os.homedir();
+    const bundledRelatives = binaryCandidates('claude').map((name) =>
+      path.join('resources', 'native-binary', name),
+    );
+    for (const extensionsDir of vscodeExtensionDirs(home)) {
+      if (!fs.existsSync(extensionsDir)) continue;
+      try {
+        const dirs = fs.readdirSync(extensionsDir);
+        const claudeDirs = dirs
+          .filter((d) => d.startsWith('anthropic.claude-code-'))
+          // Newest version first: the extension drops the previous directory.
+          .sort((a, b) => compareExtensionVersions(b, a));
+        for (const d of claudeDirs) {
+          for (const relative of bundledRelatives) {
+            candidates.push(path.join(extensionsDir, d, relative));
+          }
+        }
+      } catch {}
+    }
+
     if (IS_WINDOWS) {
       const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
       candidates.push(
@@ -564,4 +590,26 @@ function sameResolvedPath(left: string, right: string): boolean {
     return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
   };
   return normalize(left) === normalize(right);
+}
+
+/**
+ * Order two VS Code extension directory names by their trailing version.
+ *
+ * Directory names look like `anthropic.claude-code-2.1.328-win32-x64`; the
+ * extension leaves older directories behind on update, so the probe must prefer
+ * the newest one. A name without a parsable version sorts last.
+ */
+function compareExtensionVersions(left: string, right: string): number {
+  const versionOf = (name: string): number[] => {
+    const match = name.match(/(\d+(?:\.\d+)+)/);
+    return match ? match[1].split('.').map((part) => Number(part) || 0) : [];
+  };
+  const a = versionOf(left);
+  const b = versionOf(right);
+  if (a.length === 0 || b.length === 0) return a.length - b.length;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const diff = (a[i] || 0) - (b[i] || 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
 }
