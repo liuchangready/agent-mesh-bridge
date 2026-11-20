@@ -3,6 +3,7 @@
 > 版本：0.2 · 状态：已实现并通过专用 reviewer 验收；自动维护默认关闭，未经本机路径/版本/provider 认证的适配保持 `needs_validation`。
 > 设计基线：2026-11-06 用户批准的 0.1 快照。该快照是本任务输入；原始 `D:\agent_bridge\docs\NATIVE_SESSION_COMPACTION_DESIGN.md` 未从集成 ref 带入，本次不读取或覆盖用户 checkout。
 > 前置设计：[账本上下文滞后压缩 v1](CONTEXT_COMPACTION_DESIGN.md)。本设计只增加原生会话层，不改变 v1 的账本规则。
+> 2026-11-20 后续生命周期设计：[锁与队列精简](LOCK_AND_QUEUE_SIMPLIFICATION_DESIGN.md)以固定会话归属、覆盖真实退出的唯一 v2 run 及 cleanup 替代 Bridge 角色/会话运行租约。本文第 4 节租约顺序仍为当前生产实现；下一版自动维护沿用业务 run，paused 显式维护占用同角色 maintenance run，不再独立取 session 锁。原生控制面、最小权限、同 turn 完成与持久恢复证据及自动维护默认关闭的约束不变；未完成全部接线、验收与停机预检前不得删除生产保护。
 
 ## 1. 不变量
 

@@ -4,6 +4,8 @@
 
 > 2026-11-20 清理边界：审阅执行只允许 dedicated，移除 legacy 设置、缺省回退和 requester 会话探测。无 `reviewFlow` 或值为 legacy 的记录只保留历史读取、归档、删除及停止既有进程，不自动迁移。日志只使用任务目录，不再查找旧全局/按 Agent 日志；Git 执行必须具有真实 `deliveryTarget`，禁止回退旧 integration ref。当前 dedicated 任务的 session、artifactDir、worktree、交付分支及 execution.version 不改写，v1 执行控制不在本次删除范围内。下文旧版兼容条款与本边界冲突时，以本段为准。
 
+> 2026-11-20 下一版设计授权：用户已要求实施[唯一 run 替代独立原生会话锁](docs/LOCK_AND_QUEUE_SIMPLIFICATION_DESIGN.md)。该后续任务以固定会话归属、唯一 v2 run、真实子树退出和受保护 cleanup 替代 Bridge 的角色/会话运行租约，最终仅保留全局合入锁及任务短写锁；CLI 自带写保护不删。下文 roles、session 租约及交接即释放的实现约束在下一版目标中以上述设计为准，单任务单角色、同会话连续性和模型/原生维护证据不变。此授权不代表已上线：当前 dedicated/v1 任务及实施任务自身必须用现版安全收尾，不迁移、不重置会话，不自动安装/重载或停止生产进程；仅在设计前提、验收和停机预检全部满足后切换。
+
 ---
 
 ## 1. 项目定位与核心特性
