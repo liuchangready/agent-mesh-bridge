@@ -2,6 +2,7 @@ import * as child_process from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import type { ProcessIdentity } from './types';
 
 /**
  * Platform facts the bridge needs at runtime.
@@ -173,12 +174,43 @@ function bundledArchDirs(): string[] {
  * that would reach the extension host. Instead the tree is collected from
  * `/proc` and killed bottom-up.
  */
-export function killProcessTree(child: child_process.ChildProcess): void {
-  if (!child.pid) return;
-  killPidTree(child.pid);
+export function killProcessTree(
+  child: child_process.ChildProcess,
+  expectedBirthId?: string,
+  identityWasCaptured: boolean = false,
+): void {
+  const rootPid = child.pid;
+  if (!rootPid || child.exitCode !== null || child.signalCode !== null) return;
+
+  // Never call taskkill /T with a numeric PID: if the original root exited and
+  // Windows reused the PID, taskkill would walk the replacement process tree.
+  const rootBirthId = identityWasCaptured ? expectedBirthId : (expectedBirthId || getProcessBirthId(rootPid));
+  if (!rootBirthId) {
+    // A launch-time identity that could not be captured is not permission to
+    // rediscover a process by PID. Untracked legacy callers may use their live
+    // ChildProcess handle for root-only cleanup, but never expand the subtree.
+    if (!identityWasCaptured && child.exitCode === null && child.signalCode === null) {
+      try { child.kill('SIGKILL'); } catch {}
+    }
+    return;
+  }
+  if (probeProcessIdentity(rootPid, rootBirthId) !== 'alive') return;
+
+  let descendants: ProcessIdentity[] = [];
   try {
-    child.kill('SIGKILL');
+    descendants = collectDescendants(rootPid).map((pid) => ({ pid, birthId: getProcessBirthId(pid) }));
   } catch {}
+  for (const identity of descendants) {
+    if (!identity.birthId || probeProcessIdentity(identity.pid, identity.birthId) !== 'alive') continue;
+    if (probeProcessIdentity(identity.pid, identity.birthId) !== 'alive') continue;
+    try { process.kill(identity.pid, 'SIGKILL'); } catch {}
+  }
+
+  // Re-verify the original root immediately before using its child handle. If
+  // it exited or its PID was reused, do not signal the replacement process.
+  if (probeProcessIdentity(rootPid, rootBirthId) === 'alive') {
+    try { child.kill('SIGKILL'); } catch {}
+  }
 }
 
 /**
@@ -298,6 +330,15 @@ export function isProcessDescendant(candidatePid: number, rootPid: number): bool
 }
 
 /**
+ * Returns true only if candidatePid is a strict descendant of rootPid (not rootPid itself).
+ */
+export function isProcessStrictDescendant(candidatePid: number, rootPid: number): boolean {
+  if (!candidatePid || !rootPid || candidatePid <= 0 || rootPid <= 0) return false;
+  if (candidatePid === rootPid) return false;
+  return collectDescendants(rootPid).includes(candidatePid);
+}
+
+/**
  * Process birth identity resolver.
  *
  * Windows: process creation time (UTC file time).
@@ -331,7 +372,7 @@ export function getProcessBirthId(pid: number): string | undefined {
           '-Command',
           `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($p) { $p.StartTime.ToFileTimeUtc() }`,
         ],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true, timeout: 5000 },
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true, timeout: 8000 },
       );
       const trimmed = output.trim();
       const birthId = /^\d+$/.test(trimmed) ? trimmed : undefined;
@@ -408,6 +449,8 @@ export type ConfirmProcessTreeExitProvider = (
   pid: number,
   timeoutMs?: number,
   expectedBirthId?: string,
+  knownDescendants?: Array<{ pid: number; birthId?: string }>,
+  allowFreshRootScan?: boolean,
 ) => Promise<boolean>;
 let customConfirmExitProvider: ConfirmProcessTreeExitProvider | undefined;
 
@@ -426,53 +469,51 @@ export async function confirmProcessTreeExit(
   pid: number,
   timeoutMs: number = 10_000,
   expectedBirthId?: string,
+  knownDescendants: Array<{ pid: number; birthId?: string }> = [],
+  allowFreshRootScan: boolean = true,
 ): Promise<boolean> {
   if (!pid || pid <= 0) return true;
   if (customConfirmExitProvider) {
-    return customConfirmExitProvider(pid, timeoutMs, expectedBirthId);
+    return customConfirmExitProvider(pid, timeoutMs, expectedBirthId, knownDescendants, allowFreshRootScan);
   }
   const deadline = Date.now() + timeoutMs;
-  const knownProcessBirthIds = new Map<number, string | undefined>();
-
-  // Root process birthId
-  knownProcessBirthIds.set(pid, expectedBirthId ?? getProcessBirthId(pid));
+  const knownProcessBirthIds = new Map<string, { pid: number; birthId?: string }>();
+  knownProcessBirthIds.set(`${pid}:${expectedBirthId ?? 'unknown'}`, { pid, birthId: expectedBirthId });
+  for (const item of knownDescendants) {
+    knownProcessBirthIds.set(`${item.pid}:${item.birthId ?? 'unknown'}`, item);
+  }
 
   const scanDescendants = () => {
+    // A numeric PID can be reused as soon as the original root exits. Only
+    // enumerate a fresh tree while the exact root birth ID is still alive.
+    if (!allowFreshRootScan || !expectedBirthId || probeProcessIdentity(pid, expectedBirthId) !== 'alive') return;
     try {
-      const descendants = collectDescendants(pid);
-      for (const d of descendants) {
-        if (!knownProcessBirthIds.has(d)) {
-          knownProcessBirthIds.set(d, getProcessBirthId(d));
+      for (const descendantPid of collectDescendants(pid)) {
+        const birthId = getProcessBirthId(descendantPid);
+        const key = `${descendantPid}:${birthId ?? 'unknown'}`;
+        if (!knownProcessBirthIds.has(key)) {
+          knownProcessBirthIds.set(key, { pid: descendantPid, birthId });
         }
       }
     } catch {}
   };
 
-  // Perform initial descendant discovery
   scanDescendants();
-
   while (Date.now() < deadline) {
+    scanDescendants();
     let allExited = true;
-
-    for (const [p, birthId] of knownProcessBirthIds.entries()) {
-      const status = probeProcessIdentity(p, birthId);
-      if (status !== 'exited') {
+    for (const identity of knownProcessBirthIds.values()) {
+      if (!identity.birthId || probeProcessIdentity(identity.pid, identity.birthId) !== 'exited') {
         allExited = false;
         break;
       }
     }
-
-    if (allExited) {
-      return true;
-    }
-    await new Promise((r) => setTimeout(r, 100));
+    if (allExited) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
-  // Final check at deadline
-  for (const [p, birthId] of knownProcessBirthIds.entries()) {
-    if (probeProcessIdentity(p, birthId) !== 'exited') {
-      return false;
-    }
+  for (const identity of knownProcessBirthIds.values()) {
+    if (!identity.birthId || probeProcessIdentity(identity.pid, identity.birthId) !== 'exited') return false;
   }
   return true;
 }

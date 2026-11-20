@@ -1,5 +1,6 @@
 import { getTaskExecutionPath, isReviewerWakeEligible, isMergeReview } from './types';
 import * as child_process from 'child_process';
+import type { ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -20,7 +21,7 @@ import {
   appendInterruption,
 } from './types';
 import { AgentDetector } from './agent-detector';
-import { defaultBinary, needsShellWrapper, killPidTree } from './platform';
+import { defaultBinary, getProcessBirthId, killProcessTree, needsShellWrapper } from './platform';
 import { buildDshHeadlessCommand } from './deepseek-harness';
 import { resolveConfiguredModel, writeDshModelOverlay } from './model-catalog';
 import { TaskRoleLock, TaskRoleLease } from './task-role-lock';
@@ -632,7 +633,7 @@ export class CallbackManager extends EventEmitter {
 
   public async launchReviewerBootstrap(
     thread: DelegationThread,
-    onChildPid?: (pid: number) => void | Promise<void>,
+    onChildPid?: (pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>,
   ): Promise<{ confirmed: boolean; error?: string; transient?: boolean }> {
     assertCanExecute(thread.initiatorAgent, 'bootstrap as a reviewer', 'initiator');
     const store = this.taskStore;
@@ -668,9 +669,9 @@ export class CallbackManager extends EventEmitter {
         MESH_REVIEW_THREAD_ID: thread.threadId,
         MESH_CALLER_AGENT: thread.initiatorAgent,
       },
-      onChildPid: async (pid) => {
+      onChildPid: async (pid, childProc, childBirthId) => {
         if (pid && root) recordReviewerBootstrapHostPid(thread.threadId, pid, root, thread.artifactDir);
-        if (pid) await onChildPid?.(pid);
+        if (pid) await onChildPid?.(pid, childProc, childBirthId);
       },
     });
 
@@ -704,7 +705,7 @@ export class CallbackManager extends EventEmitter {
   public launchCaller(
     thread: DelegationThread,
     round: DelegationRound,
-    onChildPid?: (pid: number) => void | Promise<void>,
+    onChildPid?: (pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>,
   ): Promise<{ success: boolean; error?: string; exitCode?: number }>;
   public launchCaller(
     thread: DelegationThread,
@@ -713,7 +714,7 @@ export class CallbackManager extends EventEmitter {
     round: DelegationRound,
     wakeKind: 'review' | 'failure',
     release: () => void,
-    onChildPid?: (pid: number | undefined) => void | Promise<void>,
+    onChildPid?: (pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>,
     recoveryVersion?: string,
     mergeWakeId?: string,
     roleToken?: string,
@@ -721,11 +722,11 @@ export class CallbackManager extends EventEmitter {
   public launchCaller(
     thread: DelegationThread,
     callerSessionIdOrRound: string | DelegationRound,
-    promptMessageOrOnChildPid?: string | ((pid: number) => void | Promise<void>),
+    promptMessageOrOnChildPid?: string | ((pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>),
     roundParam?: DelegationRound,
     wakeKind?: 'review' | 'failure',
     release?: () => void,
-    onChildPid?: (pid: number | undefined) => void | Promise<void>,
+    onChildPid?: (pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>,
     recoveryVersion?: string,
     mergeWakeId?: string,
     roleToken?: string,
@@ -744,7 +745,7 @@ export class CallbackManager extends EventEmitter {
   private launchCallerAsync(
     thread: DelegationThread,
     round: DelegationRound,
-    onChildPid?: (pid: number) => void,
+    onChildPid?: (pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>,
   ): Promise<{ success: boolean; error?: string; exitCode?: number }> {
     assertCanExecute(thread.initiatorAgent, 'resume as a reviewer', 'initiator');
     const callerSessionId = this.resolveCallerSession(thread);
@@ -898,6 +899,7 @@ export class CallbackManager extends EventEmitter {
       }
 
       const childPid = child.pid;
+      const childBirthId = childPid ? getProcessBirthId(childPid) : undefined;
       let bindingError: string | undefined;
       let childError: string | undefined;
       let stdoutOutput = '';
@@ -934,10 +936,14 @@ export class CallbackManager extends EventEmitter {
 
       // Attach rejection handling immediately: a failed durable bind must stop
       // the child now, while finalization still waits for the real close event.
-      const bindingPromise = childPid ? Promise.resolve().then(() => onChildPid?.(childPid)) : Promise.resolve();
+      const bindingPromise = childPid
+        ? Promise.resolve().then(() => onChildPid?.(childPid, child, childBirthId))
+        : Promise.resolve();
       void bindingPromise.catch((err: any) => {
         bindingError = String(err?.message || err);
-        try { child.kill(); } catch {}
+        if (err?.code !== 'CHILD_BINDING_IN_PROGRESS') {
+          try { killProcessTree(child, childBirthId, true); } catch {}
+        }
       });
     });
   }
@@ -956,7 +962,7 @@ export class CallbackManager extends EventEmitter {
     round: DelegationRound,
     wakeKind: 'review' | 'failure',
     release: () => void,
-    onChildPid?: (pid: number | undefined) => void | Promise<void>,
+    onChildPid?: (pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>,
     recoveryVersion?: string,
     mergeWakeId?: string,
     roleToken?: string,
@@ -1062,6 +1068,7 @@ export class CallbackManager extends EventEmitter {
     };
 
     const attachErrorLogging = (child: child_process.ChildProcess) => {
+      const childBirthId = child.pid ? getProcessBirthId(child.pid) : undefined;
       suspension.start();
       let interruption: TaskInterruption | undefined;
       const watchdog = isMergeReview(thread) && wakeKind === 'review' ? setInterval(() => {
@@ -1073,7 +1080,7 @@ export class CallbackManager extends EventEmitter {
             reason: elapsed > 2 * 60 * 60_000 ? 'Reviewer exceeded its active time limit.' : 'Reviewer was silent beyond its active time limit.',
             at: new Date().toISOString(), by: 'callback' };
           if (watchdog) clearInterval(watchdog);
-          try { if (child.pid) killPidTree(child.pid); else child.kill(); } catch { try { child.kill(); } catch {} }
+          try { if (child.pid) killProcessTree(child, childBirthId, true); else child.kill(); } catch { try { child.kill(); } catch {} }
         }
       }, 5_000) : undefined;
       watchdog?.unref();
@@ -1188,10 +1195,12 @@ export class CallbackManager extends EventEmitter {
         const childPid = child.pid;
         // Consume the binding Promise immediately: a rejected durable PID write
         // must stop this writer now, while `close` still finishes the cleanup.
-        void Promise.resolve().then(() => onChildPid?.(childPid)).catch((error: any) => {
+        void Promise.resolve().then(() => onChildPid?.(childPid, child, childBirthId)).catch((error: any) => {
           bindingError = String(error?.message || error);
           console.error(`[CallbackManager] Could not bind reviewer child ownership for ${thread.threadId}: ${bindingError}`);
-          try { child.kill(); } catch {}
+          if (error?.code !== 'CHILD_BINDING_IN_PROGRESS') {
+            try { killProcessTree(child, childBirthId, true); } catch {}
+          }
         });
       }
       child.unref();

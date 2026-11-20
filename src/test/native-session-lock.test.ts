@@ -164,6 +164,28 @@ test('attachChild waits for a live reaper gate and never reports an unpersisted 
   lock.release(lease);
 });
 
+test('release returns false for a live child and succeeds after an acknowledged child unbind', async () => {
+  const root = tempRoot();
+  const lock = new NativeSessionLock(root);
+  const lease = lock.acquire('codex', 'release-live-child')!;
+  const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true });
+  const childClosed = new Promise<void>((resolve) => child.once('close', () => resolve()));
+  try {
+    assert.ok(child.pid);
+    assert.equal(lock.attachChild(lease, child.pid), true);
+    assert.equal(lock.release(lease), false, 'a live child prevents successful session release');
+    assert.equal(fs.existsSync(lease.path), true, 'the owner record remains while the child is live');
+
+    child.kill();
+    await childClosed;
+    assert.equal(lock.attachChild(lease, undefined), true, 'child unbinding is durably acknowledged');
+    assert.equal(lock.release(lease), true);
+    assert.equal(fs.existsSync(lease.path), false);
+  } finally {
+    try { child.kill(); } catch {}
+  }
+});
+
 test('release waits for transient reaper ownership and removes the lease before returning', async () => {
   const root = tempRoot();
   const lock = new NativeSessionLock(root);
