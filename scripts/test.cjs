@@ -72,6 +72,7 @@ const LAYER_MAPPING = {
     'task-store.test.js',
     'unified-execution-boundary.test.js',
     'unified-state-writing.test.js',
+    'unique-run-launch.test.js',
     'workspace.test.js',
     'worktree-root.test.js',
   ]),

@@ -7,6 +7,15 @@ import { spawn } from 'child_process';
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const CHILD_ACK_TIMEOUT_MS = 10_000;
 
+interface MeshLockLease {
+  token: string;
+  helper: import('child_process').ChildProcess;
+  helperPid?: number;
+  channelPath: string;
+  childAcks: Map<number, { resolve: () => void; reject: (error: Error) => void; timer: NodeJS.Timeout; timeout: NodeJS.Timeout }>;
+  releasePromise?: Promise<boolean>;
+}
+
 export function buildPosixLockHelperCommand(lockPath: string, channelPath: string): { command: string; args: string[] } {
   const script = `use Fcntl qw(:flock);
 use Time::HiRes qw(usleep);
@@ -56,13 +65,7 @@ export function meshMergeLockPath(storageDir: string): string {
 
 export class MeshFileLock {
   readonly lockPath: string;
-  private activeLease?: {
-    token: string;
-    helper: import('child_process').ChildProcess;
-    helperPid?: number;
-    channelPath: string;
-    childAcks: Map<number, { resolve: () => void; reject: (error: Error) => void; timer: NodeJS.Timeout; timeout: NodeJS.Timeout }>;
-  };
+  private activeLease?: MeshLockLease;
   constructor(lockPath = path.join(os.homedir(), '.agent-mesh-bridge', 'merge.lock')) {
     this.lockPath = lockPath;
   }
@@ -74,15 +77,36 @@ export class MeshFileLock {
   dispose(): void {
     if (this.activeLease) {
       const lease = this.activeLease;
-      try {
-        if (process.platform === 'win32') {
-          fs.writeFileSync(`${lease.channelPath}.release`, 'release');
-        } else {
-          lease.helper.stdin?.write('RELEASE\n');
-          lease.helper.stdin?.end();
-        }
-      } catch {}
+      lease.releasePromise = this.waitForLeaseRelease(lease);
+      this.signalRelease(lease);
       this.activeLease = undefined;
+    }
+  }
+
+  /** Release the specific acquired lease and wait for its OS helper to exit. */
+  public async releaseAndConfirm(
+    release: (() => void) | undefined,
+    timeoutMs: number = CHILD_ACK_TIMEOUT_MS,
+  ): Promise<boolean> {
+    if (!release) return true;
+    const lease = this.activeLease;
+    try { release(); } catch { return false; }
+    if (!lease) return false;
+    const pending = lease.releasePromise;
+    if (!pending) return false;
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+      timer.unref?.();
+    });
+    const confirmed = await Promise.race([pending, timeout]);
+    if (timer) clearTimeout(timer);
+    if (!confirmed) return false;
+    try {
+      const owner = JSON.parse(fs.readFileSync(`${this.lockPath}.owner.json`, 'utf8'));
+      return owner?.token !== lease.token;
+    } catch (error: any) {
+      return error?.code === 'ENOENT';
     }
   }
 
@@ -216,7 +240,7 @@ export class MeshFileLock {
       }
       throw error;
     }
-    const lease = { token, helper: child, helperPid, channelPath, childAcks };
+    const lease: MeshLockLease = { token, helper: child, helperPid, channelPath, childAcks };
     this.activeLease = lease;
     return () => {
       if (this.activeLease !== lease) return;
@@ -224,12 +248,9 @@ export class MeshFileLock {
         const owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8'));
         if (owner.token === token) fs.unlinkSync(ownerFile);
       } catch {}
-      if (process.platform === 'win32') {
-        try { fs.writeFileSync(`${lease.channelPath}.release`, 'release'); } catch {}
-      } else {
-        try { child.stdin!.write('RELEASE\n'); child.stdin!.end(); } catch {}
-      }
       this.activeLease = undefined;
+      lease.releasePromise = this.waitForLeaseRelease(lease);
+      this.signalRelease(lease);
     };
   }
 
@@ -311,6 +332,59 @@ export class MeshFileLock {
     }
   }
 
+  private signalRelease(lease: MeshLockLease): void {
+    if (process.platform === 'win32') {
+      try { fs.writeFileSync(`${lease.channelPath}.release`, 'release'); } catch {}
+    } else {
+      try { lease.helper.stdin!.write('RELEASE\n'); lease.helper.stdin!.end(); } catch {}
+    }
+  }
+
+  private waitForLeaseRelease(lease: MeshLockLease): Promise<boolean> {
+    if (process.platform !== 'win32') {
+      if (lease.helper.exitCode !== null || lease.helper.signalCode !== null) return Promise.resolve(true);
+      return new Promise<boolean>((resolve) => {
+        let settled = false;
+        const finish = (confirmed: boolean) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          lease.helper.removeListener('close', onClose);
+          lease.helper.removeListener('error', onError);
+          resolve(confirmed);
+        };
+        const onClose = () => finish(true);
+        const onError = () => finish(false);
+        const timeout = setTimeout(() => finish(false), CHILD_ACK_TIMEOUT_MS);
+        timeout.unref?.();
+        lease.helper.once('close', onClose);
+        lease.helper.once('error', onError);
+        if (lease.helper.exitCode !== null || lease.helper.signalCode !== null) finish(true);
+      });
+    }
+
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const releasedPath = `${lease.channelPath}.released`;
+      const finish = (confirmed: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(poll);
+        clearTimeout(timeout);
+        if (confirmed) try { fs.unlinkSync(releasedPath); } catch {}
+        resolve(confirmed);
+      };
+      const check = () => {
+        if (fs.existsSync(releasedPath)) finish(true);
+      };
+      const poll = setInterval(check, 25);
+      poll.unref?.();
+      const timeout = setTimeout(() => finish(false), CHILD_ACK_TIMEOUT_MS);
+      timeout.unref?.();
+      check();
+    });
+  }
+
   private startLockHelper(token: string, channelPath: string): import('child_process').ChildProcess {
     const mutexName = `AgentMeshMerge_${crypto.createHash('sha256').update(path.resolve(this.lockPath).toLowerCase()).digest('hex').slice(0, 32)}`;
     if (process.platform === 'win32') {
@@ -367,6 +441,7 @@ try {
   Get-ChildItem -Path ($channel + '.*') -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin @(([System.IO.Path]::GetFileName($channel + '.error')), ([System.IO.Path]::GetFileName($channel + '.done'))) } | Remove-Item -Force -ErrorAction SilentlyContinue
   [System.IO.File]::WriteAllText($channel + '.done', 'done')
   Remove-Item -LiteralPath ($channel + '.done') -Force -ErrorAction SilentlyContinue
+  [System.IO.File]::WriteAllText($channel + '.released', 'released')
   Remove-Item -LiteralPath $helperPath -Force -ErrorAction SilentlyContinue
 }
 `;

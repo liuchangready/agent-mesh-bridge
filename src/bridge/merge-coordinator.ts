@@ -11,7 +11,7 @@ import { TaskStore } from './task-store';
 import { DelegationThread, isMergeReview } from './types';
 import { gitOutput, gitExecutable } from './git-worktree';
 import { TaskExecutionRegistry } from './task-execution-registry';
-import { killProcessTree } from './platform';
+import { getProcessBirthId, killProcessTree } from './platform';
 import { taskValidationDir } from './round-log';
 import { resolveNodeCommand } from './deepseek-harness';
 import { createMergeLog, noteMergeFailure } from './merge-recovery';
@@ -118,7 +118,7 @@ export class MergeCoordinator {
   private readonly executions: TaskExecutionRegistry;
   private readonly lock: MeshFileLock;
   private readonly attemptLogs = new Map<string, { id: string; number: number; path: string; candidateTree?: string }>();
-  private activeChildPidCallback?: (pid: number) => void | Promise<void>;
+  private activeChildPidCallback?: (pid: number, childProcess?: ReturnType<typeof spawn>, childBirthId?: string) => void | Promise<void>;
 
   constructor(
     private readonly store: TaskStore,
@@ -143,19 +143,20 @@ export class MergeCoordinator {
     let child: ReturnType<typeof spawn>;
     try { child = spawn(gitExecutable(), args, { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }); }
     catch (error) { this.executions.end(registration); throw error; }
+    const childBirthId = child.pid ? getProcessBirthId(child.pid) : undefined;
     let stdout = ''; let stderr = ''; let trackingError: Error | undefined;
     try { this.executions.attachChildPid(child.pid, registration); }
-    catch (error) { trackingError = error as Error; killProcessTree(child); }
+    catch (error) { trackingError = error as Error; killProcessTree(child, childBirthId, true); }
     const record = (chunk: Buffer, isStdout: boolean) => {
       if (isStdout) stdout += chunk.toString();
       else stderr = (stderr + chunk.toString()).slice(-16_000);
-      if (logPath) try { fs.appendFileSync(logPath, chunk); } catch (error) { trackingError = error as Error; killProcessTree(child); }
+      if (logPath) try { fs.appendFileSync(logPath, chunk); } catch (error) { trackingError = error as Error; killProcessTree(child, childBirthId, true); }
     };
     child.stdout!.on('data', (chunk: Buffer) => record(chunk, true));
     child.stderr!.on('data', (chunk: Buffer) => record(chunk, false));
     let resolveResult!: (result: { code: number | null; error?: Error }) => void;
     const completion = new Promise<{ code: number | null; error?: Error }>((resolve) => { resolveResult = resolve; });
-    const timer = setTimeout(() => killProcessTree(child), 30_000);
+    const timer = setTimeout(() => killProcessTree(child, childBirthId, true), 30_000);
     timer.unref?.();
     // An `error` event reports a failed spawn/pipe, not that the process is gone:
     // resolving on it would end the registration and detach the lock while a
@@ -166,10 +167,13 @@ export class MergeCoordinator {
     try {
       // The child is already spawned: a rejected identity binding must stop this
       // subtree and be surfaced, never skip straight to the cleanup in `finally`.
-      try { if (child.pid) await this.activeChildPidCallback?.(child.pid); }
-      catch (error) { trackingError = error as Error; killProcessTree(child); }
+      try { if (child.pid) await this.activeChildPidCallback?.(child.pid, child, childBirthId); }
+      catch (error: any) {
+        trackingError = error as Error;
+        if (error?.code !== 'CHILD_BINDING_IN_PROGRESS') killProcessTree(child, childBirthId, true);
+      }
       try { if (!trackingError) await this.lock.attachChildPid(child.pid, () => !this.isMergeStillAllowed(threadId, thread?.worktree?.approvedCommit || '')); }
-      catch (error) { trackingError = error as Error; killProcessTree(child); }
+      catch (error) { trackingError = error as Error; killProcessTree(child, childBirthId, true); }
       const result = await completion;
       if (logPath) fs.appendFileSync(logPath, `\n[exit ${result.code}]\n`, 'utf8');
       if (trackingError || result.error || result.code !== 0) throw new Error(`Git command failed (${args.join(' ')}): ${trackingError?.message || result.error?.message || stderr.trim() || `exit ${result.code}`}`);
@@ -189,7 +193,7 @@ export class MergeCoordinator {
 
   async mergeApprovedAttempt(
     threadId: string,
-    onChildPid?: (pid: number) => void,
+    onChildPid?: (pid: number, childProcess?: ReturnType<typeof spawn>, childBirthId?: string) => void | Promise<void>,
     externalLease?: () => void,
   ): Promise<MergeResult> {
     this.activeChildPidCallback = onChildPid;
@@ -879,6 +883,7 @@ export class MergeCoordinator {
     let child: ReturnType<typeof spawn>;
     try { child = spawn(gitExecutable(), ['update-ref', '--stdin'], { cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }); }
     catch (failure) { this.executions.end(registration); throw failure; }
+    const childBirthId = child.pid ? getProcessBirthId(child.pid) : undefined;
     let output = ''; let error = ''; let prepared = false; let committed = false;
     const completion = new Promise<boolean>((resolve) => {
       child.stdin!.on('error', (failure) => { error += failure.message; });
@@ -909,13 +914,13 @@ export class MergeCoordinator {
       child.once('error', (failure) => { error += failure.message; });
       child.once('close', (code) => resolve(code === 0 && committed && output.includes('commit: ok')));
     });
-    const timer = setTimeout(() => killProcessTree(child), 30_000);
+    const timer = setTimeout(() => killProcessTree(child, childBirthId, true), 30_000);
     timer.unref?.();
     try {
       if (!child.pid) throw new Error('Git stash cleanup process has no PID.');
       this.executions.attachChildPid(child.pid, registration);
       await this.lock.attachChildPid(child.pid);
-      await this.activeChildPidCallback?.(child.pid);
+      await this.activeChildPidCallback?.(child.pid, child, childBirthId);
       child.stdin!.write(`start\noption no-deref\ndelete refs/stash ${sha}\nprepare\n`);
       const removed = await completion;
       if (!removed && error) {
@@ -923,7 +928,7 @@ export class MergeCoordinator {
         if (log) fs.appendFileSync(log, `\n[local stash cleanup] ${error}\n`, 'utf8');
       }
       return removed;
-    } catch (failure) { killProcessTree(child); await completion; throw failure; }
+    } catch (failure) { killProcessTree(child, childBirthId, true); await completion; throw failure; }
     finally { clearTimeout(timer); this.lock.detachChildPid(child.pid); this.executions.end(registration); }
   }
 
@@ -1145,15 +1150,16 @@ export class MergeCoordinator {
       const logPath = this.attemptLogs.get(threadId)?.path;
       if (logPath) fs.appendFileSync(logPath, `\n$ ${step.command} ${step.args.join(' ')}\n`, 'utf8');
       const child = spawn(step.command, step.args, { cwd, env, windowsHide: true, shell: step.needsShell });
+      const childBirthId = child.pid ? getProcessBirthId(child.pid) : undefined;
       let output = '';
       let trackingError: Error | undefined;
       try { this.executions.attachChildPid(child.pid, registration); }
-      catch (error) { trackingError = error as Error; killProcessTree(child); }
+      catch (error) { trackingError = error as Error; killProcessTree(child, childBirthId, true); }
       let resolveResult!: (result: { code: number | null; output: string }) => void;
       const resultPromise = new Promise<{ code: number | null; output: string }>((resolve) => { resolveResult = resolve; });
       const record = (chunk: Buffer) => {
         output = (output + chunk.toString()).slice(-8192);
-        if (logPath) try { fs.appendFileSync(logPath, chunk); } catch (error) { trackingError = error as Error; killProcessTree(child); }
+        if (logPath) try { fs.appendFileSync(logPath, chunk); } catch (error) { trackingError = error as Error; killProcessTree(child, childBirthId, true); }
       };
       child.stdout.on('data', record);
       child.stderr.on('data', record);
@@ -1167,12 +1173,15 @@ export class MergeCoordinator {
       // settle the result so the lock is not detached under a live process.
       child.on('error', (error) => {
         if (!trackingError) trackingError = error;
-        killProcessTree(child);
+        killProcessTree(child, childBirthId, true);
       });
       try { if (!trackingError) await this.lock.attachChildPid(child.pid, () => !this.isMergeStillAllowed(threadId, sourceCommit)); }
-      catch (error) { trackingError = error as Error; killProcessTree(child); }
-      try { if (child.pid) await this.activeChildPidCallback?.(child.pid); }
-      catch (error) { trackingError = error as Error; killProcessTree(child); }
+      catch (error) { trackingError = error as Error; killProcessTree(child, childBirthId, true); }
+      try { if (child.pid) await this.activeChildPidCallback?.(child.pid, child, childBirthId); }
+      catch (error: any) {
+        trackingError = error as Error;
+        if (error?.code !== 'CHILD_BINDING_IN_PROGRESS') killProcessTree(child, childBirthId, true);
+      }
       const result = await resultPromise;
       if (logPath) fs.appendFileSync(logPath, `\n${step.label} ${result.code === 0 ? 'passed' : `failed (exit ${result.code})`}\n`, 'utf8');
       if (result.code !== 0) return { ok: false, error: `${step.label} failed (exit ${result.code}): ${result.output}` };

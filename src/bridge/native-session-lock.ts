@@ -188,16 +188,22 @@ export class NativeSessionLock {
     try {
       gate = this.acquireGate(gatePath, 5_000, cancelled);
     } catch {}
-    if (!gate) return true;
+    if (!gate) return false;
     try {
-      if (!this.ownsGate(gatePath, gate.token)) return true;
+      if (!this.ownsGate(gatePath, gate.token)) return false;
       let current: NativeSessionOwner;
       try { current = JSON.parse(fs.readFileSync(lease.path, 'utf8')) as NativeSessionOwner; }
-      catch (error: any) { if (error?.code === 'ENOENT') return true; return true; }
+      catch (error: any) { return error?.code === 'ENOENT'; }
       if (current.token !== lease.token) return true;
       if (pidAlive(current.childPid)) return false;
-      try { fs.unlinkSync(lease.path); } catch {}
-      return true;
+      try { fs.unlinkSync(lease.path); }
+      catch (error: any) { if (error?.code !== 'ENOENT') return false; }
+      try {
+        const remaining = JSON.parse(fs.readFileSync(lease.path, 'utf8')) as NativeSessionOwner;
+        return remaining.token !== lease.token;
+      } catch (error: any) {
+        return error?.code === 'ENOENT';
+      }
     } finally { this.releaseGate(gatePath, gate.token); }
   }
 }

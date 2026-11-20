@@ -19,7 +19,7 @@ import {
 import { AgentDetector } from './agent-detector';
 import { buildDshHeadlessCommand } from './deepseek-harness';
 import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
-import { defaultBinary, killProcessTree, needsShellWrapper } from './platform';
+import { defaultBinary, getProcessBirthId, killProcessTree, needsShellWrapper } from './platform';
 import { normalizeModelId, resolveConfiguredModel, writeDshModelOverlay } from './model-catalog';
 import { accumulateTokenUsage, collectTokenUsage } from './token-usage-collector';
 import {
@@ -384,9 +384,23 @@ export interface RunOptions {
    * The global execution lease records it so that a leaked child (host killed,
    * agent still running) can be detected and killed before another round starts.
    */
-  onChildPid?: (pid: number | undefined) => void;
+  onChildPid?: (
+    pid: number | undefined,
+    childProcess?: child_process.ChildProcess,
+    childBirthId?: string,
+  ) => void | Promise<void>;
   /** Called as soon as a first native session id appears while its process is alive. */
   onNativeSessionId?: (sessionId: string, childPid?: number) => void;
+  /** Optional custom command override for testing or controlled child execution */
+  customCommand?: {
+    command: string;
+    args?: string[];
+    useShell?: boolean;
+    env?: NodeJS.ProcessEnv;
+    stdinPayload?: string;
+  };
+  /** Pre-spawn atomic invalidation check right before child_process.spawn */
+  preSpawnGuard?: () => Promise<{ ok: boolean; reason?: string }> | { ok: boolean; reason?: string };
 }
 
 export interface RunResult {
@@ -415,6 +429,7 @@ export class AutonomousRunner {
   private cancellationRegistry: CancellationRegistry;
   private taskStore?: TaskStore;
   private activeChildren: Map<string, child_process.ChildProcess> = new Map();
+  private childBirthIds = new WeakMap<child_process.ChildProcess, string | undefined>();
   private localCancellations: Map<string, CancellationRequest> = new Map();
   private executingThreads: Set<string> = new Set();
   /** Where an unspecified model comes from; replaceable for tests. */
@@ -631,6 +646,15 @@ export class AutonomousRunner {
    * Builds execution command and arguments for the target agent adhering to skip-danger standards.
    */
   public buildCommand(options: RunOptions): RunCommand {
+    if (options.customCommand) {
+      return {
+        command: options.customCommand.command,
+        args: options.customCommand.args || [],
+        useShell: options.customCommand.useShell ?? false,
+        env: options.customCommand.env as Record<string, string> | undefined,
+        stdinPayload: options.customCommand.stdinPayload,
+      };
+    }
     const { agent, prompt, isRework, receiverSessionId, title } = options;
     const resolvedPath = this.detector.resolveExecutable(agent);
     const model = this.resolveModel(agent, options.model);
@@ -907,10 +931,10 @@ export class AutonomousRunner {
           prompt: prepared.recoveryPrefix
             ? `<bridge_recovery_document version="${prepared.recoveryVersion}">\n${prepared.recoveryPrefix}\n</bridge_recovery_document>\n\n<CURRENT_INSTRUCTION>\n${options.prompt}\n</CURRENT_INSTRUCTION>`
             : options.prompt,
-          onChildPid: (pid) => {
-            if (nativeLease) sessionLock.attachChild(nativeLease, pid);
-            if (preparationExecution) preparationExecution.registry.attachChildPid(pid, preparationExecution.registration);
-            originalOnChildPid?.(pid);
+          onChildPid: async (pid, childProc, childBirthId) => {
+            if (nativeLease && pid) sessionLock.attachChild(nativeLease, pid);
+            if (preparationExecution && pid) preparationExecution.registry.attachChildPid(pid, preparationExecution.registration);
+            if (originalOnChildPid) await originalOnChildPid(pid, childProc, childBirthId);
           },
           onNativeSessionId: captureSession,
         };
@@ -1391,8 +1415,8 @@ export class AutonomousRunner {
    * Executes a single attempt of the agent command.
    */
   public executeOnce(options: RunOptions): Promise<RunResult> {
-    return new Promise((resolve) => {
-      const missingExecutable = this.describeMissingExecutable(options.agent);
+    return new Promise(async (resolve) => {
+      const missingExecutable = options.customCommand ? undefined : this.describeMissingExecutable(options.agent);
       if (missingExecutable) {
         console.error(`[AutonomousRunner] ${missingExecutable}`);
         resolve({
@@ -1532,6 +1556,33 @@ export class AutonomousRunner {
         return settle(this.buildInterruptedResult(preCancel));
       }
 
+      if (options.preSpawnGuard) {
+        try {
+          const guardRes = await options.preSpawnGuard();
+          if (guardRes && !guardRes.ok) {
+            const durationMs = Date.now() - startTime;
+            return settle({
+              exitCode: -1,
+              stdout: '',
+              stderr: guardRes.reason || 'Pre-spawn guard rejected execution',
+              extractedOutput: '',
+              durationMs,
+              error: guardRes.reason || 'Pre-spawn guard rejected execution',
+            });
+          }
+        } catch (guardErr: any) {
+          const durationMs = Date.now() - startTime;
+          return settle({
+            exitCode: -1,
+            stdout: '',
+            stderr: String(guardErr),
+            extractedOutput: '',
+            durationMs,
+            error: `Pre-spawn guard error: ${guardErr?.message || guardErr}`,
+          });
+        }
+      }
+
       let child: child_process.ChildProcess;
       try {
         child = child_process.spawn(command, args, {
@@ -1551,6 +1602,9 @@ export class AutonomousRunner {
           durationMs,
           error: `Failed to spawn process (${command}): ${err.message || err}`,
         });
+      }
+      if (options.onChildPid) {
+        this.childBirthIds.set(child, child.pid ? getProcessBirthId(child.pid) : undefined);
       }
 
       // CRITICAL: Close stdin so no CLI waits on interactive input. Agents that
@@ -1777,11 +1831,18 @@ export class AutonomousRunner {
         });
       });
 
-      child.on('close', (code) => {
+      let bindingPromise: Promise<void> | undefined;
+
+      const finishClose = async (code: number | null) => {
         if (isSettled) return;
         isSettled = true;
         if (child.pid) {
-          try { options.onChildPid?.(undefined); }
+          try {
+            const cleanupRes = options.onChildPid?.(undefined);
+            if (cleanupRes && typeof (cleanupRes as any).then === 'function') {
+              await cleanupRes;
+            }
+          }
           catch (error: any) { childCleanupError = String(error?.message || error); }
         }
         // Pick up a suspension window that ended right at exit time (e.g. the
@@ -1934,29 +1995,50 @@ export class AutonomousRunner {
           extractedOutput: extracted || stdoutData.trim(),
           actualSessionId,
           durationMs,
-          error,
+          error: error || childBindingError,
           interruption,
           assessment,
           tokenUsage,
           model: effectiveModel,
+        });
+      };
+
+      child.on('close', (code) => {
+        const afterBinding = bindingPromise
+          ? bindingPromise.then(() => {}, () => {})
+          : Promise.resolve();
+        afterBinding.then(() => finishClose(code)).catch((err: any) => {
+          settle({
+            exitCode: code ?? 1,
+            stdout: stdoutData,
+            stderr: stderrData,
+            extractedOutput: stdoutData.trim(),
+            durationMs: Date.now() - startTime,
+            error: String(err?.message || err),
+          } as any);
         });
       });
 
       // Install close/error handlers first. If durable PID binding fails, kill
       // this child and let close record a failed round only after it has exited.
       if (child.pid) {
-        try { options.onChildPid?.(child.pid); }
-        catch (error: any) {
+        bindingPromise = Promise.resolve().then(() => options.onChildPid?.(child.pid, child, this.childBirthIds.get(child)));
+        void bindingPromise.catch((error: any) => {
           childBindingError = String(error?.message || error);
-          try { this.killProcess(child); } catch {}
-        }
+          // The controller already handles a duplicate/in-progress identity:
+          // it either shares the original ACK or stops only the rejected child.
+          // Do not let this generic runner catch kill the original owner.
+          if (error?.code !== 'CHILD_BINDING_IN_PROGRESS') {
+            try { this.killProcess(child); } catch {}
+          }
+        });
       }
     });
   }
 
   private killProcess(child: child_process.ChildProcess): void {
     if (!child.pid) return;
-    killProcessTree(child);
+    killProcessTree(child, this.childBirthIds.get(child), this.childBirthIds.has(child));
   }
 
   /**
