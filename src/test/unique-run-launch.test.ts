@@ -85,6 +85,7 @@ function createV2Thread(
     createdAt: now,
     updatedAt: now,
     receiverSessionId: `session-${threadId}`,
+    receiverSessionCaptured: true,
     reviewerSessionId: `rev-session-${threadId}`,
     callerSessionId: `rev-session-${threadId}`,
     reviewerSessionCaptured: true,

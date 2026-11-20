@@ -610,7 +610,15 @@ export class TaskStore extends EventEmitter {
       const fd = fs.openSync(temp, 'w');
       try { fs.writeFileSync(fd, JSON.stringify(thread, null, 2), 'utf8'); fs.fsyncSync(fd); }
       finally { fs.closeSync(fd); }
-      fs.renameSync(temp, file);
+      for (let attempt = 0; ; attempt++) {
+        try { fs.renameSync(temp, file); break; }
+        catch (error: any) {
+          // Windows readers/scanners can briefly deny replacement. Preserve the
+          // old file and retry only the same atomic publish, never the mutation.
+          if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error?.code) || attempt >= 19) throw error;
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        }
+      }
       if (process.platform !== 'win32') {
         const dirFd = fs.openSync(path.dirname(file), 'r');
         try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }

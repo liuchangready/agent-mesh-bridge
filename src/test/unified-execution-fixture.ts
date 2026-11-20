@@ -143,6 +143,7 @@ export function createThread(id: string, phase: ExecutionPhase = 'develop'): Del
     createdAt: now,
     updatedAt: now,
     receiverSessionId: `session-${id}`,
+    receiverSessionCaptured: true,
     reviewerSessionId: `rev-session-${id}`,
     callerSessionId: `rev-session-${id}`,
     reviewerSessionCaptured: true,

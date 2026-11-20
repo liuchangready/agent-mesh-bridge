@@ -51,6 +51,8 @@ const LAYER_MAPPING = {
     'worktree-details.test.js',
   ]),
   boundary: new Set([
+    'controller-start-admission.test.js',
+    'task-store-atomic-write.test.js',
     'autonomous-runner.test.js',
     'callback-failure.test.js',
     'codex-session.test.js',
@@ -77,6 +79,7 @@ const LAYER_MAPPING = {
     'worktree-root.test.js',
   ]),
   integration: new Set([
+    'mock-agents-e2e.test.js',
     'concurrency.test.js',
     'git-worktree-merge.test.js',
     'git-worktree-recovery.test.js',

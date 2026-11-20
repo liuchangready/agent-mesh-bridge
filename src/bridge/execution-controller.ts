@@ -67,6 +67,13 @@ export const AUTO_RETRY_BACKOFFS_MS = [5_000, 30_000];
 export const MAX_AUTO_RETRIES = 2;
 export const PROCESS_STOP_TIMEOUT_MS = 10_000;
 
+interface StartExecutionOptions {
+  purpose?: 'bootstrap' | 'merge_resolution';
+  operationId?: string;
+  generation?: number;
+  allowStates?: ThreadStatus[];
+}
+
 export interface ExecutionControllerOptions {
   storageDir?: string;
   defaultBudgetLimitMs?: number;
@@ -94,6 +101,7 @@ export class ExecutionController {
   private readonly wallClockNow: () => number;
   private readonly mergeLock: MeshFileLock;
   private readonly activeExecutions = new Map<string, { abort: () => void; activeSinceMs: number }>();
+  private readonly startingExecutions = new Map<string, Promise<{ started: boolean; reason?: string; run?: ExecutionRun }>>();
   private readonly backoffTimers = new Map<string, NodeJS.Timeout>();
   private readonly threadTransitionChains = new Map<string, Promise<any>>();
   private standingScanTimer: NodeJS.Timeout | undefined;
@@ -227,12 +235,22 @@ export class ExecutionController {
   public async startExecution(
     threadId: string,
     targetPhase?: ExecutionPhase,
-    options?: {
-      purpose?: 'bootstrap' | 'merge_resolution';
-      operationId?: string;
-      generation?: number;
-      allowStates?: ThreadStatus[];
-    },
+    options?: StartExecutionOptions,
+  ): Promise<{ started: boolean; reason?: string; run?: ExecutionRun }> {
+    const pending = this.startingExecutions.get(threadId);
+    if (pending) return pending;
+    // V1 acquires resources before CAS. Concurrent local callers must not share
+    // a reentrant role lease and let the losing caller release the winner's.
+    const starting = this.startExecutionAttempt(threadId, targetPhase, options);
+    this.startingExecutions.set(threadId, starting);
+    try { return await starting; }
+    finally { if (this.startingExecutions.get(threadId) === starting) this.startingExecutions.delete(threadId); }
+  }
+
+  private async startExecutionAttempt(
+    threadId: string,
+    targetPhase?: ExecutionPhase,
+    options?: StartExecutionOptions,
   ): Promise<{ started: boolean; reason?: string; run?: ExecutionRun }> {
     if (this.isDisposed) return { started: false, reason: 'disposed' };
     const pendingBackoff = this.backoffTimers.get(threadId);
@@ -310,7 +328,7 @@ export class ExecutionController {
         await this.setQueuedState(threadId, phase, 'role');
         return { started: false, reason: 'role_busy' };
       }
-      if (thread.receiverSessionId) {
+      if (thread.receiverSessionCaptured && thread.receiverSessionId) {
         sessionLease = this.sessionLock.acquire(thread.targetAgent, thread.receiverSessionId);
         if (!sessionLease) {
           this.roleLock.release(roleLease);
@@ -441,7 +459,7 @@ export class ExecutionController {
           phase === 'develop'
             ? 'running'
             : phase === 'review'
-              ? 'reviewing'
+              ? t.execution.purpose === 'bootstrap' ? 'queued' : 'reviewing'
               : 'merging';
         clearTaskFailure(t);
       });
@@ -495,12 +513,7 @@ export class ExecutionController {
   public async startExecutionV2(
     threadId: string,
     targetPhase?: ExecutionPhase,
-    options?: {
-      purpose?: 'bootstrap' | 'merge_resolution';
-      operationId?: string;
-      generation?: number;
-      allowStates?: ThreadStatus[];
-    },
+    options?: StartExecutionOptions,
   ): Promise<{ started: boolean; reason?: string; run?: ExecutionRun }> {
     if (this.isDisposed) return { started: false, reason: 'disposed' };
     const pendingBackoff = this.backoffTimers.get(threadId);
@@ -698,7 +711,7 @@ export class ExecutionController {
             phase === 'develop'
               ? 'running'
               : phase === 'review'
-                ? 'reviewing'
+                ? t.execution.purpose === 'bootstrap' ? 'queued' : 'reviewing'
                 : 'merging';
           clearTaskFailure(t);
         });
@@ -746,7 +759,7 @@ export class ExecutionController {
     let mergeRelease: (() => void) | undefined;
 
     if (phase === 'develop') {
-      if (thread.receiverSessionId) {
+      if (thread.receiverSessionCaptured && thread.receiverSessionId) {
         sessionLease = this.sessionLock.acquire(thread.targetAgent, thread.receiverSessionId);
         if (!sessionLease) {
           await this.releaseStartingRunV2(threadId, finalRunId, finalOperationId, finalGeneration, 'session');
@@ -2050,7 +2063,9 @@ export class ExecutionController {
       if (t.cleanup) {
         throw new Error(`Task is marked for cleanup (${t.cleanup.action})`);
       }
-      if (t.status === 'paused' || t.status === 'completed' || t.status === 'failed') {
+      const finalizedMerge = phase === 'merge' && result.ok && t.status === 'completed' &&
+        (t.worktree?.integration?.phase === 'merged' || t.worktree?.integration?.phase === 'no_changes');
+      if (t.status === 'paused' || (t.status === 'completed' && !finalizedMerge) || t.status === 'failed') {
         throw new Error(`Cannot apply phase outcome to task in ${t.status} status`);
       }
       if (identity?.generation !== undefined && t.execution.generation !== identity.generation) {
@@ -2197,6 +2212,11 @@ export class ExecutionController {
         at: new Date().toISOString(),
         round: t.currentRound || 1,
       });
+      if (failureStage === 'bootstrap') {
+        t.reviewBootstrap = { ...(t.reviewBootstrap || { attempts: 0 }), phase: 'failed', lastError: reason || code };
+        const placeholder = t.rounds.find(round => round.round === t.currentRound);
+        if (placeholder?.status === 'running') { placeholder.status = 'failed'; placeholder.error = reason || code; }
+      }
       if (t.execution) {
         t.execution.run = undefined;
         t.execution.lastOutcome = { code, reason, at: new Date().toISOString() };
