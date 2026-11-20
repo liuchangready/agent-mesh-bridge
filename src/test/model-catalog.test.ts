@@ -554,6 +554,11 @@ test('Model routing - the sender-side default wins over the receiver-side defaul
 
 function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread {
   return {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + ('thread_test')),
+    callerSessionId: ('reviewer-' + ('thread_test')),
     threadId: 'thread_test',
     title: 'Test task',
     initiatorAgent: 'codex',

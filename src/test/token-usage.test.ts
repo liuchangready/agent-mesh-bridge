@@ -17,7 +17,7 @@ import {
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { TaskStore } from '../bridge/task-store';
 import { ContextCompactor } from '../bridge/context-compactor';
-import { getWorkerLogDir } from '../bridge/round-log';
+import { taskArtifactBase, taskWorkerLogDir } from '../bridge/round-log';
 import { CancellationRegistry } from '../bridge/cancellation-registry';
 import { NativeSessionLock } from '../bridge/native-session-lock';
 import { NativeSessionCompactor, resolveCodexProviderIdentity } from '../bridge/native-session-compactor';
@@ -51,6 +51,11 @@ function makeStore(): { store: TaskStore; dir: string } {
 function makeThread(rounds: DelegationRound[]): DelegationThread {
   const now = new Date().toISOString();
   return {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + (`thread_token_${Math.random().toString(16).slice(2, 8)}`)),
+    callerSessionId: ('reviewer-' + (`thread_token_${Math.random().toString(16).slice(2, 8)}`)),
     threadId: `thread_token_${Math.random().toString(16).slice(2, 8)}`,
     title: 'token fixture',
     initiatorAgent: 'claude_code',
@@ -600,9 +605,10 @@ describe('token usage - durability', () => {
       durationMs: 1, status: 'completed', timestamp: new Date().toISOString(),
       nativeSessionCompactions: [{ id: 'op-recovery', role: 'developer', agent: 'codex', sessionId,
         reason: 'manual', phase: 'succeeded', revision: 2, startedAt: new Date().toISOString(),
-        recoveryPath: path.join(getWorkerLogDir('codex', dir), 'recovery.json'),
-        logPath: path.join(getWorkerLogDir('codex', dir), 'native.log') }],
+        recoveryPath: path.join(taskWorkerLogDir(taskArtifactBase('thread_recovery', dir)), 'recovery.json'),
+        logPath: path.join(taskWorkerLogDir(taskArtifactBase('thread_recovery', dir)), 'native.log') }],
     }]);
+    thread.threadId = 'thread_recovery';
     thread.status = 'running';
     thread.receiverSessionId = sessionId;
     thread.receiverSessionCaptured = true;
@@ -650,7 +656,7 @@ describe('token usage - durability', () => {
   test('a recovered running maintenance operation becomes unknown and is never replayed', async () => {
     const { store, dir } = makeStore();
     const sessionId = '01a1acc2-877d-71e3-9bf1-5e668c1f2183';
-    const recoveryPath = path.join(getWorkerLogDir('codex', dir), 'crash.recovery.json');
+    const recoveryPath = path.join(taskWorkerLogDir(taskArtifactBase('thread_recovered', dir)), 'crash.recovery.json');
     fs.mkdirSync(path.dirname(recoveryPath), { recursive: true });
     fs.writeFileSync(recoveryPath, '{"recover":true}', 'utf8');
     const thread = makeThread([{
@@ -658,8 +664,9 @@ describe('token usage - durability', () => {
       status: 'completed', timestamp: new Date().toISOString(),
       nativeSessionCompactions: [{ id: 'crashed-op', role: 'developer', agent: 'codex', sessionId,
         reason: 'manual', phase: 'running', revision: 2, startedAt: new Date().toISOString(),
-        recoveryPath, logPath: path.join(getWorkerLogDir('codex', dir), 'crash.log') }],
+        recoveryPath, logPath: path.join(taskWorkerLogDir(taskArtifactBase('thread_recovered', dir)), 'crash.log') }],
     }]);
+    thread.threadId = 'thread_recovered';
     thread.status = 'running'; thread.receiverSessionId = sessionId; thread.receiverSessionCaptured = true;
     thread.targetModel = 'gpt-6-luna';
     thread.nativeSessionCompaction = { developer: { sessionId, revision: 2, lastOperationId: 'crashed-op',
@@ -687,7 +694,7 @@ describe('token usage - durability', () => {
     const thread = makeThread([{ round: 1, type: 'initial', prompt: 'complete task brief', durationMs: 1, status: 'running', timestamp: new Date().toISOString() }]);
     thread.status = 'running'; thread.targetAgent = 'codex'; thread.targetModel = 'gpt-6-luna';
     thread.receiverSessionId = sessionId; thread.receiverSessionCaptured = true;
-    const logDir = getWorkerLogDir('codex', dir);
+    const logDir = taskWorkerLogDir(taskArtifactBase(thread.threadId, dir, thread.artifactDir));
     fs.mkdirSync(logDir, { recursive: true });
     const recoveryPath = path.join(logDir, 'thread_round_1.native_op.recovery.json');
     fs.writeFileSync(recoveryPath, '{"task":"complete task brief"}');
@@ -738,7 +745,7 @@ describe('token usage - durability', () => {
     const thread = makeThread([{ round: 1, type: 'initial', prompt: 'brief', durationMs: 1, status: 'running', timestamp: new Date().toISOString() }]);
     thread.status = 'running'; thread.targetAgent = 'codex'; thread.targetModel = 'gpt-6-luna';
     thread.receiverSessionId = sessionId; thread.receiverSessionCaptured = true;
-    const logDir = getWorkerLogDir('codex', dir); fs.mkdirSync(logDir, { recursive: true });
+    const logDir = taskWorkerLogDir(taskArtifactBase(thread.threadId, dir, thread.artifactDir)); fs.mkdirSync(logDir, { recursive: true });
     const recoveryPath = path.join(logDir, 'interrupted.recovery.json'); fs.writeFileSync(recoveryPath, '{"brief":"brief"}');
     thread.rounds[0].nativeSessionCompactions = [{ id: 'interrupted-op', role: 'developer', agent: 'codex', sessionId, model: 'gpt-6-luna', reason: 'turn_budget', phase: 'interrupted', revision: 2, startedAt: new Date().toISOString(), recoveryPath, logPath: path.join(logDir, 'interrupted.log') } as any];
     thread.nativeSessionCompaction = { developer: { sessionId, lastOperationId: 'interrupted-op', recoveryVersion: 'interrupted-op', turnsSinceCompaction: 4, revision: 2 } };
@@ -763,7 +770,7 @@ describe('token usage - durability', () => {
     const thread = makeThread([{ round: 1, type: 'initial', prompt: 'full task brief', durationMs: 1, status: 'running', timestamp: new Date().toISOString() }]);
     thread.status = 'running'; thread.targetAgent = 'codex'; thread.targetModel = 'gpt-6-luna';
     thread.receiverSessionId = sessionId; thread.receiverSessionCaptured = true;
-    const logDir = getWorkerLogDir('codex', dir); fs.mkdirSync(logDir, { recursive: true });
+    const logDir = taskWorkerLogDir(taskArtifactBase(thread.threadId, dir, thread.artifactDir)); fs.mkdirSync(logDir, { recursive: true });
     const recoveryPath = path.join(logDir, 'unknown.recovery.json'); fs.writeFileSync(recoveryPath, '{"brief":"full task brief"}');
     thread.rounds[0].nativeSessionCompactions = [{ id: 'unknown-delivered-op', role: 'developer', agent: 'codex', sessionId, model: 'gpt-6-luna', reason: 'turn_budget', phase: 'unknown', revision: 3, startedAt: new Date().toISOString(), recoveryPath, logPath: path.join(logDir, 'unknown.log') } as any];
     thread.nativeSessionCompaction = { developer: { sessionId, lastOperationId: 'unknown-delivered-op', recoveryVersion: 'unknown-delivered-op', recoveryVerifiedOperationId: 'unknown-delivered-op', recoveryDeliveredVersion: 'unknown-delivered-op', autoSuppressedOperationId: 'unknown-delivered-op', turnsSinceCompaction: 0, revision: 4 } };

@@ -18,7 +18,7 @@ process.env.HOME = isolatedHome;
 import { CallbackManager } from '../bridge/callback-manager';
 import { AgentDetector } from '../bridge/agent-detector';
 import { rememberCodexResumeSupport } from '../bridge/codex-session';
-import { getBridgeHome, invalidateConfiguredModelCache, saveModelDefaults } from '../bridge/model-catalog';
+import { getBridgeHome, invalidateConfiguredModelCache, saveModelDefaults, resolveConfiguredModel } from '../bridge/model-catalog';
 import { TaskRoleLock } from '../bridge/task-role-lock';
 import { DelegationRound, DelegationThread } from '../bridge/types';
 import { readReviewerLogTail, reviewerLogPath, statReviewerLog } from '../bridge/reviewer-log';
@@ -50,6 +50,11 @@ const completedRound: DelegationRound = {
 };
 
 const makeThread = (): DelegationThread => ({
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: 'caller-codex-session-1',
+  reviewerModel: resolveConfiguredModel('codex', undefined, 'initiator'),
   threadId: 'thread_capture_1',
   title: 'Capture reviewer stream',
   initiatorAgent: 'codex',
@@ -130,6 +135,7 @@ describe('Reviewer stream capture', () => {
       const thread = makeThread();
       thread.threadId = 'thread_capture_uuid';
       thread.callerSessionId = uuid;
+      thread.reviewerSessionId = thread.callerSessionId;
 
       assert.strictEqual(await manager.notifyCaller(thread, thread.rounds[0]), true);
 
@@ -175,6 +181,7 @@ describe('Reviewer stream capture', () => {
       thread.threadId = 'thread_capture_legacy';
       // A legacy ledger may still hold the rollout spelling.
       thread.callerSessionId = rollout;
+      thread.reviewerSessionId = thread.callerSessionId;
 
       assert.strictEqual(await manager.notifyCaller(thread, thread.rounds[0]), true);
 
@@ -185,6 +192,7 @@ describe('Reviewer stream capture', () => {
       assert.strictEqual(argv[resumeIndex + 1], rollout, 'legacy CLI gets the rollout name');
       assert.ok(!argv.includes('--no-daemon'), 'a standalone CLI must not receive the flag');
       assert.strictEqual(thread.callerSessionId, uuid, 'the ledger is healed to the canonical UUID');
+      assert.strictEqual(thread.reviewerSessionId, uuid, 'both reviewer bindings remain consistent');
     } finally {
       childProcessModule.spawn = originalSpawn;
       fs.rmSync(sessionDir, { recursive: true, force: true });
@@ -215,6 +223,7 @@ describe('Reviewer stream capture', () => {
       const thread = makeThread();
       thread.threadId = 'thread_capture_sender_model';
       thread.callerSessionId = '03c39f4b-62f2-4965-a53b-a9aef6ef2fa7';
+      thread.reviewerSessionId = thread.callerSessionId;
 
       assert.strictEqual(await manager.notifyCaller(thread, thread.rounds[0]), true);
 
@@ -259,6 +268,7 @@ describe('Reviewer stream capture', () => {
       thread.reviewerSessionCaptured = true;
       thread.reviewerSessionId = reviewerSession;
       thread.callerSessionId = reviewerSession;
+      thread.reviewerSessionId = thread.callerSessionId;
 
       assert.strictEqual(await manager.notifyCaller(thread, thread.rounds[0]), true);
       assert.strictEqual(calls.length, 1);
@@ -291,6 +301,7 @@ describe('Reviewer stream capture', () => {
       const thread = makeThread();
       thread.threadId = 'thread_capture_round_clamp';
       thread.callerSessionId = '06f5b0d2-84f4-4e97-a75d-c2d0a8e4b19c';
+      thread.reviewerSessionId = thread.callerSessionId;
       thread.currentRound = 5;
       const madeRound = (round: number): DelegationRound => ({
         round,

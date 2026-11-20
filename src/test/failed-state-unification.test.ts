@@ -13,8 +13,14 @@ import { AgentDetector } from '../bridge/agent-detector';
 
 function task(root: string): DelegationThread {
   const at = '2026-01-01T00:00:00.000Z';
-  return { threadId: 'thread_failure_revision', title: 'test', initiatorAgent: 'codex', targetAgent: 'claude_code',
+  return {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + ('thread_failure_revision')),
+    callerSessionId: ('reviewer-' + ('thread_failure_revision')), threadId: 'thread_failure_revision', title: 'test', initiatorAgent: 'codex', targetAgent: 'claude_code',
     status: 'running', currentRound: 1, createdAt: at, updatedAt: at, receiverSessionId: 'receiver',
+    artifactDir: path.join(root, 'tasks', 'thread_failure_revision'),
     workspace: testWorkspace(root), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
     rounds: [{ round: 1, type: 'initial', prompt: 'work', status: 'running', durationMs: 0, timestamp: at }] };
 }

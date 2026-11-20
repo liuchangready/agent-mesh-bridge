@@ -368,6 +368,7 @@ describe('context compaction - round log helpers', () => {
     const logs = path.join(dir, 'logs');
     fs.mkdirSync(logs, { recursive: true });
     const threadId = 'thread_numeric';
+    fs.mkdirSync(path.dirname(roundExecutionLogPath(threadId, 1, dir)), { recursive: true });
     for (const round of [1, 9, 10, 11]) {
       fs.writeFileSync(roundExecutionLogPath(threadId, round, dir), `round ${round}`, 'utf8');
     }

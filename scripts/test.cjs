@@ -21,6 +21,7 @@ const LAYER_MAPPING = {
     'build-staleness.test.js',
     'caller-poll-guard.test.js',
     'caller-session-safety.test.js',
+    'legacy-removal.test.js',
     'caller-wake-queue.test.js',
     'config-sync.test.js',
     'context-compactor.test.js',

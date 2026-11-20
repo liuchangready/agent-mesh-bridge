@@ -1,3 +1,4 @@
+import { assertDedicatedTask } from './types';
 /**
  * Move an existing task to another executor: another agent and/or another model.
  *
@@ -69,6 +70,7 @@ export class TaskRetargetService {
   public async retargetTask(params: RetargetTaskParams): Promise<RetargetTaskResult> {
     this.taskStore.loadFromDisk();
     let thread = this.taskStore.getTask(params.threadId);
+    if (thread) assertDedicatedTask(thread);
     if (!thread) {
       throw new Error(`Task thread not found: ${params.threadId}`);
     }
@@ -152,15 +154,8 @@ export class TaskRetargetService {
 
     // Same-agent execution is allowed only for a dedicated-review task, and only
     // when the reviewer model differs from the executor model. A model must never
-    // review its own output; a legacy task would also resume the busy session.
+    // review its own output.
     if (nextAgent === thread.initiatorAgent) {
-      if (thread.reviewFlow !== 'dedicated') {
-        throw new Error(
-          `Cannot run task ${thread.threadId} on ${nextAgent}: that is the task's initiator ` +
-            `and the task uses the legacy review flow, whose callback resumes the initiator's own session. ` +
-            `Pick a different executor agent.`,
-        );
-      }
       const reviewerModel = thread.reviewerModel || resolveConfiguredModel(thread.initiatorAgent, undefined, 'initiator');
       const nextModel = resolution.model;
       if (!reviewerModel || !nextModel) {

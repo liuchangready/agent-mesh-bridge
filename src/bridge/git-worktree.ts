@@ -1,3 +1,4 @@
+import { taskArtifactDir } from './task-data-dir';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -49,7 +50,10 @@ export function resolveGitRepository(startPath: string, storageDir: string, requ
   catch (error) { throw new Error(`Git checkout ${repositoryPath} has no valid committed HEAD. Create a commit before dispatching.`, { cause: error }); }
   let targetRef: string;
   let deliveryTarget = inherited?.deliveryTarget;
-  if (inherited) targetRef = inherited.targetRef;
+  if (inherited) {
+    if (!inherited.deliveryTarget) throw new Error('MISSING_DELIVERY_TARGET: Cannot dispatch from a historical task worktree.');
+    targetRef = inherited.deliveryTarget.ref;
+  }
   else {
     let sourceRef = '';
     try { sourceRef = git(repositoryPath, ['symbolic-ref', '--quiet', '--short', 'HEAD']); } catch {}
@@ -125,15 +129,12 @@ function readTaskTarget(repositoryPath: string, storageDir: string): TaskTargetM
   }
 }
 
-export function createTaskWorktree(repo: GitRepository, threadId: string, storageDir: string, worktreeRoot?: string, artifactDir?: string): WorktreeInfo {
+export function createTaskWorktree(repo: GitRepository, threadId: string, storageDir: string, artifactDir?: string): WorktreeInfo {
   // Unified task directory: the worktree is a child of the task's own dir, so
   // logs/Archive and the checkout can never drift to different roots.
-  const pathRoot = artifactDir
-    ? path.resolve(artifactDir)
-    : worktreeRoot
-      ? path.resolve(worktreeRoot)
-      : path.join(storageDir, 'worktrees');
-  const worktreePath = path.join(pathRoot, artifactDir ? 'worktree' : threadId);
+  if (!repo.deliveryTarget) throw new Error('MISSING_DELIVERY_TARGET: A task requires a real local delivery branch.');
+  const pathRoot = path.resolve(artifactDir || taskArtifactDir(threadId, storageDir));
+  const worktreePath = path.join(pathRoot, 'worktree');
   const taskBranch = `mesh/task/${threadId}`;
   fs.mkdirSync(pathRoot, { recursive: true });
   if (fs.existsSync(worktreePath)) throw new Error(`Task worktree already exists: ${worktreePath}`);

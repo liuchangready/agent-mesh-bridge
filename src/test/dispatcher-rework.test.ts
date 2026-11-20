@@ -105,10 +105,27 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     );
   };
 
+  const dispatchReady = async (params: any) => {
+    const target = params.targetAgent;
+    const result = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(), ...params, reviewFlow: 'dedicated',
+      initiatorAgent: params.initiatorAgent || (target === 'antigravity' ? 'codex' : 'antigravity') });
+    const task = taskStore.getTask(result.threadId)!;
+    const reviewer = 'reviewer-' + task.threadId;
+    task.reviewBootstrap = { phase: 'confirmed', attempts: 1 };
+    task.reviewerSessionId = task.callerSessionId = reviewer;
+    task.reviewerSessionCaptured = true;
+    task.status = 'running';
+    if (task.execution) { task.execution.phase = 'develop'; task.execution.purpose = undefined; }
+    taskStore.upsertTask(task);
+    clearReviewerBootstrapToken(task.threadId, tempDir, task.artifactDir);
+    void (dispatcher as any).executeBackgroundRound(task, 1, task.rounds[0].prompt, false);
+    return result;
+  };
+
   test('does not capture a Claude session after a silent first-launch failure', async () => {
     runner.execute = async () => ({ exitCode: 1, stdout: '', stderr: 'startup failed', extractedOutput: '', durationMs: 1 });
-    const result = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
-      targetAgent: 'claude_code', title: 'Missing Claude transcript', prompt: 'do the work', reviewFlow: 'legacy',
+    const result = await dispatchReady({ workspaceRoot: process.cwd(),
+      targetAgent: 'claude_code', title: 'Missing Claude transcript', prompt: 'do the work', reviewFlow: 'dedicated',
     });
     await waitForStatus(result.threadId, 'failed');
     taskStore.loadFromDisk();
@@ -122,6 +139,11 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     test(`${entry} does not capture a Claude session when its initial launch fails`, async () => {
       const now = new Date().toISOString();
       const thread: DelegationThread = {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + (`thread_missing_claude_${entry}`)),
+    callerSessionId: ('reviewer-' + (`thread_missing_claude_${entry}`)),
         threadId: `thread_missing_claude_${entry}`, title: 'Missing Claude transcript',
         initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'running', currentRound: 1,
         createdAt: now, updatedAt: now, receiverSessionId: '5c562220-839a-47d5-92c6-e61561e66f07',
@@ -151,8 +173,8 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
         exitCode: 0, stdout: 'done', stderr: '', extractedOutput: 'done',
         actualSessionId: options.receiverSessionId, durationMs: 1,
       });
-      const result = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
-        targetAgent: agent, title: 'Existing session', prompt: 'do the work', reviewFlow: 'legacy',
+      const result = await dispatchReady({ workspaceRoot: process.cwd(),
+        targetAgent: agent, title: 'Existing session', prompt: 'do the work', reviewFlow: 'dedicated',
       });
       await waitForStatus(result.threadId, 'reviewing');
       const thread = taskStore.getTask(result.threadId)!;
@@ -177,7 +199,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       callerSessionId: 'caller-session-001',
     });
 
-    assert.strictEqual(res.status, 'DISPATCHED');
+    assert.strictEqual(res.status, 'REVIEWER_STARTING');
     assert.strictEqual(res.targetAgent, 'codex');
     assert.ok(res.threadId.startsWith('thread_'));
     assert.ok(res.receiverSessionId);
@@ -186,7 +208,8 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.ok(stored);
     assert.strictEqual(stored.title, 'Optimize SQL Query');
     assert.strictEqual(stored.currentRound, 1);
-    assert.strictEqual(stored.status, 'running');
+    assert.strictEqual(stored.status, 'queued');
+    assert.strictEqual(stored.reviewFlow, 'dedicated');
     assert.strictEqual(stored.receiverSessionId, res.receiverSessionId);
     assert.strictEqual(stored.rounds.length, 1);
     assert.strictEqual(stored.rounds[0].type, 'initial');
@@ -220,7 +243,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
           title: 'Self dispatch',
           prompt: 'do the work',
         }),
-      /self-dispatch requires the dedicated reviewer flow/i,
+      /configure a sender-side reviewer model/i,
     );
     // Rejected before the thread exists: it must not occupy the queue.
     assert.strictEqual(taskStore.getAllTasks().length, 0);
@@ -237,7 +260,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
             title: 'Self dispatch via env',
             prompt: 'do the work',
           }),
-        /self-dispatch requires the dedicated reviewer flow/i,
+        /configure a sender-side reviewer model/i,
       );
       assert.strictEqual(taskStore.getAllTasks().length, 0);
     } finally {
@@ -360,7 +383,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       by: 'user',
     }));
 
-    const res = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
+    const res = await dispatchReady({ workspaceRoot: process.cwd(),
       targetAgent: 'codex',
       title: 'Pin a specific model',
       prompt: 'Implement the parser',
@@ -394,7 +417,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     invalidateConfiguredModelCache();
 
     try {
-      const res = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
+      const res = await dispatchReady({ workspaceRoot: process.cwd(),
         targetAgent: 'codex',
         title: 'One dispatch, two model defaults',
         prompt: 'Implement the parser',
@@ -434,7 +457,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       throw new Error('a guessed model must never reach the user');
     });
 
-    const res = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
+    const res = await dispatchReady({ workspaceRoot: process.cwd(),
       targetAgent: 'codex',
       title: 'Do not guess a model',
       prompt: 'Implement the parser',
@@ -501,7 +524,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       },
     });
 
-    const res = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
+    const res = await dispatchReady({ workspaceRoot: process.cwd(),
       targetAgent: 'antigravity',
       title: 'Empty output probe',
       prompt: 'return nothing',
@@ -516,7 +539,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
   });
 
   test('refuses a rework that would move a legacy task onto its own reviewer', async () => {
-    const dispatchRes = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
+    const dispatchRes = await dispatchReady({ workspaceRoot: process.cwd(),
       targetAgent: 'claude_code',
       title: 'Rework onto the reviewer',
       prompt: 'do the work',
@@ -524,6 +547,8 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     });
     await waitForStatus(dispatchRes.threadId, 'reviewing');
 
+    const historical = taskStore.getTask(dispatchRes.threadId)!;
+    historical.reviewFlow = 'legacy'; taskStore.upsertTask(historical);
     await assert.rejects(
       () =>
         reworkController.requestRework({
@@ -531,7 +556,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
           feedback: 'and now do it yourself',
           targetAgent: 'codex',
         }),
-      /legacy review flow/i,
+      /LEGACY_REVIEW_FLOW_DISABLED/,
     );
 
     // Rejected before a new round exists: still one round, still in review.
@@ -542,7 +567,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
   });
 
   test('should request rework strictly reusing same receiverSessionId and incrementing round', async () => {
-    const dispatchRes = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
+    const dispatchRes = await dispatchReady({ workspaceRoot: process.cwd(),
       targetAgent: 'claude_code',
       title: 'Implement OAuth PKCE',
       prompt: 'Implement PKCE flow in auth.ts',
@@ -590,7 +615,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       };
     };
 
-    const dispatchRes = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
+    const dispatchRes = await dispatchReady({ workspaceRoot: process.cwd(),
       targetAgent: 'claude_code',
       title: 'Cross-agent rework',
       prompt: 'Implement the flow',
@@ -621,7 +646,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
   });
 
   test('should approve task and mark it completed', async () => {
-    const dispatchRes = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
+    const dispatchRes = await dispatchReady({ workspaceRoot: process.cwd(),
       targetAgent: 'antigravity',
       title: 'Format code according to styleguide',
       prompt: 'Run prettier and eslint',
@@ -642,48 +667,25 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     assert.strictEqual(thread.status, 'completed');
   });
 
-  test('should reject invalid callerSessionId (agent literals) and fallback properly', async () => {
-    // 1. Dispatching with invalid callerSessionId "claude_code"
-    const dispatchRes = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
-      targetAgent: 'antigravity',
-      title: 'Invalid callerSessionId test',
-      prompt: 'Check caller session sanitization',
-      callerSessionId: 'claude_code', // Invalid! Should be ignored
-    });
-
-    const thread1 = taskStore.getTask(dispatchRes.threadId);
-    assert.ok(thread1);
-    assert.notStrictEqual(thread1.callerSessionId, 'claude_code');
-
-    // 2. Requesting rework with invalid callerSessionId "antigravity"
-    await waitForStatus(dispatchRes.threadId, 'reviewing');
-    await reworkController.requestRework({
-      threadId: dispatchRes.threadId,
-      feedback: 'Fix something',
-      callerSessionId: 'antigravity', // Invalid!
-    });
-
-    const thread2 = taskStore.getTask(dispatchRes.threadId);
-    assert.ok(thread2);
-    assert.notStrictEqual(thread2.callerSessionId, 'antigravity');
-
-    // 3. Requesting rework with a valid UUID
-    await waitForStatus(dispatchRes.threadId, 'reviewing');
-    const validUuid = '12345678-abcd-ef01-2345-6789abcdef01';
-    await reworkController.requestRework({
-      threadId: dispatchRes.threadId,
-      feedback: 'Fix something else',
-      callerSessionId: validUuid,
-    });
-
-    const thread3 = taskStore.getTask(dispatchRes.threadId);
-    assert.ok(thread3);
-    assert.strictEqual(thread3.callerSessionId, validUuid);
+  test('rework cannot replace the captured reviewer with caller-supplied IDs', async () => {
+    const result = await dispatchReady({ targetAgent: 'claude_code', title: 'Identity', prompt: 'work', callerSessionId: 'requester-session' });
+    await waitForStatus(result.threadId, 'reviewing');
+    const reviewer = taskStore.getTask(result.threadId)!.reviewerSessionId;
+    for (const callerSessionId of ['antigravity', '12345678-abcd-ef01-2345-6789abcdef01']) {
+      await assert.rejects(reworkController.requestRework({threadId: result.threadId, feedback: 'fix', callerSessionId}), /reviewer session is fixed/);
+    }
+    assert.equal(taskStore.getTask(result.threadId)!.callerSessionId, reviewer);
+    assert.equal(taskStore.getTask(result.threadId)!.rounds.length, 1);
   });
 
   test('supervisor injects worker snapshot without changing round prompt', async () => {
     const now = new Date().toISOString(); let actual = '';
-    const thread: DelegationThread = {threadId:'thread_template_supervisor',title:'Supervisor',initiatorAgent:'codex',targetAgent:'claude_code',status:'running',currentRound:1,createdAt:now,updatedAt:now,receiverSessionId:'5c562220-839a-47d5-92c6-e61561e66f07',workspace:testWorkspace(process.cwd()),summary:{lastPromptSnippet:'',lastOutputSnippet:'',totalDurationMs:0},rounds:[{round:1,type:'initial',prompt:'ORIGINAL',status:'running',durationMs:0,timestamp:now}],taskTemplate:{id:'t',version:'1',label:'T',summary:'S',workerInstructions:'WORKER SNAPSHOT',reviewerInstructions:'REVIEWER SECRET',sourceFileName:'t.md',selectedAt:now}};
+    const thread: DelegationThread = {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + ('thread_template_supervisor')),
+    callerSessionId: ('reviewer-' + ('thread_template_supervisor')),threadId:'thread_template_supervisor',title:'Supervisor',initiatorAgent:'codex',targetAgent:'claude_code',status:'running',currentRound:1,createdAt:now,updatedAt:now,receiverSessionId:'5c562220-839a-47d5-92c6-e61561e66f07',workspace:testWorkspace(process.cwd()),summary:{lastPromptSnippet:'',lastOutputSnippet:'',totalDurationMs:0},rounds:[{round:1,type:'initial',prompt:'ORIGINAL',status:'running',durationMs:0,timestamp:now}],taskTemplate:{id:'t',version:'1',label:'T',summary:'S',workerInstructions:'WORKER SNAPSHOT',reviewerInstructions:'REVIEWER SECRET',sourceFileName:'t.md',selectedAt:now}};
     taskStore.upsertTask(thread); runner.execute = async params => { actual=params.prompt; return {exitCode:1,stdout:'',stderr:'failure',extractedOutput:'',durationMs:1}; };
     const supervisor = new TaskSupervisor(taskStore,runner,callbackManager,detector,new TaskExecutionRegistry(tempDir));
     try { await supervisor.executeThreadRound(thread, thread.rounds[0]); } finally { supervisor.dispose(); }
@@ -696,7 +698,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     let content = fs.readFileSync(file, 'utf8').replace('Describe the work, deliverables and evidence.', 'WORKER SNAPSHOT').replace('Describe independent checks, acceptance and rework requirements.', 'REVIEWER SNAPSHOT'); fs.writeFileSync(file, content);
     const prompts: string[] = [];
     runner.execute = async (params) => { prompts.push(params.prompt); return { exitCode: 0, stdout: 'done', stderr: '', extractedOutput: 'done', durationMs: 1 }; };
-    const result = await dispatcher.dispatchTask({workspaceRoot: process.cwd(), targetAgent:'claude_code', initiatorAgent:'codex', title:'Snapshot', prompt:'initial task', templateId:'snapshot', reviewFlow:'legacy'});
+    const result = await dispatchReady({workspaceRoot: process.cwd(), targetAgent:'claude_code', initiatorAgent:'codex', title:'Snapshot', prompt:'initial task', templateId:'snapshot', reviewFlow:'dedicated'});
     await waitForStatus(result.threadId, 'reviewing');
     fs.writeFileSync(file, content.replace('WORKER SNAPSHOT', 'changed')); fs.unlinkSync(file);
     await reworkController.requestRework({threadId:result.threadId, feedback:'fix issue'}); await waitForStatus(result.threadId,'reviewing');
@@ -709,7 +711,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
   });
 
   test('should retry failed round preserving original round number and prompt', async () => {
-    const dispatchRes = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
+    const dispatchRes = await dispatchReady({ workspaceRoot: process.cwd(),
       targetAgent: 'codex',
       title: 'Fix edge case in parser',
       prompt: 'Handle trailing comma in JSON',

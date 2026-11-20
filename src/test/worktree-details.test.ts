@@ -30,7 +30,7 @@ test('task detail shows separate escaped task, delivery and cleaned validation l
 
 test('legacy worktree detail labels the target checkout as unknown', () => {
   const html = renderWorktreeDetails({ path: 'missing-worker-path', mainPath: 'repo', targetRef: 'refs/heads/mesh/integration/old' });
-  assert.match(html, /Legacy target ref/);
-  assert.match(html, /Checkout folder: unknown/);
+  assert.match(html, /Historical record/);
+  assert.match(html, /Git execution is disabled/);
   assert.match(html, /missing-worker-path \(missing\)/);
 });

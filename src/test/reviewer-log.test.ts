@@ -13,7 +13,7 @@ import {
   reviewerLogPath,
   statReviewerLog,
 } from '../bridge/reviewer-log';
-import { getReviewerLogDir, roundExecutionLogPath } from '../bridge/round-log';
+import { taskArtifactBase, taskReviewerLogDir, roundExecutionLogPath } from '../bridge/round-log';
 
 function makeRoot(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-reviewer-log-'));
@@ -40,7 +40,7 @@ describe('Reviewer log artifact', () => {
     const root = makeRoot();
     try {
       const file = reviewerLogPath('../evil/thread', 0, root);
-      assert.strictEqual(path.dirname(file), getReviewerLogDir(undefined, root));
+      assert.strictEqual(path.dirname(file), taskReviewerLogDir(taskArtifactBase('../evil/thread', root)));
       assert.ok(!file.includes('..'));
       assert.ok(path.basename(file).includes('evil_thread_round_1'));
       assert.ok(path.basename(file).endsWith(REVIEWER_LOG_SUFFIX));
@@ -163,6 +163,7 @@ describe('Reviewer log artifact', () => {
         writer.close();
       }
       // A receiver log for the same thread must never show up as a reviewer round.
+      fs.mkdirSync(path.dirname(roundExecutionLogPath('thread_e', 9, root)), { recursive: true });
       fs.writeFileSync(roundExecutionLogPath('thread_e', 9, root), 'receiver bytes');
 
       assert.deepStrictEqual(listReviewerLogRounds('thread_e', root), [7, 3, 1]);

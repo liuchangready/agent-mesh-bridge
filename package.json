@@ -207,17 +207,17 @@
         },
         {
           "command": "agent-mesh-bridge.approveTask",
-          "when": "viewItem != workspace_group && (view == agent-mesh-bridge.active-tasks && viewItem != failed_merge && viewItem != wait_decision)",
+          "when": "viewItem != historical_task && (viewItem != workspace_group && (view == agent-mesh-bridge.active-tasks && viewItem != failed_merge && viewItem != wait_decision))",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.requestRework",
-          "when": "viewItem != workspace_group && (view == agent-mesh-bridge.active-tasks && viewItem != failed_merge && viewItem != wait_decision)",
+          "when": "viewItem != historical_task && (viewItem != workspace_group && (view == agent-mesh-bridge.active-tasks && viewItem != failed_merge && viewItem != wait_decision))",
           "group": "1_actions"
         },
         {
           "command": "agent-mesh-bridge.resumeTask",
-          "when": "viewItem != workspace_group && ((view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge && viewItem != failed_bootstrap && viewItem != wait_decision)",
+          "when": "viewItem != historical_task && (viewItem != workspace_group && ((view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge && viewItem != failed_bootstrap && viewItem != wait_decision))",
           "group": "1_actions"
         },
         {
@@ -227,7 +227,7 @@
         },
         {
           "command": "agent-mesh-bridge.retargetTask",
-          "when": "viewItem != workspace_group && ((view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge && viewItem != wait_decision)",
+          "when": "viewItem != historical_task && (viewItem != workspace_group && ((view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge && viewItem != wait_decision))",
           "group": "1_actions"
         },
         {
@@ -242,7 +242,7 @@
         },
         {
           "command": "agent-mesh-bridge.wakeUpCaller",
-          "when": "viewItem != workspace_group && ((viewItem == reviewing_stalled || viewItem == reviewing_blocked || viewItem == failed_review) && (view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks))",
+          "when": "viewItem != historical_task && (viewItem != workspace_group && ((viewItem == reviewing_stalled || viewItem == reviewing_blocked || viewItem == failed_review) && (view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks)))",
           "group": "1_actions"
         }
       ]
@@ -334,15 +334,6 @@
           "enum": ["off", "auto"],
           "default": "off",
           "markdownDescription": "Bridge-controlled compaction of a captured, bridge-owned native session before resume. `auto` is honored only by certified adapters; current unverified adapters stay disabled. This does not change an agent CLI's own automatic compaction."
-        },
-        "agentMeshBridge.reviewFlow": {
-          "type": "string",
-          "enum": [
-            "dedicated",
-            "legacy"
-          ],
-          "default": "dedicated",
-          "markdownDescription": "How NEW tasks are reviewed. `dedicated` (default): the bridge starts a fresh reviewer conversation which dispatches the task and later reviews the developer report; this allows the same agent on both ends as long as the reviewer and executor models differ. `legacy`: resume the requester's own conversation for review (the old behaviour, kept as a rollback switch). Existing tasks never change topology."
         },
         "agentMeshBridge.concurrency.enabled": {
           "type": "boolean",

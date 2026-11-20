@@ -1,3 +1,5 @@
+import { taskArtifactBase } from './round-log';
+import { assertDedicatedTask } from './types';
 import { appendTemplateInstructions } from './task-templates';
 import { getTaskExecutionPath } from './types';
 import {
@@ -143,6 +145,7 @@ export class ReworkController {
    */
   public async requestRework(params: RequestReworkParams): Promise<RequestReworkResult> {
     let thread = this.taskStore.getTask(params.threadId);
+    if (thread) assertDedicatedTask(thread);
     if (!thread) {
       throw new Error(`Task thread not found: ${params.threadId}`);
     }
@@ -252,9 +255,7 @@ export class ReworkController {
     const expectedOperationId = thread.execution?.operationId;
     const expectedGeneration = thread.execution?.generation;
     const expectedRunId = thread.execution?.run?.id;
-    const expectedReviewerSession = thread.reviewFlow === 'dedicated'
-      ? thread.reviewerSessionId
-      : (thread.reviewerSessionId || thread.callerSessionId);
+    const expectedReviewerSession = thread.reviewerSessionId;
 
     thread.currentRound = nextRound;
     clearTaskFailure(thread);
@@ -265,28 +266,7 @@ export class ReworkController {
     }
     thread.interruption = undefined;
     thread.updatedAt = nowIso;
-    if (thread.reviewFlow === 'dedicated') {
-      // Dedicated review always resumes the captured reviewer conversation.
-      // MCP-supplied ids and detector guesses cannot rebind that identity.
-      thread.callerSessionId = thread.reviewerSessionId;
-    } else if (params.callerSessionId && isValidSessionId(params.callerSessionId)) {
-      thread.callerSessionId = params.callerSessionId;
-    } else if (
-      (!thread.callerSessionId || !isValidSessionId(thread.callerSessionId)) &&
-      this.detector
-    ) {
-      const detected = this.detector.detectActiveSession(
-        thread.initiatorAgent,
-        getTaskExecutionPath(thread),
-        [thread.receiverSessionId],
-      );
-      if (detected) {
-        thread.callerSessionId = detected;
-        console.log(
-          `[ReworkController] Auto-detected caller session for ${thread.initiatorAgent}: ${detected}`,
-        );
-      }
-    }
+    thread.callerSessionId = thread.reviewerSessionId;
     thread.rounds.push(reworkRound);
     thread.summary.lastPromptSnippet = (params.feedback || '').slice(0, 100);
     thread.summary.lastOutputSnippet = retarget && retarget.toAgent !== retarget.fromAgent
@@ -451,6 +431,7 @@ export class ReworkController {
   ): Promise<DelegationRound> {
     this.taskStore.loadFromDisk();
     let thread = this.taskStore.getTask(threadId);
+    if (thread) assertDedicatedTask(thread);
     if (!thread) {
       throw new Error(`Task thread not found: ${threadId}`);
     }
@@ -567,6 +548,7 @@ export class ReworkController {
   ): Promise<DelegationRound> {
     this.taskStore.loadFromDisk();
     let thread = this.taskStore.getTask(threadId);
+    if (thread) assertDedicatedTask(thread);
     if (!thread) {
       throw new Error(`Task thread not found: ${threadId}`);
     }
@@ -610,14 +592,14 @@ export class ReworkController {
       }
       const roles = new TaskRoleLock(this.storageDir);
       const nativeLock = new NativeSessionLock(this.storageDir);
-      const sessionId = thread.reviewFlow === 'dedicated' ? thread.reviewerSessionId : thread.callerSessionId;
+      const sessionId = thread.reviewerSessionId;
       const deadline = Date.now() + 30_000;
       while (Date.now() < deadline) {
         if (this.executionRegistry.getOwner(threadId) || this.mergeWorkers.has(threadId)) {
           await new Promise((resolve) => setTimeout(resolve, 100));
           continue;
         }
-        const role = roles.tryAcquire(threadId, 'reviewer', thread.reviewFlow === 'dedicated' ? sessionId : undefined);
+        const role = roles.tryAcquire(threadId, 'reviewer', sessionId);
         if (!role) { await new Promise((resolve) => setTimeout(resolve, 100)); continue; }
         let lease: ReturnType<NativeSessionLock['acquire']>;
         try { lease = isValidSessionId(sessionId) ? nativeLock.acquire(thread.initiatorAgent, sessionId!) : undefined; }
@@ -818,6 +800,7 @@ export class ReworkController {
   }
 
   private assertDedicatedReviewerReady(thread: DelegationThread, operation: string): void {
+    assertDedicatedTask(thread);
     if (thread.reviewFlow === 'dedicated' && isReviewerBootstrapPending(thread)) {
       const phase = thread.reviewBootstrap?.phase || 'missing';
       throw new Error(
@@ -868,6 +851,7 @@ export class ReworkController {
     by?: string;
   }): { threadId: string; status: ThreadStatus; waitingForThreadId?: string; message: string } {
     const thread = this.taskStore.getTask(params.threadId);
+    if (thread) assertDedicatedTask(thread);
     if (!thread) {
       throw new Error(`Task thread not found: ${params.threadId}`);
     }
@@ -917,6 +901,7 @@ export class ReworkController {
    */
   public approveTask(params: ApproveTaskParams): ApproveResult {
     const thread = this.taskStore.getTask(params.threadId);
+    if (thread) assertDedicatedTask(thread);
     if (!thread) {
       throw new Error(`Task thread not found: ${params.threadId}`);
     }
@@ -961,7 +946,7 @@ export class ReworkController {
         let failure = `Could not create approved snapshot: ${String(error)}`;
         const number = (thread.mergeHistory?.length || 0) + 1;
         const safeId = thread.threadId.replace(/[^A-Za-z0-9_-]/g, '_');
-        const dir = path.join(thread.artifactDir || path.join(this.storageDir, 'merge-logs', safeId), 'merge_log');
+        const dir = path.join(taskArtifactBase(thread.threadId, this.storageDir, thread.artifactDir), 'merge_log');
         let logPath: string | undefined; let logFileNumber: number | undefined;
         try {
           ({ logPath, logFileNumber } = createMergeLog(dir, safeId, number, `${failure}\n`));
@@ -1002,9 +987,7 @@ export class ReworkController {
     const expectedOperationId = thread.execution?.operationId;
     const expectedGeneration = thread.execution?.generation;
     const expectedRunId = thread.execution?.run?.id;
-    const expectedReviewerSession = thread.reviewFlow === 'dedicated'
-      ? thread.reviewerSessionId
-      : (thread.reviewerSessionId || thread.callerSessionId);
+    const expectedReviewerSession = thread.reviewerSessionId;
 
     let approvalRound: DelegationRound | undefined;
     if (params.remarks) {
@@ -1159,6 +1142,7 @@ export class ReworkController {
 
   public async requestMergeDecision(threadId: string, question: string, background: string, suggestion: string, conflictFiles: string[] = [], logPath?: string): Promise<{ threadId: string; status: 'wait_decision'; decisionId: string; nextAction: string; message: string }> {
     const current = this.taskStore.getTask(threadId);
+    if (current) assertDedicatedTask(current);
     if (!current || current.status !== 'reviewing' || !question?.trim()) throw new Error('An active review and a non-empty question are required.');
     if (current.execution && ExecutionController.getInstance()) {
       const decision = await ExecutionController.getInstance()!.requestTaskDecision(threadId, {
@@ -1198,6 +1182,7 @@ export class ReworkController {
 
   public submitMergeDecision(threadId: string, answer: string): { threadId: string; status: 'reviewing'; decisionId: string } {
     const current = this.taskStore.getTask(threadId);
+    if (current) assertDedicatedTask(current);
     if (!current || current.status !== 'wait_decision' || !answer?.trim()) throw new Error('A pending merge decision and a non-empty answer are required.');
     if (current.execution && ExecutionController.getInstance()) {
       const decisionId = current.decision?.id || current.mergeControl?.pendingDecisionId || '';
@@ -1221,6 +1206,7 @@ export class ReworkController {
 
   public retryMerge(threadId: string): { threadId: string; status: 'queued' | 'reviewing'; retryGeneration: number } {
     const current = this.taskStore.getTask(threadId);
+    if (current) assertDedicatedTask(current);
     if (!current || current.archivedAt || current.status !== 'failed' || current.failure?.stage !== 'merge') throw new Error('Only a merge failure can restart its merge budget.');
     if (current.execution && ExecutionController.getInstance()) {
       void ExecutionController.getInstance()!.retryOperation(threadId);
@@ -1247,6 +1233,7 @@ export class ReworkController {
 
   public submitMergeResolution(threadId: string): { threadId: string; status: 'QUEUED'; message: string } {
     const thread = this.taskStore.getTask(threadId);
+    if (thread) assertDedicatedTask(thread);
     const worktree = thread?.worktree;
     if (!thread || !isMergeReview(thread) || !worktree?.approvedCommit || !worktree.mergeResolutionPath || !worktree.integration?.targetOldCommit) {
       throw new Error('No approved merge resolution workspace is awaiting submission.');
@@ -1281,6 +1268,7 @@ export class ReworkController {
   public resumePendingMerges(): void {
     this.taskStore.loadFromDisk();
     for (const thread of this.taskStore.getAllTasks()) {
+      if (thread.reviewFlow !== 'dedicated') continue;
       if (thread.execution || !(thread.status === 'queued' && thread.queuePhase === 'merge') && thread.status !== 'merging') continue;
       if (['blocked', 'conflict', 'validation_failed'].includes(thread.worktree?.integration?.phase || '')) continue;
       const blockedAt = this.blockedMergeRetries.get(thread.threadId);
@@ -1289,7 +1277,7 @@ export class ReworkController {
       if (this.mergeWorkers.has(thread.threadId)) continue;
       if (thread.status === 'merging') {
         const roles = new TaskRoleLock(this.storageDir);
-        const lease = roles.tryAcquire(thread.threadId, 'reviewer', thread.reviewFlow === 'dedicated' ? thread.reviewerSessionId : undefined);
+        const lease = roles.tryAcquire(thread.threadId, 'reviewer', thread.reviewerSessionId);
         if (!lease) continue;
         this.mergeWorkers.add(thread.threadId);
         let recovered = false;

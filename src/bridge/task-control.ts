@@ -211,8 +211,9 @@ export class TaskControlService {
           // task worktree still matches its approved source.
           const txPath = path.join(this.storageDir, 'merge-transactions', `${candidate.threadId}.json`);
           const tx = JSON.parse(fs.readFileSync(txPath, 'utf8'));
-          const repo = worktree.repositoryPath || worktree.mainPath;
-          const target = gitOutput(repo, ['rev-parse', '--verify', `${worktree.targetRef}^{commit}`]);
+          if (!worktree.deliveryTarget) throw new Error('Historical delivery state cannot prove integration.');
+          const repo = worktree.deliveryTarget.repositoryPath;
+          const target = gitOutput(repo, ['rev-parse', '--verify', `${worktree.deliveryTarget.ref}^{commit}`]);
           const integrated = tx.candidateCommit && (target === tx.candidateCommit || gitOutput(repo, ['merge-base', '--is-ancestor', tx.candidateCommit, target]) === '');
           if (integrated && head === tx.sourceCommit) return false;
         }

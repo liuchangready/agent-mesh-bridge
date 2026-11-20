@@ -26,10 +26,6 @@ import * as zlib from 'zlib';
 import { randomBytes } from 'crypto';
 import {
   bridgeHomeDir,
-  bridgeLogsDir,
-  getWorkerLogDir,
-  getReviewerLogDir,
-  getArchiveLogDir,
   taskArchiveDir,
   taskBootstrapDir,
   taskModelOverlayDir,
@@ -153,8 +149,8 @@ export function buildFinalSummary(
     ...(nativeOperations.length ? { nativeCompactions: { count: nativeOperations.filter((operation) => operation.phase === 'succeeded').length, warnings: nativeWarnings } } : {}),
     ...(thread.worktree ? { gitDelivery: {
       taskBranch: thread.worktree.taskBranch, taskPath: thread.worktree.path, approvedCommit: thread.worktree.approvedCommit,
-      targetBranch: thread.worktree.deliveryTarget?.branch, targetRef: thread.worktree.deliveryTarget?.ref || thread.worktree.targetRef,
-      targetRepositoryPath: thread.worktree.deliveryTarget?.repositoryPath || thread.worktree.repositoryPath || thread.worktree.mainPath,
+      targetBranch: thread.worktree.deliveryTarget?.branch, targetRef: thread.worktree.deliveryTarget?.ref,
+      targetRepositoryPath: thread.worktree.deliveryTarget?.repositoryPath,
       targetPath: thread.worktree.integration?.targetPath || thread.worktree.deliveryTarget?.checkoutPath,
       targetCommit: thread.worktree.integration?.targetCommit || thread.worktree.integration?.targetOldCommit || thread.worktree.deliveryTarget?.baseCommit,
       mergeState: thread.worktree.integration?.phase, blockedReason: thread.worktree.integration?.error,
@@ -294,15 +290,7 @@ export function collectExpectedArchiveLogFiles(
   const foundFilenames = new Set<string>();
 
   // 1. Gather worker logs
-  const workerDirs = artifactDir
-    ? [taskWorkerLogDir(artifactDir)]
-    : Array.from(
-        new Set([
-          getWorkerLogDir(thread.targetAgent, root),
-          getWorkerLogDir(undefined, root),
-          bridgeLogsDir(root),
-        ]),
-      );
+  const workerDirs = artifactDir ? [taskWorkerLogDir(artifactDir)] : [];
   for (const dir of workerDirs) {
     if (!fs.existsSync(dir)) continue;
     for (const name of fs.readdirSync(dir)) {
@@ -321,15 +309,7 @@ export function collectExpectedArchiveLogFiles(
   }
 
   // 2. Gather reviewer logs
-  const reviewerDirs = artifactDir
-    ? [taskReviewerLogDir(artifactDir)]
-    : Array.from(
-        new Set([
-          getReviewerLogDir(thread.initiatorAgent, root),
-          getReviewerLogDir(undefined, root),
-          bridgeLogsDir(root),
-        ]),
-      );
+  const reviewerDirs = artifactDir ? [taskReviewerLogDir(artifactDir)] : [];
   for (const dir of reviewerDirs) {
     if (!fs.existsSync(dir)) continue;
     for (const name of fs.readdirSync(dir)) {
@@ -348,8 +328,8 @@ export function collectExpectedArchiveLogFiles(
   }
 
   // 3. Merge logs
-  const mergeDir = artifactDir ? path.join(artifactDir, 'merge_log') : path.join(bridgeHomeDir(root), 'merge-logs', safe, 'merge_log');
-  if (fs.existsSync(mergeDir)) {
+  const mergeDir = artifactDir ? path.join(artifactDir, 'merge_log') : undefined;
+  if (mergeDir && fs.existsSync(mergeDir)) {
     for (const name of fs.readdirSync(mergeDir)) {
       if (!name.startsWith(`${safe}_merge_`) || !name.endsWith('.log')) continue;
       const full = path.join(mergeDir, name);
@@ -393,17 +373,8 @@ export function archiveCompletedTaskLogs(
   const safe = String(thread.threadId || '').replace(/[^A-Za-z0-9_.-]/g, '_');
   const artifactDir = thread.artifactDir;
 
-  // New tasks own exactly one archive location; legacy entries keep the old
-  // per-agent Archive directories and are never migrated.
-  const archiveDirs = artifactDir
-    ? [taskArchiveDir(artifactDir)]
-    : Array.from(
-        new Set([
-          getArchiveLogDir(thread.targetAgent, root),
-          getArchiveLogDir(thread.initiatorAgent, root),
-          getArchiveLogDir(undefined, root),
-        ]),
-      );
+  // Archive only the directory recorded by this task.
+  const archiveDirs = artifactDir ? [taskArchiveDir(artifactDir)] : [];
 
   for (const dir of archiveDirs) {
     fs.mkdirSync(dir, { recursive: true });
@@ -500,18 +471,7 @@ export function removeTaskArtifacts(
   const keepArchive = options.keepArchive !== false;
   const artifactDir = options.artifactDir;
 
-  const targetDirs = artifactDir
-    ? [taskWorkerLogDir(artifactDir), taskReviewerLogDir(artifactDir), path.join(artifactDir, 'merge_log')]
-    : Array.from(
-        new Set([
-          getWorkerLogDir(options.targetAgent, root),
-          getWorkerLogDir(undefined, root),
-          getReviewerLogDir(options.initiatorAgent, root),
-          getReviewerLogDir(undefined, root),
-          bridgeLogsDir(root),
-          path.join(bridgeHomeDir(root), 'merge-logs', safe, 'merge_log'),
-        ]),
-      );
+  const targetDirs = artifactDir ? [taskWorkerLogDir(artifactDir), taskReviewerLogDir(artifactDir), path.join(artifactDir, 'merge_log')] : [];
 
   for (const dir of targetDirs) {
     if (!fs.existsSync(dir)) continue;
@@ -551,15 +511,7 @@ export function removeTaskArtifacts(
   }
 
   if (!keepArchive) {
-    const archiveDirs = artifactDir
-      ? [taskArchiveDir(artifactDir)]
-      : Array.from(
-          new Set([
-            getArchiveLogDir(options.targetAgent, root),
-            getArchiveLogDir(options.initiatorAgent, root),
-            getArchiveLogDir(undefined, root),
-          ]),
-        );
+    const archiveDirs = artifactDir ? [taskArchiveDir(artifactDir)] : [];
     for (const dir of archiveDirs) {
       if (!fs.existsSync(dir)) continue;
       try {

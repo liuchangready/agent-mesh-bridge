@@ -109,6 +109,10 @@ describe('CallbackManager records stalled reviewer wakes', () => {
       output: 'delivered',
     };
     return {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: 'caller-session-1',
       threadId: 'thread_review_wake_1',
       title: 'Lobby service',
       initiatorAgent: 'codex',
@@ -623,6 +627,10 @@ describe('CallbackManager records stalled reviewer wakes', () => {
 
 describe('ReviewWakeScheduler', () => {
   const makeThread = (state: Partial<DelegationThread['reviewWake']> = {}): DelegationThread => ({
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: 'caller-session-1',
     threadId: 'thread_review_wake_sched',
     title: 'Lobby service',
     initiatorAgent: 'codex',
@@ -736,7 +744,7 @@ describe('ReviewWakeScheduler', () => {
         stallTimeoutMs: 1,
       });
       const thread = makeThread({ autoRetryAt: new Date(now - 1_000).toISOString() });
-      thread.callerSessionId = '11111111-1111-4111-8111-111111111111';
+      thread.callerSessionId = thread.reviewerSessionId = '11111111-1111-4111-8111-111111111111';
       thread.updatedAt = new Date(now - 60 * 60_000).toISOString();
       thread.rounds[0].timestamp = thread.updatedAt;
       store.upsertTask(thread);
@@ -1170,6 +1178,10 @@ describe('ReviewWakeScheduler', () => {
 
 describe('review_failed lifecycle status', () => {
   const baseThread = (): DelegationThread => ({
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: 'caller-session-1',
     threadId: 'thread_review_failed_1',
     title: 'Review failed task',
     initiatorAgent: 'codex',

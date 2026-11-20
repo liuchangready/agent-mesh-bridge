@@ -17,8 +17,7 @@
  * current global setting: changing `agentMeshBridge.taskDataRoot` must not split
  * one task's files across two roots.
  *
- * Legacy ledger entries have no `artifactDir`; they keep their original worktree
- * path and per-agent `logDirectories` layout untouched.
+ * Old global log layouts are no longer managed or searched.
  */
 
 import * as fs from 'fs';

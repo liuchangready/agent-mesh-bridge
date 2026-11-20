@@ -81,7 +81,7 @@ test('task data root defaults to <storage>/tasks and resolves relative values ag
   assert.strictEqual(resolveTaskDataRoot(storage), path.normalize(absolute));
 
   // Clearing returns to the default; a legacy worktreeRoot must not leak into it.
-  saveBridgePolicy({ taskDataRoot: '   ', worktreeRoot: path.join(storage, 'legacy-worktrees') }, storage);
+  saveBridgePolicy({ taskDataRoot: '   ', worktreeRoot: path.join(storage, 'legacy-worktrees') } as any, storage);
   assert.strictEqual(readBridgePolicy(storage).taskDataRoot, undefined);
   assert.strictEqual(resolveTaskDataRoot(storage), path.join(storage, 'tasks'));
 });
@@ -114,7 +114,6 @@ test('a task directory is created with the standard layout and the worktree live
     resolveGitRepository(repo, storage),
     threadId,
     storage,
-    undefined,
     dirs.artifactDir,
   );
   assert.strictEqual(path.resolve(worktree.path), path.resolve(dirs.artifactDir, 'worktree'));
@@ -146,6 +145,11 @@ test('archive and cleanup stay inside the task directory and never delete the ar
   fs.writeFileSync(overlayFile, 'model: task-overlay\n', 'utf8');
 
   const thread = {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + (threadId)),
+    callerSessionId: ('reviewer-' + (threadId)),
     threadId,
     title: 'Unified task data',
     initiatorAgent: 'codex',
@@ -205,6 +209,11 @@ test('TaskStore.deleteTask removes a task directory and its bootstrap credential
 
   const now = new Date().toISOString();
   store.upsertTask({
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + (threadId)),
+    callerSessionId: ('reviewer-' + (threadId)),
     threadId,
     title: 'Delete unified',
     initiatorAgent: 'codex',
@@ -238,7 +247,6 @@ test('delete_task removes the unified directory including its worktree', async (
     resolveGitRepository(repo, storage),
     threadId,
     storage,
-    undefined,
     dirs.artifactDir,
   );
   fs.writeFileSync(path.join(worktree.path, 'readme.txt'), 'changed\n', 'utf8');
@@ -247,6 +255,11 @@ test('delete_task removes the unified directory including its worktree', async (
 
   const now = new Date().toISOString();
   store.upsertTask({
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + (threadId)),
+    callerSessionId: ('reviewer-' + (threadId)),
     threadId,
     title: 'Delete unified worktree',
     initiatorAgent: 'codex',
@@ -280,15 +293,15 @@ test('delete_task removes the unified directory including its worktree', async (
   assert.strictEqual(store.getTask(threadId), undefined);
 });
 
-test('legacy threads without artifactDir keep using per-agent log directories', (t) => {
+test('stale log settings cannot redirect task logs', (t) => {
   const storage = isolatedDir('mesh-taskdata-legacy-');
   t.after(() => removeTree(storage));
   const threadId = 'thread_legacy_paths';
   const logDir = path.join(storage, 'custom-logs');
-  saveBridgePolicy({ logDirectories: { default: logDir } }, storage);
+  fs.writeFileSync(path.join(storage, 'bridge-policy.json'), JSON.stringify({ logDirectories: { default: logDir } }));
 
   const legacyPath = roundExecutionLogPath(threadId, 2, storage, 'codex');
-  assert.strictEqual(legacyPath, path.join(logDir, 'worker_log', `${threadId}_round_2.log`));
+  assert.strictEqual(legacyPath, path.join(storage, 'tasks', threadId, 'worker_log', `${threadId}_round_2.log`));
   assert.strictEqual(fs.existsSync(taskArtifactDir(threadId, storage)), false);
 });
 
@@ -310,6 +323,11 @@ test('TaskStore.archiveTask keeps overlays, rounds and sessions when an overlay 
   fs.writeFileSync(path.join(dirs.workerLogDir, `${threadId}_round_1.log`), 'worker', 'utf8');
   const now = new Date().toISOString();
   store.upsertTask({
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + (threadId)),
+    callerSessionId: ('reviewer-' + (threadId)),
     threadId,
     title: 'Archive overlay EIO',
     initiatorAgent: 'codex',
@@ -412,8 +430,16 @@ test('dispatch pins the absolute task directory and writes its round log there',
     initiatorAgent: 'antigravity',
     title: 'Unified dispatch layout',
     prompt: 'do the work',
-    reviewFlow: 'legacy',
+    reviewFlow: 'dedicated',
   });
+  const prepared = store.getTask(result.threadId)!;
+  prepared.reviewBootstrap = { phase: 'confirmed', attempts: 1 };
+  prepared.reviewerSessionCaptured = true;
+  prepared.reviewerSessionId = prepared.callerSessionId = 'reviewer-layout-test';
+  prepared.status = 'running';
+  if (prepared.execution) { prepared.execution.phase = 'develop'; prepared.execution.purpose = undefined; }
+  store.upsertTask(prepared);
+  await (dispatcher as any).executeBackgroundRound(prepared, 1, prepared.rounds[0].prompt, false);
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline && store.getTask(result.threadId)?.status !== 'reviewing') {
     await new Promise((resolve) => setTimeout(resolve, 20));

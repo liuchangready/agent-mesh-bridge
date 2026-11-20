@@ -23,9 +23,8 @@ import * as path from 'path';
 import {
   PagedText,
   REVIEWER_LOG_DIRNAME,
-  bridgeLogsDir,
   formatBytes,
-  getReviewerLogDir,
+  taskArtifactBase,
   readTextFilePaged,
   resolveExistingArtifactPath,
   safeThreadIdPart,
@@ -53,7 +52,7 @@ export function reviewerLogPath(
   artifactDir?: string,
 ): string {
   const safeRound = Number.isFinite(round) ? Math.max(1, Math.floor(round)) : 1;
-  const dir = artifactDir ? taskReviewerLogDir(artifactDir) : getReviewerLogDir(agent, root);
+  const dir = taskReviewerLogDir(taskArtifactBase(threadId, root, artifactDir));
   return path.join(
     dir,
     `${safeThreadIdPart(threadId)}_round_${safeRound}${REVIEWER_LOG_SUFFIX}`,
@@ -66,7 +65,7 @@ export function reviewerBootstrapLogPath(
   agent?: string,
   artifactDir?: string,
 ): string {
-  const dir = artifactDir ? taskReviewerLogDir(artifactDir) : getReviewerLogDir(agent, root);
+  const dir = taskReviewerLogDir(taskArtifactBase(threadId, root, artifactDir));
   return path.join(
     dir,
     `${safeThreadIdPart(threadId)}_bootstrap.log`,
@@ -74,31 +73,10 @@ export function reviewerBootstrapLogPath(
 }
 
 export function findExistingReviewerLog(
-  threadId: string,
-  round: number,
+  threadId: string, round: number,
   options: { root?: string; agent?: string; artifactDir?: string } = {},
 ): string | undefined {
-  if (options.artifactDir) {
-    return resolveExistingArtifactPath([
-      reviewerLogPath(threadId, round, undefined, undefined, options.artifactDir),
-    ]);
-  }
-  const safeRound = Number.isFinite(round) ? Math.max(1, Math.floor(round)) : 1;
-  const candidates: Array<string | undefined> = [
-    reviewerLogPath(threadId, round, options.root, options.agent),
-    reviewerLogPath(threadId, round, options.root),
-    // Reviews written before a log directory was configured live here.
-    path.join(
-      bridgeLogsDir(options.root),
-      REVIEWER_LOG_DIRNAME,
-      `${safeThreadIdPart(threadId)}_round_${safeRound}${REVIEWER_LOG_SUFFIX}`,
-    ),
-    path.join(
-      bridgeLogsDir(options.root),
-      `${safeThreadIdPart(threadId)}_round_${safeRound}${REVIEWER_LOG_SUFFIX}`,
-    ),
-  ];
-  return resolveExistingArtifactPath(candidates);
+  return resolveExistingArtifactPath([reviewerLogPath(threadId, round, options.root, undefined, options.artifactDir)]);
 }
 
 export interface ReviewerLogStat {
@@ -138,17 +116,7 @@ export function listReviewerLogRounds(
   agent?: string,
   artifactDir?: string,
 ): number[] {
-  const dirs = new Set<string>();
-  if (artifactDir) {
-    dirs.add(taskReviewerLogDir(artifactDir));
-  } else {
-    dirs.add(getReviewerLogDir(agent, root));
-    dirs.add(getReviewerLogDir(undefined, root));
-    // Reviews written before a log directory was configured live in the legacy
-    // reviewer_log/ (or, older still, directly under logs/).
-    dirs.add(path.join(bridgeLogsDir(root), REVIEWER_LOG_DIRNAME));
-    dirs.add(bridgeLogsDir(root));
-  }
+  const dirs = [taskReviewerLogDir(taskArtifactBase(threadId, root, artifactDir))];
 
   const prefix = `${safeThreadIdPart(threadId)}_round_`;
   const rounds = new Set<number>();

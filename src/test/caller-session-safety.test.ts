@@ -120,7 +120,7 @@ describe('caller session resolution', () => {
     assert.strictEqual(resolve({ ...valid, callerSessionId: 'requester-session-123' }), undefined);
   });
 
-  test('legacy caller session retains the previous id and detection fallback behavior', () => {
+  test('historical callers are never resumed or auto-detected', () => {
     let detections = 0;
     const detector = {
       detectActiveSession: () => {
@@ -131,10 +131,10 @@ describe('caller session resolution', () => {
     const manager = new CallbackManager(detector);
     const resolve = (item: DelegationThread) => (manager as any).resolveCallerSession(item);
 
-    assert.strictEqual(resolve(thread({ callerSessionId: 'legacy-session-123' })), 'legacy-session-123');
+    assert.strictEqual(resolve(thread({ callerSessionId: 'legacy-session-123' })), undefined);
     const missing = thread({ callerSessionId: undefined });
-    assert.strictEqual(resolve(missing), 'detected-legacy-session');
-    assert.strictEqual(missing.callerSessionId, 'detected-legacy-session');
-    assert.strictEqual(detections, 1);
+    assert.strictEqual(resolve(missing), undefined);
+    assert.strictEqual(missing.callerSessionId, undefined);
+    assert.strictEqual(detections, 0);
   });
 });

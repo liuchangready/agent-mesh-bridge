@@ -271,20 +271,12 @@ export function findReviewerBootstrapByHostPid(
   return found;
 }
 
-/**
- * Review topology for a NEW task.
- *
- * Dedicated requires a long-lived process to launch the reviewer bootstrap; the
- * mirrored policy says the extension-host supervisor is available. A standalone
- * MCP server (or a test without the policy snapshot) stays legacy instead of
- * creating a task that could never be dispatched.
- */
-export function resolveReviewFlow(
-  override?: ReviewFlow,
-  policyFlow?: ReviewFlow,
-): ReviewFlow {
-  if (override === 'legacy' || override === 'dedicated') return override;
-  return policyFlow === 'dedicated' ? 'dedicated' : 'legacy';
+/** A stale policy snapshot must never resume the requester for new work. */
+export function resolveReviewFlow(override?: ReviewFlow, _policyFlow?: ReviewFlow): 'dedicated' {
+  if (override !== undefined && override !== 'dedicated') {
+    throw new Error('LEGACY_REVIEW_FLOW_DISABLED: New tasks require a dedicated reviewer.');
+  }
+  return 'dedicated';
 }
 
 export interface ReviewerBootstrapDeps {

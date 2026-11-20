@@ -19,7 +19,11 @@ import { TaskControlService } from '../bridge/task-control';
 
 function task(root: string): DelegationThread {
   const now = new Date().toISOString();
-  return { threadId: 'thread_merge_decision', title: 'merge', initiatorAgent: 'codex', targetAgent: 'claude_code',
+  return {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: 'reviewer-session', threadId: 'thread_merge_decision', title: 'merge', initiatorAgent: 'codex', targetAgent: 'claude_code',
     status: 'reviewing', currentRound: 1, createdAt: now, updatedAt: now,
     receiverSessionId: 'receiver-session', callerSessionId: 'reviewer-session', workspace: testWorkspace(root),
     summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },

@@ -1,4 +1,4 @@
-import { testWorkspace } from './workspace-fixture';
+import { testWorkspace, confirmTestReviewer } from './workspace-fixture';
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -96,6 +96,13 @@ describe('MCPServer Protocol Tests', () => {
   });
 
   const waitForStatus = async (threadId: string, status: string, timeoutMs = 3000) => {
+    const pending = taskStore.getTask(threadId);
+    if (pending?.reviewBootstrap?.phase === 'pending') {
+      const task = confirmTestReviewer(pending);
+      taskStore.upsertTask(task);
+      clearReviewerBootstrapToken(task.threadId, tempDir, task.artifactDir);
+      void (dispatcher as any).executeBackgroundRound(task, 1, task.rounds[0].prompt, false);
+    }
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (taskStore.getTask(threadId)?.status === status) return;
@@ -531,6 +538,11 @@ describe('MCPServer Protocol Tests', () => {
     });
 
     taskStore.upsertTask({
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + (threadId)),
+    callerSessionId: ('reviewer-' + (threadId)),
       threadId,
       title: 'capsule projection',
       initiatorAgent: 'codex',
@@ -596,9 +608,14 @@ describe('MCPServer Protocol Tests', () => {
 
   test('get_merge_log reads bounded pages from the task-owned log', async () => {
     const threadId = 'thread_merge_log_page'; const now = new Date().toISOString();
-    const logPath = path.join(tempDir, 'merge-logs', threadId, 'merge_log', `${threadId}_merge_1.log`);
+    const logPath = path.join(tempDir, 'tasks', threadId, 'merge_log', `${threadId}_merge_1.log`);
     fs.mkdirSync(path.dirname(logPath), { recursive: true }); fs.writeFileSync(logPath, 'abcdefghij');
-    taskStore.upsertTask({ threadId, title: 'merge log', initiatorAgent: 'codex', targetAgent: 'claude_code',
+    taskStore.upsertTask({
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + (threadId)),
+    callerSessionId: ('reviewer-' + (threadId)), threadId, title: 'merge log', initiatorAgent: 'codex', targetAgent: 'claude_code',
       status: 'reviewing', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-abcdef12',
       workspace: testWorkspace(tempDir), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 }, rounds: [],
       mergeHistory: [{ id: 'one', number: 1, at: now, phase: 'conflict', result: 'failed', logPath }] });
@@ -610,11 +627,16 @@ describe('MCPServer Protocol Tests', () => {
 
   test('get_merge_log resolves decision and legacy file numbers but rejects paths outside the task log', async () => {
     const threadId = 'thread_merge_log_mapping'; const now = new Date().toISOString();
-    const dir = path.join(tempDir, 'merge-logs', threadId, 'merge_log'); fs.mkdirSync(dir, { recursive: true });
+    const dir = path.join(tempDir, 'tasks', threadId, 'merge_log'); fs.mkdirSync(dir, { recursive: true });
     const logPath = path.join(dir, `${threadId}_merge_2.log`); fs.writeFileSync(logPath, 'abcdefghij');
     const decisionLog = path.join(dir, `${threadId}_merge_9.log`); fs.writeFileSync(decisionLog, 'decision context');
     const outside = path.join(tempDir, `${threadId}_merge_2.log`); fs.writeFileSync(outside, 'private');
-    taskStore.upsertTask({ threadId, title: 'merge log', initiatorAgent: 'codex', targetAgent: 'claude_code',
+    taskStore.upsertTask({
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + (threadId)),
+    callerSessionId: ('reviewer-' + (threadId)), threadId, title: 'merge log', initiatorAgent: 'codex', targetAgent: 'claude_code',
       status: 'reviewing', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-abcdef12',
       workspace: testWorkspace(tempDir), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 }, rounds: [],
       mergeHistory: [
@@ -638,7 +660,11 @@ describe('MCPServer Protocol Tests', () => {
 
   test('merge_failed rejects ordinary controls and retry_merge keeps task identity', async () => {
     const threadId = 'thread_merge_failed_control'; const now = new Date().toISOString();
-    taskStore.upsertTask({ threadId, title: 'merge failure', initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'failed', failure: { stage: 'merge', reason: 'conflict', at: now }, failureRevision: 1,
+    taskStore.upsertTask({
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: 'reviewer-session', threadId, title: 'merge failure', initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'failed', failure: { stage: 'merge', reason: 'conflict', at: now }, failureRevision: 1,
       currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-abcdef12', callerSessionId: 'reviewer-session',
       workspace: testWorkspace(tempDir), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 }, rounds: [],
       mergeControl: { revision: 1, retryGeneration: 0, consecutiveRetries: 6, failureFingerprint: 'failure' } });
@@ -683,6 +709,11 @@ describe('MCPServer Protocol Tests', () => {
     });
 
     taskStore.upsertTask({
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + (threadId)),
+    callerSessionId: ('reviewer-' + (threadId)),
       threadId,
       title: 'token usage',
       initiatorAgent: 'claude_code',
@@ -761,7 +792,7 @@ describe('MCPServer Protocol Tests', () => {
     const dispatchRes = await mcpServer.handleRpcMessage(dispatchCall);
     assert.strictEqual(dispatchRes.id, 10);
     const dispatchData = JSON.parse(dispatchRes.result.content[0].text);
-    assert.strictEqual(dispatchData.status, 'DISPATCHED');
+    assert.strictEqual(dispatchData.status, 'REVIEWER_STARTING');
     const threadId = dispatchData.threadId;
     const receiverSessionId = dispatchData.receiverSessionId;
     assert.ok(threadId);
@@ -1253,7 +1284,7 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(rejected.error, 'a self-dispatch must be an error, not a queued task');
     assert.match(
       String(rejected.error.message),
-      /self-dispatch requires the dedicated reviewer flow/,
+      /configure a sender-side reviewer model/,
     );
     assert.strictEqual(taskStore.getAllTasks().length, 0);
 

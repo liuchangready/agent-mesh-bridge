@@ -1,3 +1,4 @@
+import { assertDedicatedTask } from './types';
 import { appendTemplateInstructions } from './task-templates';
 import { getTaskExecutionPath } from './types';
 import * as fs from 'fs';
@@ -58,7 +59,6 @@ export class TaskSupervisor extends EventEmitter {
   private activeTasks: Map<string, Promise<void>> = new Map();
   private liveLogs: Map<string, string> = new Map();
   private lockFilePath: string;
-  private logDir: string;
   private heartbeatInterval: NodeJS.Timeout | null = null;
   private pollInterval: NodeJS.Timeout | null = null;
   private isDisposed: boolean = false;
@@ -94,13 +94,6 @@ export class TaskSupervisor extends EventEmitter {
       } catch {}
     }
     this.lockFilePath = path.join(storageDir, 'supervisor.json');
-
-    this.logDir = path.join(storageDir, 'logs');
-    if (!fs.existsSync(this.logDir)) {
-      try {
-        fs.mkdirSync(this.logDir, { recursive: true });
-      } catch {}
-    }
 
     this.startHeartbeat();
     this.startWatching();
@@ -264,7 +257,7 @@ export class TaskSupervisor extends EventEmitter {
   private scheduleReadyTasks(allTasks: DelegationThread[], policy: ConcurrencyPolicy): void {
     const candidates = allTasks
       .filter((thread) => {
-        if (!thread || !thread.threadId || this.activeTasks.has(thread.threadId)) return false;
+        if (!thread || !thread.threadId || thread.reviewFlow !== 'dedicated' || this.activeTasks.has(thread.threadId)) return false;
         if (thread.status === 'paused' || thread.status === 'reviewing') return false;
         if (thread.queuePhase === 'merge' || thread.reviewBlocked || isReviewerBootstrapPending(thread)) return false;
         return thread.status === 'running' || thread.status === 'queued';
@@ -385,6 +378,7 @@ export class TaskSupervisor extends EventEmitter {
       }
       return Promise.resolve();
     }
+    assertDedicatedTask(stored);
     let fresh = stored;
     // Dedicated review: the reviewer conversation must dispatch first.
     if (isReviewerBootstrapPending(fresh)) {

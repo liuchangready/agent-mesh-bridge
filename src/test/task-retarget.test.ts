@@ -81,6 +81,10 @@ function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread
     timestamp: now,
   };
   return {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: 'caller-1',
     threadId: 'thread_retarget_1',
     title: '统一码牌千术',
     // The reviewer must differ from every executor these tests switch to:
@@ -382,7 +386,7 @@ describe('TaskRetargetService - switching a task executor', () => {
           targetAgent: 'claude_code',
           reason: 'run it on the reviewer',
         }),
-      /legacy review flow/i,
+      /reviewer model and.*executor model/i,
     );
 
     // Nothing moved: no executor change, no session reset, no retarget record.

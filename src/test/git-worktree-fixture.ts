@@ -77,8 +77,14 @@ function createRepositoryTemplate(): void {
 export function thread(threadId: string, worktree: WorktreeInfo): DelegationThread {
   const now = new Date().toISOString();
   return {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + (threadId)),
+    callerSessionId: ('reviewer-' + (threadId)),
     threadId, title: threadId, initiatorAgent: 'codex', targetAgent: 'claude_code',
     status: 'queued', queuePhase: 'merge', currentRound: 1, createdAt: now, updatedAt: now,
+    artifactDir: path.dirname(worktree.path),
     receiverSessionId: `session-${threadId}`, workspace: testWorkspace(worktree.path),
     summary: { lastPromptSnippet: 'review', lastOutputSnippet: 'approved', totalDurationMs: 1 },
     rounds: [{ round: 1, type: 'initial', prompt: 'change one line', output: 'done', durationMs: 1, status: 'completed', timestamp: now }],

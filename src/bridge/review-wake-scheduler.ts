@@ -276,6 +276,7 @@ export class ReviewWakeScheduler extends EventEmitter {
 
     const stalled: DelegationThread[] = [];
     for (const thread of tasks) {
+      if (thread.reviewFlow !== 'dedicated') continue;
       try {
         if (isMergeReview(thread) && isReviewerWakeEligible(thread)) {
           if (this.isReviewerActive(thread.threadId)) continue;

@@ -171,7 +171,7 @@ export function clearTaskFailure(thread: DelegationThread): void {
 
 /** States in which a completed developer round can be reviewed. */
 export function isReviewerWakeEligible(thread: DelegationThread): boolean {
-  return thread.status === 'reviewing';
+  return thread.reviewFlow === 'dedicated' && thread.status === 'reviewing';
 }
 
 export function isMergeReview(thread: DelegationThread): boolean {
@@ -588,12 +588,17 @@ export interface ThreadSummary {
 /**
  * Which review topology a task was created with.
  *
- * `legacy` (and an absent field) resumes the requester's own conversation for
- * review, exactly as the bridge always did. `dedicated` gives the task its own
- * bridge-created reviewer conversation, which dispatches the task and later
- * receives the developer report. Existing threads never migrate automatically.
+ * New work always uses a dedicated reviewer. Legacy and absent values
+ * remain readable for history only; requester conversations are never resumed.
  */
 export type ReviewFlow = 'legacy' | 'dedicated';
+
+/** Historical requester-review tasks remain readable and safely removable. */
+export function assertDedicatedTask(thread: Pick<DelegationThread, 'threadId' | 'reviewFlow'>): void {
+  if (thread.reviewFlow !== 'dedicated') {
+    throw new Error(`LEGACY_REVIEW_FLOW_DISABLED: Task ${thread.threadId} is historical; only reading, archival, deletion and stopping existing processes are supported.`);
+  }
+}
 
 /** Lifecycle of the dedicated reviewer's bootstrap (dispatch) turn. */
 export type ReviewBootstrapPhase =
@@ -722,6 +727,15 @@ export interface WorktreeInfo {
 }
 
 /** Metadata written by the isolated-worktree lifecycle introduced by the bridge. */
+/** Only a pinned real local delivery target may drive Git execution. */
+export function requireDeliveryTarget(worktree: WorktreeInfo): NonNullable<WorktreeInfo['deliveryTarget']> {
+  const target = worktree.deliveryTarget;
+  if (!target?.repositoryPath || !target.ref || !target.branch || target.ref !== `refs/heads/${target.branch}`) {
+    throw new Error('MISSING_DELIVERY_TARGET: Historical Git delivery metadata cannot be executed.');
+  }
+  return target;
+}
+
 export function isIsolatedTaskWorktree(worktree?: WorktreeInfo): worktree is WorktreeInfo & { targetRef: string; taskBranch: string; baseCommit: string; repositoryPath: string; commonDir: string } {
   return !!worktree?.targetRef && !!worktree.taskBranch && !!worktree.baseCommit && !!worktree.repositoryPath && !!worktree.commonDir;
 }
@@ -1000,6 +1014,7 @@ export interface DispatchTaskParams {
   targetAgent?: TargetAgentSelection;
   title: string;
   prompt: string;
+  /** Deprecated dispatch input, ignored: only the captured reviewer is resumed. */
   callerSessionId?: string;
   initiatorAgent?: AgentId;
   workspaceId?: string;
@@ -1032,9 +1047,8 @@ export interface DispatchTaskParams {
    */
   initiatorModel?: string;
   /**
-   * Override the review topology for this task (tests/internal callers only).
-   * Omitted = mirrored policy (`bridge-policy.json`), falling back to legacy
-   * when no extension host/supervisor is alive to run the reviewer bootstrap.
+   * Optional internal flow assertion. Explicit legacy is rejected; omitted
+   * always creates a dedicated reviewer, including standalone MCP.
    */
   reviewFlow?: ReviewFlow;
 }

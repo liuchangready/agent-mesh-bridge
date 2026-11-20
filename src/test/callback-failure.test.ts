@@ -41,6 +41,10 @@ describe('CallbackManager failure wake-ups', () => {
   });
 
   const makeThread = (overrides: Partial<DelegationThread> = {}): DelegationThread => ({
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: 'caller-codex-session-1',
     threadId: 'thread_cb_1',
     title: 'Implement e68faed extension',
     initiatorAgent: 'codex',

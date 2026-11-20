@@ -44,6 +44,11 @@ function initRepo(root: string): void {
 function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread {
   const now = new Date().toISOString();
   return {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + ('thread_merge_gate')),
+    callerSessionId: ('reviewer-' + ('thread_merge_gate')),
     threadId: 'thread_merge_gate', title: 'Merge gate', initiatorAgent: 'codex', targetAgent: 'claude_code',
     status: 'completed', currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-1',
     workspace: testWorkspace(os.tmpdir()), summary: { lastPromptSnippet: 'p', lastOutputSnippet: 'o', totalDurationMs: 1 }, rounds: [],

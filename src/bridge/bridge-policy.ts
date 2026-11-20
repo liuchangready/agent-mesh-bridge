@@ -28,7 +28,6 @@ export const DEFAULT_COMPACTION_MIN_CHARS = 1500;
  * explicit concurrency limits are the execution blockers; Git worktrees
  * isolate task files from each other.
  */
-export type AgentLogDirectories = Partial<Record<AgentId | 'default', string>>;
 
 export interface ConcurrencyPolicy {
   enabled: boolean;
@@ -54,14 +53,8 @@ export interface BridgePolicy {
     maxConcurrentTasks?: number;
     maxConcurrentPerAgent?: number;
   };
-  /**
-   * Review topology for NEW tasks. Omitted = dedicated when the extension host
-   * is alive, legacy otherwise (standalone MCP has no process able to run the
-   * reviewer bootstrap).
-   */
+  /** Historical snapshots may contain legacy; all new work is dedicated. */
   reviewFlow?: 'legacy' | 'dedicated';
-  /** Legacy log roots read for tasks created before unified task directories. */
-  logDirectories?: AgentLogDirectories;
   /**
    * Root directory for NEW tasks' unified data directories.
    *
@@ -72,12 +65,6 @@ export interface BridgePolicy {
    * they were created, so changing this never forks a running task's files.
    */
   taskDataRoot?: string;
-  /**
-   * Legacy worktree root (pre-unified task directories), read for old callers.
-   *
-   * Retained when loading old policy snapshots; new tasks use `taskDataRoot`.
-   */
-  worktreeRoot?: string;
   updatedAt?: string;
 }
 
@@ -137,19 +124,8 @@ export function saveBridgePolicy(patch: BridgePolicy, root?: string): BridgePoli
     if (perAgent !== undefined) merged.maxConcurrentPerAgent = perAgent;
     if (Object.keys(merged).length > 0) next.concurrency = merged;
   }
-  if (patch.reviewFlow === 'legacy' || patch.reviewFlow === 'dedicated') {
-    next.reviewFlow = patch.reviewFlow;
-  }
-  if (patch.logDirectories !== undefined) {
-    const mergedDirs: AgentLogDirectories = { ...(next.logDirectories || {}) };
-    for (const [key, value] of Object.entries(patch.logDirectories)) {
-      if (typeof value !== 'string') continue;
-      const trimmed = value.trim();
-      if (trimmed) mergedDirs[key as AgentId | 'default'] = trimmed;
-      else delete mergedDirs[key as AgentId | 'default'];
-    }
-    next.logDirectories = mergedDirs;
-  }
+  next.reviewFlow = 'dedicated';
+  delete (next as any).logDirectories;
   if (patch.taskDataRoot !== undefined) {
     if (typeof patch.taskDataRoot === 'string') {
       const trimmed = patch.taskDataRoot.trim();
@@ -160,11 +136,7 @@ export function saveBridgePolicy(patch: BridgePolicy, root?: string): BridgePoli
       }
     }
   }
-  if (patch.worktreeRoot !== undefined && typeof patch.worktreeRoot === 'string') {
-    const trimmed = patch.worktreeRoot.trim();
-    if (trimmed) next.worktreeRoot = trimmed;
-    else delete next.worktreeRoot;
-  }
+  delete (next as any).worktreeRoot;
   next.updatedAt = new Date().toISOString();
 
   try {
@@ -216,30 +188,4 @@ export function concurrencyPolicy(root?: string): ConcurrencyPolicy {
     maxConcurrentPerAgent:
       positiveSlotCount(raw.maxConcurrentPerAgent) ?? DEFAULT_CONCURRENCY_POLICY.maxConcurrentPerAgent,
   };
-}
-
-
-/** Custom log directories configured per agent or globally. */
-export function getAgentLogDirectories(root?: string): AgentLogDirectories {
-  return readBridgePolicy(root).logDirectories || {};
-}
-
-/**
- * Root directory that holds every (legacy) task worktree.
- *
- * Falls back to `<storage>/worktrees`. New tasks ignore this switch and place
- * their worktree inside the unified task directory; the setting is retained for
- * old ledger entries and direct worktree creation callers.
- */
-export function worktreeRoot(storageDir: string, root?: string): string {
-  // The mirrored policy lives next to the ledger, which is `storageDir` for every
-  // real caller. Reading only `root` would consult the real home directory and
-  // silently ignore a root recorded for a custom storage dir.
-  const policyRoot = root && root.trim() ? root : storageDir;
-  const configured = readBridgePolicy(policyRoot).worktreeRoot;
-  if (typeof configured === 'string' && configured.trim()) {
-    const value = configured.trim();
-    return path.isAbsolute(value) ? path.normalize(value) : path.resolve(policyRoot, value);
-  }
-  return path.join(storageDir, 'worktrees');
 }

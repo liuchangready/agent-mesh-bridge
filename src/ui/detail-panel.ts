@@ -1,3 +1,4 @@
+import { taskArtifactBase } from '../bridge/round-log';
 import { getTaskExecutionPath } from '../bridge/types';
 import * as fs from 'fs';
 import * as vscode from 'vscode';
@@ -403,7 +404,7 @@ export class TaskDetailPanel {
 
     try {
       const safeId = thread.threadId.replace(/[^A-Za-z0-9_-]/g, '_');
-      const root = thread.artifactDir || path.join(path.dirname(this.taskStore.getStoragePath()), 'merge-logs', safeId);
+      const root = taskArtifactBase(thread.threadId, path.dirname(this.taskStore.getStoragePath()), thread.artifactDir);
       const source = event.phase === 'decision' && event.logNumber
         ? thread.mergeHistory?.find((entry) => entry.number === event.logNumber && entry.logPath === event.logPath)
         : event;
@@ -470,6 +471,7 @@ export class TaskDetailPanel {
         .replace(/'/g, '&#039;');
     };
 
+    const historical = thread.reviewFlow !== 'dedicated';
     const safeMrUrl =
       thread.mergeRequest?.url && /^https?:\/\//i.test(thread.mergeRequest.url)
         ? thread.mergeRequest.url
@@ -916,7 +918,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
             thread.reviewFlow === 'dedicated'
               ? `🧭 专用 reviewer 会话 ${escapeHtml(thread.reviewerSessionId || '（待捕获）')}
                  · reviewer 模型 ${escapeHtml(thread.reviewerModel || 'Agent 默认')}`
-              : 'legacy — 请求方会话审阅'
+              : '历史记录 — 执行已停用'
           }
           ${thread.archivedAt ? ` · 📦 已归档 (${escapeHtml(thread.archivedAt)})` : ''}
         </div>
@@ -1008,7 +1010,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
       <div class="meta-item" style="grid-column:1/-1;">
         <div class="meta-label">Native Session Compaction / 原生会话压缩</div>
         <div class="meta-val">Bridge mode: off by default · ${escapeHtml(nativeStatus('developer', thread.targetAgent, thread.receiverSessionCaptured ? thread.receiverSessionId : undefined))}<br/>${escapeHtml(nativeStatus('reviewer', thread.initiatorAgent, thread.reviewerSessionCaptured ? thread.reviewerSessionId : undefined))}</div>
-        ${thread.status === 'paused' ? '<button class="secondary" style="margin-top:8px;" onclick="compactNativeSession()">Compress a captured task session…</button>' : ''}
+        ${!historical && thread.status === 'paused' ? '<button class="secondary" style="margin-top:8px;" onclick="compactNativeSession()">Compress a captured task session…</button>' : ''}
       </div>
       ${thread.worktree ? renderWorktreeDetails(thread.worktree) : ''}
       ${
@@ -1185,9 +1187,9 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
       : ''
   }
 
-  ${(thread.status === 'failed' && thread.failure?.stage === 'merge') ? `<div class="action-bar"><button onclick="retryMerge()">重试合并</button><button onclick="deleteTask()">删除任务</button></div>` : ''}
+  ${(!historical && thread.status === 'failed' && thread.failure?.stage === 'merge') ? `<div class="action-bar"><button onclick="retryMerge()">重试合并</button><button onclick="deleteTask()">删除任务</button></div>` : ''}
   ${thread.status === 'reviewing' && thread.worktree?.integration?.stashRecoveryPending ? `<div class="action-bar"><button onclick="retryMerge()">重试恢复 stash 元数据</button></div>` : ''}
-  <div class="action-bar" ${(thread.status === 'failed' && thread.failure?.stage === 'merge') ? 'style="display:none"' : ''}>
+  <div class="action-bar" ${(historical || thread.status === 'failed' && thread.failure?.stage === 'merge') ? 'style="display:none"' : ''}>
     ${thread.status === 'failed' && thread.failure?.stage === 'execution' ? `<button class="retry-btn" style="background: #dc2626; color: white;" onclick="retryFailedRound()">🔄 重试失败轮次 (Retry Failed)</button>` : ''}
     ${thread.status === 'reviewing' && thread.reviewWake && thread.reviewWake.round === (thread.currentRound || 1) ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（唤醒失败）</button>` : ''}
     ${(thread.status === 'failed' && thread.failure?.stage === 'review') ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（检视失败）</button>` : ''}
@@ -1215,6 +1217,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
     <pre id="recentLogViewer" class="code-block output-text" style="max-height: 380px; overflow-y: auto; background: #0b0f19; border: 1px solid #1e293b; padding: 12px; border-radius: 6px; font-family: Consolas, monospace; font-size: 12px; line-height: 1.5; color: #e2e8f0; white-space: pre-wrap; word-break: break-all;">${escapeHtml(recentLogs.logs || '(暂无输出日志)')}</pre>
   </div>
 
+  ${historical ? '<div class="action-bar"><button onclick="deleteTask()">Delete historical task</button><button class="secondary" onclick="printRecentLogs()">View logs</button></div>' : ''}
   <div class="timeline">
     <h3>Interaction Timeline</h3>
     ${roundsHtml}
@@ -1234,10 +1237,10 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
       ${event.mergedCommit ? `<div>Revert by creating a new commit: <code>git revert -m 1 ${escapeHtml(event.mergedCommit)}</code></div>` : ''}
     </div>`).join('')}</div>` : ''}
 
-  ${thread.status === 'wait_decision' ? `<div class="rework-box"><h3>提交检视决定</h3><textarea id="mergeDecision" placeholder="输入您的决定"></textarea><button onclick="submitMergeDecision()">提交决定并唤醒 Reviewer</button></div>` : ''}
+  ${!historical && thread.status === 'wait_decision' ? `<div class="rework-box"><h3>提交检视决定</h3><textarea id="mergeDecision" placeholder="输入您的决定"></textarea><button onclick="submitMergeDecision()">提交决定并唤醒 Reviewer</button></div>` : ''}
 
   ${
-    thread.status !== 'completed' && !(thread.status === 'failed' && thread.failure?.stage === 'merge') && thread.status !== 'wait_decision'
+    !historical && thread.status !== 'completed' && !(thread.status === 'failed' && thread.failure?.stage === 'merge') && thread.status !== 'wait_decision'
       ? `
   <div class="rework-box">
     <h3>Manual Rework Intervention</h3>

@@ -23,6 +23,10 @@ import { DelegationThread } from '../bridge/types';
 
 function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread {
   return {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: 'rollout-loop-0001',
     threadId: 'thread_loop_1',
     title: 'no-op rework guard',
     initiatorAgent: 'codex',

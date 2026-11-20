@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as fs from 'fs';
@@ -13,8 +14,8 @@ export function testMultiStashRecovery(phase: string, addConcurrent: boolean): v
   test(`multi-stash cleanup recovers ${phase}, concurrent=${addConcurrent}`, async (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-multi-crash-'));
     const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); const { old, extra } = initMultiStashRepo(repository);
-    const safePhase = phase.replace(/[^A-Za-z0-9_-]/g, '_');
-    const id = `thread_stash_multi_${safePhase}_${addConcurrent ? 'conc' : 'solo'}`;
+    // Match dispatched ID lengths so Windows Git metadata stays within its path limit.
+    const id = `thread_20261120_000000_${createHash('sha256').update(phase + addConcurrent).digest('hex').slice(0, 4)}`;
     const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, id, storage);
     fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task\nmiddle\nbeta\n'); worktree.headCommit = commitTaskChanges(worktree, 'task');
     fs.writeFileSync(path.join(repository, 'mine.txt'), 'mine');
@@ -23,9 +24,9 @@ export function testMultiStashRecovery(phase: string, addConcurrent: boolean): v
     const script = `const {TaskStore}=require(process.argv[1]),{MergeCoordinator,MeshFileLock}=require(process.argv[2]);
       const s=new TaskStore(process.argv[3]), c=new MergeCoordinator(s,process.argv[3],new MeshFileLock(process.argv[4]));
       const write=c.writeTransaction.bind(c);c.writeTransaction=(file,tx)=>{const p=process.argv[5];if(p.startsWith('before_')&&tx.phase===p.slice(7))process.exit(71);write(file,tx);if(p.startsWith('hard_')&&tx.phase===p.slice(5))process.kill(process.pid,'SIGKILL');if(tx.phase===p)process.exit(71)};
-      c.mergeApproved('${id}').catch(e=>{console.error(e);process.exit(2)});`;
+      c.mergeApproved('${id}').then(r=>console.log(JSON.stringify(r))).catch(e=>{console.error(e);process.exit(2)});`;
     const child = spawnSync(process.execPath, ['-e', script, require.resolve('../bridge/task-store'), require.resolve('../bridge/merge-coordinator'), storage, path.join(root, 'merge.lock'), phase], { encoding: 'utf8', timeout: 60000, windowsHide: true });
-    if (phase.startsWith('hard_')) assert.notEqual(child.status, 0, child.stderr); else assert.equal(child.status, 71, child.stderr);
+    if (phase.startsWith('hard_')) assert.notEqual(child.status, 0, child.stderr); else assert.equal(child.status, 71, child.stderr || child.stdout);
     const landed = git(repository, 'rev-parse', target.targetRef);
     if (addConcurrent) {
       let stored = false;
@@ -48,8 +49,7 @@ export function testStashCrashRecovery(crashPhase: string): void {
   test(`a process crash after ${crashPhase} recovers local files and landing`, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-ref-crash-stash-'));
   const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
-  const safePhase = crashPhase.replace(/[^A-Za-z0-9_-]/g, '_');
-  const id = `thread_ref_crash_${safePhase}`;
+  const id = `thread_20261120_000000_${createHash('sha256').update(crashPhase).digest('hex').slice(0, 4)}`;
   const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, id, storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task\nmiddle\nbeta\n'); worktree.headCommit = commitTaskChanges(worktree, 'task');
   let concurrentStash = '';
@@ -64,9 +64,9 @@ export function testStashCrashRecovery(crashPhase: string): void {
     const s=new TaskStore(process.argv[3]), c=new MergeCoordinator(s,process.argv[3],new MeshFileLock(process.argv[4]));
     if(process.argv[5]==='after_reflog_deleted')c.removeSoleLandingStash=async(id,cwd)=>{require('fs').unlinkSync(require('path').join(cwd,'.git','logs','refs','stash'));process.exit(71)};
     const write=c.writeTransaction.bind(c);c.writeTransaction=(file,tx)=>{if((process.argv[5].startsWith('before_stash_restored')&&tx.phase==='stash_restored')||(process.argv[5]==='before_stash_applied'&&tx.phase==='stash_applied'))process.exit(71);write(file,tx);if(tx.phase===process.argv[5])process.exit(71)};
-    c.mergeApproved('${id}').catch(e=>{console.error(e);process.exit(2)});`;
+    c.mergeApproved('${id}').then(r=>console.log(JSON.stringify(r))).catch(e=>{console.error(e);process.exit(2)});`;
   const child = spawnSync(process.execPath, ['-e', script, require.resolve('../bridge/task-store'), require.resolve('../bridge/merge-coordinator'), storage, path.join(root, 'merge.lock'), crashPhase], { encoding: 'utf8', timeout: 60000, windowsHide: true });
-  assert.equal(child.status, 71, child.stderr);
+  assert.equal(child.status, 71, child.stderr || child.stdout);
   const landed = git(repository, 'rev-parse', target.targetRef);
   if (concurrentStash) git(repository, 'stash', 'store', '-m', 'concurrent', concurrentStash);
   const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));

@@ -48,7 +48,13 @@ function initRepo(root: string): void {
 function makeThread(threadId: string, worktree: ReturnType<typeof createTaskWorktree>): DelegationThread {
   const now = new Date().toISOString();
   return {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + (threadId)),
+    callerSessionId: ('reviewer-' + (threadId)),
     threadId, title: threadId, initiatorAgent: 'codex', targetAgent: 'claude_code', status: 'reviewing', currentRound: 1,
+    artifactDir: path.dirname(worktree.path),
     createdAt: now, updatedAt: now, receiverSessionId: `session-${threadId}`, workspace: testWorkspace(worktree.path),
     summary: { lastPromptSnippet: 'review', lastOutputSnippet: 'done', totalDurationMs: 1 },
     rounds: [{ round: 1, type: 'initial', prompt: 'change', output: 'changed file', durationMs: 1, status: 'completed', timestamp: now }],
@@ -74,7 +80,7 @@ test('resident host observes a short-lived MCP approval from disk and merges wit
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'changed\n'); worktree.headCommit = commitTaskChanges(worktree, 'task change');
   const hostStore = new TaskStore(storage); const mcpStore = new TaskStore(storage);
   const host = makeController(hostStore, true); const shortMcp = makeController(mcpStore);
-  t.after(() => { host.dispose(); hostStore.dispose(); mcpStore.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
+  t.after(() => { host.dispose(); hostStore.dispose(); mcpStore.dispose(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   mcpStore.upsertTask(makeThread('thread_resident_merge', worktree));
   assert.equal(shortMcp.approveTask({ threadId: 'thread_resident_merge' }).status, 'QUEUED');
   await waitFor(() => hostStore.getTask('thread_resident_merge')?.status === 'completed', 30_000);
@@ -86,11 +92,11 @@ test('pre-ref merge infrastructure failure returns a concrete error to the origi
   const repo = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repo);
   const target = resolveGitRepository(repo, storage); const worktree = createTaskWorktree(target, 'thread_merge_review_error', storage);
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'changed\n'); worktree.headCommit = commitTaskChanges(worktree, 'task change');
-  worktree.targetRef = 'refs/heads/missing-target'; worktree.deliveryTarget = undefined;
+  worktree.targetRef = 'refs/heads/missing-target'; worktree.deliveryTarget = { ...worktree.deliveryTarget!, branch: 'missing-target', ref: 'refs/heads/missing-target' };
   const store = new TaskStore(storage); const detector = new AgentDetector(); const callback = new CallbackManager(detector);
   const notified: DelegationThread[] = []; callback.notifyCaller = async (thread) => { notified.push(thread); return true; };
   const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector);
-  t.after(() => { store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
+  t.after(() => { store.dispose(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const original = makeThread('thread_merge_review_error', worktree); original.callerSessionId = 'reviewer-session-original';
   store.upsertTask({ ...original, status: 'merging', worktree: { ...worktree, approvedCommit: worktree.headCommit, integration: { phase: 'waiting', updatedAt: new Date().toISOString() } } });
   controller.resumePendingMerges();
@@ -101,7 +107,7 @@ test('pre-ref merge infrastructure failure returns a concrete error to the origi
   assert.match(latest.worktree?.integration?.error || '', /Git|fatal|unknown revision|not a valid object/i);
   assert.equal(notified[0].threadId, 'thread_merge_review_error');
   assert.equal(notified[0].callerSessionId, original.callerSessionId);
-  assert.ok(latest.mergeHistory?.some((entry) => entry.phase === 'coordinator' && entry.result === 'failed' && /Git|fatal|revision|object/i.test(entry.error || '')));
+  assert.ok(latest.mergeHistory?.some((entry) => ['coordinator', 'blocked'].includes(entry.phase) && entry.result === 'failed' && /Git|fatal|revision|object/i.test(entry.error || '')));
 });
 
 test('a landed ref with repeated ledger EIO is not retried in a loop and recovers after host restart', async (t) => {
@@ -121,7 +127,7 @@ test('a landed ref with repeated ledger EIO is not retried in a loop and recover
     return realRename(from, to);
   }) as typeof fs.renameSync;
   host = makeController(store, true);
-  t.after(() => { mutableFs.renameSync = realRename; host.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
+  t.after(() => { mutableFs.renameSync = realRename; host.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   await waitFor(() => gitOutput(repo, ['rev-parse', target.targetRef]) !== target.baseCommit, 30_000);
   const landed = gitOutput(repo, ['rev-parse', target.targetRef]);
   await waitFor(() => writeFailures > 0);
@@ -168,7 +174,7 @@ test('an initial ledger EIO is logged and backed off until the same host can rec
   assert.equal(failures, failuresAfterSettlement, 'one-second host polls must not retry a failed ledger write');
   assert.equal(wakes, 0); assert.equal(gitOutput(repo, ['rev-parse', target.targetRef]), target.baseCommit);
   assert.equal(store.getTask(id)?.status, 'queued');
-  const logs = path.join(storage, 'merge-logs', id, 'merge_log');
+  const logs = path.join(task.artifactDir!, 'merge_log');
   const originalLog = path.join(logs, `${id}_merge_1.log`);
   const originalContent = fs.readFileSync(originalLog, 'utf8'); assert.match(originalContent, /EIO/i);
   mutableFs.renameSync = realRename;

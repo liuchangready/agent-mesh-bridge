@@ -2,6 +2,8 @@
 
 本指南为在 `D:\agent_bridge` 项目中协作开发的各 AI Agent（Google Antigravity、OpenAI Codex、Anthropic Claude Code、DeepSeek Harness）提供系统设计规范、编码准则与质量基线。
 
+> 2026-11-20 清理边界：审阅执行只允许 dedicated，移除 legacy 设置、缺省回退和 requester 会话探测。无 `reviewFlow` 或值为 legacy 的记录只保留历史读取、归档、删除及停止既有进程，不自动迁移。日志只使用任务目录，不再查找旧全局/按 Agent 日志；Git 执行必须具有真实 `deliveryTarget`，禁止回退旧 integration ref。当前 dedicated 任务的 session、artifactDir、worktree、交付分支及 execution.version 不改写，v1 执行控制不在本次删除范围内。下文旧版兼容条款与本边界冲突时，以本段为准。
+
 ---
 
 ## 1. 项目定位与核心特性

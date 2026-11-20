@@ -58,7 +58,7 @@ export class QueueDrainer {
     }
     const candidates = allTasks
       .filter((thread) => {
-        if (!thread || !thread.threadId || thread.execution || thread.status === 'paused' || thread.status === 'reviewing') {
+        if (!thread || !thread.threadId || thread.reviewFlow !== 'dedicated' || thread.execution || thread.status === 'paused' || thread.status === 'reviewing') {
           return false;
         }
         if (thread.queuePhase === 'merge' || thread.reviewBlocked || isReviewerBootstrapPending(thread)) return false;

@@ -13,7 +13,7 @@ export function renderWorktreeDetails(worktree: WorktreeInfo): string {
     <div class="meta-label" style="margin-top:10px;">Git delivery target</div>
     <div class="meta-val">${target
       ? `Branch: ${escape(target.branch)} (${escape(target.ref)})<br/>Repository: ${escape(target.repositoryPath)}<br/>Checkout folder: ${targetPath ? exists(targetPath) : 'not checked out'}<br/>Target commit: ${escape(worktree.integration?.targetCommit || worktree.integration?.targetOldCommit || target.baseCommit || 'unknown')}<br/>Merge state: ${escape(worktree.integration?.phase || 'ready')}`
-      : `Legacy target ref: ${escape(worktree.targetRef || 'unknown')}<br/>Repository: ${escape(worktree.repositoryPath || worktree.mainPath || 'unknown')}<br/>Checkout folder: unknown (legacy record has no real delivery target)<br/>Merge state: ${escape(worktree.integration?.phase || 'unknown')}`}</div>
+      : `Historical record: delivery target unavailable; Git execution is disabled.`}</div>
     ${worktree.validation ? `<div class="meta-label" style="margin-top:10px;">Combined verification worktree</div><div class="meta-val">Folder: ${exists(worktree.validation.path)}<br/>Verified commit: ${escape(worktree.validation.commit || 'unknown')}<br/>State: ${escape(worktree.validation.status)}${worktree.validation.result ? ` (${escape(worktree.validation.result)})` : ''}</div>` : ''}
     ${worktree.integration?.error ? `<div class="meta-val" style="white-space:pre-wrap;color:#fca5a5;">${escape(worktree.integration.error)}</div>` : ''}
     ${worktree.integration?.conflictFiles?.length ? `<div class="meta-val">Conflicts: ${escape(worktree.integration.conflictFiles.join(', '))}</div>` : ''}

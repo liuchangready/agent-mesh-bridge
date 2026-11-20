@@ -1,3 +1,4 @@
+import { assertDedicatedTask } from './types';
 import * as readline from 'readline';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
@@ -37,8 +38,7 @@ import {
   MAX_RAW_LOG_BYTES,
   findExistingExecutionLog,
   findExistingOutputArchive,
-  getReviewerLogDir,
-  getWorkerLogDir,
+  taskArtifactBase,
   readTextFilePaged,
   resolveExistingArtifactPath,
   roundExecutionLogPath,
@@ -226,13 +226,8 @@ export class MCPServer {
       const operation = round.nativeSessionCompactions?.find((entry) => entry.id === args?.operationId);
       if (!operation) throw new Error(`Native compaction operation not found on round ${roundNumber}.`);
       const root = path.dirname(this.taskStore.getStoragePath());
-      const allowedDir = task.artifactDir
-        ? operation.role === 'reviewer'
-          ? taskReviewerLogDir(task.artifactDir)
-          : taskWorkerLogDir(task.artifactDir)
-        : operation.role === 'reviewer'
-          ? getReviewerLogDir(operation.agent, root)
-          : getWorkerLogDir(operation.agent, root);
+      const dir = taskArtifactBase(threadId, root, task.artifactDir);
+      const allowedDir = operation.role === 'reviewer' ? taskReviewerLogDir(dir) : taskWorkerLogDir(dir);
       const file = path.resolve(operation.logPath);
       if (path.dirname(file) !== path.resolve(allowedDir)) throw new Error('Native compaction log path is outside its agent log directory.');
       const page = readTextFilePaged(file, { offsetBytes, maxBytes });
@@ -422,7 +417,7 @@ export class MCPServer {
           'You may also dispatch to your own agent identity: new tasks run through a DEDICATED reviewer ' +
           'conversation, so the task gets its own reviewer instead of resuming this busy session. Same-agent dispatch ' +
           'requires reviewFlow=dedicated (the bridge default) plus a sender-side reviewer model that differs from the ' +
-          'receiver model (`initiatorModels.<agent>` vs `models.<agent>`); the legacy review flow refuses it. ' +
+          'receiver model (`initiatorModels.<agent>` vs `models.<agent>`). ' +
           'This tool is unavailable while this agent is itself executing a delegated task (receivers must not forward work).',
         inputSchema: {
           type: 'object',
@@ -445,11 +440,6 @@ export class MCPServer {
               type: 'string',
               description:
                 'Detailed instructions, background, and acceptance criteria for the target agent.',
-            },
-            callerSessionId: {
-              type: 'string',
-              description:
-                'Your native session UUID so the bridge can proactively wake you up upon completion. Do NOT pass agent names (e.g. "claude_code"). If omitted, the bridge automatically auto-detects your active session.',
             },
             workspaceRoot: {
               type: 'string',
@@ -1308,6 +1298,7 @@ export class MCPServer {
         (CONTROL_TOOLS.has(name) || name === 'request_rework' || name === 'approve_task')) {
       throw new Error('A failed merge only permits retry_merge or delete_task.');
     }
+    if (controlledTask && (CONTROL_TOOLS.has(name) || name === 'request_rework' || name === 'approve_task' || name === 'retry_merge') && !['pause_task', 'delete_task', 'record_merge_request'].includes(name)) assertDedicatedTask(controlledTask);
     switch (name) {
       case 'list_task_templates': {
         const explicit = !!(args.workspaceId || args.workspaceRoot);
@@ -1353,7 +1344,6 @@ export class MCPServer {
           initiatorAgent,
           title: args.title,
           prompt: args.prompt,
-          callerSessionId: args.callerSessionId,
           workspaceRoot: args.workspaceRoot, workspaceId: args.workspaceId || inheritedWorkspaceId,
           workspaceSource: inheritedWorkspaceId && windowContext?.defaultWorkspaceId === inheritedWorkspaceId ? 'window-default' :
             inheritedWorkspaceId ? resolvedContext?.source || 'explicit' : 'explicit',
@@ -1473,7 +1463,7 @@ export class MCPServer {
         const event = thread?.mergeHistory?.find((entry) => entry.number === Number(args.number));
         if (!thread || !event?.logPath) throw new Error('Merge log not found.');
         const safeId = thread.threadId.replace(/[^A-Za-z0-9_-]/g, '_');
-        const root = thread.artifactDir || path.join(path.dirname(this.taskStore.getStoragePath()), 'merge-logs', safeId);
+        const root = taskArtifactBase(thread.threadId, path.dirname(this.taskStore.getStoragePath()), thread.artifactDir);
         const source = event.phase === 'decision' && event.logNumber
           ? thread.mergeHistory?.find((entry) => entry.number === event.logNumber && entry.logPath === event.logPath)
           : event;

@@ -1,3 +1,4 @@
+import { assertDedicatedTask } from './types';
 import { getTaskExecutionPath, isReviewerWakeEligible, isMergeReview } from './types';
 import * as child_process from 'child_process';
 import * as fs from 'fs';
@@ -210,7 +211,7 @@ export class CallbackManager extends EventEmitter {
     const storageRoot = this.taskStore ? path.dirname(this.taskStore.getStoragePath()) : undefined;
     const roleLock = new TaskRoleLock(storageRoot);
     const reviewerConversationId =
-      thread.reviewFlow === 'dedicated' ? thread.callerSessionId : undefined;
+      thread.reviewerSessionId;
     const roleLease: TaskRoleLease | null = roleLock.tryAcquire(
       thread.threadId,
       'reviewer',
@@ -228,7 +229,7 @@ export class CallbackManager extends EventEmitter {
 
     let reviewerPreparation: Awaited<ReturnType<NativeSessionCompactor['prepareBeforeResume']>> | undefined;
     const nativeLock = new NativeSessionLock(this.taskStore ? path.dirname(this.taskStore.getStoragePath()) : undefined);
-    if (thread.reviewFlow === 'dedicated' && this.taskStore) {
+    if (this.taskStore) {
       try {
         const reviewerModel = thread.reviewerModel || resolveConfiguredModel(thread.initiatorAgent, undefined, 'initiator');
         reviewerPreparation = await new NativeSessionCompactor(this.taskStore, this.detector)
@@ -251,7 +252,7 @@ export class CallbackManager extends EventEmitter {
       return false;
     }
     let reviewerSessionLease = reviewerPreparation?.lease;
-    if (thread.reviewFlow !== 'dedicated' || !this.taskStore) {
+    if (!this.taskStore) {
       reviewerSessionLease = nativeLock.acquire(thread.initiatorAgent, callerSessionId);
       if (!reviewerSessionLease) {
         roleLock.release(roleLease);
@@ -282,7 +283,7 @@ export class CallbackManager extends EventEmitter {
       return false;
     }
 
-    if (thread.reviewFlow === 'dedicated' && this.taskStore) {
+    if (this.taskStore) {
       this.taskStore.loadFromDisk();
       const fresh = this.taskStore.getTask(thread.threadId);
       const owner = roleLock.getOwner(thread.threadId);
@@ -468,7 +469,7 @@ export class CallbackManager extends EventEmitter {
 
     const storageRoot = this.taskStore ? path.dirname(this.taskStore.getStoragePath()) : undefined;
     const roleLock = new TaskRoleLock(storageRoot);
-    const roleLease = roleLock.tryAcquire(thread.threadId, 'reviewer', thread.reviewFlow === 'dedicated' ? callerSessionId : undefined);
+    const roleLease = roleLock.tryAcquire(thread.threadId, 'reviewer', callerSessionId);
     const nativeLock = new NativeSessionLock(storageRoot);
     const sessionLease = roleLease && nativeLock.acquire(thread.initiatorAgent, callerSessionId);
     if (!roleLease || !sessionLease) {
@@ -494,7 +495,7 @@ export class CallbackManager extends EventEmitter {
     if (this.taskStore) {
       this.taskStore.loadFromDisk();
       const fresh = this.taskStore.getTask(thread.threadId);
-      const freshSession = fresh?.reviewFlow === 'dedicated' ? fresh.reviewerSessionId : fresh?.callerSessionId;
+      const freshSession = fresh?.reviewerSessionId;
       if (!fresh || fresh.archivedAt || fresh.status !== 'failed' || fresh.failure?.stage !== 'execution' || freshSession !== callerSessionId ||
           roleLock.getOwner(thread.threadId)?.token !== roleLease.token ||
           new CancellationRegistry(storageRoot).peek(thread.threadId)) {
@@ -563,42 +564,15 @@ export class CallbackManager extends EventEmitter {
    * what makes a proactive wake-up possible at all.
    */
   private resolveCallerSession(thread: DelegationThread): string | undefined {
-    let callerSessionId = thread.callerSessionId;
-    const initiator = thread.initiatorAgent;
-
-    // Dedicated review resumes the bridge-created reviewer conversation. If its
-    // native id was never captured, do NOT guess another session of the same
-    // agent: waking the requester (or an unrelated conversation) would put the
-    // review in the wrong chat and reintroduce the writer conflict.
-    if (thread.reviewFlow === 'dedicated') {
-      const reviewerSessionId = thread.reviewerSessionId;
-      if (
+    if (thread.reviewFlow !== 'dedicated' ||
         thread.reviewBootstrap?.phase !== 'confirmed' ||
         thread.reviewerSessionCaptured !== true ||
-        !reviewerSessionId ||
-        !isValidSessionId(reviewerSessionId) ||
-        callerSessionId !== reviewerSessionId
-      ) {
-        return undefined;
-      }
-      return reviewerSessionId;
-    }
-
-    if ((!callerSessionId || !isValidSessionId(callerSessionId)) && this.detector) {
-      callerSessionId = this.detector.detectActiveSession(initiator, getTaskExecutionPath(thread), [
-        thread.receiverSessionId,
-      ]);
-      if (callerSessionId) {
-        thread.callerSessionId = callerSessionId;
-        console.log(
-          `[CallbackManager] Auto-detected caller session for ${initiator}: ${callerSessionId}`,
-        );
-      }
-    }
-
-    return callerSessionId && isValidSessionId(callerSessionId) ? callerSessionId : undefined;
+        !isValidSessionId(thread.reviewerSessionId) ||
+        thread.callerSessionId !== thread.reviewerSessionId) return undefined;
+    return thread.reviewerSessionId;
   }
 
+  /** Build the report for the captured task reviewer. */
   public buildReviewWakeMessage(thread: DelegationThread, reviewRound: DelegationRound): string {
     const preview = reviewRound.output
       ? reviewRound.output.slice(0, 200).replace(/[\r\n]+/g, ' ')
@@ -634,6 +608,7 @@ export class CallbackManager extends EventEmitter {
     thread: DelegationThread,
     onChildPid?: (pid: number) => void | Promise<void>,
   ): Promise<{ confirmed: boolean; error?: string; transient?: boolean }> {
+    assertDedicatedTask(thread);
     assertCanExecute(thread.initiatorAgent, 'bootstrap as a reviewer', 'initiator');
     const store = this.taskStore;
     const root = this.storageDir || (store ? path.dirname(store.getStoragePath()) : undefined);
@@ -730,6 +705,7 @@ export class CallbackManager extends EventEmitter {
     mergeWakeId?: string,
     roleToken?: string,
   ): boolean | Promise<{ success: boolean; error?: string; exitCode?: number }> {
+    assertDedicatedTask(thread);
     if (typeof callerSessionIdOrRound !== 'string') {
       const round = callerSessionIdOrRound;
       const childPidCb = typeof promptMessageOrOnChildPid === 'function' ? promptMessageOrOnChildPid : undefined;
@@ -754,7 +730,7 @@ export class CallbackManager extends EventEmitter {
 
     const initiator = thread.initiatorAgent;
     const cwd = isMergeReview(thread) && thread.worktree?.mergeResolutionPath || getTaskExecutionPath(thread);
-    const senderModel = thread.reviewFlow === 'dedicated' ? thread.reviewerModel : resolveConfiguredModel(initiator, undefined, 'initiator');
+    const senderModel = thread.reviewerModel;
     const modelFlagArgs = senderModel ? ['--model', senderModel] : [];
     const codexModelArgs = senderModel ? ['-c', `model="${senderModel}"`] : [];
 
@@ -774,7 +750,7 @@ export class CallbackManager extends EventEmitter {
     delete callbackEnv.MESH_REVIEW_BOOTSTRAP;
     delete callbackEnv.MESH_REVIEW_BOOTSTRAP_TOKEN;
     delete callbackEnv.MESH_REVIEW_THREAD_ID;
-    if (thread.reviewFlow === 'dedicated') {
+    {
       callbackEnv.MESH_REVIEW_SESSION_ID = callerSessionId;
       callbackEnv.MESH_REVIEW_THREAD_ID = thread.threadId;
     }
@@ -969,7 +945,7 @@ export class CallbackManager extends EventEmitter {
     // separately from the receiver-side default: the same agent can dispatch a
     // task to itself and execute it with a different model. An empty sender
     // default means "whatever the agent/CLI already uses" (no flag).
-    const senderModel = thread.reviewFlow === 'dedicated' ? thread.reviewerModel : resolveConfiguredModel(initiator, undefined, 'initiator');
+    const senderModel = thread.reviewerModel;
     const modelFlagArgs = senderModel ? ['--model', senderModel] : [];
     // Codex takes the model as a global config override, valid for `exec resume`.
     const codexModelArgs = senderModel ? ['-c', `model="${senderModel}"`] : [];
@@ -1017,7 +993,7 @@ export class CallbackManager extends EventEmitter {
     delete callbackEnv.MESH_REVIEW_BOOTSTRAP;
     delete callbackEnv.MESH_REVIEW_BOOTSTRAP_TOKEN;
     delete callbackEnv.MESH_REVIEW_THREAD_ID;
-    if (thread.reviewFlow === 'dedicated') {
+    {
       // Bind this wake to the reviewer conversation so approve/rework can only
       // come from the conversation that holds the review role.
       callbackEnv.MESH_REVIEW_SESSION_ID = callerSessionId;
@@ -1273,6 +1249,7 @@ export class CallbackManager extends EventEmitter {
           );
           try {
             thread.callerSessionId = canonicalId;
+            thread.reviewerSessionId = canonicalId;
             this.taskStore?.upsertTask(thread);
           } catch (err) {
             console.warn('[CallbackManager] Could not persist the normalised caller session:', err);

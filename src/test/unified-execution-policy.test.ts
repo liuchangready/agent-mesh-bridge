@@ -363,6 +363,11 @@ describe('Unified Execution Policy Tests', () => {
     try {
       const now = new Date().toISOString();
       const legacyThread: DelegationThread = {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + ('thread_legacy_14')),
+    callerSessionId: ('reviewer-' + ('thread_legacy_14')),
         threadId: 'thread_legacy_14',
         title: 'Legacy Task',
         initiatorAgent: 'codex',

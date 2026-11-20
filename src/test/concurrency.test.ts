@@ -1,4 +1,4 @@
-import { testWorkspace } from './workspace-fixture';
+import { testWorkspace, confirmTestReviewer } from './workspace-fixture';
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -48,6 +48,11 @@ function makeTempDir(prefix: string): string {
 function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread {
   const now = new Date().toISOString();
   return {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + ('thread_merge_1')),
+    callerSessionId: ('reviewer-' + ('thread_merge_1')),
     threadId: 'thread_merge_1',
     title: 'Merge gate probe',
     initiatorAgent: 'codex',
@@ -123,6 +128,14 @@ describe('AsyncDispatcher - independent task admission', () => {
   let active: number;
   let maxActive: number;
 
+  const dispatchReady = async (params: any) => {
+    const result = await dispatcher.dispatchTask({ ...params, initiatorAgent: params.targetAgent === 'antigravity' ? 'codex' : 'antigravity' });
+    const task = confirmTestReviewer(taskStore.getTask(result.threadId)!);
+    taskStore.upsertTask(task);
+    void (dispatcher as any).executeBackgroundRound(task, 1, task.rounds[0].prompt, false);
+    return result;
+  };
+
   beforeEach(() => {
     tempDir = trackedTempDir('agent-bridge-dispatch-concurrency-');
     workspace = path.join(tempDir, 'workspace');
@@ -161,16 +174,16 @@ describe('AsyncDispatcher - independent task admission', () => {
 
   test('same-file tasks in one repository run concurrently in isolated worktrees', async () => {
     saveBridgePolicy({ concurrency: { enabled: false } });
-    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'A', prompt: 'edit a', workspaceRoot: workspace });
-    assert.strictEqual(first.status, 'DISPATCHED');
+    const first = await dispatchReady({ targetAgent: 'codex', title: 'A', prompt: 'edit a', workspaceRoot: workspace });
+    assert.strictEqual(first.status, 'REVIEWER_STARTING');
     await waitFor(() => started.length === 1);
 
-    const conflict = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'B same file', prompt: 'edit a too', workspaceRoot: workspace });
-    assert.strictEqual(conflict.status, 'DISPATCHED');
+    const conflict = await dispatchReady({ targetAgent: 'antigravity', title: 'B same file', prompt: 'edit a too', workspaceRoot: workspace });
+    assert.strictEqual(conflict.status, 'REVIEWER_STARTING');
     await waitFor(() => started.length === 2);
 
-    const disjoint = await dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'C disjoint', prompt: 'edit c', workspaceRoot: workspace });
-    assert.strictEqual(disjoint.status, 'DISPATCHED', disjoint.message);
+    const disjoint = await dispatchReady({ targetAgent: 'claude_code', title: 'C disjoint', prompt: 'edit c', workspaceRoot: workspace });
+    assert.strictEqual(disjoint.status, 'REVIEWER_STARTING', disjoint.message);
     await waitFor(() => started.length === 3);
     assert.strictEqual(maxActive, 3, 'the runner promises overlap in wall time, not merely in dispatcher return statuses');
     assert.deepStrictEqual(started.slice().sort(), ['A', 'B same file', 'C disjoint']);
@@ -188,7 +201,7 @@ describe('AsyncDispatcher - independent task admission', () => {
       await held;
       return { exitCode: 0, stdout: 'Streaming chunk 1\nStreaming chunk 2\nTask completed', stderr: '', extractedOutput: 'Task completed successfully', durationMs: 150 };
     };
-    const task = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Streaming', prompt: 'stream output', workspaceRoot: workspace });
+    const task = await dispatchReady({ targetAgent: 'antigravity', title: 'Streaming', prompt: 'stream output', workspaceRoot: workspace });
     try {
       await waitFor(() => chunkSeen);
       await waitFor(() => !!taskStore.getTask(task.threadId)?.rounds[0].output?.includes('Streaming chunk'));
@@ -215,7 +228,7 @@ describe('AsyncDispatcher - independent task admission', () => {
       await held;
       return { exitCode: 0, stdout: rawLogText, stderr: '', extractedOutput: rawLogText, durationMs: 50 };
     };
-    const task = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'High volume log', prompt: 'emit 1500 lines', workspaceRoot: workspace });
+    const task = await dispatchReady({ targetAgent: 'antigravity', title: 'High volume log', prompt: 'emit 1500 lines', workspaceRoot: workspace });
     supervisor.checkPendingTasks();
     try {
       await waitFor(() => logChunkSeen);
@@ -241,8 +254,8 @@ describe('AsyncDispatcher - independent task admission', () => {
     const legacy = { token: 'legacy', pid: process.pid, threadId: 'old-thread', round: 1, acquiredAt: Date.now(), updatedAt: Date.now() };
     fs.writeFileSync(path.join(tempDir, 'execution.lock'), JSON.stringify(legacy));
     saveBridgePolicy({ concurrency: { enabled: false } });
-    const task = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Independent', prompt: 'edit', workspaceRoot: workspace });
-    assert.strictEqual(task.status, 'DISPATCHED');
+    const task = await dispatchReady({ targetAgent: 'codex', title: 'Independent', prompt: 'edit', workspaceRoot: workspace });
+    assert.strictEqual(task.status, 'REVIEWER_STARTING');
     await waitFor(() => started.length === 1);
     assert.strictEqual(taskStore.getTask(task.threadId)?.status, 'running');
     assert.ok(registry.getOwner(task.threadId));
@@ -250,36 +263,36 @@ describe('AsyncDispatcher - independent task admission', () => {
 
   test('enabled limits queue only after observed registrations reach the cap', async () => {
     saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 1, maxConcurrentPerAgent: 2 } });
-    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Limited A', prompt: 'a', workspaceRoot: workspace });
-    assert.strictEqual(first.status, 'DISPATCHED');
+    const first = await dispatchReady({ targetAgent: 'codex', title: 'Limited A', prompt: 'a', workspaceRoot: workspace });
+    assert.strictEqual(first.status, 'REVIEWER_STARTING');
     await waitFor(() => started.length === 1);
-    const second = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Limited B', prompt: 'b', workspaceRoot: workspace });
-    assert.strictEqual(second.status, 'QUEUED');
-    assert.match(second.message, /limit reached/i);
+    const second = await dispatchReady({ targetAgent: 'antigravity', title: 'Limited B', prompt: 'b', workspaceRoot: workspace });
+    assert.strictEqual(taskStore.getTask(second.threadId)!.status, 'queued');
+    assert.match(taskStore.getTask(second.threadId)!.summary.lastOutputSnippet, /limit reached/i);
   });
 
   test('merge process registrations do not consume a configured agent slot', async () => {
     saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 1, maxConcurrentPerAgent: 1 } });
     const registration = registry.begin('independent_merge', 1, 'merge-git', workspace);
     try {
-      const dispatched = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Agent during merge', prompt: 'work', workspaceRoot: workspace });
-      assert.strictEqual(dispatched.status, 'DISPATCHED', dispatched.message);
+      const dispatched = await dispatchReady({ targetAgent: 'codex', title: 'Agent during merge', prompt: 'work', workspaceRoot: workspace });
+      assert.strictEqual(dispatched.status, 'REVIEWER_STARTING', dispatched.message);
       await waitFor(() => started.includes('Agent during merge'));
     } finally { registry.end(registration); }
   });
 
   test('a per-agent cap skips only that agent and still starts a different agent candidate', async () => {
     saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 3, maxConcurrentPerAgent: 1 } });
-    const first = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Codex active', prompt: 'a', workspaceRoot: workspace });
-    assert.strictEqual(first.status, 'DISPATCHED');
+    const first = await dispatchReady({ targetAgent: 'codex', title: 'Codex active', prompt: 'a', workspaceRoot: workspace });
+    assert.strictEqual(first.status, 'REVIEWER_STARTING');
     await waitFor(() => started.length === 1);
 
-    const sameAgent = await dispatcher.dispatchTask({ targetAgent: 'codex', title: 'Codex queued', prompt: 'b', workspaceRoot: workspace });
-    assert.strictEqual(sameAgent.status, 'QUEUED');
-    assert.match(sameAgent.message, /agent codex/i);
+    const sameAgent = await dispatchReady({ targetAgent: 'codex', title: 'Codex queued', prompt: 'b', workspaceRoot: workspace });
+    assert.strictEqual(taskStore.getTask(sameAgent.threadId)!.status, 'queued');
+    assert.match(taskStore.getTask(sameAgent.threadId)!.summary.lastOutputSnippet, /agent codex/i);
 
-    const otherAgent = await dispatcher.dispatchTask({ targetAgent: 'antigravity', title: 'Other agent', prompt: 'c', workspaceRoot: workspace });
-    assert.strictEqual(otherAgent.status, 'DISPATCHED', otherAgent.message);
+    const otherAgent = await dispatchReady({ targetAgent: 'antigravity', title: 'Other agent', prompt: 'c', workspaceRoot: workspace });
+    assert.strictEqual(otherAgent.status, 'REVIEWER_STARTING', otherAgent.message);
     await waitFor(() => started.length === 2);
     assert.deepStrictEqual(started.slice().sort(), ['Codex active', 'Other agent']);
     assert.strictEqual(maxActive, 2);

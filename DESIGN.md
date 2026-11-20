@@ -1,5 +1,7 @@
 # 🌉 多 Agent 协同桥接 VSCode 插件设计与架构规范 (Agent Mesh Bridge)
 
+> 2026-11-20：新任务强制 dedicated，移除 legacy 审阅回退及设置；旧 requester-review 任务禁止继续执行。日志仅按任务目录读写，不兼容旧全局或按 Agent 日志目录；旧 Git `targetRef` 不再作为缺失 `deliveryTarget` 时的执行后备。保留账本历史、摘要和安全删除保护，不迁移既有会话、任务目录或真实交付分支。当前 dedicated/v1 任务仍可执行，锁与队列 v2 的停机切换不属于本次清理。下文旧兼容描述以此边界为准。
+
 > 测试分层、覆盖边界及四并发性能验收见 [测试分层与性能验收设计](docs/TEST_LAYERING_DESIGN.md)。完整测试集实测有稳定收益后才尝试合入。
 
 > 文件夹级 Bridge Workspace 的实现状态和上线条件见 [WORKSPACE_DESIGN.md](docs/WORKSPACE_DESIGN.md)。上线前必须处理所有未终态旧任务；新模型不兼容或迁移旧账本，代码任务继续要求有 HEAD 的 Git 仓库及隔离 worktree。

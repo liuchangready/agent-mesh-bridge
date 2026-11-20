@@ -1,3 +1,4 @@
+import { assertDedicatedTask } from './types';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -222,6 +223,7 @@ export class ExecutionController {
     this.taskStore.ensureUpToDate();
     let thread = this.taskStore.getTask(threadId);
     if (!thread) return { started: false, reason: 'not_found' };
+    if (thread.reviewFlow !== 'dedicated') return { started: false, reason: 'LEGACY_REVIEW_FLOW_DISABLED' };
 
     const allowStates = options?.allowStates;
     const isAllowed = (s: ThreadStatus) => allowStates?.includes(s);
@@ -1227,6 +1229,7 @@ export class ExecutionController {
   ): Promise<TaskDecisionRecord> {
     this.taskStore.ensureUpToDate();
     const thread = this.taskStore.getTask(threadId);
+    if (thread) assertDedicatedTask(thread);
     if (!thread) throw new Error(`Task thread not found: ${threadId}`);
 
     const decisionId = crypto.randomUUID();
@@ -1334,6 +1337,7 @@ export class ExecutionController {
   ): Promise<DelegationThread> {
     this.taskStore.ensureUpToDate();
     const thread = this.taskStore.getTask(threadId);
+    if (thread) assertDedicatedTask(thread);
     if (!thread) throw new Error(`Task thread not found: ${threadId}`);
     if (thread.status !== 'wait_decision' || !thread.decision || thread.decision.id !== decisionId) {
       throw new Error(`Task ${threadId} has no pending decision matching ID ${decisionId}`);
@@ -1412,6 +1416,7 @@ export class ExecutionController {
   public async retryOperation(threadId: string, by = 'user'): Promise<DelegationThread> {
     this.taskStore.ensureUpToDate();
     const thread = this.taskStore.getTask(threadId);
+    if (thread) assertDedicatedTask(thread);
     if (!thread) throw new Error(`Task thread not found: ${threadId}`);
 
     if (thread.execution?.run?.state === 'stopping' || thread.interruption?.reason === 'PROCESS_STOP_UNCONFIRMED') {
@@ -1448,6 +1453,7 @@ export class ExecutionController {
   public async resumeOperation(threadId: string, by = 'user'): Promise<DelegationThread> {
     this.taskStore.ensureUpToDate();
     const thread = this.taskStore.getTask(threadId);
+    if (thread) assertDedicatedTask(thread);
     if (!thread) throw new Error(`Task thread not found: ${threadId}`);
 
     if (thread.execution?.run?.state === 'stopping' || thread.interruption?.reason === 'PROCESS_STOP_UNCONFIRMED') {
@@ -1575,6 +1581,7 @@ export class ExecutionController {
     const tasks = this.taskStore.getAllTasks();
 
     for (const thread of tasks) {
+      if (thread.reviewFlow !== 'dedicated') continue;
       if (!thread.execution) continue; // Only manage unified execution tasks!
       const status = thread.status;
       const threadId = thread.threadId;

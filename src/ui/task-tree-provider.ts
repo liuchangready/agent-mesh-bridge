@@ -189,7 +189,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
     item.id = thread.threadId;
     item.description = description;
     item.iconPath = new vscode.ThemeIcon(iconName);
-    item.contextValue =
+    item.contextValue = thread.reviewFlow !== 'dedicated' ? 'historical_task' :
       thread.status === 'failed' && thread.failure?.stage === 'merge'
         ? 'failed_merge'
         : thread.status === 'wait_decision'

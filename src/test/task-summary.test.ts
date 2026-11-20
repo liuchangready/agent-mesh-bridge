@@ -203,14 +203,17 @@ test('TaskStore.archiveTask strips rounds, logs and persists the digest', () => 
   const dir = makeTempDir('bridge-archive-store-');
   const store = new TaskStore(dir);
   const thread = makeThread({ status: 'completed' });
+  thread.artifactDir = path.join(dir, 'tasks', thread.threadId);
   store.upsertTask(thread);
   assert.ok(store.getTask(thread.threadId)?.finalSummary);
 
-  const logsDir = path.join(dir, 'logs');
+  const logsDir = path.join(dir, 'tasks', 'thread_summary_1', 'worker_log');
   fs.mkdirSync(logsDir, { recursive: true });
   const logFile = path.join(logsDir, `${thread.threadId}_round_1.log`);
   fs.writeFileSync(logFile, 'raw stdio');
-  const reviewerLog = path.join(logsDir, `${thread.threadId}_round_1.reviewer.log`);
+  const reviewerDir = path.join(thread.artifactDir!, 'reviewer_log');
+  fs.mkdirSync(reviewerDir, { recursive: true });
+  const reviewerLog = path.join(reviewerDir, `${thread.threadId}_round_1.reviewer.log`);
   fs.writeFileSync(reviewerLog, 'reviewer stdio');
 
   const archived = store.archiveTask(thread.threadId);
@@ -233,6 +236,7 @@ test('TaskStore does not archive while a native session write lease is active', 
   const store = new TaskStore(dir);
   const sessionId = '01a1acc2-877d-71e3-9bf1-5e668c1f2183';
   const thread = makeThread({ status: 'completed', receiverSessionId: sessionId, receiverSessionCaptured: true });
+  thread.artifactDir = path.join(dir, 'tasks', thread.threadId);
   store.upsertTask(thread);
   const lock = new NativeSessionLock(dir);
   const lease = lock.acquire(thread.targetAgent, sessionId)!;
@@ -251,6 +255,7 @@ test('TaskArchiveService archives terminal tasks beyond the retention window', (
     store.upsertTask(
       makeThread({
         threadId: `thread_service_${i}`,
+        artifactDir: path.join(dir, 'tasks', `thread_service_${i}`),
         createdAt: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
         status: 'completed',
       }),
@@ -271,12 +276,12 @@ test('TaskArchiveService archives terminal tasks beyond the retention window', (
 
 test('removeTaskArtifacts removes only that task bridge files', () => {
   const dir = makeTempDir('bridge-archive-artifacts-');
-  const logsDir = path.join(dir, 'logs');
+  const logsDir = path.join(dir, 'tasks', 'thread_a', 'worker_log');
   fs.mkdirSync(logsDir, { recursive: true });
   fs.writeFileSync(path.join(logsDir, 'thread_a_round_1.log'), 'a');
   fs.writeFileSync(path.join(logsDir, 'thread_a_round_1.output.md'), 'a');
   fs.writeFileSync(path.join(logsDir, 'thread_b_round_1.log'), 'b');
-  const removed = removeTaskArtifacts('thread_a', dir);
+  const removed = removeTaskArtifacts('thread_a', dir, { artifactDir: path.dirname(logsDir) });
   assert.strictEqual(removed, 2);
   assert.strictEqual(fs.existsSync(path.join(logsDir, 'thread_b_round_1.log')), true);
   fs.rmSync(dir, { recursive: true, force: true });

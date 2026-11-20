@@ -1,3 +1,6 @@
+import { taskArtifactBase } from './round-log';
+import { requireDeliveryTarget } from './types';
+import { assertDedicatedTask } from './types';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -206,7 +209,9 @@ export class MergeCoordinator {
     externalLease?: () => void,
   ): Promise<MergeResult | (MergeResult & { retryTarget: true })> {
     let thread = this.store.getTask(threadId);
+    if (thread) assertDedicatedTask(thread);
     if (!thread?.worktree?.targetRef || !thread.worktree.approvedCommit) throw new Error(`Task ${threadId} has no approved isolated worktree commit.`);
+    requireDeliveryTarget(thread.worktree);
     if (isMergeReview(thread)) {
       thread = structuredClone(thread);
       thread.status = 'queued'; thread.queuePhase = 'merge';
@@ -214,8 +219,8 @@ export class MergeCoordinator {
     }
     if (!(thread.status === 'queued' && thread.queuePhase === 'merge') && thread.status !== 'merging') throw new Error(`Task ${threadId} is not waiting to merge.`);
     const worktree = thread.worktree!;
-    const repoPath = worktree.deliveryTarget?.repositoryPath || worktree.repositoryPath || worktree.mainPath;
-    const targetRef = worktree.deliveryTarget?.ref || worktree.targetRef!;
+    const repoPath = requireDeliveryTarget(worktree).repositoryPath;
+    const targetRef = requireDeliveryTarget(worktree).ref;
     const sourceCommit = worktree.approvedCommit!;
     const interruptionCount = thread.interruptions?.length || 0;
     const stillCurrent = () => this.isMergeStillAllowed(threadId, sourceCommit) &&
@@ -246,7 +251,7 @@ export class MergeCoordinator {
         const latest = structuredClone(this.store.getTask(threadId)!);
         const number = (latest.mergeHistory?.length || 0) + 1;
         const safeId = threadId.replace(/[^A-Za-z0-9_-]/g, '_');
-        const dir = path.join(latest.artifactDir || path.join(this.storageDir, 'merge-logs', safeId), 'merge_log');
+        const dir = path.join(taskArtifactBase(latest.threadId, this.storageDir, latest.artifactDir), 'merge_log');
         const { logPath, logFileNumber } = createMergeLog(dir, safeId, number, `Merge attempt ${number} for ${threadId}\n`);
         const id = crypto.randomUUID();
         this.attemptLogs.set(threadId, { id, number, path: logPath, candidateTree: worktree.approvedSnapshot?.tree });
@@ -1061,8 +1066,8 @@ export class MergeCoordinator {
     const thread = structuredClone(current); const worktree = thread.worktree!; const at = new Date().toISOString();
     let landedTarget: string | undefined;
     try {
-      const repo = worktree.deliveryTarget?.repositoryPath || worktree.repositoryPath || worktree.mainPath;
-      const ref = worktree.deliveryTarget?.ref || worktree.targetRef!;
+      const repo = requireDeliveryTarget(worktree).repositoryPath;
+      const ref = requireDeliveryTarget(worktree).ref;
       const target = gitOutput(repo, ['rev-parse', '--verify', `${ref}^{commit}`]);
       if (target !== tx.candidateCommit) gitOutput(repo, ['merge-base', '--is-ancestor', tx.candidateCommit, target]);
       landedTarget = target;
@@ -1090,7 +1095,7 @@ export class MergeCoordinator {
       const budget = noteMergeFailure(thread, 'blocked', code, reason);
       thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number: (thread.mergeHistory?.length || 0) + 1,
         at: new Date().toISOString(), phase: 'blocked', result: 'failed', error: reason.slice(-5000), errorCode: code,
-        targetRef: thread.worktree!.deliveryTarget?.ref || thread.worktree!.targetRef, targetOldCommit, candidateCommit: sourceCommit,
+        targetRef: requireDeliveryTarget(thread.worktree!).ref, targetOldCommit, candidateCommit: sourceCommit,
         candidateTree: this.attemptLogs.get(threadId)?.candidateTree, attemptId: this.attemptLogs.get(threadId)?.id, ...budget }];
     }
     thread.summary.lastOutputSnippet = reason; thread.updatedAt = new Date().toISOString(); this.store.upsertTask(thread);
@@ -1207,7 +1212,7 @@ export class MergeCoordinator {
     {
       const number = (thread.mergeHistory?.length || 0) + 1;
       const safeId = threadId.replace(/[^A-Za-z0-9_-]/g, '_');
-      const dir = path.join(thread.artifactDir || path.join(this.storageDir, 'merge-logs', safeId), 'merge_log');
+      const dir = path.join(taskArtifactBase(thread.threadId, this.storageDir, thread.artifactDir), 'merge_log');
       let logPath: string | undefined; let logFileNumber: number | undefined;
       try {
         ({ logPath, logFileNumber } = createMergeLog(dir, safeId, number, `${phase}: ${error}\n`));
@@ -1215,7 +1220,7 @@ export class MergeCoordinator {
       const code = phase === 'validation_failed' ? (error.match(/exit\s+(-?\d+)/i)?.[1] || 'VALIDATION_FAILED') : 'CONFLICT';
       const budget = noteMergeFailure(thread, phase, code, error, conflictFiles);
       thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number, at, phase, result: 'failed', ...budget, attemptId: this.attemptLogs.get(threadId)?.id,
-        error: error.slice(-5000), errorCode: phase === 'conflict' ? 'CONFLICT' : 'VALIDATION_FAILED', logPath, logFileNumber, exitCode: phase === 'conflict' ? 1 : Number(error.match(/exit\s+(-?\d+)/i)?.[1] || -1), targetRef: worktree.deliveryTarget?.ref || worktree.targetRef,
+        error: error.slice(-5000), errorCode: phase === 'conflict' ? 'CONFLICT' : 'VALIDATION_FAILED', logPath, logFileNumber, exitCode: phase === 'conflict' ? 1 : Number(error.match(/exit\s+(-?\d+)/i)?.[1] || -1), targetRef: requireDeliveryTarget(worktree).ref,
         targetOldCommit, candidateCommit: sourceCommit, candidateTree: this.attemptLogs.get(threadId)?.candidateTree || worktree.approvedSnapshot?.tree, conflictFiles }];
     }
     worktree.integration = { phase, error: error.slice(-5000), targetOldCommit, sourceCommit, conflictFiles, updatedAt: at };
@@ -1237,13 +1242,13 @@ export class MergeCoordinator {
     const stashRestore = tx?.stashToken ? { status: tx.stashCleanupUncertain ? 'stash_cleanup_uncertain' : tx.stashRetained && tx.phase === 'stash_restored' ? 'stash_restored_retained' : tx.phase, sha: tx.stashSha, error: tx.stashRestoreError } : undefined;
     if (thread.mergeControl) thread.mergeControl = { ...thread.mergeControl, revision: thread.mergeControl.revision + 1, failureFingerprint: undefined, consecutiveRetries: 0 };
     if (this.attemptLogs.has(threadId) && targetOldCommit && !(thread.mergeHistory || []).some((entry) => entry.mergedCommit === mergedCommit)) {
-      const repo = worktree.deliveryTarget?.repositoryPath || worktree.repositoryPath || worktree.mainPath;
+      const repo = requireDeliveryTarget(worktree).repositoryPath;
       const changedFiles = (this.isMergeStillAllowed(threadId, worktree.approvedCommit || '')
         ? await this.loggedGit(threadId, repo, ['diff', '--name-status', `${targetOldCommit}..${mergedCommit}`])
         : gitOutput(repo, ['diff', '--name-status', `${targetOldCommit}..${mergedCommit}`])).split(/\r?\n/).filter(Boolean);
       const number = (thread.mergeHistory?.length || 0) + 1;
       thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number, at: new Date().toISOString(),
-        phase: 'merged', result: 'merged', targetRef: worktree.deliveryTarget?.ref || worktree.targetRef, targetOldCommit,
+        phase: 'merged', result: 'merged', targetRef: requireDeliveryTarget(worktree).ref, targetOldCommit,
         targetCommit: commit, sourceCommit: worktree.approvedSnapshot?.sourceCommit, candidateCommit: worktree.approvedCommit, candidateTree: this.attemptLogs.get(threadId)?.candidateTree || worktree.approvedSnapshot?.tree, mergedCommit, changedFiles, exitCode: 0, attemptId: this.attemptLogs.get(threadId)?.id }];
     }
     if (stashRestore && !(thread.mergeHistory || []).some((entry) => entry.phase === 'stash_restore' && entry.attemptId === this.attemptLogs.get(threadId)?.id)) {
@@ -1260,10 +1265,10 @@ export class MergeCoordinator {
   public async hasLandedCandidate(threadId: string): Promise<boolean> {
     const tx = this.readTransaction(this.transactionPath(threadId));
     const thread = this.store.getTask(threadId);
-    if (!tx?.candidateCommit || !thread?.worktree?.targetRef || !thread.worktree.repositoryPath) return false;
+    if (!tx?.candidateCommit || !thread?.worktree?.deliveryTarget) return false;
     try {
       const run = (args: string[]) => Promise.resolve(gitOutput(thread.worktree!.repositoryPath!, args));
-      const head = await run(['rev-parse', '--verify', `${thread.worktree.targetRef}^{commit}`]);
+      const head = await run(['rev-parse', '--verify', `${thread.worktree.deliveryTarget.ref}^{commit}`]);
       if (head === tx.candidateCommit) return true;
       try { await run(['merge-base', '--is-ancestor', tx.candidateCommit, head]); return true; } catch { return false; }
     } catch { return false; }

@@ -387,10 +387,8 @@ export function activate(context: vscode.ExtensionContext) {
       nativeSessionCompaction: {
         mode: bridgeCfg.get<'off' | 'auto'>('nativeSessionCompaction.mode', 'off'),
       },
-      // New tasks get a dedicated reviewer conversation. `legacy` keeps the old
-      // caller-resume flow and is the rollback switch; existing tasks stay on
-      // whatever topology they were created with.
-      reviewFlow: bridgeCfg.get<'dedicated' | 'legacy'>('reviewFlow', 'dedicated'),
+      // Stale user settings cannot restore requester-session review.
+      reviewFlow: 'dedicated',
       // Unified task data directories for NEW tasks (worktree + logs + Archive).
       // Old tasks keep their recorded artifactDir/worktree path.
       taskDataRoot: bridgeCfg.get<string>('taskDataRoot', ''),
@@ -1432,7 +1430,11 @@ export function activate(context: vscode.ExtensionContext) {
           return;
         }
 
-        if (thread.reviewFlow === 'dedicated') {
+        if (thread.reviewFlow !== 'dedicated') {
+          vscode.window.showErrorMessage('Historical requester-review tasks cannot be resumed.');
+          return;
+        }
+        {
           const reviewerSessionId = thread.reviewerSessionId;
           if (
             thread.reviewBootstrap?.phase !== 'confirmed' ||
@@ -1498,24 +1500,6 @@ export function activate(context: vscode.ExtensionContext) {
         if (!lastRound) {
           vscode.window.showErrorMessage(`任务无有效轮次: ${threadId}`);
           return;
-        }
-
-        // Legacy tasks may recover a missing caller session from detection or user input.
-        // Dedicated reviewer sessions are validated above and never replaced here.
-        if (!thread.callerSessionId) {
-          const detected = detector.detectActiveSession(
-            thread.initiatorAgent,
-            getTaskExecutionPath(thread),
-            [thread.receiverSessionId],
-          );
-          const input = await vscode.window.showInputBox({
-            prompt: `请输入下发者 [${thread.initiatorAgent}] 的会话 ID:`,
-            value: detected || '',
-            placeHolder: '例如 UUID 会话 ID',
-          });
-          if (!input) return;
-          thread.callerSessionId = input.trim();
-          taskStore.upsertTask(thread);
         }
 
         const success = await callbackManager.notifyCaller(thread, lastRound);

@@ -1387,6 +1387,11 @@ describe('AutonomousRunner Tests', () => {
 
     try {
       store.upsertTask({
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + ('thread_store_1')),
+    callerSessionId: ('reviewer-' + ('thread_store_1')),
         threadId: 'thread_store_1',
         title: 'store-driven cancellation',
         initiatorAgent: 'codex',

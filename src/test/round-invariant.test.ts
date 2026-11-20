@@ -44,6 +44,11 @@ function makeRound(
 
 function makeThread(rounds: DelegationRound[], currentRound: number): DelegationThread {
   return {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + ('thread_test_0001')),
+    callerSessionId: ('reviewer-' + ('thread_test_0001')),
     threadId: 'thread_test_0001',
     title: 'Round invariant probe',
     initiatorAgent: 'codex',

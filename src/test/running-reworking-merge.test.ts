@@ -81,6 +81,10 @@ describe('Running and Reworking Status Merge Tests', () => {
     const threadsDir = path.join(tmpDir, 'threads');
     fs.mkdirSync(threadsDir, { recursive: true });
     const legacyThreadJson = {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: 'caller-session-legacy-5678',
       threadId,
       title: 'Legacy Reworking Task',
       initiatorAgent: 'codex',
@@ -170,6 +174,11 @@ describe('Running and Reworking Status Merge Tests', () => {
 
   test('statusFilter compatibility alias: "reworking" filters tasks in running status with active rework round', () => {
     const threadInitial: DelegationThread = {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + ('thread_initial_run')),
+    callerSessionId: ('reviewer-' + ('thread_initial_run')),
       threadId: 'thread_initial_run',
       title: 'Initial Running Task',
       initiatorAgent: 'codex',
@@ -194,6 +203,11 @@ describe('Running and Reworking Status Merge Tests', () => {
     };
 
     const threadRework: DelegationThread = {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + ('thread_rework_run')),
+    callerSessionId: ('reviewer-' + ('thread_rework_run')),
       threadId: 'thread_rework_run',
       title: 'Rework Running Task',
       initiatorAgent: 'codex',
@@ -247,6 +261,11 @@ describe('Running and Reworking Status Merge Tests', () => {
   test('rework creation and retry/resume lifecycle writes status "running"', async () => {
     const threadId = 'thread_lifecycle_test';
     const initialThread: DelegationThread = {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + (threadId)),
+    callerSessionId: ('reviewer-' + (threadId)),
       threadId,
       title: 'Lifecycle Task',
       initiatorAgent: 'codex',
@@ -327,6 +346,11 @@ describe('Running and Reworking Status Merge Tests', () => {
 
   test('UI task tree status formatter: differentiates Running vs Reworking based on active round type', () => {
     const threadInitial: DelegationThread = {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + ('tree_init')),
+    callerSessionId: ('reviewer-' + ('tree_init')),
       threadId: 'tree_init',
       title: 'Initial Task',
       initiatorAgent: 'codex',
@@ -351,6 +375,11 @@ describe('Running and Reworking Status Merge Tests', () => {
     };
 
     const threadRework: DelegationThread = {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + ('tree_rework')),
+    callerSessionId: ('reviewer-' + ('tree_rework')),
       threadId: 'tree_rework',
       title: 'Rework Task',
       initiatorAgent: 'codex',
@@ -405,6 +434,10 @@ describe('Running and Reworking Status Merge Tests', () => {
     const threadId = 'thread_compactor_test';
 
     const thread: DelegationThread = {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    callerSessionId: 'reviewer-sess-1',
       threadId,
       title: 'Compactor Thread',
       initiatorAgent: 'codex',

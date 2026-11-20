@@ -1,3 +1,4 @@
+import { assertDedicatedTask } from './types';
 import * as child_process from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -806,6 +807,10 @@ export class AutonomousRunner {
     const baseBackoffMs = options.retryBackoffMs ?? 2000;
     const authBackoffMs = options.authBackoffMs ?? 5000;
     const taskThreadId = options.taskThreadId;
+    if (taskThreadId && this.taskStore) {
+      const task = this.taskStore.getTask(taskThreadId);
+      if (task) assertDedicatedTask(task);
+    }
     const nativeRole = options.nativeSessionRole || 'developer';
     const initialTaskExisted =
       taskThreadId && this.taskStore ? Boolean(this.taskStore.getTask(taskThreadId)) : false;

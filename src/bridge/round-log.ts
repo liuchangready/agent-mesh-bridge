@@ -34,8 +34,7 @@ export const MODEL_OVERLAY_DIRNAME = 'model-overlays';
  *
  * A new task records the absolute base in `thread.artifactDir`; every later
  * write goes through that recorded value instead of re-reading the (mutable)
- * global `taskDataRoot` policy. Legacy tasks have no such base and keep using
- * the per-agent log directories below.
+ * global `taskDataRoot` policy. No agent-wide or historical log directories are scanned.
  */
 export function taskWorkerLogDir(artifactDir: string): string {
   return path.join(artifactDir, WORKER_LOG_DIRNAME);
@@ -66,77 +65,6 @@ export function taskModelOverlayDir(artifactDir: string): string {
   return path.join(artifactDir, MODEL_OVERLAY_DIRNAME);
 }
 
-function readPolicySnapshot(root?: string): any {
-  try {
-    const file = path.join(bridgeHomeDir(root), 'bridge-policy.json');
-    if (fs.existsSync(file)) {
-      return JSON.parse(fs.readFileSync(file, 'utf8'));
-    }
-  } catch {}
-  return {};
-}
-
-/**
- * Resolve the base log directory for an agent (or default mesh log directory).
- *
- * Checks in order:
- *  1. agent-specific directory in bridge-policy.json (e.g. logDirectories.codex);
- *  2. default directory in bridge-policy.json (logDirectories.default);
- *  3. ~/.agent-mesh-bridge/logs (or <root>/logs).
- */
-export function resolveAgentLogBaseDir(
-  agent?: string,
-  root?: string,
-  overridePolicy?: any,
-): string {
-  const policy = overridePolicy || readPolicySnapshot(root);
-  const normalizedAgent = agent ? String(agent).replace(/-/g, '_') : undefined;
-  if (
-    normalizedAgent &&
-    policy?.logDirectories &&
-    typeof policy.logDirectories[normalizedAgent] === 'string'
-  ) {
-    const custom = policy.logDirectories[normalizedAgent].trim();
-    if (custom) return custom;
-  }
-  if (policy?.logDirectories && typeof policy.logDirectories.default === 'string') {
-    const customDefault = policy.logDirectories.default.trim();
-    if (customDefault) return customDefault;
-  }
-  return bridgeLogsDir(root);
-}
-
-/** Ensure the three subdirectories (worker_log, reviewer_log, Archive) exist. */
-export function ensureAgentLogDirs(agent?: string, root?: string): {
-  baseDir: string;
-  workerLogDir: string;
-  reviewerLogDir: string;
-  archiveDir: string;
-} {
-  const baseDir = resolveAgentLogBaseDir(agent, root);
-  const workerLogDir = path.join(baseDir, WORKER_LOG_DIRNAME);
-  const reviewerLogDir = path.join(baseDir, REVIEWER_LOG_DIRNAME);
-  const archiveDir = path.join(baseDir, ARCHIVE_DIRNAME);
-  try {
-    fs.mkdirSync(workerLogDir, { recursive: true });
-    fs.mkdirSync(reviewerLogDir, { recursive: true });
-    fs.mkdirSync(archiveDir, { recursive: true });
-  } catch {}
-  return { baseDir, workerLogDir, reviewerLogDir, archiveDir };
-}
-
-export function getWorkerLogDir(agent?: string, root?: string): string {
-  return ensureAgentLogDirs(agent, root).workerLogDir;
-}
-
-export function getReviewerLogDir(agent?: string, root?: string): string {
-  return ensureAgentLogDirs(agent, root).reviewerLogDir;
-}
-
-export function getArchiveLogDir(agent?: string, root?: string): string {
-  return ensureAgentLogDirs(agent, root).archiveDir;
-}
-
 /** Default page size for `get_round_raw_log` (never dump a 1.6MB log at once). */
 export const DEFAULT_RAW_LOG_BYTES = 20_000;
 /** Absolute ceiling for one `get_round_raw_log` call. */
@@ -145,10 +73,6 @@ export const MAX_RAW_LOG_BYTES = 200_000;
 /** `~/.agent-mesh-bridge`, or an explicit root (tests, custom storage dirs). */
 export function bridgeHomeDir(root?: string): string {
   return root && root.trim() ? root : path.join(os.homedir(), BRIDGE_HOME_DIRNAME);
-}
-
-export function bridgeLogsDir(root?: string): string {
-  return path.join(bridgeHomeDir(root), 'logs');
 }
 
 /**
@@ -160,6 +84,11 @@ export function safeThreadIdPart(threadId: string): string {
     .replace(/[^A-Za-z0-9._-]/g, '_')
     .replace(/\.{2,}/g, '_')
     .slice(0, 120);
+}
+
+/** Default layout for direct callers; recorded task roots always take precedence. */
+export function taskArtifactBase(threadId: string, root?: string, artifactDir?: string): string {
+  return artifactDir || path.join(bridgeHomeDir(root), 'tasks', safeThreadIdPart(threadId));
 }
 
 function artifactBase(threadId: string, round: number): string {
@@ -174,7 +103,7 @@ export function roundExecutionLogPath(
   agent?: string,
   artifactDir?: string,
 ): string {
-  const dir = artifactDir ? taskWorkerLogDir(artifactDir) : getWorkerLogDir(agent, root);
+  const dir = taskWorkerLogDir(taskArtifactBase(threadId, root, artifactDir));
   return path.join(dir, `${artifactBase(threadId, round)}.log`);
 }
 
@@ -185,7 +114,7 @@ export function roundOutputArchivePath(
   agent?: string,
   artifactDir?: string,
 ): string {
-  const dir = artifactDir ? taskWorkerLogDir(artifactDir) : getWorkerLogDir(agent, root);
+  const dir = taskWorkerLogDir(taskArtifactBase(threadId, root, artifactDir));
   return path.join(dir, `${artifactBase(threadId, round)}${ROUND_OUTPUT_ARCHIVE_SUFFIX}`);
 }
 
@@ -194,24 +123,7 @@ export function findExistingExecutionLog(
   round: number,
   options: { root?: string; agent?: string; artifactDir?: string } = {},
 ): string | undefined {
-  if (options.artifactDir) {
-    // A unified task directory is self-contained: one lifecycle file, one path.
-    return resolveExistingArtifactPath([
-      roundExecutionLogPath(threadId, round, undefined, undefined, options.artifactDir),
-    ]);
-  }
-  const candidates: Array<string | undefined> = [
-    roundExecutionLogPath(threadId, round, options.root, options.agent),
-    roundExecutionLogPath(threadId, round, options.root),
-    // Rounds written before a log directory was configured live here.
-    path.join(
-      bridgeLogsDir(options.root),
-      WORKER_LOG_DIRNAME,
-      `${artifactBase(threadId, round)}.log`,
-    ),
-    path.join(bridgeLogsDir(options.root), `${artifactBase(threadId, round)}.log`),
-  ];
-  return resolveExistingArtifactPath(candidates);
+  return resolveExistingArtifactPath([roundExecutionLogPath(threadId, round, options.root, undefined, options.artifactDir)]);
 }
 
 export function findExistingOutputArchive(
@@ -219,26 +131,7 @@ export function findExistingOutputArchive(
   round: number,
   options: { root?: string; agent?: string; artifactDir?: string } = {},
 ): string | undefined {
-  if (options.artifactDir) {
-    return resolveExistingArtifactPath([
-      roundOutputArchivePath(threadId, round, undefined, undefined, options.artifactDir),
-    ]);
-  }
-  const candidates: Array<string | undefined> = [
-    roundOutputArchivePath(threadId, round, options.root, options.agent),
-    roundOutputArchivePath(threadId, round, options.root),
-    // Rounds written before a log directory was configured live here.
-    path.join(
-      bridgeLogsDir(options.root),
-      WORKER_LOG_DIRNAME,
-      `${artifactBase(threadId, round)}${ROUND_OUTPUT_ARCHIVE_SUFFIX}`,
-    ),
-    path.join(
-      bridgeLogsDir(options.root),
-      `${artifactBase(threadId, round)}${ROUND_OUTPUT_ARCHIVE_SUFFIX}`,
-    ),
-  ];
-  return resolveExistingArtifactPath(candidates);
+  return resolveExistingArtifactPath([roundOutputArchivePath(threadId, round, options.root, undefined, options.artifactDir)]);
 }
 
 export interface RoundArtifact {
@@ -250,25 +143,14 @@ export interface RoundArtifact {
   mtimeMs: number;
 }
 
-/** Every artifact recorded under worker_log/ or legacy logs/ for one task, ordered by round. */
+/** Artifacts in one task worker_log directory, ordered by round. */
 export function listRoundArtifacts(
   threadId: string,
   root?: string,
   agent?: string,
   artifactDir?: string,
 ): RoundArtifact[] {
-  const dirs = new Set<string>();
-  if (artifactDir) {
-    // Self-contained task directory: never rescan every agent's global logs.
-    dirs.add(taskWorkerLogDir(artifactDir));
-  } else {
-    dirs.add(getWorkerLogDir(agent, root));
-    dirs.add(getWorkerLogDir(undefined, root));
-    // Rounds written before a log directory was configured live in the legacy
-    // worker_log/ (or, older still, directly under logs/).
-    dirs.add(path.join(bridgeLogsDir(root), WORKER_LOG_DIRNAME));
-    dirs.add(bridgeLogsDir(root));
-  }
+  const dirs = [taskWorkerLogDir(taskArtifactBase(threadId, root, artifactDir))];
 
   const prefix = `${safeThreadIdPart(threadId)}_round_`;
   const map = new Map<string, RoundArtifact>();

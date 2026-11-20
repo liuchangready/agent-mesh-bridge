@@ -1,3 +1,4 @@
+import { assertDedicatedTask } from './types';
 import { getTaskExecutionPath, isReviewerWakeEligible, isMergeReview } from './types';
 import * as crypto from 'crypto';
 import { spawnSync } from 'child_process';
@@ -9,7 +10,7 @@ import { CancellationRegistry } from './cancellation-registry';
 import { CodexNativeCompaction } from './codex-native-compaction';
 import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
 import { resolveConfiguredModel } from './model-catalog';
-import { getReviewerLogDir, getWorkerLogDir, safeThreadIdPart, taskReviewerLogDir, taskWorkerLogDir } from './round-log';
+import { taskArtifactBase, safeThreadIdPart, taskReviewerLogDir, taskWorkerLogDir } from './round-log';
 import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 import { TaskRoleLock, TaskRole } from './task-role-lock';
 import { TaskStore } from './task-store';
@@ -150,8 +151,7 @@ function recoveryDocument(thread: DelegationThread, role: TaskRole, agent: Agent
 /**
  * Bridge log directory for a role, preferring the task's recorded unified dir.
  *
- * Legacy tasks (no `artifactDir`) keep their per-agent logDirectories layout.
- * New tasks never rescan agent-wide directories for their own files.
+ * Only the task directory is used; agent-wide directories are never scanned.
  */
 function roleLogDir(
   thread: DelegationThread,
@@ -159,14 +159,10 @@ function roleLogDir(
   agent: AgentId,
   root?: string,
 ): string {
-  if (thread.artifactDir) {
-    return role === 'reviewer'
-      ? taskReviewerLogDir(thread.artifactDir)
-      : taskWorkerLogDir(thread.artifactDir);
-  }
-  return role === 'reviewer'
-    ? getReviewerLogDir(agent, root)
-    : getWorkerLogDir(agent, root);
+  const dir = taskArtifactBase(thread.threadId, root, thread.artifactDir);
+  const logDir = role === 'reviewer' ? taskReviewerLogDir(dir) : taskWorkerLogDir(dir);
+  fs.mkdirSync(logDir, { recursive: true });
+  return role === 'reviewer' ? taskReviewerLogDir(dir) : taskWorkerLogDir(dir);
 }
 
 function emptyMaintenanceUsage(id: string, role: TaskRole, agent: AgentId, model: string): TokenUsageComponent {
@@ -241,8 +237,9 @@ export class NativeSessionCompactor {
     const root = path.dirname(this.store.getStoragePath());
     this.store.loadFromDisk();
     let thread = this.store.getTask(threadId);
+    if (thread) assertDedicatedTask(thread);
     if (!thread || thread.archivedAt) throw new Error('Task disappeared before native-session preparation.');
-    if (role === 'reviewer' && thread.reviewFlow !== 'dedicated') return {};
+
     const agent = role === 'developer' ? thread.targetAgent : thread.initiatorAgent;
     const captured = role === 'developer' ? thread.receiverSessionCaptured : thread.reviewerSessionCaptured;
     const sessionId = role === 'developer' ? thread.receiverSessionId : thread.reviewerSessionId;
@@ -686,6 +683,7 @@ export class NativeSessionCompactor {
     const root = path.dirname(this.store.getStoragePath());
     this.store.loadFromDisk();
     let thread = this.store.getTask(threadId);
+    if (thread) assertDedicatedTask(thread);
     if (!thread || thread.archivedAt || thread.status !== 'paused') throw new Error('Native compaction is available only for an unarchived paused task.');
     if (role === 'reviewer' && thread.reviewFlow !== 'dedicated') throw new Error('Legacy caller/requester sessions are not managed by Bridge compaction.');
     const agent = role === 'developer' ? thread.targetAgent : thread.initiatorAgent;

@@ -41,6 +41,11 @@ function initRepo(root: string): void {
 function thread(threadId: string, worktree: WorktreeInfo): DelegationThread {
   const now = new Date().toISOString();
   return {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + (threadId)),
+    callerSessionId: ('reviewer-' + (threadId)),
     threadId,
     title: threadId,
     initiatorAgent: 'codex',

@@ -23,6 +23,11 @@ import { TaskRoleLock } from '../bridge/task-role-lock';
 
 function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread {
   return {
+    reviewFlow: 'dedicated',
+    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+    reviewerSessionCaptured: true,
+    reviewerSessionId: ('reviewer-' + ('thread_control_1')),
+    callerSessionId: ('reviewer-' + ('thread_control_1')),
     threadId: 'thread_control_1',
     title: 'Pause/delete probe',
     initiatorAgent: 'codex',
