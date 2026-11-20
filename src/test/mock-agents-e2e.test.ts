@@ -23,7 +23,7 @@ function trace(root: string): any[] {
 }
 
 /** Observe durable task files; do not keep a caller turn alive by polling MCP. */
-async function waitForTask(root: string, threadId: string, predicate: (task: DelegationThread) => boolean): Promise<DelegationThread> {
+async function waitForTask(root: string, threadId: string, predicate: (task: DelegationThread) => boolean, timeoutMs = 360_000): Promise<DelegationThread> {
   const dir = path.join(root, 'home', '.agent-mesh-bridge', 'threads');
   const file = path.join(dir, `${threadId}.json`);
   return new Promise((resolve, reject) => {
@@ -43,7 +43,8 @@ async function waitForTask(root: string, threadId: string, predicate: (task: Del
       } catch { /* Atomic replacement can briefly hide the file. */ }
     };
     const watcher = fs.watch(dir, check);
-    const timer = setTimeout(() => finish(new Error(`Task timed out; evidence=${root}; status=${latest?.status}; run=${JSON.stringify(latest?.execution)}`)), 180_000);
+    // Real Windows OS-lock helpers and concurrent Git suites can exceed three minutes.
+    const timer = setTimeout(() => finish(new Error(`Task timed out; evidence=${root}; status=${latest?.status}; run=${JSON.stringify(latest?.execution)}`)), timeoutMs);
     check();
   });
 }
@@ -130,7 +131,7 @@ async function fixture(t: TestContext, scenario: MockScenario) {
   return { root, repo, base, client, threadId: state.threadId!, finish: () => { state.passed = true; } };
 }
 
-test('mock agents: real MCP bootstrap, three worker/reviewer rounds and validated Git delivery', { timeout: 240_000 }, async t => {
+test('mock agents: real MCP bootstrap, three worker/reviewer rounds and validated Git delivery', { timeout: 420_000 }, async t => {
   const f = await fixture(t, { rounds: 3, reviewerTailMs: 200 });
   const task = await waitForTask(f.root, f.threadId, task => task.status === 'completed' && !task.execution?.run);
   const events = trace(f.root);
@@ -176,7 +177,7 @@ test('mock agents: real MCP bootstrap, three worker/reviewer rounds and validate
 for (const fault of ['empty-worker', 'nonzero-worker', 'no-verdict', 'bad-bootstrap-token'] as const) {
   test(`mock agents fail closed: ${fault}`, { timeout: 180_000 }, async t => {
     const f = await fixture(t, { rounds: 1, fault });
-    const task = await waitForTask(f.root, f.threadId, task => task.status === 'failed' && !task.execution?.run);
+    const task = await waitForTask(f.root, f.threadId, task => task.status === 'failed' && !task.execution?.run, 120_000);
     const events = trace(f.root);
     assert.equal(git(f.repo, 'rev-parse', 'HEAD'), f.base, 'Failed task must never advance the delivery target');
     assert.equal(fs.existsSync(path.join(f.root, 'validation.jsonl')), false);
