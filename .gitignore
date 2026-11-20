@@ -6,3 +6,8 @@ node_modules
 .DS_Store
 Thumbs.db
 
+# Local bridge runtime state: template snapshots, quarantined logs and whole
+# worktree copies produced by the extension itself, never source.
+.agent_bridge/
+
+
