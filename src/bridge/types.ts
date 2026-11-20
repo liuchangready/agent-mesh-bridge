@@ -679,8 +679,8 @@ export interface TaskFinalSummary {
 /**
  * Metadata for a task that ran in a temporary git worktree.
  *
- * `deliveryTarget` pins the real local branch for new tasks. Missing metadata
- * keeps the historical `targetRef` meaning for existing ledger entries.
+ * `deliveryTarget` pins the real local branch for executable tasks. Historical
+ * `targetRef` values remain readable but cannot drive delivery.
  * An MR is separate remote-delivery metadata and never changes local delivery.
  */
 export interface WorktreeInfo {
@@ -726,7 +726,6 @@ export interface WorktreeInfo {
   mergePending?: boolean;
 }
 
-/** Metadata written by the isolated-worktree lifecycle introduced by the bridge. */
 /** Only a pinned real local delivery target may drive Git execution. */
 export function requireDeliveryTarget(worktree: WorktreeInfo): NonNullable<WorktreeInfo['deliveryTarget']> {
   const target = worktree.deliveryTarget;
@@ -736,6 +735,7 @@ export function requireDeliveryTarget(worktree: WorktreeInfo): NonNullable<Workt
   return target;
 }
 
+/** Metadata written by the isolated-worktree lifecycle introduced by the bridge. */
 export function isIsolatedTaskWorktree(worktree?: WorktreeInfo): worktree is WorktreeInfo & { targetRef: string; taskBranch: string; baseCommit: string; repositoryPath: string; commonDir: string } {
   return !!worktree?.targetRef && !!worktree.taskBranch && !!worktree.baseCommit && !!worktree.repositoryPath && !!worktree.commonDir;
 }
@@ -872,8 +872,8 @@ export interface DelegationThread {
    *
    * Written once at creation and never re-resolved from the global
    * `agentMeshBridge.taskDataRoot` setting: a policy change must not make one
-   * task write into two roots. Absent on legacy ledger entries, which keep their
-   * recorded `worktree.path` and any legacy log locations in bridge policy.
+   * task write into two roots. Historical entries without this field do not
+   * resolve logs from the retired global or per-agent directories.
    */
   artifactDir?: string;
   /** Alias retained for callers/UI that name the same directory `taskDataDir`. */
@@ -881,7 +881,7 @@ export interface DelegationThread {
 
   /**
    * Review topology pinned when the task was created (see `ReviewFlow`).
-   * Absent on legacy ledger entries, which must keep the old caller-review path.
+   * Absent on historical entries, which cannot resume requester review.
    */
   reviewFlow?: ReviewFlow;
 
