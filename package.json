@@ -434,6 +434,7 @@
     "test:policy": "node scripts/test.cjs --layer=policy",
     "test:boundary": "node scripts/test.cjs --layer=boundary",
     "test:integration": "node scripts/test.cjs --layer=integration",
+    "test:e2e:mock": "npm run compile && node --test --test-reporter=spec out/test/mock-agents-e2e.test.js",
     "package": "npx @vscode/vsce package --no-dependencies --allow-missing-repository",
     "smoke:extension-host": "npm run package && node scripts/extension-host-smoke.cjs",
     "lint": "eslint .",
