@@ -1358,7 +1358,41 @@ export class MergeCoordinator {
     thread.status = 'completed'; worktree.integration = { ...worktree.integration, phase: 'merged', targetOldCommit, targetCommit: commit, targetPath, mergedCommit, stashRecoveryPending: false, stashRecoveryLockHeld: false, stashRestore, updatedAt: new Date().toISOString() };
     if (worktree.deliveryTarget) worktree.deliveryTarget.checkoutPath = targetPath;
     if (validation) worktree.validation = validation;
-    worktree.mergePending = false; thread.updatedAt = new Date().toISOString(); this.store.upsertTask(thread);
+    worktree.mergePending = false; thread.updatedAt = new Date().toISOString();
+    if (thread.execution?.version === 2) {
+      const expected = thread.execution;
+      const expectedRunId = expected.run?.id;
+      if (!expectedRunId || expected.phase !== 'merge') throw new Error(`Cannot finalize merged task ${threadId} without its v2 merge run.`);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const fresh = this.store.reloadTask(threadId);
+        if (fresh?.execution?.version !== 2 || fresh.execution.run?.id !== expectedRunId ||
+            fresh.execution.operationId !== expected.operationId || fresh.execution.generation !== expected.generation ||
+            fresh.execution.phase !== 'merge' || fresh.status !== 'merging' || fresh.cleanup) {
+          throw new Error(`Cannot finalize merged task ${threadId}: v2 merge identity changed.`);
+        }
+        try {
+          await this.store.transitionExecution(threadId, fresh.execution.revision, (current) => {
+            if (current.execution?.version !== 2 || current.execution.run?.id !== expectedRunId ||
+                current.execution.operationId !== expected.operationId || current.execution.generation !== expected.generation ||
+                current.execution.phase !== 'merge' || current.status !== 'merging' || current.cleanup) {
+              throw new Error(`Cannot finalize merged task ${threadId}: v2 merge identity changed.`);
+            }
+            current.status = 'completed';
+            current.mergeControl = thread.mergeControl;
+            current.mergeHistory = thread.mergeHistory;
+            const latestWorktree = current.worktree!;
+            latestWorktree.integration = { ...latestWorktree.integration!, phase: 'merged', targetOldCommit, targetCommit: commit, targetPath, mergedCommit,
+              stashRecoveryPending: false, stashRecoveryLockHeld: false, stashRestore, updatedAt: thread.updatedAt };
+            if (latestWorktree.deliveryTarget) latestWorktree.deliveryTarget.checkoutPath = targetPath;
+            if (validation) latestWorktree.validation = validation;
+            latestWorktree.mergePending = false;
+          });
+          break;
+        } catch (error: any) {
+          if (attempt === 2 || !String(error?.message || error).includes('revision mismatch')) throw error;
+        }
+      }
+    } else this.store.upsertTask(thread);
   }
 
   /** True when the target ref contains a candidate whose ledger write is pending. */

@@ -771,6 +771,7 @@ export async function registerRunChildV2(
   // 3. Phase 1: Atomically persist pending binding evidence under task write lock
   let phase1Succeeded = false;
   let phase1Error: string | undefined;
+  let bindingInProgressReason = '';
 
   for (let attempt = 0; attempt < 5; attempt++) {
     taskStore.ensureUpToDate();
@@ -805,7 +806,10 @@ export async function registerRunChildV2(
         // Repeated callbacks must not repeat lease attachment or failure cleanup.
         const existingChild = t.execution.run.child;
         if (t.execution.run.state === 'stopping' || t.execution.run.unconfirmed) {
-          if (existingChild?.pid) throw CHILD_BINDING_IN_PROGRESS;
+          if (existingChild?.pid) {
+            bindingInProgressReason = `run is ${t.execution.run.state}/${t.execution.run.step}`;
+            throw CHILD_BINDING_IN_PROGRESS;
+          }
           throw new Error('Run is stopping or unconfirmed; cannot register child');
         }
         if (existingChild?.pid) {
@@ -822,13 +826,20 @@ export async function registerRunChildV2(
             ? probeProcessIdentity(existingChild.pid, existingChild.birthId)
             : 'unknown';
           if (sameCapturedIdentity || existingStatus !== 'exited') {
+            bindingInProgressReason = `prior child ${existingChild.pid}/${existingChild.birthId || 'missing birthId'} is ${existingStatus}${sameCapturedIdentity ? ' and matches this child' : ''}`;
             throw CHILD_BINDING_IN_PROGRESS;
           }
           if (identity.phase === 'merge') {
             const previous = t.execution.run.subtrees?.find(({ root }) =>
               root.pid === existingChild.pid && root.birthId === existingChild.birthId);
-            if (!previous || previous.descendants.some(({ pid, birthId }) =>
-              !birthId || probeProcessIdentity(pid, birthId) !== 'exited')) {
+            const descendantStates = previous?.descendants.map(({ pid, birthId }) => ({
+              pid, birthId, state: probeProcessIdentity(pid, birthId),
+            })) || [];
+            const blockedDescendant = descendantStates.find(({ state }) => state !== 'exited');
+            if (!previous || blockedDescendant) {
+              bindingInProgressReason = !previous
+                ? `prior child ${existingChild.pid}/${existingChild.birthId || 'missing birthId'} has no captured subtree`
+                : `prior child ${existingChild.pid}/${existingChild.birthId || 'missing birthId'} is exited but descendant ${blockedDescendant!.pid}/${blockedDescendant!.birthId || 'missing birthId'} is ${blockedDescendant!.state}`;
               throw CHILD_BINDING_IN_PROGRESS;
             }
           }
@@ -884,7 +895,7 @@ export async function registerRunChildV2(
         return {
           success: false,
           inProgress: true,
-          error: `Child binding for ${childPid}/${effectiveBirthId} is already owned by this run`,
+          error: `Child binding for ${childPid}/${effectiveBirthId} is already owned by this run${bindingInProgressReason ? `: ${bindingInProgressReason}` : ''}`,
         };
       }
       if (err === CHILD_BINDING_ALREADY_REGISTERED) {

@@ -8,6 +8,8 @@ export interface MockScenario {
   rounds: number;
   fault?: 'empty-worker' | 'nonzero-worker' | 'no-verdict' | 'bad-bootstrap-token';
   reviewerTailMs?: number;
+  pauseAt?: 'bootstrap' | 'develop' | 'review' | 'merge';
+  pauseRound?: number;
 }
 
 export function fixtureRoot(): string {
@@ -33,7 +35,7 @@ export class MockMcpClient {
   private closed: Promise<void>;
 
   constructor(env: NodeJS.ProcessEnv, cwd: string) {
-    this.child = spawn(process.execPath, [path.join(__dirname, 'mock-bridge-host.js')], {
+    this.child = spawn(process.execPath, [path.resolve(__dirname, '../../../bin/agent-bridge-mcp.cjs')], {
       cwd, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child.stderr.on('data', chunk => {

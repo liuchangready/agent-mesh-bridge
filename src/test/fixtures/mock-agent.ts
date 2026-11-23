@@ -17,6 +17,19 @@ const threadId = process.env.MESH_TASK_THREAD_ID || process.env.MESH_REVIEW_THRE
 const model = args.find(arg => arg.startsWith('model='));
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const emit = (value: unknown) => process.stdout.write(JSON.stringify(value) + '\n');
+async function waitForDurableBinding(): Promise<string> {
+  const file = path.join(root, 'home', '.agent-mesh-bridge', 'threads', `${threadId}.json`);
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try {
+      const task = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const child = task.execution?.run?.child;
+      if (task.execution?.run?.state === 'active' && child?.pid === process.pid && typeof child.birthId === 'string') return task.execution.run.id;
+    } catch { /* the ledger is atomically replaced during launch binding */ }
+    await delay(20);
+  }
+  throw new Error(`Timed out waiting for durable v2 child binding for ${threadId}`);
+}
 function answer(text: string): void {
   emit({ type: 'item.completed', item: { type: 'agent_message', text } });
   emit({ type: 'turn.completed', usage: { input_tokens: 20, cached_input_tokens: 5, output_tokens: 10 } });
@@ -30,9 +43,28 @@ async function main(): Promise<void> {
   assert.ok(args.indexOf('--ask-for-approval') < exec);
   assert.ok(threadId);
   emit({ type: 'thread.started', thread_id: sessionId });
+  const runId = await waitForDurableBinding();
   const role = bootstrap ? 'bootstrap' : worker ? 'worker' : 'reviewer';
   const round = Number(process.env.MESH_TASK_ROUND || 0);
-  event(root, 'agent.start', { launchId: process.env.MESH_MOCK_LAUNCH_ID, role, round, threadId, sessionId, resume, model, cwd: process.cwd() });
+  event(root, 'agent.start', { launchId: process.env.MESH_MOCK_LAUNCH_ID, role, round, threadId, sessionId, resume, runId, model, cwd: process.cwd() });
+  const pauseStage = bootstrap ? 'bootstrap' : worker ? 'develop' : 'review';
+  const credential = bootstrap ? /^(\{"reviewBootstrap":\s*\{[^\n]+\}\})$/m.exec(prompt) : undefined;
+  const bootstrapToken = credential ? JSON.parse(credential[1]).reviewBootstrap.token : undefined;
+  if (bootstrapToken) event(root, 'bootstrap.prompt', { threadId, sessionId, bootstrapToken, resume });
+  const shouldPause = scenario.pauseAt === pauseStage && (scenario.pauseRound === undefined || scenario.pauseRound === round);
+  const pauseMarker = path.join(root, `${pauseStage}-${round}.pause-marker`);
+  if (shouldPause && !fs.existsSync(pauseMarker)) {
+    fs.writeFileSync(pauseMarker, 'held');
+    event(root, 'agent.pause-ready', { launchId: process.env.MESH_MOCK_LAUNCH_ID, role, round, threadId, sessionId, bootstrapToken });
+    await new Promise<void>((resolve, reject) => {
+      const poll = setInterval(() => {
+        if (fs.existsSync(path.join(root, `${pauseStage}-${round}.release`))) {
+          clearInterval(poll); clearTimeout(deadline); resolve();
+        }
+      }, 20);
+      const deadline = setTimeout(() => { clearInterval(poll); reject(new Error(`Timed out at ${pauseStage} barrier`)); }, 120_000);
+    });
+  }
   // Give the real launcher time to attach its process identity even for faults.
   await delay(150);
   if (worker && scenario.fault === 'empty-worker') return;
@@ -46,7 +78,6 @@ async function main(): Promise<void> {
   try {
     await mcp.initialize();
     if (bootstrap) {
-      const credential = /^(\{"reviewBootstrap":\s*\{[^\n]+\}\})$/m.exec(prompt);
       assert.ok(credential, 'Bootstrap credential must come from the real prompt');
       const payload = JSON.parse(credential[1]);
       if (scenario.fault === 'bad-bootstrap-token') payload.reviewBootstrap.token = 'invalid-test-token';

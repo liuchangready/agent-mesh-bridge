@@ -64,6 +64,7 @@ import {
   RunIdentity,
 } from './process-binding';
 import { requireV2ExecutionEligibility, validateV2ExecutionEligibility } from './execution-gate';
+import { CancellationRegistry } from './cancellation-registry';
 import { nativeSessionNamespace, SessionOwnershipStore } from './session-ownership';
 
 export const DEFAULT_EXECUTION_BUDGET_MS = 120 * 60 * 1000; // 120 minutes
@@ -1185,6 +1186,7 @@ export class ExecutionController {
           : 'merge-git',
       thread.workspace?.executionPath,
       phase === 'develop' ? 'developer' : phase === 'review' ? 'reviewer' : undefined,
+      ownerBirthId,
     );
 
     // Launch background worker for v2
@@ -1388,17 +1390,6 @@ export class ExecutionController {
     let aborted = false;
     let abortReason = '';
     let unconfirmedMergeHelper: { pid?: number; birthId?: string; channelPath: string } | undefined;
-    let settleRun!: () => void;
-    const settled = new Promise<void>((resolve) => { settleRun = resolve; });
-    const abortFn = () => {
-      aborted = true;
-    };
-    this.activeExecutions.set(threadId, { abort: abortFn, activeSinceMs: this.monotonicNow(), settled });
-
-    const guard = new HostSuspensionGuard({ monotonicNow: this.monotonicNow });
-    guard.start();
-    let lastMonotonic = this.monotonicNow();
-    let accumulatedSpentMs = 0;
     type TrackedChild = ProcessIdentity & {
       process?: ChildProcess;
       descendants: ProcessIdentity[];
@@ -1408,6 +1399,23 @@ export class ExecutionController {
     const trackedChildren = new Map<string, TrackedChild>();
     let registrationUnconfirmed = false;
     let stopTrackedInFlight: Promise<boolean> | undefined;
+    let stopTrackedChildren: () => Promise<boolean> = async () => false;
+    let settleRun!: () => void;
+    const settled = new Promise<void>((resolve) => { settleRun = resolve; });
+    const abortFn = () => {
+      aborted = true;
+      if (trackedChildren.size) {
+        void stopTrackedChildren().then((stopped) => {
+          if (!stopped) registrationUnconfirmed = true;
+        });
+      }
+    };
+    this.activeExecutions.set(threadId, { abort: abortFn, activeSinceMs: this.monotonicNow(), settled });
+
+    const guard = new HostSuspensionGuard({ monotonicNow: this.monotonicNow });
+    guard.start();
+    let lastMonotonic = this.monotonicNow();
+    let accumulatedSpentMs = 0;
     const processIdentityKey = (identity: ProcessIdentity) => `${identity.pid}:${identity.birthId ?? 'unknown'}`;
     const refreshDescendants = async (tracked: TrackedChild) => {
       if (!tracked.belongsToSubtree || !tracked.birthId) return;
@@ -1418,7 +1426,7 @@ export class ExecutionController {
       }
       tracked.descendants.splice(0, tracked.descendants.length, ...known.values());
     };
-    const stopTrackedChildren = async (): Promise<boolean> => {
+    stopTrackedChildren = async (): Promise<boolean> => {
       if (stopTrackedInFlight) return stopTrackedInFlight;
       const operation = (async () => {
         let allStopped = trackedChildren.size > 0 || !registrationUnconfirmed;
@@ -1563,7 +1571,7 @@ export class ExecutionController {
         attachLeases: async (p) => {
           if (sessionLease) await this.sessionLock.attachChild(sessionLease, p);
           if (mergeRelease) await this.mergeLock.attachChildPid(p, undefined, candidateBirthId);
-          await this.executionRegistry.attachChildPid(p, registration);
+          await this.executionRegistry.attachChildPid(p, registration, candidateBirthId);
         },
       });
 
@@ -3294,6 +3302,10 @@ export class ExecutionController {
         e.run = undefined;
         e.queue = undefined;
       });
+      this.runner.clearPendingCancellation(threadId);
+      const cancellations = new CancellationRegistry(this.storageDir);
+      cancellations.clear(threadId);
+      if (cancellations.peek(threadId)) throw new Error(`Cannot resume task ${threadId}: cancellation request could not be cleared.`);
       await this.startExecution(threadId, captured.phase, { allowStates: ['paused', 'queued'] });
       return this.taskStore.getTask(threadId) || updated;
     }

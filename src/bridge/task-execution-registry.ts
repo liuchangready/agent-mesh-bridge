@@ -12,7 +12,9 @@ import { killPidTree } from './platform';
 export interface TaskExecutionOwner {
   token: string;
   pid: number;
+  birthId?: string;
   childPid?: number;
+  childBirthId?: string;
   threadId: string;
   round: number;
   /**
@@ -89,12 +91,14 @@ export class TaskExecutionRegistry {
     agent?: string,
     workspace?: string,
     role?: TaskExecutionRole,
+    birthId?: string,
   ): TaskExecutionRegistration {
     const recordPath = this.recordPath(threadId);
     const now = Date.now();
     const owner: TaskExecutionOwner = {
       token: crypto.randomUUID(),
       pid: process.pid,
+      ...(birthId ? { birthId } : {}),
       threadId,
       round,
       acquiredAt: now,
@@ -130,10 +134,12 @@ export class TaskExecutionRegistry {
   public attachChildPid(
     childPid: number | undefined,
     registration: TaskExecutionRegistration,
+    childBirthId?: string,
   ): void {
     const owner = this.readOwner(registration.recordPath);
     if (!owner || owner.token !== registration.token) return;
     owner.childPid = childPid && childPid > 0 ? childPid : undefined;
+    owner.childBirthId = owner.childPid && childBirthId ? childBirthId : undefined;
     owner.updatedAt = Date.now();
     this.writeOwner(owner);
   }

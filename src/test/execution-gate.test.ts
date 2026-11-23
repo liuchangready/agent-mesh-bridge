@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
+import { getProcessBirthId } from '../bridge/platform';
 
 const dirs: string[] = [];
 function tempDir(): string {
@@ -26,6 +27,8 @@ describe('TaskExecutionRegistry - observation without mutual exclusion', () => {
     const b = new TaskExecutionRegistry(storage);
     const first = a.begin('thread_a', 1, 'codex', ws);
     const second = b.begin('thread_b', 1, 'claude_code', ws);
+    const firstRecord = JSON.parse(fs.readFileSync(first.recordPath, 'utf8'));
+    assert.equal(firstRecord.birthId, undefined, 'legacy registry callers keep their historical identity shape');
 
     assert.notStrictEqual(first.token, second.token);
     assert.deepStrictEqual(
@@ -35,8 +38,12 @@ describe('TaskExecutionRegistry - observation without mutual exclusion', () => {
     );
     assert.strictEqual(a.getOwner('legacy')?.threadId, 'legacy', 'legacy lock remains readable for same-thread recovery');
     assert.strictEqual(fs.existsSync(path.join(storage, 'execution.lock')), true, 'legacy files are ignored, not rewritten');
+    const ownBirthId = getProcessBirthId(process.pid);
+    const v2 = a.begin('thread_v2', 1, 'codex', ws, 'developer', ownBirthId);
+    assert.equal(JSON.parse(fs.readFileSync(v2.recordPath, 'utf8')).birthId, ownBirthId);
     a.end(first);
     b.end(second);
+    a.end(v2);
     a.dispose();
     b.dispose();
   });
@@ -64,7 +71,9 @@ describe('TaskExecutionRegistry - observation without mutual exclusion', () => {
     const target = registry.begin('thread_target', 1, 'codex');
     const other = registry.begin('thread_other', 1, 'claude_code');
     try {
-      registry.attachChildPid(child.pid!, target);
+      const childBirthId = getProcessBirthId(child.pid!);
+      registry.attachChildPid(child.pid!, target, childBirthId);
+      assert.equal(JSON.parse(fs.readFileSync(target.recordPath, 'utf8')).childBirthId, childBirthId);
       registry.killOrphanChild('thread_other', true);
       assert.strictEqual(child.exitCode, null, 'cancelling an unrelated thread must not kill this child');
       registry.killOrphanChild('thread_target', true);
