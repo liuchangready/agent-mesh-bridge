@@ -461,7 +461,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
   // -------------------------------------------------------------------------
   // Acceptance Criterion 1 & 4: Stale callbacks & identity validation
   // -------------------------------------------------------------------------
-  test('Stale callbacks: child registration with mismatched runId, operationId, generation, or round is rejected', async () => {
+  test('Stale callbacks: child registration with mismatched runId, operationId, generation, or round is rejected', async (t) => {
     const storageDir = createTempDir('stale-callbacks');
     const threadId = 'thread_stale_callbacks';
 
@@ -479,11 +479,20 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       store.upsertTask(thread);
 
       const spawnChild = () => {
-        const c = child_process.spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 5000)'], {
+        // Keep the real process alive until the binding check reaches the CAS assertion.
+        const c = child_process.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
           windowsHide: true,
           stdio: 'ignore',
         });
-        return { child: c, pid: c.pid!, birthId: getProcessBirthId(c.pid!) };
+        const closed = new Promise<void>((resolve) => c.once('close', () => resolve()));
+        t.after(async () => {
+          if (c.exitCode === null && c.signalCode === null) c.kill();
+          await closed;
+        });
+        assert.ok(c.pid, 'the test child must spawn');
+        const birthId = getProcessBirthId(c.pid);
+        assert.ok(birthId, 'the test child must have a real birth identity');
+        return { child: c, pid: c.pid, birthId };
       };
 
       // Stale runId

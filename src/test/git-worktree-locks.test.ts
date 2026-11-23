@@ -16,6 +16,7 @@ import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { ReworkController } from '../bridge/rework-controller';
+import { getProcessBirthId } from '../bridge/platform';
 import { gitExe, git, initRepo, thread, waitFor, waitForExit, waitForProcessExit } from './git-worktree-fixture';
 
 test('unpublished child command files survive helper scans without losing child protection', async (t) => {
@@ -40,7 +41,12 @@ test('unpublished child command files survive helper scans without losing child 
   const exitTemp = `${lease.channelPath}.command.exit.${child.pid}.unpublished.tmp`;
   fs.writeFileSync(childTemp, 'CHILD');
   fs.writeFileSync(exitTemp, 'EXIT');
-  await lock.attachChildPid(child.pid);
+  const birthId = (await lock.attachChildPid(child.pid)) || '';
+  if (process.platform === 'win32') {
+    assert.match(birthId || '', /^\d+$/);
+    assert.equal(birthId, getProcessBirthId(child.pid!));
+    assert.equal(await lock.attachChildPid(child.pid, undefined, birthId), birthId, 'the same lease reuses its exact verified child ACK');
+  }
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.ok(fs.existsSync(childTemp), 'a writer must retain its temporary file until atomic publication');
   assert.ok(fs.existsSync(exitTemp), 'an unpublished exit command must be ignored');

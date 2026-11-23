@@ -125,9 +125,12 @@ describe('Round invariant - ReworkController refuses to overlap rounds', () => {
     // Never spawn a real caller CLI from a unit test.
     callbackManager.notifyCallerOfFailure = async () => false;
     reworkController = new ReworkController(taskStore, runner, callbackManager, detector);
+    // The round assertions end at dispatch. Keep background work in the fixture.
+    (reworkController as unknown as { executeReworkBackground: () => Promise<void> }).executeReworkBackground = async () => {};
   });
 
   afterEach(() => {
+    reworkController.dispose();
     taskStore.dispose();
     try {
       fs.rmSync(tempDir, { recursive: true, force: true });

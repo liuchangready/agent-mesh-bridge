@@ -1087,7 +1087,7 @@ export class ExecutionController {
         childProcess,
         attachLeases: async (p) => {
           if (sessionLease) this.sessionLock.attachChild(sessionLease, p);
-          if (mergeRelease) await this.mergeLock.attachChildPid(p);
+          if (mergeRelease) await this.mergeLock.attachChildPid(p, undefined, candidateBirthId);
           this.executionRegistry.attachChildPid(p, registration);
         },
       });
@@ -1432,10 +1432,10 @@ export class ExecutionController {
           threadId,
           runId,
           sessionLease,
-          (pid) => {
+          (pid, _child, reportedBirthId) => {
             childPid = pid;
             if (pid) {
-              childBirthId = getProcessBirthId(pid);
+              childBirthId = reportedBirthId || getProcessBirthId(pid);
               this.executionRegistry.attachChildPid(pid, registration);
               // Native-session preparation checks the child binding on the role lease.
               this.roleLock.attachChild(roleLease, pid);
@@ -1448,10 +1448,10 @@ export class ExecutionController {
           { operationId, generation },
         );
       } else if (phase === 'review') {
-        phaseResult = await this.executeReviewAdapter(threadId, runId, params.purpose, (pid) => {
+        phaseResult = await this.executeReviewAdapter(threadId, runId, params.purpose, (pid, _child, reportedBirthId) => {
           childPid = pid;
           if (pid) {
-            childBirthId = getProcessBirthId(pid);
+            childBirthId = reportedBirthId || getProcessBirthId(pid);
             this.executionRegistry.attachChildPid(pid, registration);
             this.roleLock.attachChild(roleLease, pid);
             void this.updateRunChild(threadId, runId, pid, childBirthId);
@@ -1465,16 +1465,14 @@ export class ExecutionController {
           threadId,
           runId,
           params.purpose,
-          (pid) => {
+          (pid, _child, reportedBirthId) => {
             childPid = pid;
             if (pid) {
-              childBirthId = getProcessBirthId(pid);
+              childBirthId = reportedBirthId || getProcessBirthId(pid);
               this.executionRegistry.attachChildPid(pid, registration);
-              void this.mergeLock.attachChildPid(pid);
               void this.updateRunChild(threadId, runId, pid, childBirthId);
             } else {
               this.executionRegistry.attachChildPid(undefined, registration);
-              void this.mergeLock.attachChildPid(undefined);
             }
           },
           mergeRelease,

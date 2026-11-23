@@ -18,6 +18,34 @@ import {
 } from './unified-execution-fixture';
 
 describe('Unified Execution Policy Tests', () => {
+  test('v1 develop preserves the runner-captured child birth identity', async () => {
+    const fixture = await setupFixture({ useFastLock: true });
+    let finishRun!: () => void;
+    const held = new Promise<void>((resolve) => { finishRun = resolve; });
+    try {
+      const threadId = 'thread_v1_captured_identity';
+      fixture.store.upsertTask(createThread(threadId, 'develop'));
+      const execute = fixture.runner.execute.bind(fixture.runner);
+      fixture.runner.execute = (options) => execute({
+        ...options,
+        onChildPid: (pid: number) => options.onChildPid(pid, undefined, 'runner-captured-birth-id'),
+      });
+      fixture.runner.setOnExecute(async () => { await held; });
+
+      assert.equal((await fixture.controller.startExecution(threadId, 'develop')).started, true);
+      const deadline = Date.now() + 5_000;
+      let child = fixture.store.getTask(threadId)?.execution?.run?.child;
+      while (!child && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        child = fixture.store.getTask(threadId)?.execution?.run?.child;
+      }
+      assert.deepEqual(child, { pid: 777777, birthId: 'runner-captured-birth-id' });
+    } finally {
+      finishRun();
+      await fixture.cleanup();
+    }
+  });
+
   // Scenario 2: Active budget with monotonic tracking; output does not extend budget
   test('Scenario 2: Active time budget is enforced and output does not extend deadline', async () => {
     const fixture = await setupFixture({ useFastLock: true });

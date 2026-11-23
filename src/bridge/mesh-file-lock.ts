@@ -12,7 +12,9 @@ interface MeshLockLease {
   helper: import('child_process').ChildProcess;
   helperPid?: number;
   channelPath: string;
-  childAcks: Map<number, { resolve: () => void; reject: (error: Error) => void; timer: NodeJS.Timeout; timeout: NodeJS.Timeout }>;
+  childAcks: Map<number, { resolve: (birthId?: string) => void; reject: (error: Error) => void; timer: NodeJS.Timeout; timeout: NodeJS.Timeout }>;
+  childBirthIds: Map<number, string>;
+  detachedChildren: Set<number>;
   releasePromise?: Promise<boolean>;
 }
 
@@ -117,7 +119,9 @@ export class MeshFileLock {
     const token = crypto.randomUUID();
     const channelPath = `${this.lockPath}.${token}`;
     const child = this.startLockHelper(token, channelPath);
-    const childAcks = new Map<number, { resolve: () => void; reject: (error: Error) => void; timer: NodeJS.Timeout; timeout: NodeJS.Timeout }>();
+    const childAcks = new Map<number, { resolve: (birthId?: string) => void; reject: (error: Error) => void; timer: NodeJS.Timeout; timeout: NodeJS.Timeout }>();
+    const childBirthIds = new Map<number, string>();
+    const detachedChildren = new Set<number>();
     let output = '';
     let stdoutUtf8 = '';
     let stdoutUtf16 = '';
@@ -240,7 +244,7 @@ export class MeshFileLock {
       }
       throw error;
     }
-    const lease: MeshLockLease = { token, helper: child, helperPid, channelPath, childAcks };
+    const lease: MeshLockLease = { token, helper: child, helperPid, channelPath, childAcks, childBirthIds, detachedChildren };
     this.activeLease = lease;
     return () => {
       if (this.activeLease !== lease) return;
@@ -254,24 +258,39 @@ export class MeshFileLock {
     };
   }
 
-  attachChildPid(pid: number | undefined, cancelled?: () => boolean): Promise<void> {
+  attachChildPid(pid: number | undefined, cancelled?: () => boolean, expectedBirthId?: string): Promise<string | void> {
     const lease = this.activeLease;
     if (!pid || !lease) return Promise.resolve();
     if (cancelled?.()) return Promise.reject(new Error('Child registration cancelled because the merge task is no longer active.'));
-    return new Promise<void>((resolve, reject) => {
+    const registeredBirthId = lease.childBirthIds.get(pid);
+    if (expectedBirthId && registeredBirthId === expectedBirthId && this.isPidAlive(lease.helperPid) &&
+        !fs.existsSync(`${lease.channelPath}.error`) && !fs.existsSync(`${lease.channelPath}.done`)) {
+      return Promise.resolve(registeredBirthId);
+    }
+    lease.detachedChildren.delete(pid);
+    return new Promise<string | void>((resolve, reject) => {
       const ackPath = `${lease.channelPath}.child.${pid}`;
-      const finish = (error?: Error) => {
+      const finish = (error?: Error, birthId?: string) => {
         const pending = lease.childAcks.get(pid);
         if (!pending) return;
         lease.childAcks.delete(pid);
         clearInterval(pending.timer);
         clearTimeout(pending.timeout);
-        if (error) pending.reject(error); else pending.resolve();
+        if (error) pending.reject(error);
+        else {
+          if (birthId && !lease.detachedChildren.has(pid)) lease.childBirthIds.set(pid, birthId);
+          pending.resolve(birthId);
+        }
       };
       const timer = setInterval(() => {
         if (fs.existsSync(ackPath)) {
-          try { fs.unlinkSync(ackPath); } catch {}
-          finish();
+          try {
+            const ack = process.platform === 'win32' ? fs.readFileSync(ackPath, 'utf8') : 'missing';
+            fs.unlinkSync(ackPath);
+            const birthId = /^tracked:([0-9]+)$/.exec(ack)?.[1];
+            if (!birthId && ack !== 'missing') throw new Error('Invalid mesh lock child acknowledgement.');
+            finish(undefined, birthId);
+          } catch (error) { finish(error as Error); }
           return;
         }
         const errorPath = `${lease.channelPath}.error`;
@@ -325,6 +344,8 @@ export class MeshFileLock {
   detachChildPid(pid: number | undefined): void {
     const lease = this.activeLease;
     if (!pid || !lease) return;
+    lease.detachedChildren.add(pid);
+    lease.childBirthIds.delete(pid);
     if (process.platform === 'win32') {
       try { fs.writeFileSync(`${lease.channelPath}.command.exit.${pid}`, 'EXIT'); } catch {}
     } else {
@@ -415,8 +436,16 @@ try {
       $pidText = $command.Name.Substring($childPrefix.Length)
       # Ignore temporary files until the writer atomically publishes the PID-only name.
       if (-not [int]::TryParse($pidText, [ref]$pidValue)) { continue }
-      try { $process = Get-Process -Id $pidValue -ErrorAction Stop; $children[$pidValue] = $process.StartTime.ToUniversalTime().Ticks } catch { }
-      [System.IO.File]::WriteAllText(($channel + '.child.' + $pidValue), 'tracked')
+      $ack = 'missing'
+      try {
+        $startedAt = (Get-Process -Id $pidValue -ErrorAction Stop).StartTime
+        $children[$pidValue] = $startedAt.ToUniversalTime().Ticks
+        $ack = 'tracked:' + $startedAt.ToFileTimeUtc().ToString([System.Globalization.CultureInfo]::InvariantCulture)
+      } catch { }
+      $ackPath = $channel + '.child.' + $pidValue
+      $temporaryAck = $ackPath + '.tmp'
+      [System.IO.File]::WriteAllText($temporaryAck, $ack)
+      [System.IO.File]::Move($temporaryAck, $ackPath)
       Remove-Item -LiteralPath $command.FullName -Force -ErrorAction SilentlyContinue
     }
     foreach ($command in (Get-ChildItem -Path ($channel + '.command.exit.*') -ErrorAction SilentlyContinue)) {
