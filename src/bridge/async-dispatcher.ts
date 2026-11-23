@@ -54,6 +54,7 @@ export class AsyncDispatcher {
   private queueDrainer: QueueDrainer;
   /** Answers model-switch confirmations; the file channel unless overridden. */
   private modelApprovalHandler?: ModelApprovalHandler;
+  private v2DispatchEnabled = false;
 
   constructor(
     taskStore: TaskStore,
@@ -97,6 +98,9 @@ export class AsyncDispatcher {
   public setModelApprovalHandler(handler: ModelApprovalHandler | undefined): void {
     this.modelApprovalHandler = handler;
   }
+
+  /** Production enables v2 only after its unified controller is fully wired. */
+  public enableV2Dispatch(): void { this.v2DispatchEnabled = true; }
 
   /**
    * Dispatches a new task asynchronously and non-blockingly.
@@ -258,7 +262,7 @@ export class AsyncDispatcher {
     const initialPhase: ExecutionPhase = 'review';
     const initialPurpose = 'bootstrap' as const;
     tempCandidate.execution = {
-      version: 1,
+      version: this.v2DispatchEnabled ? 2 : 1,
       revision: 1,
       operationId: `${initialPhase}_1_${Date.now()}`,
       phase: initialPhase,
@@ -299,20 +303,22 @@ export class AsyncDispatcher {
       createdAt: nowIso,
     }, this.storageDir, taskDirs.artifactDir);
     if (!tokenWritten) {
-      thread.status = 'failed';
-      thread.failureRevision = (thread.failureRevision || 0) + 1;
-      thread.failure = { stage: 'bootstrap', reason: 'token write failed', at: nowIso, round: thread.currentRound };
-      const placeholder = thread.rounds.find(r => r.round === thread.currentRound);
-      if (placeholder) { placeholder.status = 'failed'; placeholder.error = 'token write failed'; }
-      thread.reviewBootstrap = { phase: 'failed', attempts: 0, lastError: 'token write failed' };
-      thread.summary.lastOutputSnippet = '[Reviewer bootstrap failed] could not write the dispatch token';
-      this.taskStore.upsertTask(thread);
+      await this.taskStore.transitionExecution(threadId, thread.execution!.revision, (fresh) => {
+        fresh.status = 'failed';
+        fresh.failureRevision = (fresh.failureRevision || 0) + 1;
+        fresh.failure = { stage: 'bootstrap', reason: 'token write failed', at: nowIso, round: fresh.currentRound };
+        const placeholder = fresh.rounds.find(r => r.round === fresh.currentRound);
+        if (placeholder) { placeholder.status = 'failed'; placeholder.error = 'token write failed'; }
+        fresh.reviewBootstrap = { phase: 'failed', attempts: 0, lastError: 'token write failed' };
+        fresh.summary.lastOutputSnippet = '[Reviewer bootstrap failed] could not write the dispatch token';
+      });
       throw new Error(
         `Could not start the dedicated reviewer for ${threadId}: the bootstrap token could not be written.`,
       );
     }
-    thread.workspace.dispatchAccepted = true;
-    this.taskStore.upsertTask(thread);
+    await this.taskStore.transitionExecution(threadId, this.taskStore.getTask(threadId)?.execution?.revision ?? thread.execution!.revision, (fresh) => {
+      if (fresh.workspace) fresh.workspace.dispatchAccepted = true;
+    });
     if (ExecutionController.getInstance()) {
       void ExecutionController.getInstance()!.startExecution(threadId, 'review', { purpose: 'bootstrap' });
     }
@@ -352,6 +358,10 @@ export class AsyncDispatcher {
     isRework: boolean,
   ): Promise<void> {
     assertDedicatedTask(thread);
+    // The production v2 dispatcher has one execution owner: the durable run
+    // controller. Never let the legacy queue pump execute v1, missing-version,
+    // or unknown-version history after the host has enabled the cutover path.
+    if (this.v2DispatchEnabled || thread.execution?.version === 2) return;
     // A dedicated task may not execute before its reviewer conversation has
     // dispatched it. The bootstrap service owns that first turn.
     if (isReviewerBootstrapPending(thread)) {

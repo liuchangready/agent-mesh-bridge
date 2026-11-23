@@ -82,6 +82,7 @@ export function createMockRunner() {
             stdout: custom.stdout ?? 'output',
             stderr: custom.stderr ?? '',
             extractedOutput: custom.extractedOutput ?? 'output',
+            actualSessionId: custom.actualSessionId,
             durationMs: custom.durationMs ?? 10,
             error: custom.error,
             assessment: custom.assessment ?? {

@@ -7,16 +7,22 @@ import * as os from 'os';
 import * as path from 'path';
 import { AgentDetector } from './agent-detector';
 import { CancellationRegistry } from './cancellation-registry';
-import { CodexNativeCompaction } from './codex-native-compaction';
+import { CodexNativeCompaction, MAX_NATIVE_COMPACTION_ACTIVE_MS, MAX_NATIVE_RECOVERY_PROBE_ACTIVE_MS } from './codex-native-compaction';
 import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
 import { resolveConfiguredModel } from './model-catalog';
 import { taskArtifactBase, safeThreadIdPart, taskReviewerLogDir, taskWorkerLogDir } from './round-log';
 import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 import { TaskRoleLock, TaskRole } from './task-role-lock';
 import { TaskStore } from './task-store';
-import { AgentId, DelegationThread, NativeSessionCompactionOperation, TokenUsageComponent, appendInterruption, isValidSessionId, findInFlightRound } from './types';
+import { AgentId, DelegationThread, ExecutionSubtreeEvidence, NativeSessionCompactionOperation, ProcessIdentity, TokenUsageComponent, appendInterruption, isValidSessionId, findInFlightRound } from './types';
+import { ExecutionRun } from './types';
 import { appendTokenUsageComponent } from './token-usage-collector';
 import { readBridgePolicy } from './bridge-policy';
+import { SessionOwnershipStore, nativeSessionNamespace } from './session-ownership';
+import { getProcessBirthId } from './platform';
+import { captureChildDescendants } from './process-binding';
+import { probeProcessIdentity } from './platform';
+import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
 
 export interface NativeSessionPreparation {
   sessionId?: string;
@@ -26,6 +32,16 @@ export interface NativeSessionPreparation {
   recoveryVersion?: string;
   warning?: string;
   pauseReason?: string;
+}
+
+export interface NativeRunPreparationContext {
+  runId: string;
+  operationId: string;
+  generation: number;
+  phase: 'develop' | 'review' | 'merge';
+  round: number;
+  role: 'developer' | 'reviewer';
+  onChildPid?: (pid: number | undefined, childProcess?: import('child_process').ChildProcess, childBirthId?: string) => void | Promise<void>;
 }
 
 export type NativeCompactionCapability = 'unsupported' | 'needs_validation' | 'certified';
@@ -233,7 +249,7 @@ export class NativeSessionCompactor {
   }
 
   /** Acquire the session write lease and supply any still-undelivered recovery document. */
-  public async prepareBeforeResume(threadId: string, role: TaskRole, model?: string, reviewerBootstrap = false, existingLease?: NativeSessionLease): Promise<NativeSessionPreparation> {
+  public async prepareBeforeResume(threadId: string, role: TaskRole, model?: string, reviewerBootstrap = false, existingLease?: NativeSessionLease, runContext?: NativeRunPreparationContext): Promise<NativeSessionPreparation> {
     const root = path.dirname(this.store.getStoragePath());
     this.store.loadFromDisk();
     let thread = this.store.getTask(threadId);
@@ -244,14 +260,42 @@ export class NativeSessionCompactor {
     const captured = role === 'developer' ? thread.receiverSessionCaptured : thread.reviewerSessionCaptured;
     const sessionId = role === 'developer' ? thread.receiverSessionId : thread.reviewerSessionId;
     if (!captured || !isValidSessionId(sessionId || '')) return {};
-    const lease = existingLease || new NativeSessionLock(root).acquire(agent, sessionId!);
-    if (!lease) throw new Error(`Native session ${sessionId} is already owned by another Bridge process.`);
+    const isV2Run = Boolean(runContext);
+    if (isV2Run) {
+      const assignment = thread.nativeSessionAssignments?.[role];
+      if (!assignment || assignment.namespace !== nativeSessionNamespace(agent) || !Number.isSafeInteger(assignment.sessionEpoch)) {
+        throw new Error('SESSION_OWNERSHIP_UNVERIFIED: Native preparation has no pinned namespace and session epoch.');
+      }
+      const ownership = new SessionOwnershipStore(root).verify({
+        agent, namespace: assignment.namespace, sessionId: sessionId!, threadId, role,
+        sessionEpoch: assignment.sessionEpoch,
+      });
+      if (!ownership.ok) throw new Error(`${ownership.code}: ${ownership.reason}`);
+      const run = thread.execution?.run;
+      if (thread.execution?.version !== 2 || !run || run.id !== runContext!.runId ||
+          thread.execution.operationId !== runContext!.operationId || thread.execution.generation !== runContext!.generation ||
+          thread.execution.phase !== runContext!.phase || thread.execution.round !== runContext!.round ||
+          run.role !== runContext!.role || run.state === 'stopping' || run.unconfirmed || thread.cleanup || thread.execution.next) {
+        throw new Error('V2 native preparation is not covered by the current protected run.');
+      }
+    }
+    // V2 has no Bridge session lease: the pinned static ownership record and
+    // the unique durable run/subtree are the only admission and lifetime proof.
+    const lease = isV2Run ? undefined : existingLease || new NativeSessionLock(root).acquire(agent, sessionId!);
+    if (!isV2Run && !lease) throw new Error(`Native session ${sessionId} is already owned by another Bridge process.`);
     let executionLease: NativeSessionPreparation['executionLease'];
     let keepLease = Boolean(existingLease);
     try {
-    const roleOwnerAtStart = new TaskRoleLock(root).getOwner(threadId);
-    if (!roleOwnerAtStart || roleOwnerAtStart.role !== role) {
-      if (!existingLease) new NativeSessionLock(root).release(lease);
+    const roleLock = isV2Run ? undefined : new TaskRoleLock(root);
+    const roleOwnerAtStart = roleLock?.getOwner(threadId);
+    const roleLease = roleOwnerAtStart ? {
+      token: roleOwnerAtStart.token,
+      threadId,
+      role,
+      ...(roleOwnerAtStart.conversationId ? { conversationId: roleOwnerAtStart.conversationId } : {}),
+    } : undefined;
+    if (!isV2Run && (!roleOwnerAtStart || roleOwnerAtStart.role !== role)) {
+      if (!existingLease && lease) new NativeSessionLock(root).release(lease);
       throw new Error('The task role lease is not held during native-session preparation.');
     }
     const cancellation = new CancellationRegistry(root).peek(threadId);
@@ -271,17 +315,21 @@ export class NativeSessionCompactor {
         freshModel !== model || worktreeChanged || cancellation ||
         (role === 'developer' && !['running', 'queued'].includes(fresh.status)) ||
         (role === 'reviewer' && !isReviewerWakeEligible(fresh) && !(reviewerBootstrap && fresh.status === 'queued' && fresh.reviewBootstrap?.phase === 'launching'))) {
-      if (!existingLease) new NativeSessionLock(root).release(lease);
+      if (!existingLease && lease) new NativeSessionLock(root).release(lease);
       throw new Error('Task state, cancellation, model, worktree, or native session changed before resume preparation.');
     }
     thread = fresh;
-    const ensureExecutionLease = () => {
+    const ensureExecutionLease = (): NativeSessionPreparation['executionLease'] => {
       if (executionLease) return executionLease;
+      // The v2 controller already owns process registration through the run's
+      // child/subtree handshake; do not create a second process lease.
+      if (isV2Run) return undefined;
       const registry = new TaskExecutionRegistry(root);
       const owner = registry.getOwner(threadId);
       if (owner) {
         executionLease = { registry, registration: { token: owner.token, threadId, round: owner.round, recordPath: owner.recordPath }, owned: false };
       } else {
+        if (isV2Run) throw new Error('V2 native preparation has no matching execution registry entry.');
         const currentRound = [...(thread!.rounds || [])].reverse().find((entry) => entry.type !== 'approval');
         executionLease = {
           registry,
@@ -296,13 +344,6 @@ export class NativeSessionCompactor {
         };
       }
       return executionLease;
-    };
-    const roleLock = new TaskRoleLock(root);
-    const roleLease = {
-      token: roleOwnerAtStart.token,
-      threadId,
-      role,
-      ...(roleOwnerAtStart.conversationId ? { conversationId: roleOwnerAtStart.conversationId } : {}),
     };
     const releaseExecutionLease = () => {
       if (!executionLease) return;
@@ -349,20 +390,32 @@ export class NativeSessionCompactor {
       } else {
         const activeExecution = ensureExecutionLease();
         let recovered = false;
+        const nativeRun = snapshotNativeRun(thread);
         try {
           const executable = agent === 'codex' ? this.detector.resolveExecutable('codex') : undefined;
+          if (nativeRun) await setNativeRunMaintenanceStep(this.store, threadId, nativeRun, true);
           recovered = !!executable && !!latestOperation.model && await this.codex.probeResume({
             executable, sessionId: sessionId!, cwd: getTaskExecutionPath(thread),
             model: latestOperation.model || model || '', operationId: latestOperation.id,
             role, cancelled: () => !!new CancellationRegistry(root).peek(threadId),
-            onChildPid: (pid) => {
-              new NativeSessionLock(root).attachChild(lease, pid, pid ? () => !!new CancellationRegistry(root).peek(threadId) : undefined);
-              activeExecution.registry.attachChildPid(pid, activeExecution.registration);
-              roleLock.attachChild(roleLease, pid);
+            onChildPid: async (pid, birthId) => {
+              if (isV2Run) await runContext!.onChildPid?.(pid, undefined, birthId);
+              else if (lease) new NativeSessionLock(root).attachChild(lease, pid, pid ? () => !!new CancellationRegistry(root).peek(threadId) : undefined);
+              if (activeExecution) activeExecution.registry.attachChildPid(pid, activeExecution.registration);
+              if (!isV2Run && roleLease) roleLock!.attachChild(roleLease, pid);
+              if (nativeRun && !isV2Run) await bindNativeRunChild(this.store, threadId, nativeRun, pid, birthId);
             },
           });
         } catch (error: any) {
           warning = `Same-ID read-only recovery probe failed: ${String(error?.message || error).slice(0, 300)}`;
+        } finally {
+          if (nativeRun) {
+            this.store.loadFromDisk();
+            const latest = this.store.getTask(threadId);
+            if (latest?.execution?.run?.id === nativeRun.id && !latest.execution.run.child && !latest.execution.run.unconfirmed) {
+              try { await setNativeRunMaintenanceStep(this.store, threadId, nativeRun, false); } catch {}
+            }
+          }
         }
         if (!recovered) {
           releaseExecutionLease();
@@ -370,7 +423,7 @@ export class NativeSessionCompactor {
           appendInterruption(thread, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' });
           thread.status = 'paused';
           this.store.upsertTask(thread);
-          new NativeSessionLock(root).release(lease);
+          if (lease) new NativeSessionLock(root).release(lease);
           return { sessionId, pauseReason: reason };
         }
         if (cursor) {
@@ -410,10 +463,10 @@ export class NativeSessionCompactor {
         const capability = identity ? this.capabilityResolver(identity) : 'needs_validation';
         if (capability === 'certified' && identity) {
           ensureExecutionLease();
-          const result = await this.compactAutomatically(thread, role, agent, model!, sessionId!, lease, cursor || { sessionId: sessionId!, turnsSinceCompaction: 0 }, identity);
+          const result = await this.compactAutomatically(thread, role, agent, model!, sessionId!, lease, cursor || { sessionId: sessionId!, turnsSinceCompaction: 0 }, identity, runContext);
           if (result.pauseReason) {
             releaseExecutionLease();
-            if (!existingLease) new NativeSessionLock(root).release(lease);
+            if (!existingLease && lease) new NativeSessionLock(root).release(lease);
             return { sessionId, pauseReason: result.pauseReason };
           }
           warning = result.warning;
@@ -432,7 +485,7 @@ export class NativeSessionCompactor {
         releaseExecutionLease();
         const reason = 'Pending native-session recovery record is missing; refusing to resume without task context.';
         appendInterruption(thread, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' });
-        thread.status = 'paused'; this.store.upsertTask(thread); if (!existingLease) new NativeSessionLock(root).release(lease);
+        thread.status = 'paused'; this.store.upsertTask(thread); if (!existingLease && lease) new NativeSessionLock(root).release(lease);
         return { sessionId, pauseReason: reason };
       }
       const logDir = roleLogDir(thread, role, agent, root);
@@ -441,7 +494,7 @@ export class NativeSessionCompactor {
         releaseExecutionLease();
         const reason = 'Pending native-session recovery path is outside the task agent log directory.';
         appendInterruption(thread, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' });
-        thread.status = 'paused'; this.store.upsertTask(thread); if (!existingLease) new NativeSessionLock(root).release(lease);
+        thread.status = 'paused'; this.store.upsertTask(thread); if (!existingLease && lease) new NativeSessionLock(root).release(lease);
         return { sessionId, pauseReason: reason };
       }
       try { recoveryPrefix = fs.readFileSync(recoveryPath, 'utf8'); }
@@ -449,7 +502,7 @@ export class NativeSessionCompactor {
         releaseExecutionLease();
         const reason = `Pending native-session recovery document is unavailable: ${String(error?.message || error).slice(0, 300)}`;
         appendInterruption(thread, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' });
-        thread.status = 'paused'; this.store.upsertTask(thread); if (!existingLease) new NativeSessionLock(root).release(lease);
+        thread.status = 'paused'; this.store.upsertTask(thread); if (!existingLease && lease) new NativeSessionLock(root).release(lease);
         return { sessionId, pauseReason: reason };
       }
     }
@@ -471,8 +524,10 @@ export class NativeSessionCompactor {
       : isReviewerWakeEligible(latestThread) || reviewerBootstrap && latestThread.status === 'queued' && latestThread.reviewBootstrap?.phase === 'launching');
     if (!latestThread || latestThread.archivedAt || !statusAllowed || latestAgent !== agent || latestSession !== sessionId ||
         latestModel !== model || latestWorktree !== originalWorktree || new CancellationRegistry(root).peek(threadId) ||
-        new TaskRoleLock(root).getOwner(threadId)?.token !== roleOwnerAtStart.token) {
-      if (!existingLease) new NativeSessionLock(root).release(lease);
+        (!isV2Run && new TaskRoleLock(root).getOwner(threadId)?.token !== roleOwnerAtStart?.token) ||
+        (isV2Run && (latestThread?.execution?.run?.id !== runContext!.runId || latestThread.execution.operationId !== runContext!.operationId ||
+          latestThread.execution.generation !== runContext!.generation || latestThread.cleanup || latestThread.execution.next))) {
+      if (!existingLease && lease) new NativeSessionLock(root).release(lease);
       releaseExecutionLease();
       return { sessionId, pauseReason: 'Task, role, model, session, worktree, or cancellation state changed during preparation.' };
     }
@@ -481,7 +536,7 @@ export class NativeSessionCompactor {
     } catch (error) {
       if (executionLease?.owned) executionLease.registry.end(executionLease.registration);
       executionLease?.registry.dispose();
-      if (!keepLease && !existingLease) new NativeSessionLock(root).release(lease);
+      if (!keepLease && !existingLease && lease) new NativeSessionLock(root).release(lease);
       throw error;
     }
   }
@@ -492,16 +547,31 @@ export class NativeSessionCompactor {
     agent: AgentId,
     model: string,
     sessionId: string,
-    lease: ReturnType<NativeSessionLock['acquire']> & {},
+    lease: ReturnType<NativeSessionLock['acquire']> | undefined,
     cursor: NonNullable<DelegationThread['nativeSessionCompaction']>[TaskRole],
     identity: NativeCompactionCapabilityIdentity,
+    runContext?: NativeRunPreparationContext,
   ): Promise<{ warning?: string; pauseReason?: string }> {
     const root = path.dirname(this.store.getStoragePath());
-    const roleLock = new TaskRoleLock(root);
-    const roleOwner = roleLock.getOwner(thread.threadId);
-    if (!roleOwner || roleOwner.role !== role) return { warning: 'Automatic compaction skipped because the task role lease is not held.' };
+    const v2Run = snapshotNativeRun(thread);
+    const initialBudget = v2Run ? remainingMaintenanceBudget(thread) : undefined;
+    if (v2Run && (!initialBudget || initialBudget.remainingMs <= 0)) {
+      if (v2Run) {
+        try { await setNativeRunMaintenanceStep(this.store, thread.threadId, v2Run, false); } catch {}
+      }
+      return { warning: 'Automatic compaction skipped because no active execution budget remains.' };
+    }
+    const maintenanceTimeoutMs = Math.min(MAX_NATIVE_COMPACTION_ACTIVE_MS, initialBudget?.remainingMs ?? MAX_NATIVE_COMPACTION_ACTIVE_MS);
+    const roleLock = v2Run ? undefined : new TaskRoleLock(root);
+    const roleOwner = roleLock?.getOwner(thread.threadId);
+    if (!v2Run && (!roleOwner || roleOwner.role !== role)) return { warning: 'Automatic compaction skipped because the task role lease is not held.' };
     const cancellation = new CancellationRegistry(root);
     if (cancellation.peek(thread.threadId)) return { warning: 'Automatic compaction skipped because cancellation is pending.' };
+    if (v2Run) {
+      await setNativeRunMaintenanceStep(this.store, thread.threadId, v2Run, true);
+      this.store.loadFromDisk();
+      thread = this.store.getTask(thread.threadId) || thread;
+    }
     const latest = [...(thread.rounds || [])].reverse().find((round) => round.type !== 'approval');
     if (!latest) return { warning: 'Automatic compaction skipped because no business round is available.' };
     const id = crypto.randomUUID();
@@ -525,14 +595,15 @@ export class NativeSessionCompactor {
     }
     const executable = this.detector.resolveExecutable('codex');
     if (!executable) return { warning: 'Automatic compaction skipped because Codex executable disappeared.' };
-    const registry = new TaskExecutionRegistry(root);
-    const executionOwner = registry.getOwner(thread.threadId);
+    const registry = runContext ? undefined : new TaskExecutionRegistry(root);
+    const executionOwner = registry?.getOwner(thread.threadId);
     const registration = executionOwner ? { token: executionOwner.token, threadId: executionOwner.threadId, round: executionOwner.round, recordPath: executionOwner.recordPath } : undefined;
-    const roleLease = { token: roleOwner.token, threadId: thread.threadId, role: role as 'developer' | 'reviewer', ...(roleOwner.conversationId ? { conversationId: roleOwner.conversationId } : {}) };
-    const bindChild = (pid: number | undefined) => {
-      new NativeSessionLock(root).attachChild(lease, pid, pid ? () => !!cancellation.peek(thread.threadId) : undefined);
-      if (registration) registry.attachChildPid(pid, registration);
-      roleLock.attachChild(roleLease, pid);
+    const bindChild = async (pid: number | undefined, birthId?: string) => {
+      if (runContext) await runContext.onChildPid?.(pid, undefined, birthId);
+      else if (lease) new NativeSessionLock(root).attachChild(lease, pid, pid ? () => !!cancellation.peek(thread.threadId) : undefined);
+      if (!runContext && registration && registry) registry.attachChildPid(pid, registration);
+      if (!runContext && roleOwner) roleLock!.attachChild({ token: roleOwner.token, threadId: thread.threadId, role: role as 'developer' | 'reviewer' }, pid);
+      if (v2Run && !runContext) await bindNativeRunChild(this.store, thread.threadId, v2Run, pid, birthId);
     };
     const originalStatus = thread.status;
     operation.phase = 'running'; operation.revision++;
@@ -540,6 +611,7 @@ export class NativeSessionCompactor {
     try {
       const result = await this.codex.compact({
         executable, sessionId, cwd: getTaskExecutionPath(thread), model, operationId: id, role: role as 'developer' | 'reviewer',
+        timeoutMs: maintenanceTimeoutMs,
         expectedProviderId: identity.providerId,
         cancelled: () => !!cancellation.peek(thread.threadId),
         onUsage: (usage) => this.recordMaintenanceUsage(thread.threadId, latest.round, id, role, agent, model, usage),
@@ -547,12 +619,15 @@ export class NativeSessionCompactor {
       });
       this.store.loadFromDisk();
       const current = this.store.getTask(thread.threadId);
-      const currentOwner = roleLock.getOwner(thread.threadId);
+      const currentOwner = roleLock?.getOwner(thread.threadId);
       const currentAgent = current && (role === 'developer' ? current.targetAgent : current.initiatorAgent);
       const currentSession = current && (role === 'developer' ? current.receiverSessionId : current.reviewerSessionId);
       const currentModel = current && (role === 'developer' ? current.targetModel : current.reviewerModel);
       if (!current || current.archivedAt || current.status !== originalStatus || cancellation.peek(thread.threadId) ||
-          currentAgent !== agent || currentSession !== sessionId || currentModel !== model || currentOwner?.token !== roleOwner.token) {
+          currentAgent !== agent || currentSession !== sessionId || currentModel !== model ||
+          (!runContext && currentOwner?.token !== roleOwner?.token) ||
+          (runContext && (current.execution?.run?.id !== runContext.runId || current.execution.operationId !== runContext.operationId ||
+            current.execution.generation !== runContext.generation || current.cleanup || current.execution.next))) {
         throw new Error('Task state changed while automatic maintenance was active.');
       }
       operation.phase = 'succeeded'; operation.nativeTurnId = result.nativeTurnId; operation.finishedAt = new Date().toISOString(); operation.revision++;
@@ -591,13 +666,25 @@ export class NativeSessionCompactor {
       try { fs.appendFileSync(operation.logPath, `${JSON.stringify({ at: operation.finishedAt, operationId: id, phase: operation.phase, errorCode: operation.errorCode, error: operation.error })}\n`); } catch {}
       if (operation.phase === 'interrupted') return { pauseReason: 'Automatic compaction was cancelled; the task must remain paused.' };
       try {
-        const healthy = await this.codex.probeResume({ executable, sessionId, cwd: getTaskExecutionPath(thread), model, operationId: id, role: role as 'developer' | 'reviewer', cancelled: () => !!cancellation.peek(thread.threadId), onChildPid: bindChild });
+        this.store.loadFromDisk();
+        const probeThread = this.store.getTask(thread.threadId) || thread;
+        const probeBudget = v2Run ? remainingMaintenanceBudget(probeThread) : undefined;
+        if (v2Run && (!probeBudget || probeBudget.remainingMs <= 0)) throw new Error('NATIVE_MAINTENANCE_BUDGET_EXHAUSTED: No active budget remains for recovery probe.');
+        const probeTimeoutMs = Math.min(MAX_NATIVE_RECOVERY_PROBE_ACTIVE_MS, probeBudget?.remainingMs ?? MAX_NATIVE_RECOVERY_PROBE_ACTIVE_MS);
+        const healthy = await this.codex.probeResume({ executable, sessionId, cwd: getTaskExecutionPath(thread), model, operationId: id, role: role as 'developer' | 'reviewer', timeoutMs: probeTimeoutMs, cancelled: () => !!cancellation.peek(thread.threadId), onChildPid: bindChild });
         if (healthy) return { warning: 'Automatic compaction outcome is unknown; same-ID read-only recovery succeeded and the recovery document remains pending.' };
       } catch {}
       const reason = `Native session ${sessionId} could not be proven healthy after automatic operation ${id}; compression was not replayed.`;
       if (current) { appendInterruption(current, { kind: 'paused', reason, at: new Date().toISOString(), by: 'native_session_compaction' }); current.status = 'paused'; this.store.upsertTask(current); }
       return { pauseReason: reason };
-    } finally { registry.dispose(); }
+    } finally {
+      this.store.loadFromDisk();
+      const latest = this.store.getTask(thread.threadId);
+      if (v2Run && latest?.execution?.run?.id === v2Run.id && !latest.execution.run.child && !latest.execution.run.unconfirmed) {
+        try { await setNativeRunMaintenanceStep(this.store, thread.threadId, v2Run, false); } catch {}
+      }
+      registry?.dispose();
+    }
   }
 
   /** Count a completed business turn and acknowledge only the recovery version it actually carried. */
@@ -697,39 +784,75 @@ export class NativeSessionCompactor {
     const captured = role === 'developer' ? thread.receiverSessionCaptured : thread.reviewerSessionCaptured;
     if (!captured || !isValidSessionId(sessionId || '')) throw new Error(`The ${role} native session is not captured.`);
     const nativeSessionId = sessionId!;
+    // A captured ledger ID is not proof of ownership. Verify the durable static
+    // binding before capability probes, leases, recovery files, or native RPC.
+    const assignment = thread.nativeSessionAssignments?.[role];
+    if (!assignment || !Number.isSafeInteger(assignment.sessionEpoch) || assignment.sessionEpoch < 1 ||
+        assignment.namespace !== nativeSessionNamespace(agent)) {
+      throw new Error('SESSION_OWNERSHIP_UNVERIFIED: Captured native session has no matching pinned namespace and epoch.');
+    }
+    const ownership = new SessionOwnershipStore(root).verify({
+      agent, namespace: assignment.namespace, sessionId: nativeSessionId, threadId, role,
+      sessionEpoch: assignment.sessionEpoch,
+    });
+    if (!ownership.ok) throw new Error(`${ownership.code}: ${ownership.reason}`);
     if (agent !== 'codex') throw new Error(`${agent} is ${nativeCompactionCapability(agent)} for Bridge initiated compaction.`);
     const model = role === 'developer'
       ? thread.targetModel || resolveConfiguredModel(agent)
       : thread.reviewerModel || thread.initiatorModel || resolveConfiguredModel(agent, undefined, 'initiator');
     if (!model) throw new Error(`No resolved ${role} model is available; refusing to guess.`);
-    const identity = this.capabilityIdentity(agent, model);
-    if (!identity) throw new Error('Codex provider route could not be safely resolved; refusing native compaction.');
+    const initialBudget = remainingMaintenanceBudget(thread);
+    if (!initialBudget || initialBudget.remainingMs <= 0) {
+      throw new Error('NATIVE_MAINTENANCE_BUDGET_EXHAUSTED: No active execution budget remains for native maintenance.');
+    }
     let round = [...(thread.rounds || [])].reverse().find((entry) => entry.type !== 'approval');
     if (!round) throw new Error('The task has no business round to attach the maintenance record to.');
 
-    const roleLock = new TaskRoleLock(root);
-    const roleLease = roleLock.tryAcquire(threadId, role, role === 'reviewer' ? nativeSessionId : undefined);
-    if (!roleLease) throw new Error('Another developer or reviewer process owns this task role.');
-    const sessionLock = new NativeSessionLock(root);
-    const sessionLease = sessionLock.acquire(agent, nativeSessionId);
-    if (!sessionLease) { roleLock.release(roleLease); throw new Error('Another process owns this native session.'); }
     const executions = new TaskExecutionRegistry(root);
     let registration: TaskExecutionRegistration | undefined;
     let nativeChildPid: number | undefined;
+    let nativeChildBirthId: string | undefined;
+    let nativeSubtreeTimer: NodeJS.Timeout | undefined;
+    let nativeSubtreeTail: Promise<void> = Promise.resolve();
+    let nativeRunUnconfirmed = false;
+    let nativeExitConfirmed = false;
+    let nativeSpawnNotStarted = false;
+    let maintenanceTimeoutMs = 0;
+    let admittedBudgetLimitMs = 0;
+    let admittedBudgetSpentMs = 0;
+    let maintenanceGuard: HostSuspensionGuard | undefined;
+    let maintenanceStartedAt: number | undefined;
+    let maintenanceActiveMs = 0;
     const cancellation = new CancellationRegistry(root);
+    const id = crypto.randomUUID();
     const baselineCancellation = cancellation.peek(threadId);
     const isNewCancellation = () => {
       const current = cancellation.peek(threadId);
       return !!current && JSON.stringify(current) !== JSON.stringify(baselineCancellation);
     };
+    const finishMaintenanceClock = () => {
+      if (maintenanceStartedAt === undefined) return maintenanceActiveMs;
+      const guard = maintenanceGuard;
+      const now = monotonicNowMs();
+      guard?.sync();
+      maintenanceActiveMs += Math.max(0, now - maintenanceStartedAt - (guard?.suspendedWithin(maintenanceStartedAt, now) || 0));
+      guard?.stop();
+      maintenanceStartedAt = undefined;
+      return maintenanceActiveMs;
+    };
+    const remainingMaintenanceTimeMs = () => {
+      if (maintenanceStartedAt === undefined) return maintenanceTimeoutMs;
+      const now = monotonicNowMs();
+      maintenanceGuard?.sync();
+      const elapsed = Math.max(0, now - maintenanceStartedAt - (maintenanceGuard?.suspendedWithin(maintenanceStartedAt, now) || 0));
+      return Math.max(0, maintenanceTimeoutMs - elapsed);
+    };
     let resourceFinalized = false;
     let resourcesReleased = false;
     const releaseResources = () => {
-      if (resourcesReleased || nativeChildPid && processAlive(nativeChildPid)) return;
+      if (resourcesReleased || nativeRunUnconfirmed || nativeChildPid && processAlive(nativeChildPid)) return;
       resourcesReleased = true;
       if (registration) executions.end(registration);
-      sessionLock.release(sessionLease);
-      roleLock.release(roleLease);
       executions.dispose();
     };
     try {
@@ -751,6 +874,35 @@ export class NativeSessionCompactor {
       const freshRound = [...(thread.rounds || [])].reverse().find((entry) => entry.type !== 'approval');
       if (!freshRound) throw new Error('The task has no business round to attach the maintenance record to.');
       round = freshRound;
+      const ownerBirthId = getProcessBirthId(process.pid);
+      if (!ownerBirthId) throw new Error('SESSION_OWNERSHIP_UNVERIFIED: Maintenance controller process identity is unavailable.');
+      const revision = fresh.execution?.revision ?? 0;
+      const now = new Date().toISOString();
+      thread = await this.store.transitionExecution(threadId, revision, (current) => {
+        if (current.status !== 'paused' || current.archivedAt || current.execution?.version !== 2 ||
+            current.execution.run || current.execution.next || current.cleanup ||
+            current.execution.operationId !== fresh.execution?.operationId ||
+            current.execution.generation !== fresh.execution?.generation ||
+            JSON.stringify(current.nativeSessionAssignments?.[role]) !== JSON.stringify(assignment)) {
+          throw new Error('Maintenance admission changed: run, handoff, cleanup, or session assignment is present.');
+        }
+        const budget = remainingMaintenanceBudget(current);
+        if (!budget || budget.remainingMs <= 0) {
+          throw new Error('NATIVE_MAINTENANCE_BUDGET_EXHAUSTED: No active execution budget remains for native maintenance.');
+        }
+        admittedBudgetLimitMs = budget.limitMs;
+        admittedBudgetSpentMs = budget.spentActiveMs;
+        maintenanceTimeoutMs = Math.min(MAX_NATIVE_COMPACTION_ACTIVE_MS, budget.remainingMs);
+        current.execution = {
+          ...current.execution,
+          run: {
+            id, // replaced below once generated; kept unique for the admission CAS
+            purpose: 'native_maintenance', role,
+            owner: { pid: process.pid, birthId: ownerBirthId },
+            step: 'native_maintenance', state: 'active', startedAt: now,
+          },
+        };
+      });
       registration = executions.begin(
         threadId,
         freshRound.round,
@@ -758,10 +910,27 @@ export class NativeSessionCompactor {
         getTaskExecutionPath(thread),
         'maintenance',
       );
+      maintenanceGuard = new HostSuspensionGuard();
+      maintenanceGuard.start();
+      maintenanceStartedAt = monotonicNowMs();
     } catch (error) {
-      executions.dispose(); sessionLock.release(sessionLease); roleLock.release(roleLease); throw error;
+      if (!registration) {
+        try {
+          this.store.loadFromDisk();
+          const current = this.store.getTask(threadId);
+          if (current?.execution?.run?.id === id && current.execution.run.purpose === 'native_maintenance' &&
+              !current.execution.run.spawnIntentAt && !current.execution.run.child && !current.cleanup) {
+            await this.store.transitionExecution(threadId, current.execution.revision, (latest) => {
+              if (latest.execution?.run?.id === id && latest.execution.run.purpose === 'native_maintenance' &&
+                  !latest.execution.run.spawnIntentAt && !latest.execution.run.child && !latest.cleanup) latest.execution.run = undefined;
+            });
+          }
+        } catch {}
+      }
+      executions.dispose(); throw error;
     }
-    const id = crypto.randomUUID();
+    const admittedOperationId = thread.execution!.operationId;
+    const admittedGeneration = thread.execution!.generation;
     const logDir = roleLogDir(thread, role, agent, root);
     const base = `${safeThreadIdPart(threadId)}_round_${round.round}.native_${id}`;
     const logPath = path.join(logDir, role === 'reviewer' ? `${base}.reviewer.log` : `${base}.log`);
@@ -771,33 +940,183 @@ export class NativeSessionCompactor {
       phase: 'prepared', revision: 1, startedAt: new Date().toISOString(), logPath, recoveryPath,
     };
     try {
+      const identity = this.capabilityIdentity(agent, model);
+      if (!identity) throw new Error('Codex provider route could not be safely resolved; refusing native compaction.');
       fs.writeFileSync(recoveryPath, recoveryDocument(thread, role, agent, model, nativeSessionId), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
       fs.writeFileSync(logPath, `${JSON.stringify({ at: new Date().toISOString(), operationId: id, phase: 'prepared', agent, model })}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-      round.nativeSessionCompactions = [...(round.nativeSessionCompactions || []), operation];
-      const oldCursor = thread.nativeSessionCompaction?.[role];
-      thread.nativeSessionCompaction = {
-        ...thread.nativeSessionCompaction,
-      [role]: { revision: (oldCursor?.revision || 0) + 1, sessionId: nativeSessionId, lastOperationId: id, turnsSinceCompaction: 0, recoveryVersion: id, turnCounterResetId: id },
-      };
-      this.store.upsertTask(thread);
+      thread = await this.store.transitionExecution(threadId, thread.execution!.revision, (current) => {
+        if (current.status !== 'paused' || current.execution?.run?.id !== id || current.execution.run.purpose !== 'native_maintenance' || current.cleanup) {
+          throw new Error('Native maintenance preparation lost its protected run.');
+        }
+        const targetRound = [...(current.rounds || [])].reverse().find((entry) => entry.round === round!.round);
+        if (!targetRound) throw new Error('The business round disappeared during maintenance admission.');
+        targetRound.nativeSessionCompactions = [...(targetRound.nativeSessionCompactions || []), operation];
+        const oldCursor = current.nativeSessionCompaction?.[role];
+        current.nativeSessionCompaction = {
+          ...current.nativeSessionCompaction,
+          [role]: { revision: (oldCursor?.revision || 0) + 1, sessionId: nativeSessionId, lastOperationId: id, turnsSinceCompaction: 0, recoveryVersion: id, turnCounterResetId: id },
+        };
+      });
 
       const executable = this.detector.resolveExecutable('codex');
       if (!executable) throw new Error('Codex executable is unavailable.');
       operation.phase = 'running';
       operation.revision++;
-      this.store.upsertTask(thread);
+      thread = await this.store.transitionExecution(threadId, thread.execution!.revision, (current) => {
+        if (current.execution?.run?.id !== id || current.execution.run.purpose !== 'native_maintenance' || current.status !== 'paused' || current.cleanup) {
+          throw new Error('Native maintenance lost its protected run before RPC admission.');
+        }
+        const targetRound = [...(current.rounds || [])].reverse().find((entry) => entry.round === round!.round);
+        const target = targetRound?.nativeSessionCompactions?.find((item) => item.id === id);
+        if (!target) throw new Error('Native maintenance operation record disappeared before RPC admission.');
+        target.phase = 'running'; target.revision = operation.revision;
+      });
+      thread = await this.store.transitionExecution(threadId, thread.execution!.revision, (current) => {
+        const activeRun = current.execution?.run;
+        if (current.status !== 'paused' || !current.execution || !activeRun || activeRun.id !== id ||
+            activeRun.purpose !== 'native_maintenance' || activeRun.unconfirmed || current.cleanup || current.execution.next) {
+          throw new Error('Native maintenance lost run admission before spawn intent.');
+        }
+        activeRun.state = 'starting';
+        activeRun.spawnIntentAt = new Date().toISOString();
+      });
+      const rpcTimeoutMs = remainingMaintenanceTimeMs();
+      if (rpcTimeoutMs <= 0) throw new Error('NATIVE_MAINTENANCE_BUDGET_EXHAUSTED: Setup consumed the remaining active budget.');
       const result = await this.codex.compact({
         executable, sessionId: nativeSessionId, cwd: getTaskExecutionPath(thread), model, operationId: id, role: role as 'developer' | 'reviewer',
+        timeoutMs: rpcTimeoutMs,
         expectedProviderId: identity.providerId,
         cancelled: isNewCancellation,
         onUsage: (usage) => this.recordMaintenanceUsage(threadId, round!.round, id, role, agent, model!, usage),
-        onChildPid: (pid) => {
-          nativeChildPid = pid;
+        onSpawnNotStarted: async () => {
+          nativeSpawnNotStarted = true;
+          this.store.loadFromDisk();
+          const latest = this.store.getTask(threadId);
+          if (!latest?.execution || latest.execution.run?.id !== id) throw new Error('Native maintenance spawn refusal lost its run.');
+          await this.store.transitionExecution(threadId, latest.execution.revision, (current) => {
+            const activeRun = current.execution?.run;
+            if (!current.execution || !activeRun || activeRun.id !== id || activeRun.purpose !== 'native_maintenance' ||
+                activeRun.child || activeRun.unconfirmed) throw new Error('Cannot clear spawn intent after a child was registered.');
+            activeRun.spawnIntentAt = undefined;
+            activeRun.state = 'active';
+          }, latest.cleanup?.token);
+        },
+        onChildPid: async (pid, birthId) => {
           executions.attachChildPid(pid, registration);
-          if (pid) { sessionLock.attachChild(sessionLease, pid); roleLock.attachChild(roleLease, pid); }
-          else if (resourceFinalized) releaseResources();
+          if (!pid && nativeSubtreeTimer) { clearInterval(nativeSubtreeTimer); nativeSubtreeTimer = undefined; }
+          if (!pid) await nativeSubtreeTail;
+          this.store.loadFromDisk();
+          const current = this.store.getTask(threadId);
+          const run = current?.execution?.run;
+          if (!current?.execution || run?.id !== id || run.purpose !== 'native_maintenance' ||
+              current.execution.operationId !== admittedOperationId ||
+              current.execution.generation !== admittedGeneration) {
+            throw new Error('Native maintenance run identity changed while registering a child.');
+          }
+          const cleanupToken = current.cleanup?.token;
+          const runExitProof = !pid && nativeChildPid && subtreeEvidenceExit(mergeSubtreeEvidence(run?.subtrees,
+            nativeChildBirthId ? [{ root: { pid: nativeChildPid, birthId: nativeChildBirthId }, descendants: [] }] : [])) === 'exited'
+            ? { runId: id, operationId: admittedOperationId, generation: admittedGeneration }
+            : undefined;
+          const sampledDescendants = pid && birthId ? await captureChildDescendants(pid, birthId) : [];
+          await this.store.transitionExecution(threadId, current.execution.revision, (fresh) => {
+            const activeRun = fresh.execution?.run;
+            if (!fresh.execution || !activeRun || activeRun.id !== id || activeRun.purpose !== 'native_maintenance' ||
+                fresh.execution.operationId !== admittedOperationId ||
+                fresh.execution.generation !== admittedGeneration || (fresh.cleanup && fresh.cleanup.token !== cleanupToken)) {
+              throw new Error('Native maintenance child registration lost its run or cleanup guard.');
+            }
+            if (pid) {
+              if (!birthId || probeProcessIdentity(pid, birthId) !== 'alive') {
+                activeRun.unconfirmed = true; activeRun.state = 'stopping'; nativeRunUnconfirmed = true;
+              }
+              nativeChildPid = pid; nativeChildBirthId = birthId;
+              const descendants = sampledDescendants;
+              if (descendants.some((item) => !item.birthId)) {
+                activeRun.unconfirmed = true; activeRun.state = 'stopping'; nativeRunUnconfirmed = true;
+              }
+              const priorSubtrees = activeRun.subtrees || [];
+              const priorExit = subtreeEvidenceExit(priorSubtrees);
+              const priorSettled = !activeRun.child && (!priorSubtrees.length || priorExit === 'exited');
+              const additions = birthId
+                ? [{ root: { pid, birthId }, descendants, sampledAt: new Date().toISOString() }]
+                : [{ root: { pid }, descendants, sampledAt: new Date().toISOString() }];
+              activeRun.subtrees = mergeSubtreeEvidence(priorSettled ? undefined : priorSubtrees, additions);
+              if (!priorSettled) {
+                activeRun.unconfirmed = true;
+                activeRun.state = 'stopping';
+                nativeRunUnconfirmed = true;
+              }
+              activeRun.child = { pid, birthId };
+              if (!nativeRunUnconfirmed) activeRun.state = 'active';
+              activeRun.registeredAt = new Date().toISOString();
+              activeRun.step = 'native_maintenance';
+            } else {
+              const currentSubtrees = mergeSubtreeEvidence(activeRun.subtrees, nativeChildPid && nativeChildBirthId
+                ? [{ root: { pid: nativeChildPid, birthId: nativeChildBirthId }, descendants: [] }]
+                : []);
+              // The adapter reports this exact ChildProcess close, but a reparented
+              // descendant can outlive it. Every immutable identity must probe exited.
+              const allExited = subtreeEvidenceExit(currentSubtrees) === 'exited';
+              if (nativeChildPid && !allExited) {
+                activeRun.subtrees = currentSubtrees;
+                activeRun.unconfirmed = true; activeRun.state = 'stopping'; nativeRunUnconfirmed = true;
+                return;
+              }
+              if (nativeChildPid && allExited) {
+                // A previous close notification may have arrived while a
+                // detached descendant was still alive. Re-evaluate from the
+                // immutable durable identities; once each exact PID/birthId is
+                // confirmed exited, the earlier uncertainty is resolved.
+                nativeRunUnconfirmed = false;
+                nativeExitConfirmed = true;
+                activeRun.unconfirmed = undefined;
+                activeRun.state = 'active';
+              }
+              if (nativeChildPid && allExited && subtreeEvidenceExit(mergeSubtreeEvidence(activeRun.subtrees, currentSubtrees)) !== 'exited') {
+                activeRun.subtrees = currentSubtrees;
+                activeRun.unconfirmed = true; activeRun.state = 'stopping'; nativeRunUnconfirmed = true; nativeExitConfirmed = false;
+                return;
+              }
+              nativeChildPid = undefined; nativeChildBirthId = undefined;
+              activeRun.child = undefined;
+              activeRun.subtrees = [];
+              activeRun.registeredAt = undefined;
+              activeRun.spawnIntentAt = undefined;
+              if (resourceFinalized && nativeExitConfirmed && !nativeRunUnconfirmed) {
+                fresh.execution!.run = undefined;
+              }
+            }
+          }, cleanupToken, runExitProof);
+          if (pid && nativeChildPid === pid && !nativeRunUnconfirmed && !nativeSubtreeTimer) {
+            nativeSubtreeTimer = setInterval(() => {
+              nativeSubtreeTail = nativeSubtreeTail.then(async () => {
+                if (nativeChildPid !== pid || !nativeChildBirthId) return;
+                const descendants = await captureChildDescendants(pid, nativeChildBirthId);
+                if (descendants.some((item) => !item.birthId)) nativeRunUnconfirmed = true;
+                this.store.loadFromDisk();
+                const latest = this.store.getTask(threadId);
+                if (!latest?.execution || latest.execution.run?.id !== id) { nativeRunUnconfirmed = true; return; }
+                await this.store.transitionExecution(threadId, latest.execution.revision, (fresh) => {
+                  const activeRun = fresh.execution?.run;
+                  if (!fresh.execution || !activeRun || activeRun.id !== id || activeRun.purpose !== 'native_maintenance' || fresh.cleanup) {
+                    nativeRunUnconfirmed = true; return;
+                  }
+                  activeRun.subtrees = mergeSubtreeEvidence(activeRun.subtrees, [
+                    { root: { pid, birthId: nativeChildBirthId! }, descendants, sampledAt: new Date().toISOString() },
+                  ]);
+                  if (nativeRunUnconfirmed) { activeRun.unconfirmed = true; activeRun.state = 'stopping'; }
+                });
+              }).catch(() => { nativeRunUnconfirmed = true; });
+            }, 150);
+            nativeSubtreeTimer.unref();
+          }
+          if (nativeRunUnconfirmed) throw new Error('Native maintenance child identity or subtree exit could not be confirmed.');
+          if (!pid && resourceFinalized) releaseResources();
         },
       });
+      finishMaintenanceClock();
+      operation.activeDurationMs = maintenanceActiveMs;
       this.store.loadFromDisk();
       const fresh = this.store.getTask(threadId);
       if (!fresh || fresh.archivedAt || fresh.status !== 'paused' || isNewCancellation() ||
@@ -807,8 +1126,7 @@ export class NativeSessionCompactor {
           JSON.stringify(fresh.worktree && {
             path: fresh.worktree.path, branch: fresh.worktree.taskBranch, base: fresh.worktree.baseCommit,
             head: fresh.worktree.headCommit, approved: fresh.worktree.approvedCommit,
-          }) !== boundWorktree ||
-          roleLock.getOwner(threadId)?.token !== roleLease.token) {
+          }) !== boundWorktree || fresh.execution?.run?.id !== id) {
         operation.phase = 'unknown';
         operation.errorCode = 'TASK_CHANGED_DURING_MAINTENANCE';
         operation.revision++;
@@ -818,17 +1136,31 @@ export class NativeSessionCompactor {
       operation.nativeTurnId = result.nativeTurnId;
       operation.finishedAt = new Date().toISOString();
       operation.revision++;
-      const freshRound = [...fresh.rounds].reverse().find((entry) => entry.round === round.round);
-      if (freshRound) {
-        freshRound.nativeSessionCompactions = [...(freshRound.nativeSessionCompactions || []).filter((item) => item.id !== id), operation];
-        const usage = result.usage || emptyMaintenanceUsage(id, role, agent, model);
-        usage.id = id;
-        freshRound.tokenUsage = appendTokenUsageComponent(freshRound.tokenUsage, usage, `legacy-business-round-${round.round}`);
-      }
-      this.store.upsertTask(fresh);
+      const usage = result.usage || emptyMaintenanceUsage(id, role, agent, model);
+      usage.id = id;
+      await this.store.transitionExecution(threadId, fresh.execution!.revision, (current) => {
+        if (current.status !== 'paused' || current.execution?.run?.id !== id ||
+            current.execution.run.purpose !== 'native_maintenance' || current.execution.operationId !== fresh.execution!.operationId ||
+            current.execution.generation !== fresh.execution!.generation || current.execution.run.spawnIntentAt || current.execution.run.child ||
+            current.execution.run.unconfirmed || current.execution.next || current.cleanup || isNewCancellation()) {
+          throw new Error('Native maintenance settlement lost its run, operation, or paused task guard.');
+        }
+        if (current.execution.budget.limitMs !== admittedBudgetLimitMs || current.execution.budget.spentActiveMs !== admittedBudgetSpentMs) {
+          throw new Error('Native maintenance budget changed during protected maintenance.');
+        }
+        current.execution.budget.spentActiveMs += maintenanceActiveMs;
+        const freshRound = [...(current.rounds || [])].reverse().find((entry) => entry.round === round.round);
+        if (freshRound) {
+          freshRound.nativeSessionCompactions = [...(freshRound.nativeSessionCompactions || []).filter((item) => item.id !== id), operation];
+          freshRound.tokenUsage = appendTokenUsageComponent(freshRound.tokenUsage, usage, `legacy-business-round-${round.round}`);
+        }
+        current.execution.run = undefined;
+      });
       fs.appendFileSync(logPath, `${JSON.stringify({ at: operation.finishedAt, operationId: id, phase: operation.phase, nativeTurnId: operation.nativeTurnId, usage: result.usage || { available: false } })}\n`, 'utf8');
       return operation;
     } catch (error: any) {
+      finishMaintenanceClock();
+      operation.activeDurationMs = maintenanceActiveMs;
       this.recordMaintenanceUsage(threadId, round!.round, id, role, agent, model!);
       operation.phase = isNewCancellation() ? 'interrupted' : 'unknown';
       operation.errorCode = operation.phase === 'interrupted' ? 'CANCELLED' : 'NATIVE_COMPACTION_UNCONFIRMED';
@@ -841,19 +1173,174 @@ export class NativeSessionCompactor {
         ? [...(fresh.rounds || [])].reverse().find((entry) => entry.round === round.round)
         : undefined;
       if (fresh && targetRound) {
-        targetRound.nativeSessionCompactions = [...(targetRound.nativeSessionCompactions || []).filter((item) => item.id !== id), operation];
-        this.store.upsertTask(fresh);
+        try {
+          const cleanupProof = fresh.cleanup && nativeExitConfirmed && !nativeRunUnconfirmed
+            ? { runId: id, operationId: admittedOperationId, generation: admittedGeneration }
+            : undefined;
+          await this.store.transitionExecution(threadId, fresh.execution?.revision ?? 0, (current) => {
+            const activeRun = current.execution?.run;
+            if (!current.execution || !activeRun || activeRun.id !== id || activeRun.purpose !== 'native_maintenance') return;
+            const currentRound = [...(current.rounds || [])].reverse().find((entry) => entry.round === round!.round);
+            if (currentRound) currentRound.nativeSessionCompactions = [...(currentRound.nativeSessionCompactions || []).filter((item) => item.id !== id), operation];
+            if (current.execution.budget.limitMs === admittedBudgetLimitMs && current.execution.budget.spentActiveMs === admittedBudgetSpentMs) {
+              current.execution.budget.spentActiveMs += maintenanceActiveMs;
+            }
+            if (nativeChildPid || nativeRunUnconfirmed || activeRun.spawnIntentAt) {
+              activeRun.state = 'stopping'; activeRun.unconfirmed = true;
+              activeRun.settlementPending = true;
+            }
+            else current.execution.run = undefined;
+          }, fresh.cleanup?.token, cleanupProof);
+        } catch { /* A failed CAS leaves the durable run protected for recovery. */ }
       }
       try { fs.appendFileSync(logPath, `${JSON.stringify({ at: operation.finishedAt, operationId: id, phase: operation.phase, errorCode: operation.errorCode, error: operation.error })}\n`, 'utf8'); } catch {}
       return operation;
     } finally {
+      if (nativeSubtreeTimer) clearInterval(nativeSubtreeTimer);
+      try { await nativeSubtreeTail; } catch { nativeRunUnconfirmed = true; }
+      if (maintenanceGuard) maintenanceGuard.stop();
       resourceFinalized = true;
       releaseResources();
     }
   }
 }
 
+interface NativeRunSnapshot { id: string; operationId: string; generation: number; priorStep: string; }
+
+type ProcessEvidenceExit = 'exited' | 'alive' | 'unknown';
+
+function processEvidenceKey(identity: ProcessIdentity): string {
+  return `${identity.pid}:${identity.birthId || 'unknown'}`;
+}
+
+/** Preserve every identity ever observed for this run until every identity is proven exited. */
+function mergeSubtreeEvidence(
+  existing: ExecutionSubtreeEvidence[] | undefined,
+  additions: ExecutionSubtreeEvidence[],
+): ExecutionSubtreeEvidence[] {
+  const merged = new Map<string, ExecutionSubtreeEvidence>();
+  for (const evidence of [...(existing || []), ...additions]) {
+    const key = processEvidenceKey(evidence.root);
+    const current = merged.get(key) || { root: { ...evidence.root }, descendants: [] };
+    const descendants = new Map(current.descendants.map((identity) => [processEvidenceKey(identity), { ...identity }] as const));
+    for (const identity of evidence.descendants) descendants.set(processEvidenceKey(identity), { ...identity });
+    current.descendants = [...descendants.values()];
+    if (evidence.sampledAt && (!current.sampledAt || evidence.sampledAt > current.sampledAt)) current.sampledAt = evidence.sampledAt;
+    merged.set(key, current);
+  }
+  return [...merged.values()];
+}
+
+function processEvidenceExit(identities: ProcessIdentity[]): ProcessEvidenceExit {
+  if (!identities.length || identities.some((identity) => !identity.birthId)) return 'unknown';
+  let unknown = false;
+  for (const identity of identities) {
+    const status = probeProcessIdentity(identity.pid, identity.birthId);
+    if (status === 'alive') return 'alive';
+    if (status === 'unknown') unknown = true;
+  }
+  return unknown ? 'unknown' : 'exited';
+}
+
+function subtreeEvidenceExit(subtrees: ExecutionSubtreeEvidence[] | undefined): ProcessEvidenceExit {
+  if (!subtrees?.length) return 'exited';
+  const identities = subtrees.flatMap((tree) => [tree.root, ...tree.descendants]);
+  return processEvidenceExit(identities);
+}
+
+function snapshotNativeRun(thread: DelegationThread): NativeRunSnapshot | undefined {
+  const control = thread.execution;
+  const run = control?.run;
+  if (control?.version !== 2 || !run || (run.state !== 'active' && run.state !== 'starting') || run.unconfirmed) return undefined;
+  return { id: run.id, operationId: control.operationId, generation: control.generation, priorStep: run.step };
+}
+
+async function setNativeRunMaintenanceStep(store: TaskStore, threadId: string, expected: NativeRunSnapshot, enabled: boolean): Promise<void> {
+  store.loadFromDisk();
+  const fresh = store.getTask(threadId);
+  if (!fresh?.execution || fresh.execution.run?.id !== expected.id) throw new Error('Native maintenance lost its v2 run.');
+  await store.transitionExecution(threadId, fresh.execution.revision, (current) => {
+    const control = current.execution;
+    const run = control?.run;
+    if (!control || control.version !== 2 || !run || run.id !== expected.id || (run.state !== 'active' && run.state !== 'starting') || run.unconfirmed ||
+        control.operationId !== expected.operationId || control.generation !== expected.generation || control.next || current.cleanup) {
+      throw new Error('Native maintenance step no longer matches the active run.');
+    }
+    run.step = enabled ? 'native_maintenance' : expected.priorStep;
+  });
+}
+
+async function bindNativeRunChild(
+  store: TaskStore,
+  threadId: string,
+  expected: NativeRunSnapshot,
+  pid: number | undefined,
+  birthId?: string,
+): Promise<void> {
+  store.loadFromDisk();
+  const fresh = store.getTask(threadId);
+  if (!fresh?.execution || fresh.execution.run?.id !== expected.id) throw new Error('Native maintenance child has no matching v2 run.');
+  let descendants: Awaited<ReturnType<typeof captureChildDescendants>> = [];
+  if (pid) {
+    if (!birthId || probeProcessIdentity(pid, birthId) !== 'alive') throw new Error('Native maintenance child identity is unverified.');
+    descendants = await captureChildDescendants(pid, birthId);
+  }
+  let bindingUnconfirmed = false;
+  await store.transitionExecution(threadId, fresh.execution.revision, (current) => {
+    const control = current.execution;
+    const run = control?.run;
+    if (!control || control.version !== 2 || !run || run.id !== expected.id || (run.state !== 'active' && run.state !== 'starting') || run.unconfirmed ||
+        control.operationId !== expected.operationId || control.generation !== expected.generation || control.next || current.cleanup) {
+      throw new Error('Native maintenance child registration lost its run identity.');
+    }
+    if (pid && birthId) {
+      const priorSubtrees = run.subtrees || [];
+      const priorExit = subtreeEvidenceExit(priorSubtrees);
+      const priorSettled = !run.child && (!priorSubtrees.length || priorExit === 'exited');
+      run.subtrees = mergeSubtreeEvidence(priorSettled ? undefined : priorSubtrees, [
+        { root: { pid, birthId }, descendants, sampledAt: new Date().toISOString() },
+      ]);
+      run.child = { pid, birthId };
+      run.registeredAt = new Date().toISOString();
+      run.step = 'native_maintenance';
+      if (!priorSettled || descendants.some((item) => !item.birthId)) {
+        run.state = 'stopping';
+        run.unconfirmed = true;
+        bindingUnconfirmed = true;
+      }
+    } else {
+      const subtrees = mergeSubtreeEvidence(run.subtrees, run.child?.birthId
+        ? [{ root: { ...run.child }, descendants: [] }]
+        : []);
+      const exited = subtreeEvidenceExit(subtrees) === 'exited';
+      if ((run.child || subtrees.length) && (!exited || run.unconfirmed)) {
+        run.subtrees = subtrees;
+        run.state = 'stopping'; run.unconfirmed = true; bindingUnconfirmed = true;
+        return;
+      }
+      run.child = undefined; run.subtrees = undefined; run.registeredAt = undefined; run.step = expected.priorStep;
+    }
+  });
+  if (bindingUnconfirmed) throw new Error('Native maintenance subtree identity or exit is unconfirmed.');
+  if (!pid) {
+    store.loadFromDisk();
+    const latest = store.getTask(threadId)?.execution?.run;
+    if (latest?.id === expected.id && latest.unconfirmed) throw new Error('Native maintenance process subtree exit is unconfirmed.');
+  }
+}
+
 function processAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (error: any) { return error?.code === 'EPERM'; }
+}
+
+function remainingMaintenanceBudget(thread: DelegationThread): { limitMs: number; spentActiveMs: number; remainingMs: number } | undefined {
+  const budget = thread.execution?.budget;
+  if (!budget || !Number.isFinite(budget.limitMs) || !Number.isFinite(budget.spentActiveMs) ||
+      budget.limitMs < 0 || budget.spentActiveMs < 0) return undefined;
+  return {
+    limitMs: budget.limitMs,
+    spentActiveMs: budget.spentActiveMs,
+    remainingMs: Math.max(0, budget.limitMs - budget.spentActiveMs),
+  };
 }

@@ -2,6 +2,7 @@ import * as childProcess from 'child_process';
 import * as readline from 'readline';
 import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
 import { TokenUsageComponent } from './types';
+import { getProcessBirthIdAsync } from './platform';
 
 export interface CodexCompactionRequest {
   executable: string;
@@ -13,9 +14,13 @@ export interface CodexCompactionRequest {
   role: 'developer' | 'reviewer';
   timeoutMs?: number;
   cancelled?: () => boolean;
-  onChildPid?: (pid: number | undefined) => void;
+  onChildPid?: (pid: number | undefined, birthId?: string) => void | Promise<void>;
+  onSpawnNotStarted?: () => void | Promise<void>;
   onUsage?: (usage: TokenUsageComponent | undefined) => void;
 }
+
+export const MAX_NATIVE_COMPACTION_ACTIVE_MS = 120_000;
+export const MAX_NATIVE_RECOVERY_PROBE_ACTIVE_MS = 30_000;
 
 export interface CodexCompactionResult {
   threadId: string;
@@ -32,7 +37,7 @@ interface RpcMessage { id?: number | string; method?: string; result?: any; erro
 export class CodexNativeCompaction {
   /** Read-only same-ID recovery check; this never submits a turn or compaction request. */
   public async probeResume(request: CodexCompactionRequest): Promise<boolean> {
-    const timeoutMs = Math.min(request.timeoutMs ?? 30_000, 30_000);
+    const timeoutMs = Math.min(request.timeoutMs ?? MAX_NATIVE_RECOVERY_PROBE_ACTIVE_MS, MAX_NATIVE_RECOVERY_PROBE_ACTIVE_MS);
     const startedAt = monotonicNowMs();
     const guard = new HostSuspensionGuard(); guard.start();
     const remaining = () => {
@@ -77,10 +82,11 @@ export class CodexNativeCompaction {
       if (!exited) { try { child.kill(); } catch {} }
       while (!exited && remaining() > timeoutMs - 7_000 && monotonicNowMs() - closeStartedAt < 7_000) await new Promise((resolve) => setTimeout(resolve, 25));
       if (!exited) throw new Error('Codex recovery probe process exit could not be confirmed.');
-      request.onChildPid?.(undefined);
+      await request.onChildPid?.(undefined);
     };
     try {
-      request.onChildPid?.(child.pid);
+      const birthId = child.pid ? await getProcessBirthIdAsync(child.pid!) : undefined;
+      await request.onChildPid?.(child.pid, birthId);
       await rpc('initialize', { clientInfo: { name: 'agent-mesh-bridge', title: 'Agent Mesh Bridge', version: '1.0.0' }, capabilities: null });
       child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} })}\n`);
       const response = await rpc('thread/resume', { threadId: request.sessionId, cwd: request.cwd, model: request.model, approvalPolicy: 'never', sandbox: 'read-only', excludeTurns: true, config: { mcp_servers: {}, hooks: {} } });
@@ -102,7 +108,7 @@ export class CodexNativeCompaction {
       throw new Error('Codex compaction requires a canonical thread UUID.');
     }
     if (!request.cwd || !request.model) throw new Error('Codex compaction requires the existing worktree and resolved model.');
-    const timeoutMs = request.timeoutMs ?? 120_000;
+    const timeoutMs = Math.min(request.timeoutMs ?? MAX_NATIVE_COMPACTION_ACTIVE_MS, MAX_NATIVE_COMPACTION_ACTIVE_MS);
     const guard = new HostSuspensionGuard();
     guard.start();
     const startedAt = monotonicNowMs();
@@ -117,11 +123,15 @@ export class CodexNativeCompaction {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env },
     });
+    if (!child.pid) {
+      await request.onSpawnNotStarted?.();
+      throw new Error('Codex app-server did not start; no native child PID was created.');
+    }
     if (!child.stdin || !child.stdout) throw new Error('Codex app-server stdio is unavailable.');
-    let activeChildPid = child.pid;
+    let activeChildPid: number | undefined = child.pid;
     let compactSettled = false;
-    const reportPid = (pid: number | undefined) => { activeChildPid = pid; request.onChildPid?.(pid); };
-    const reportMainExit = () => { if (compactSettled && activeChildPid === child.pid) reportPid(undefined); };
+    const reportPid = async (pid: number | undefined, birthId?: string) => { activeChildPid = pid; await request.onChildPid?.(pid, birthId); };
+    const reportMainExit = () => { if (compactSettled && activeChildPid === child.pid) void reportPid(undefined); };
     child.once('exit', reportMainExit);
     let nextId = 0;
     const notifications: RpcMessage[] = [];
@@ -207,7 +217,8 @@ export class CodexNativeCompaction {
     };
 
     try {
-      reportPid(child.pid);
+      const birthId = child.pid ? await getProcessBirthIdAsync(child.pid) : undefined;
+      await reportPid(child.pid, birthId);
       await rpc('initialize', { clientInfo: { name: 'agent-mesh-bridge', title: 'Agent Mesh Bridge', version: '1.0.0' }, capabilities: null });
       child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} })}\n`);
       const resumed = await rpc('thread/resume', {
@@ -240,13 +251,13 @@ export class CodexNativeCompaction {
       const exitCode = await close();
       if (exitCode !== 0) throw new Error(`Codex app-server exited ${exitCode} after reporting compaction completion.`);
       await this.verifyPersisted({ ...request, onChildPid: reportPid }, turn.id, thread.modelProvider, remainingMs, guard);
-      if (activeChildPid === child.pid) reportPid(undefined);
+      if (activeChildPid === child.pid) await reportPid(undefined);
       return { threadId, nativeTurnId: turn.id, model: thread.model, provider: thread.modelProvider, processExitCode: exitCode, usage };
     } catch (error) {
       try { child.kill(); } catch {}
       try {
         await close();
-        request.onChildPid?.(undefined);
+        await request.onChildPid?.(undefined);
       } catch (closeError: any) {
         throw new Error(`${String((error as any)?.message || error)}; ${closeError?.message || closeError}`);
       }
@@ -276,9 +287,10 @@ export class CodexNativeCompaction {
     });
     if (!child.stdin || !child.stdout) throw new Error('Codex persistence verifier stdio is unavailable.');
     let verifierSettled = false;
-    const reportVerifierExit = () => { if (verifierSettled) request.onChildPid?.(undefined); };
+    const reportVerifierExit = () => { if (verifierSettled) void request.onChildPid?.(undefined); };
     child.once('exit', reportVerifierExit);
-    request.onChildPid?.(child.pid);
+    const birthId = child.pid ? await getProcessBirthIdAsync(child.pid) : undefined;
+    await request.onChildPid?.(child.pid, birthId);
     const reader = readline.createInterface({ input: child.stdout });
     const waiters = new Map<string, { resolve: (value: RpcMessage) => void; reject: (error: Error) => void }>();
     let id = 0;
@@ -354,7 +366,7 @@ export class CodexNativeCompaction {
       throw error;
     } finally {
       verifierSettled = true;
-      if (exited || child.exitCode !== null) request.onChildPid?.(undefined);
+      if (exited || child.exitCode !== null) await request.onChildPid?.(undefined);
     }
   }
 }

@@ -37,6 +37,8 @@ export interface ReviewWakeSchedulerOptions {
   watchdogIntervalMs?: number;
   /** True while a reviewer process holds this task's role lock. */
   isReviewerActive?: (threadId: string) => boolean;
+  /** Production hosts set this to make historical wake state read-only. */
+  requireV2Execution?: boolean;
 }
 
 /**
@@ -71,6 +73,7 @@ export class ReviewWakeScheduler extends EventEmitter {
   private readonly watchdogIntervalMs: number;
   private readonly isReviewerActive: (threadId: string) => boolean;
   private stallTimeoutMs: number;
+  private readonly requireV2Execution: boolean;
 
   constructor(
     private readonly taskStore: TaskStore,
@@ -83,6 +86,7 @@ export class ReviewWakeScheduler extends EventEmitter {
     // but clamping keeps a corrupt timestamp from scheduling an instant loop.
     this.maxTimerMs = options.maxTimerMs ?? 6 * 60 * 60 * 1000;
     this.stallTimeoutMs = options.stallTimeoutMs ?? REVIEW_STALL_TIMEOUT_MS;
+    this.requireV2Execution = options.requireV2Execution === true;
     this.watchdogIntervalMs = options.watchdogIntervalMs ?? 60_000;
     this.isReviewerActive =
       options.isReviewerActive ??
@@ -277,6 +281,7 @@ export class ReviewWakeScheduler extends EventEmitter {
     const stalled: DelegationThread[] = [];
     for (const thread of tasks) {
       if (thread.reviewFlow !== 'dedicated') continue;
+      if (this.requireV2Execution && thread.execution?.version !== 2) continue;
       try {
         if (isMergeReview(thread) && isReviewerWakeEligible(thread)) {
           if (this.isReviewerActive(thread.threadId)) continue;
@@ -467,6 +472,7 @@ export class ReviewWakeScheduler extends EventEmitter {
         .getAllTasks()
         .filter(
           (t) =>
+            (!this.requireV2Execution || t.execution?.version === 2) &&
             isReviewerWakeEligible(t) &&
             !!t.reviewWake &&
             t.reviewWake.gaveUp !== true &&

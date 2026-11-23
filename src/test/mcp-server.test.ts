@@ -4,7 +4,8 @@ import * as assert from 'node:assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { spawnSync } from 'child_process';
+import * as crypto from 'crypto';
+import { spawn, spawnSync } from 'child_process';
 
 const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-mcp-home-'));
 process.env.USERPROFILE = isolatedHome;
@@ -33,6 +34,11 @@ import { AsyncDispatcher } from '../bridge/async-dispatcher';
 import { ReworkController } from '../bridge/rework-controller';
 import { MCPServer } from '../bridge/mcp-server';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
+import { ExecutionController } from '../bridge/execution-controller';
+import { getProcessBirthId, probeProcessIdentity } from '../bridge/platform';
+import { registerRunChildV2 } from '../bridge/process-binding';
+import { meshMergeLockPath } from '../bridge/mesh-file-lock';
+import { MeshFileLock } from '../bridge/mesh-file-lock';
 import { TaskRoleLock } from '../bridge/task-role-lock';
 import { roundOutputArchivePath } from '../bridge/round-log';
 import { reviewerLogPath } from '../bridge/reviewer-log';
@@ -48,6 +54,14 @@ import {
 } from '../bridge/reviewer-bootstrap';
 import { DelegationRound } from '../bridge/types';
 import { WindowWorkspace, WorkspaceRegistry, physicalDirectory } from '../bridge/workspace';
+
+const { createBridgeHost } = require('../../bin/agent-bridge-mcp.cjs') as { createBridgeHost: (options?: any) => any };
+
+function configureCodexReviewerFixture(): void {
+  const home = getBridgeHome();
+  saveModelDefaults({ codex: 'gpt-6-flash' }, home, { initiatorModels: { codex: 'gpt-6-pro' } });
+  invalidateConfiguredModelCache();
+}
 
 describe('MCPServer Protocol Tests', () => {
   let tempDir: string;
@@ -67,6 +81,8 @@ describe('MCPServer Protocol Tests', () => {
     savedThreadIdEnv = process.env.MESH_TASK_THREAD_ID;
     delete process.env.MESH_TASK_RECEIVER;
     delete process.env.MESH_TASK_THREAD_ID;
+    saveModelDefaults({}, getBridgeHome(), { initiatorModels: {} });
+    invalidateConfiguredModelCache();
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-mcp-test-'));
     const workspace = path.join(tempDir, 'repo');
     fs.mkdirSync(workspace, { recursive: true });
@@ -133,6 +149,239 @@ describe('MCPServer Protocol Tests', () => {
     } catch {}
   });
 
+  test('independent MCP host dispatches v2 through bootstrap, rework, approval, and merge after child exit', async () => {
+    (dispatcher as any).queueDrainer?.dispose();
+    reworkController.dispose();
+    taskStore.dispose();
+    const taskLockTails = new Map<string, Promise<void>>();
+    taskStore = new TaskStore(tempDir, { lockFactory: (lockPath) => ({
+      acquire: async () => {
+        const key = path.resolve(lockPath);
+        const previous = taskLockTails.get(key) || Promise.resolve();
+        let releaseNext!: () => void;
+        const next = new Promise<void>((resolve) => { releaseNext = resolve; });
+        taskLockTails.set(key, next);
+        await previous;
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          releaseNext();
+          if (taskLockTails.get(key) === next) taskLockTails.delete(key);
+        };
+      },
+      dispose: () => undefined,
+    }) });
+    const registry = new TaskExecutionRegistry(tempDir);
+    callbackManager.setTaskStore(taskStore);
+    callbackManager.setAutonomousRunner(runner);
+    const host = createBridgeHost({ taskStore, detector, resolver, runner, callbackManager, registry,
+      executionControllerOptions: { storageDir: tempDir, standingScanIntervalMs: 0, streamSyncIntervalMs: 60_000 } });
+    dispatcher = host.dispatcher;
+    reworkController = host.reworkController;
+    mcpServer = host.server;
+    const controller: ExecutionController = host.executionController;
+    const mergeActiveMarker = path.join(tempDir, 'merge-helper-active');
+    const mergeReleaseMarker = path.join(tempDir, 'merge-helper-release');
+    const validationDir = path.join(process.cwd(), '.agent-mesh-bridge');
+    fs.mkdirSync(validationDir, { recursive: true });
+    fs.writeFileSync(path.join(validationDir, 'validate.json'), JSON.stringify({
+      commands: [{ command: process.execPath, args: ['-e', `const fs=require('fs');const p=${JSON.stringify(mergeActiveMarker)};const r=${JSON.stringify(mergeReleaseMarker)};fs.writeFileSync(p,'active');const t=setInterval(()=>{if(fs.existsSync(r)){clearInterval(t);try{fs.unlinkSync(p)}catch{};process.exit(0)}},20)`], label: 'fixture validation' }],
+    }), 'utf8');
+    const fixtureValidationCommit = spawnSync(gitExe, ['add', '.agent-mesh-bridge/validate.json'], { cwd: process.cwd(), encoding: 'utf8', windowsHide: true });
+    assert.equal(fixtureValidationCommit.status, 0, fixtureValidationCommit.stderr);
+    const fixtureBaselineCommit = spawnSync(gitExe, ['commit', '-m', 'declare isolated merge validation'], { cwd: process.cwd(), encoding: 'utf8', windowsHide: true });
+    assert.equal(fixtureBaselineCommit.status, 0, fixtureBaselineCommit.stderr);
+    const previousReviewSession = process.env.MESH_REVIEW_SESSION_ID;
+    let bootstrapStage = 'not_started';
+    const processEvents: Array<{ at: number; event: string; pid?: number; detail?: string }> = [];
+    const recordProcessEvent = (event: string, pid?: number, detail?: string) => processEvents.push({ at: Date.now(), event, pid, detail });
+    const originalTransitionExecution = taskStore.transitionExecution.bind(taskStore);
+    taskStore.transitionExecution = (async (threadId: string, expectedRevision: number, change: (thread: any) => void) => {
+      const startedAt = Date.now();
+      recordProcessEvent('task_cas_begin', undefined, `rev=${expectedRevision}`);
+      try {
+        const result = await originalTransitionExecution(threadId, expectedRevision, change);
+        recordProcessEvent('task_cas_ack', undefined, `rev=${result.execution?.revision};elapsed=${Date.now() - startedAt}`);
+        return result;
+      } catch (error: any) {
+        recordProcessEvent('task_cas_rejected', undefined, `rev=${expectedRevision};elapsed=${Date.now() - startedAt};error=${error?.message || error}`);
+        throw error;
+      }
+    }) as any;
+    const controlledChildren = new Set<{ child: any; pid: number; birthId: string; closed: Promise<void>; isClosed: () => boolean }>();
+    const rpc = async (name: string, args: any) => {
+      const response = await mcpServer.handleRpcMessage({ jsonrpc: '2.0', id: crypto.randomUUID(), method: 'tools/call', params: { name, arguments: args } });
+      if (response?.error) throw new Error(response.error.message);
+      if (response?.result?.isError) throw new Error(response.result.content?.[0]?.text || `${name} failed`);
+      return JSON.parse(response.result.content[0].text);
+    };
+    const waitFor = async (predicate: () => boolean, label: string) => {
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        taskStore.loadFromDisk();
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error(`Timed out waiting for ${label}; state=${JSON.stringify({ calls: { bootstrapSeen, bootstrapStage, developerCalls, reviewCalls }, processEvents, tasks: taskStore.getAllTasks().map((task) => ({ id: task.threadId, status: task.status, phase: task.execution?.phase, run: task.execution?.run, next: task.execution?.next, failure: task.failure, bootstrap: task.reviewBootstrap })) })}`);
+    };
+    const controlledChild = async (onChildPid?: (pid: number | undefined, child?: any, birthId?: string) => void, duringAlive?: (pid: number) => Promise<void>) => {
+      const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: ['ignore', 'ignore', 'ignore'], windowsHide: true });
+      let isClosed = false;
+      let resolveClosed!: () => void;
+      const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
+      child.once('close', () => { isClosed = true; recordProcessEvent('child_close', child.pid); resolveClosed(); });
+      const childRecord: { child: any; pid: number; birthId: string; closed: Promise<void>; isClosed: () => boolean } = { child, pid: 0, birthId: '', closed, isClosed: () => isClosed };
+      try {
+        await new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('spawn', resolve); });
+        const pid = child.pid;
+        const birthId = pid ? getProcessBirthId(pid) : undefined;
+        if (!pid || !birthId) throw new Error('Controlled subprocess identity was not observable after spawn.');
+        childRecord.pid = pid;
+        childRecord.birthId = birthId;
+        controlledChildren.add(childRecord);
+        recordProcessEvent('child_spawned', pid, birthId);
+        recordProcessEvent('child_binding_begin', pid, birthId);
+        await onChildPid?.(pid, child, birthId);
+        recordProcessEvent('child_binding_ack', pid, birthId);
+        await duringAlive?.(pid);
+        recordProcessEvent('child_stop_requested', pid, birthId);
+        if (!isClosed) child.kill('SIGKILL');
+        await Promise.race([closed, new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error(`Controlled child ${pid}/${birthId} did not emit close.`)), 5000))]);
+        recordProcessEvent('child_close_confirmed', pid, `${birthId};probe=${probeProcessIdentity(pid, birthId)}`);
+        if (probeProcessIdentity(pid, birthId) !== 'exited') throw new Error(`Controlled child ${pid}/${birthId} emitted close but its identity is not confirmed exited.`);
+        recordProcessEvent('child_exit_callback_begin', pid, birthId);
+        await onChildPid?.(undefined);
+        recordProcessEvent('child_exit_callback_ack', pid, birthId);
+      } finally {
+        if (!isClosed) {
+          recordProcessEvent('child_failure_cleanup', child.pid);
+          try { child.kill('SIGKILL'); } catch {}
+          await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 5000))]);
+        }
+        if (isClosed) controlledChildren.delete(childRecord);
+      }
+    };
+    let bootstrapSeen = false;
+    let developerCalls = 0;
+    let reviewCalls = 0;
+    let requesterSessionUsed = false;
+    try {
+      runner.execute = async (options: any) => {
+        if (!bootstrapSeen) {
+          bootstrapSeen = true;
+          bootstrapStage = 'loading_token';
+          const task = taskStore.getTask(options.taskThreadId)!;
+          const credential = readReviewerBootstrapToken(task.threadId, tempDir, task.artifactDir)!;
+          bootstrapStage = 'child_started';
+          await controlledChild(options.onChildPid, async () => { bootstrapStage = 'confirming'; await rpc('dispatch_task', { reviewBootstrap: { threadId: task.threadId, token: credential.token } }); bootstrapStage = 'confirmed'; });
+          bootstrapStage = 'child_exited';
+          return { exitCode: 0, stdout: 'reviewer ready', stderr: '', extractedOutput: 'reviewer ready', actualSessionId: 'reviewer-session-fixed', durationMs: 1 };
+        }
+        bootstrapStage = 'business_runner';
+        developerCalls++;
+        recordProcessEvent('developer_runner_start', undefined, `round=${developerCalls}`);
+        fs.writeFileSync(path.join(options.cwd, `round-${developerCalls}.txt`), `work ${developerCalls}\n`);
+        await controlledChild(options.onChildPid);
+        return {
+          exitCode: 0, stdout: `developer output ${developerCalls}`, stderr: '',
+          extractedOutput: `developer output ${developerCalls}`, actualSessionId: 'developer-session-fixed', durationMs: 1,
+          assessment: { success: true, exitCode: 0, stream: { hasActualOutput: true, chunkCount: 1, stdoutBytes: 12, stderrBytes: 0, continuous: true, gapExceeded: false, maxGapMs: 0, gapThresholdMs: 60_000 } },
+        } as any;
+      };
+      callbackManager.launchCaller = (async (thread: any, _round: any, onChildPid: any) => {
+        reviewCalls++;
+        recordProcessEvent('reviewer_runner_start', undefined, `review=${reviewCalls}`);
+        const reviewer = thread.reviewerSessionId;
+        assert.equal(reviewer, 'reviewer-session-fixed');
+        assert.notEqual(reviewer, thread.requesterSessionId);
+        requesterSessionUsed ||= reviewer === thread.callerSessionId && reviewer !== 'reviewer-session-fixed';
+        process.env.MESH_REVIEW_SESSION_ID = reviewer;
+        const doReview = async (pid: number) => {
+          if (reviewCalls === 1) {
+            await rpc('request_rework', { threadId: thread.threadId, feedback: 'add a second change' });
+            recordProcessEvent('rework_decision_persisted', pid);
+          const handed = taskStore.getTask(thread.threadId)!;
+          assert.equal(handed.execution?.next?.phase, 'develop', 'review decision and next phase are durable together');
+          assert.equal(handed.execution?.run?.role, 'reviewer', 'reviewer run remains until its controlled child exits');
+          assert.equal(developerCalls, 1, 'next is not consumed while the reviewer child is alive');
+          } else {
+            await rpc('approve_task', { threadId: thread.threadId, remarks: 'accepted' });
+            recordProcessEvent('approve_decision_persisted', pid);
+          const handed = taskStore.getTask(thread.threadId)!;
+          assert.equal(handed.execution?.next?.phase, 'merge', 'approval and merge handoff are durable together');
+          assert.equal(handed.execution?.run?.role, 'reviewer', 'approved reviewer run remains until its child exits');
+          }
+        };
+        await controlledChild(onChildPid, doReview);
+        return { success: false, exitCode: 17, error: 'controlled reviewer tail exits nonzero after durable decision' };
+      }) as any;
+
+      const dispatched = await rpc('dispatch_task', {
+        workspaceRoot: process.cwd(), targetAgent: 'claude_code', initiatorAgent: 'codex',
+        title: 'Independent MCP v2 lifecycle', prompt: 'Implement the fixture change',
+      });
+      const threadId = dispatched.threadId;
+      assert.equal(taskStore.getTask(threadId)?.execution?.version, 2, 'formal independent MCP dispatch creates v2');
+      const targetAdvance = spawnSync(gitExe, ['commit', '--allow-empty', '-m', 'advance delivery target for merge fixture'], { cwd: process.cwd(), encoding: 'utf8', windowsHide: true });
+      assert.equal(targetAdvance.status, 0, targetAdvance.stderr || 'could not advance temporary delivery target');
+      await waitFor(() => developerCalls >= 1, 'first developer launch after bootstrap exit ACK');
+      await waitFor(() => reviewCalls >= 1, 'reviewer launch after first developer exit ACK');
+      await waitFor(() => processEvents.some((event) => event.event === 'rework_decision_persisted'), 'durable rework decision');
+      const firstReworkPid = processEvents.find((event) => event.event === 'rework_decision_persisted')?.pid;
+      assert.ok(firstReworkPid, 'the rework decision must be tied to its real reviewer child');
+      await waitFor(() => processEvents.some((event) => event.event === 'child_exit_callback_ack' && event.pid === firstReworkPid), 'reviewer child close and run exit ACK');
+      await waitFor(() => developerCalls >= 2, 'next consumption after reviewer exit ACK');
+      await waitFor(() => reviewCalls >= 2, 'second review');
+      await waitFor(() => fs.existsSync(mergeActiveMarker), 'merge helper child to hold the global merge lock');
+      recordProcessEvent('merge_helper_active');
+      const competingMergeLock = new MeshFileLock(meshMergeLockPath(tempDir));
+      const stolenMergeLock = await competingMergeLock.acquire(undefined, undefined, 250);
+      assert.equal(stolenMergeLock, undefined, 'the global merge lock remains unavailable while the real Git hook child is alive');
+      competingMergeLock.dispose();
+      fs.writeFileSync(mergeReleaseMarker, 'release', 'utf8');
+      recordProcessEvent('merge_helper_release_requested');
+      await waitFor(() => taskStore.getTask(threadId)?.status === 'completed', 'merge completion');
+      assert.equal(fs.existsSync(mergeActiveMarker), false, 'the merge hook child exited before lock release was acknowledged');
+      const completed = taskStore.getTask(threadId)!;
+      assert.equal(completed.reviewerSessionId, 'reviewer-session-fixed');
+      assert.equal(completed.callerSessionId, 'reviewer-session-fixed');
+      assert.equal(requesterSessionUsed, false);
+      assert.equal(developerCalls, 2);
+      assert.equal(reviewCalls, 2);
+      const reworkIndex = processEvents.findIndex((event) => event.event === 'rework_decision_persisted');
+      const reworkPid = processEvents[reworkIndex]?.pid;
+      const reworkExitAckIndex = processEvents.findIndex((event) => event.event === 'child_exit_callback_ack' && event.pid === reworkPid);
+      const secondDeveloperIndex = processEvents.findIndex((event) => event.event === 'developer_runner_start' && event.detail === 'round=2');
+      assert.ok(reworkIndex >= 0 && reworkIndex < reworkExitAckIndex && reworkExitAckIndex < secondDeveloperIndex,
+        `rework was not consumed after confirmed child close/exit callback: ${JSON.stringify(processEvents)}`);
+      const mergeLock = new MeshFileLock(meshMergeLockPath(tempDir));
+      const release = await mergeLock.acquire(undefined, undefined, 10_000);
+      assert.ok(release, 'global merge lock helper acknowledged release');
+      release();
+      mergeLock.dispose();
+    } finally {
+      try { fs.writeFileSync(mergeReleaseMarker, 'failure cleanup release', 'utf8'); } catch {}
+      const mergeExitDeadline = Date.now() + 5000;
+      while (fs.existsSync(mergeActiveMarker) && Date.now() < mergeExitDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      for (const child of [...controlledChildren]) {
+        if (!child.isClosed()) {
+          recordProcessEvent('outer_failure_cleanup', child.pid, child.birthId);
+          try { child.child.kill('SIGKILL'); } catch {}
+        }
+        await Promise.race([child.closed, new Promise((resolve) => setTimeout(resolve, 5000))]);
+        controlledChildren.delete(child);
+      }
+      if (previousReviewSession === undefined) delete process.env.MESH_REVIEW_SESSION_ID;
+      else process.env.MESH_REVIEW_SESSION_ID = previousReviewSession;
+      await controller.waitForActiveExecutions(5000);
+      controller.dispose();
+      registry.dispose();
+    }
+  });
+
   test('should handle initialize request with proper capabilities', async () => {
     const initReq = {
       jsonrpc: '2.0',
@@ -146,6 +395,234 @@ describe('MCPServer Protocol Tests', () => {
     assert.strictEqual(res.id, 1);
     assert.strictEqual(res.result.serverInfo.name, 'agent-mesh-bridge');
     assert.ok(res.result.capabilities.tools);
+  });
+
+  test('standalone stdio reads historical history but refuses retry without changing ledger files', async () => {
+    const isolatedUserHome = path.join(tempDir, 'stdio-user-home');
+    const bridgeHome = path.join(isolatedUserHome, '.agent-mesh-bridge');
+    const fixtureStore = new TaskStore(bridgeHome);
+    const historical = [
+      { threadId: 'thread_stdio_completed_v1_history', version: 1 },
+      { threadId: 'thread_stdio_completed_no_execution_history', version: undefined },
+      { threadId: 'thread_stdio_completed_unknown_version_history', version: 99 },
+      { threadId: 'thread_stdio_completed_v1_live_ledger_owner', version: 1, liveOwner: true },
+    ];
+    const heldLegacyOwnerPid = process.pid;
+    const heldLegacyBirthId = getProcessBirthId(heldLegacyOwnerPid);
+    assert.ok(heldLegacyBirthId, 'live historical owner must have an exact PID/birthId');
+    for (const fixture of historical) fixtureStore.upsertTask({
+      threadId: fixture.threadId,
+      title: `Completed historical fixture ${fixture.threadId}`,
+      initiatorAgent: 'codex', targetAgent: 'claude_code', reviewFlow: 'dedicated', status: 'completed', currentRound: 1,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      receiverSessionId: 'historical-session-never-resumed', workspace: testWorkspace(tempDir),
+      rounds: [{ round: 1, type: 'initial', prompt: 'historical work', status: 'completed', durationMs: 1, timestamp: new Date().toISOString(), output: 'done' }],
+      summary: { lastPromptSnippet: 'historical work', lastOutputSnippet: 'done', totalDurationMs: 1 },
+      ...(fixture.version === undefined ? {} : { execution: {
+        version: fixture.version, revision: 1, operationId: 'legacy_operation', phase: 'develop', round: 1,
+        generation: 1, attempt: 0, autoRetriesUsed: 0,
+        budget: { limitMs: 120_000, spentActiveMs: 1, maxAutoRetries: 2 },
+        ...(fixture.liveOwner ? { run: { id: 'legacy-live-run', owner: { pid: heldLegacyOwnerPid, birthId: heldLegacyBirthId },
+          state: 'stopping', step: 'develop', startedAt: new Date().toISOString() }, next: { phase: 'review', round: 2, sourceRunId: 'legacy-live-run' } } : {}),
+      } }),
+    } as any);
+    fixtureStore.dispose();
+    const before = new Map(historical.map(({ threadId }) => {
+      const file = path.join(bridgeHome, 'threads', `${threadId}.json`);
+      return [threadId, fs.readFileSync(file)] as const;
+    }));
+    const packageRoot = path.resolve(__dirname, '../..');
+    const packageVersion = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8')).version;
+    fs.writeFileSync(path.join(bridgeHome, 'v2-runtime-components.json'), JSON.stringify({
+      schemaVersion: 1, cutoverApproved: true,
+      components: [
+        { component: 'extension-host', version: packageVersion, packageRoot, path: path.join(packageRoot, 'out', 'extension.js'), completeProcessInventory: true, previousProcesses: [] },
+        { component: 'standalone-mcp', version: packageVersion, packageRoot, path: path.join(packageRoot, 'bin', 'agent-bridge-mcp.cjs'), completeProcessInventory: true, previousProcesses: [] },
+      ],
+    }));
+    const snapshotFiles = (root: string): Map<string, Buffer> => {
+      const files = new Map<string, Buffer>();
+      const visit = (directory: string) => {
+        for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+          const absolute = path.join(directory, entry.name);
+          if (entry.isDirectory()) visit(absolute);
+          else if (entry.isFile()) files.set(path.relative(root, absolute).replace(/\\/g, '/'), fs.readFileSync(absolute));
+        }
+      };
+      visit(root);
+      return files;
+    };
+    const serverEntry = path.resolve(__dirname, '../../bin/agent-bridge-mcp.cjs');
+    const child = spawn(process.execPath, [serverEntry, '--caller', 'codex'], {
+      cwd: process.cwd(), windowsHide: true,
+      env: { ...process.env, AGENT_MESH_BRIDGE_HOME: bridgeHome, USERPROFILE: isolatedUserHome, HOME: isolatedUserHome },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let output = '';
+    let stderr = '';
+    let closed = false;
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    const waitResponse = async (id: number): Promise<any> => {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const lines = output.split(/\r?\n/);
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const message = JSON.parse(line);
+            if (message.id === id) return message;
+          } catch {}
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      throw new Error(`stdio response ${id} timed out; stdout=${output}; stderr=${stderr}`);
+    };
+    const request = async (id: number, method: string, params: any = {}) => {
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+      return waitResponse(id);
+    };
+    try {
+      const initialized = await request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'history-gate-test', version: '1' } });
+      assert.equal(initialized.result?.serverInfo?.name, 'agent-mesh-bridge', JSON.stringify(initialized));
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
+      let requestId = 2;
+      const retryIds: string[] = [];
+      for (const { threadId, version } of historical) {
+        const summary = await request(requestId++, 'tools/call', { name: 'get_task_summary', arguments: { threadId } });
+        assert.ok(summary.result?.content?.[0]?.text, `stdio summary failed: ${JSON.stringify(summary)}; stderr=${stderr}`);
+        assert.equal(JSON.parse(summary.result.content[0].text).status, 'completed', 'history reads remain available over actual stdio');
+        retryIds.push(threadId);
+      }
+      const beforeControlCalls = snapshotFiles(bridgeHome);
+      for (const [index, threadId] of retryIds.entries()) {
+        const { version } = historical[index];
+        const retry = await request(requestId++, 'tools/call', { name: 'retry_task', arguments: { threadId } });
+        const reason = version === 1 ? 'LEGACY_VERSION_1' : version === undefined ? 'NO_EXECUTION' : 'UNKNOWN_VERSION';
+        assert.match(retry.error?.message || '', new RegExp(`HISTORICAL_TASK_READ_ONLY.*${reason}`));
+      }
+      const afterControlCalls = snapshotFiles(bridgeHome);
+      assert.deepEqual([...afterControlCalls.keys()].sort(), [...beforeControlCalls.keys()].sort(), 'historical retry must not create or remove control/session files');
+      for (const [relative, bytes] of beforeControlCalls) {
+        assert.deepEqual(afterControlCalls.get(relative), bytes, `${relative} changed after rejecting historical execution`);
+      }
+      for (const [threadId, bytes] of before) {
+        assert.deepEqual(fs.readFileSync(path.join(bridgeHome, 'threads', `${threadId}.json`)), bytes,
+          `${threadId} retry must not alter generation, execution, rounds, or any ledger bytes`);
+      }
+      const dispatch = await request(requestId++, 'tools/call', { name: 'dispatch_task', arguments: {
+        targetAgent: 'claude_code', title: 'blocked before v2 activation', prompt: 'must not spawn', workspaceRoot: process.cwd(),
+      } });
+      assert.match(dispatch.error?.message || '', /V2_STARTUP_BLOCKED.*(RUN_RECORD_REMAINS|RUNTIME_OLD_PROCESS_ALIVE|HISTORICAL_TASK_NOT_DRAINED)/);
+      assert.deepEqual(snapshotFiles(bridgeHome), beforeControlCalls, 'failed runtime admission must not add a task, run, session, or control record');
+    } finally {
+      child.stdin.end();
+      const exited = await Promise.race([
+        new Promise<boolean>((resolve) => child.once('close', () => { closed = true; resolve(true); })),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 2_000)),
+      ]);
+      if (!exited) {
+        child.kill();
+        await new Promise<void>((resolve) => child.once('close', () => { closed = true; resolve(); }));
+      }
+      assert.equal(closed, true, 'standalone stdio process must exit after stdin closes');
+    }
+  });
+
+  test('two standalone stdio hosts recover admission for the exact live v2 merge helper without acquiring another lock', async () => {
+    const isolatedHome = path.join(tempDir, 'stdio-v2-live-merge-home');
+    const bridgeHome = path.join(isolatedHome, '.agent-mesh-bridge');
+    const threadId = 'thread_stdio_v2_live_merge';
+    const token = 'stdio-live-merge-token';
+    const channelPath = path.join(bridgeHome, `merge.lock.${token}`);
+    const owner = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true });
+    const helper = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true });
+    const validation = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true });
+    assert.ok(owner.pid && helper.pid && validation.pid);
+    const ownerBirth = getProcessBirthId(owner.pid!);
+    const helperBirth = getProcessBirthId(helper.pid!);
+    const validationBirth = getProcessBirthId(validation.pid!);
+    assert.ok(ownerBirth && helperBirth && validationBirth);
+    fs.mkdirSync(path.join(bridgeHome, 'threads'), { recursive: true });
+    const task = {
+      threadId, title: 'Active merge recovery fixture', initiatorAgent: 'codex', targetAgent: 'claude_code',
+      status: 'merging', currentRound: 1, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      reviewFlow: 'dedicated', workspace: testWorkspace(process.cwd()), rounds: [], summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
+      execution: { version: 2, revision: 1, operationId: 'merge-operation', phase: 'merge', round: 1, generation: 1,
+        attempt: 0, autoRetriesUsed: 0, budget: { limitMs: 120_000, spentActiveMs: 10, maxAutoRetries: 2 },
+        run: { id: 'live-merge-run', owner: { pid: owner.pid, birthId: ownerBirth }, child: { pid: validation.pid, birthId: validationBirth },
+          subtrees: [{ root: { pid: validation.pid, birthId: validationBirth }, descendants: [] }],
+          mergeLockHelper: { pid: helper.pid, birthId: helperBirth, channelPath, reason: 'held for restart recovery', observedAt: new Date().toISOString() },
+          state: 'active', step: 'merge', startedAt: new Date().toISOString() },
+      },
+    } as any;
+    fs.writeFileSync(path.join(bridgeHome, 'threads', `${threadId}.json`), JSON.stringify(task));
+    fs.writeFileSync(path.join(bridgeHome, 'delegation_threads.json'), JSON.stringify([task]));
+    const packageRoot = path.resolve(__dirname, '../..');
+    const packageVersion = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8')).version;
+    fs.writeFileSync(path.join(bridgeHome, 'v2-runtime-components.json'), JSON.stringify({ schemaVersion: 1, cutoverApproved: true,
+      components: [
+        { component: 'extension-host', version: packageVersion, packageRoot, path: path.join(packageRoot, 'out', 'extension.js'), completeProcessInventory: true, previousProcesses: [] },
+        { component: 'standalone-mcp', version: packageVersion, packageRoot, path: path.join(packageRoot, 'bin', 'agent-bridge-mcp.cjs'), completeProcessInventory: true, previousProcesses: [] },
+      ] }));
+    fs.writeFileSync(`${channelPath}.helper-pid`, String(helper.pid));
+    fs.writeFileSync(`${channelPath}.helper-birth`, helperBirth);
+    fs.writeFileSync(`${channelPath}.child.${validation.pid}`, 'tracked');
+    fs.writeFileSync(path.join(bridgeHome, 'merge.lock.owner.json'), JSON.stringify({ token, pid: owner.pid, birthId: ownerBirth,
+      helperPid: helper.pid, helperBirthId: helperBirth, acquiredAt: Date.now() }));
+
+    const beforeTask = fs.readFileSync(path.join(bridgeHome, 'threads', `${threadId}.json`));
+    const beforeOwner = fs.readFileSync(path.join(bridgeHome, 'merge.lock.owner.json'));
+    const beforeChannels = fs.readdirSync(bridgeHome).filter((name) => name.startsWith('merge.lock.')).sort();
+    const entry = path.resolve(__dirname, '../../bin/agent-bridge-mcp.cjs');
+    const startHost = () => spawn(process.execPath, [entry, '--caller', 'codex'], { cwd: process.cwd(), windowsHide: true,
+      env: { ...process.env, AGENT_MESH_BRIDGE_HOME: bridgeHome, USERPROFILE: isolatedHome, HOME: isolatedHome, MESH_GIT_PATH: gitExe },
+      stdio: ['pipe', 'pipe', 'pipe'] });
+    const hosts = [startHost(), startHost()];
+    const connectAndRead = async (host: ReturnType<typeof spawn>) => {
+      let stdout = ''; let stderr = '';
+      host.stdout!.setEncoding('utf8'); host.stderr!.setEncoding('utf8');
+      host.stdout!.on('data', (chunk) => { stdout += chunk; }); host.stderr!.on('data', (chunk) => { stderr += chunk; });
+      const response = async (id: number) => {
+        const deadline = Date.now() + 15_000;
+        while (Date.now() < deadline) {
+          for (const line of stdout.split(/\r?\n/)) {
+            try { const message = JSON.parse(line); if (message.id === id) return message; } catch {}
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        throw new Error(`stdio ${id} timed out; stdout=${stdout}; stderr=${stderr}`);
+      };
+      host.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'live-v2-restart', version: '1' } } })}\n`);
+      const initialized = await response(1);
+      assert.equal(initialized.result?.serverInfo?.name, 'agent-mesh-bridge', JSON.stringify(initialized));
+      host.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
+      host.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'get_task_summary', arguments: { threadId } } })}\n`);
+      const summary = await response(2);
+      assert.ok(summary.result?.content?.[0]?.text, JSON.stringify(summary));
+      assert.equal(JSON.parse(summary.result.content[0].text).status, 'merging');
+      host.stdin!.end();
+      await Promise.race([new Promise<void>((resolve) => host.once('close', () => resolve())), new Promise<void>((resolve) => setTimeout(resolve, 5_000))]);
+      if (host.exitCode === null && host.signalCode === null) host.kill();
+    };
+    try {
+      await Promise.all(hosts.map(connectAndRead));
+      assert.deepEqual(fs.readFileSync(path.join(bridgeHome, 'threads', `${threadId}.json`)), beforeTask,
+        'restart scanners must leave the live merge run untouched until owner/helper/child exit evidence changes');
+      assert.deepEqual(fs.readFileSync(path.join(bridgeHome, 'merge.lock.owner.json')), beforeOwner,
+        'restart must not replace or duplicate the current OS helper owner');
+      assert.deepEqual(fs.readdirSync(bridgeHome).filter((name) => name.startsWith('merge.lock.')).sort(), beforeChannels,
+        'parallel stdio restarts must not create another helper channel while the exact v2 run owns the merge');
+    } finally {
+      for (const host of hosts) { try { if (host.exitCode === null && host.signalCode === null) host.kill(); } catch {} }
+      const stop = async (child: ReturnType<typeof spawn>) => {
+        if (child.exitCode !== null || child.signalCode !== null) return;
+        await new Promise<void>((resolve) => { child.once('close', () => resolve()); try { child.kill(); } catch { resolve(); } });
+      };
+      await Promise.all([stop(owner), stop(helper), stop(validation)]);
+    }
   });
 
   test('client roots resolve only a unique live window and its manual default', async () => {
@@ -314,7 +791,10 @@ describe('MCPServer Protocol Tests', () => {
         method: 'tools/call',
         params: { name, arguments: args },
       });
-    const payload = (res: any) => JSON.parse(res.result.content[0].text);
+    const payload = (res: any) => {
+      assert.ok(res?.result?.content?.[0]?.text, `MCP call failed: ${JSON.stringify(res)}`);
+      return JSON.parse(res.result.content[0].text);
+    };
 
     const home = getBridgeHome();
     // Sender and receiver defaults are independent per agent (self-dispatch is
@@ -457,6 +937,7 @@ describe('MCPServer Protocol Tests', () => {
   });
 
   test('tells the caller to stop and wait, and starves repeated polls', async () => {
+    configureCodexReviewerFixture();
     const call = async (name: string, args: any) =>
       mcpServer.handleRpcMessage({
         jsonrpc: '2.0',
@@ -464,7 +945,10 @@ describe('MCPServer Protocol Tests', () => {
         method: 'tools/call',
         params: { name, arguments: args },
       });
-    const payload = (res: any) => JSON.parse(res.result.content[0].text);
+    const payload = (res: any) => {
+      assert.ok(res?.result?.content?.[0]?.text, `MCP call failed: ${JSON.stringify(res)}`);
+      return JSON.parse(res.result.content[0].text);
+    };
 
     const dispatched = payload(
       await call('dispatch_task', { workspaceRoot: process.cwd(),
@@ -772,7 +1256,17 @@ describe('MCPServer Protocol Tests', () => {
     assert.strictEqual(details.tokenUsage.totalTokens, 2_000);
   });
 
+  test('disposing the current execution controller clears its process singleton', () => {
+    const controller = new ExecutionController(taskStore, runner, callbackManager,
+      reworkController.getMergeCoordinator(), undefined, undefined, undefined,
+      { storageDir: tempDir, standingScanIntervalMs: 0 } as any);
+    assert.strictEqual(ExecutionController.getInstance(), controller);
+    controller.dispose();
+    assert.strictEqual(ExecutionController.getInstance(), undefined);
+  });
+
   test('should execute dispatch_task, get_thread_details, request_rework, and approve_task via tools/call', async () => {
+    configureCodexReviewerFixture();
     // 1. Dispatch
     const dispatchCall = {
       jsonrpc: '2.0',
@@ -1167,6 +1661,7 @@ describe('MCPServer Protocol Tests', () => {
   });
 
   test('retry_task re-runs the failed round in place instead of creating a duplicate round', async () => {
+    configureCodexReviewerFixture();
     let shouldFail = true;
     runner.execute = async () =>
       shouldFail
@@ -1225,7 +1720,220 @@ describe('MCPServer Protocol Tests', () => {
     assert.strictEqual(after.rounds[0].prompt, originalPrompt);
   });
 
+  test('MCP v2 retry_task and resume_task reject a live child without clearing its run or generation', async () => {
+    const controller = new ExecutionController(taskStore, runner, callbackManager,
+      reworkController.getMergeCoordinator(), undefined, undefined, undefined,
+      { storageDir: tempDir, standingScanIntervalMs: 0 } as any);
+    let child: ReturnType<typeof spawn> | undefined;
+    const oldExecute = runner.execute;
+    let executions = 0;
+    runner.execute = async (...args: any[]) => { executions++; return oldExecute.apply(runner, args as any); };
+    try {
+      child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true });
+      await new Promise<void>((resolve, reject) => { child!.once('error', reject); child!.once('spawn', resolve); });
+      const pid = child.pid!;
+      const birthId = getProcessBirthId(pid);
+      assert.ok(birthId);
+      const makeV2 = (threadId: string, status: 'failed' | 'paused') => ({
+        threadId, title: threadId, initiatorAgent: 'codex', targetAgent: 'claude_code',
+        status, currentRound: 1, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+        receiverSessionId: `receiver-${threadId}`, receiverSessionCaptured: true,
+        reviewerSessionId: `reviewer-${threadId}`, reviewFlow: 'dedicated',
+        workspace: testWorkspace(process.cwd()),
+        reviewBootstrap: { phase: 'confirmed', attempts: 1 }, rounds: [],
+        summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
+        execution: {
+          version: 2, revision: 1, operationId: `op-${threadId}`, phase: 'develop', round: 1,
+          generation: 7, attempt: 1, autoRetriesUsed: 0,
+          budget: { limitMs: 120 * 60 * 1000, spentActiveMs: 25, maxAutoRetries: 2 },
+          run: {
+            id: `run-${threadId}`, role: 'developer', owner: { pid: process.pid, birthId: getProcessBirthId(process.pid) },
+            child: { pid, birthId }, subtrees: [{ root: { pid, birthId }, descendants: [] }],
+            step: 'executing', state: 'active', startedAt: new Date().toISOString(),
+            spawnIntentAt: new Date().toISOString(), registeredAt: new Date().toISOString(),
+          },
+        },
+      });
+      const retryThread: any = makeV2('mcp-v2-live-retry', 'failed');
+      const resumeThread: any = makeV2('mcp-v2-live-resume', 'paused');
+      taskStore.upsertTask(retryThread);
+      taskStore.upsertTask(resumeThread);
+
+      for (const [name, threadId] of [['retry_task', retryThread.threadId], ['resume_task', resumeThread.threadId]] as const) {
+        const response = await mcpServer.handleRpcMessage({
+          jsonrpc: '2.0', id: 801, method: 'tools/call', params: { name, arguments: { threadId } },
+        });
+        assert.equal(response.error?.code, -32000, `${name} reports an actionable rejection`);
+        assert.match(response.error?.message || '', /previous run exit is not confirmed/);
+        const after = taskStore.reloadTask(threadId)!;
+        assert.equal(after.execution?.run?.id, `run-${threadId}`);
+        assert.equal(after.execution?.generation, 7);
+      }
+      assert.equal(executions, 0, 'neither control path starts a replacement runner');
+    } finally {
+      runner.execute = oldExecute;
+      controller.dispose();
+      if (child && child.exitCode === null && child.signalCode === null) {
+        const closed = new Promise<void>((resolve) => child!.once('close', () => resolve()));
+        try { child.kill('SIGKILL'); } catch {}
+        await closed;
+      }
+    }
+  });
+
+  test('MCP decision keeps a v2 spawn-intent run until owner/child exit acknowledgement; answer is durable next', async () => {
+    const controller = new ExecutionController(taskStore, runner, callbackManager,
+      reworkController.getMergeCoordinator(), undefined, undefined, undefined,
+      { storageDir: tempDir, standingScanIntervalMs: 0 } as any);
+    const oldReceiver = process.env.MESH_TASK_RECEIVER;
+    const oldThread = process.env.MESH_TASK_THREAD_ID;
+    const children: ReturnType<typeof spawn>[] = [];
+    const ownerBirthId = getProcessBirthId(process.pid);
+    assert.ok(ownerBirthId);
+    const makeRun = (threadId: string, child?: { pid: number; birthId: string }) => ({
+      threadId, title: threadId, initiatorAgent: 'codex', targetAgent: 'claude_code',
+      status: 'running', currentRound: 1, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      receiverSessionId: `receiver-${threadId}`, receiverSessionCaptured: true,
+      reviewerSessionId: `reviewer-${threadId}`, reviewFlow: 'dedicated',
+      reviewBootstrap: { phase: 'confirmed', attempts: 1 }, workspace: testWorkspace(process.cwd()),
+      rounds: [{ round: 1, type: 'initial', prompt: 'work', status: 'running', durationMs: 0, timestamp: new Date().toISOString() }],
+      summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
+      execution: {
+        version: 2, revision: 1, operationId: `op-${threadId}`, phase: 'develop', round: 1,
+        generation: 3, attempt: 1, autoRetriesUsed: 0,
+        budget: { limitMs: 120 * 60 * 1000, spentActiveMs: 10, maxAutoRetries: 2 },
+        run: {
+          id: `run-${threadId}`, role: 'developer', owner: { pid: process.pid, birthId: ownerBirthId },
+          ...(child ? { child: { pid: child.pid, birthId: child.birthId }, subtrees: [{ root: child, descendants: [] }], registeredAt: new Date().toISOString() } : {}),
+          step: child ? 'spawning' : 'spawning', state: 'starting', spawnIntentAt: new Date().toISOString(), startedAt: new Date().toISOString(),
+        },
+      },
+    });
+    try {
+      process.env.MESH_TASK_RECEIVER = '1';
+      const noBindingId = 'mcp-v2-decision-no-binding';
+      process.env.MESH_TASK_THREAD_ID = noBindingId;
+      taskStore.upsertTask(makeRun(noBindingId) as any);
+      const request = await mcpServer.handleRpcMessage({
+        jsonrpc: '2.0', id: 821, method: 'tools/call',
+        params: { name: 'request_task_decision', arguments: { threadId: noBindingId, question: 'Need direction', resumePoint: 'continue_develop' } },
+      });
+      assert.equal(request.error, undefined);
+      let persisted = taskStore.reloadTask(noBindingId)!;
+      assert.equal(persisted.status, 'wait_decision');
+      assert.equal(persisted.execution?.run?.id, `run-${noBindingId}`);
+      assert.equal(persisted.execution?.run?.state, 'stopping');
+      assert.equal(persisted.execution?.run?.unconfirmed, true, 'spawn intent without a bound child is not treated as no-spawn proof');
+
+      const noBindingDecisionId = persisted.decision!.id;
+      const answerScript = `const {TaskStore}=require(${JSON.stringify(require.resolve('../bridge/task-store'))});
+        const {ExecutionController}=require(${JSON.stringify(require.resolve('../bridge/execution-controller'))});
+        const store=new TaskStore(${JSON.stringify(tempDir)});
+        const controller=new ExecutionController(store,{execute:async()=>{throw new Error('unexpected spawn')}},{},{},undefined,undefined,undefined,{storageDir:${JSON.stringify(tempDir)},standingScanIntervalMs:0});
+        controller.submitTaskDecision(${JSON.stringify(noBindingId)},${JSON.stringify(noBindingDecisionId)},'Proceed carefully').then(()=>{process.stdout.write('answered');controller.dispose();store.dispose()}).catch(e=>{process.stderr.write(String(e.stack||e));controller.dispose();store.dispose();process.exitCode=1});`;
+      const answerProcess = spawnSync(process.execPath, ['-e', answerScript], { encoding: 'utf8', windowsHide: true });
+      assert.equal(answerProcess.status, 0, answerProcess.stderr);
+      assert.equal(answerProcess.stdout, 'answered', 'a separate real control process may durably answer without clearing the uncertain run');
+      persisted = taskStore.reloadTask(noBindingId)!;
+      assert.equal(persisted.execution?.run?.id, `run-${noBindingId}`);
+      assert.equal(persisted.execution?.next?.sourceRunId, `run-${noBindingId}`);
+      assert.equal(persisted.status, 'wait_decision', 'answer is durable while previous run remains protected');
+
+      const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true });
+      children.push(child);
+      await new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('spawn', resolve); });
+      const childBirthId = getProcessBirthId(child.pid!);
+      assert.ok(childBirthId);
+      const childThreadId = 'mcp-v2-decision-bound-child';
+      taskStore.upsertTask(makeRun(childThreadId, { pid: child.pid!, birthId: childBirthId }) as any);
+      process.env.MESH_TASK_THREAD_ID = childThreadId;
+      const childRequest = await mcpServer.handleRpcMessage({
+        jsonrpc: '2.0', id: 822, method: 'tools/call',
+        params: { name: 'request_task_decision', arguments: { threadId: childThreadId, question: 'Confirm stop', resumePoint: 'continue_develop' } },
+      });
+      assert.equal(childRequest.error, undefined);
+      assert.equal(probeProcessIdentity(child.pid!, childBirthId), 'exited', 'controlled child was stopped and positively observed exited');
+      const childState = taskStore.reloadTask(childThreadId)!;
+      assert.equal(childState.execution?.run?.id, `run-${childThreadId}`, 'controller-owner exit/release evidence is still required');
+      assert.equal(childState.execution?.run?.unconfirmed, true);
+      const late = await registerRunChildV2({
+        taskStore, threadId: childThreadId,
+        identity: { runId: `run-${childThreadId}`, operationId: childState.execution!.operationId, generation: 3, phase: 'develop', round: 1 },
+        childPid: child.pid!, childBirthId,
+      });
+      assert.equal(late.success, false, 'late callback cannot rebind a stopping decision run');
+      assert.equal(taskStore.reloadTask(childThreadId)?.execution?.run?.id, `run-${childThreadId}`);
+    } finally {
+      for (const child of children) {
+        if (child.exitCode === null && child.signalCode === null) {
+          const closed = new Promise<void>((resolve) => child.once('close', () => resolve()));
+          try { child.kill('SIGKILL'); } catch {}
+          await closed;
+        }
+      }
+      if (oldReceiver === undefined) delete process.env.MESH_TASK_RECEIVER; else process.env.MESH_TASK_RECEIVER = oldReceiver;
+      if (oldThread === undefined) delete process.env.MESH_TASK_THREAD_ID; else process.env.MESH_TASK_THREAD_ID = oldThread;
+      controller.dispose();
+    }
+  });
+
+  test('v2 decision cannot replace a first review-run rework handoff', async () => {
+    const controller = new ExecutionController(taskStore, runner, callbackManager,
+      reworkController.getMergeCoordinator(), undefined, undefined, undefined,
+      { storageDir: tempDir, standingScanIntervalMs: 0 } as any);
+    const ownerBirthId = getProcessBirthId(process.pid)!;
+    const createReview = (threadId: string, pendingDecision = false) => {
+      const runId = `review-run-${threadId}`;
+      const decision = pendingDecision ? {
+        id: `decision-${threadId}`, sourceRunId: runId, operationId: `op-${threadId}`, generation: 4,
+        phase: 'review', round: 1, question: 'change or approve?', resumePoint: 'continue_review',
+        createdAt: new Date().toISOString(),
+      } : undefined;
+      return {
+        threadId, title: threadId, initiatorAgent: 'codex', targetAgent: 'claude_code',
+        status: pendingDecision ? 'wait_decision' : 'reviewing', currentRound: 1,
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+        reviewerSessionId: `reviewer-${threadId}`, reviewerSessionCaptured: true, reviewFlow: 'dedicated',
+        reviewBootstrap: { phase: 'confirmed', attempts: 1 }, workspace: testWorkspace(process.cwd()),
+        rounds: [{ round: 1, type: 'initial', prompt: 'review work', status: 'completed', durationMs: 1, timestamp: new Date().toISOString() }],
+        summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 1 },
+        ...(decision ? { decision, decisions: [decision] } : {}),
+        execution: {
+          version: 2, revision: 1, operationId: `op-${threadId}`, phase: 'review', round: 1,
+          generation: 4, attempt: 0, autoRetriesUsed: 0,
+          budget: { limitMs: 120 * 60 * 1000, spentActiveMs: 0, maxAutoRetries: 2 },
+          next: { phase: 'develop', round: 2, sourceRunId: runId },
+          run: { id: runId, role: 'reviewer', owner: { pid: process.pid, birthId: ownerBirthId },
+            state: pendingDecision ? 'stopping' : 'active', step: 'executing', startedAt: new Date().toISOString(), registeredAt: new Date().toISOString() },
+        },
+      };
+    };
+    try {
+      const requestId = 'v2-decision-existing-rework';
+      taskStore.upsertTask(createReview(requestId) as any);
+      await assert.rejects(
+        controller.requestTaskDecision(requestId, { question: 'Continue reviewing?', resumePoint: 'continue_review' }),
+        /already has a durable handoff/,
+      );
+      let saved = taskStore.reloadTask(requestId)!;
+      assert.deepEqual(saved.execution?.next, { phase: 'develop', round: 2, sourceRunId: `review-run-${requestId}` });
+      assert.equal(saved.status, 'reviewing');
+      assert.equal(saved.decision, undefined);
+
+      const submitId = 'v2-submit-existing-rework';
+      taskStore.upsertTask(createReview(submitId, true) as any);
+      await assert.rejects(controller.submitTaskDecision(submitId, `decision-${submitId}`, 'continue review'), /cannot replace an existing durable handoff/);
+      saved = taskStore.reloadTask(submitId)!;
+      assert.deepEqual(saved.execution?.next, { phase: 'develop', round: 2, sourceRunId: `review-run-${submitId}` });
+      assert.equal(saved.execution?.run?.id, `review-run-${submitId}`);
+      assert.equal(saved.decision?.answer, undefined);
+    } finally {
+      controller.dispose();
+    }
+  });
+
   test('request_rework flags a round whose instruction repeats an earlier one', async () => {
+    configureCodexReviewerFixture();
     const prompt = 'Implement the sleeve bloom extension as designed';
     const dispatchRes = await mcpServer.handleRpcMessage({
       jsonrpc: '2.0',

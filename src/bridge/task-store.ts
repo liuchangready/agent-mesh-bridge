@@ -36,6 +36,7 @@ import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
 import { removeTaskDataDir } from './task-data-dir';
 import { MeshFileLock } from './mesh-file-lock';
 import { WindowsTaskLock } from './windows-process-helper';
+import { probeProcessIdentity } from './platform';
 import {
   validateV2ExecutionEligibility,
   ExecutionEligibilityResult,
@@ -788,6 +789,27 @@ export class TaskStore extends EventEmitter {
     return task ? structuredClone(task) : undefined;
   }
 
+  /** Read one task file directly after a cross-process CAS miss, independent of directory mtime granularity. */
+  public reloadTask(threadId: string): DelegationThread | undefined {
+    if (this.isTaskTombstoned(threadId)) {
+      this.tasks.delete(threadId);
+      return undefined;
+    }
+    const file = this.threadFilePath(threadId);
+    if (!fs.existsSync(file)) {
+      this.tasks.delete(threadId);
+      return undefined;
+    }
+    try {
+      const thread = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')) as DelegationThread);
+      this.tasks.set(threadId, thread);
+      this.knownMtimes.set(path.basename(file), this.fileMtimeMs(file));
+      return structuredClone(thread);
+    } catch (error: any) {
+      throw new Error(`Corrupted task file on disk for ${threadId}: ${error?.message || error}`);
+    }
+  }
+
   private taskLockFilePath(threadId: string): string {
     const lockDir = path.join(this.storageDir, 'execution-locks');
     fs.mkdirSync(lockDir, { recursive: true });
@@ -867,6 +889,8 @@ export class TaskStore extends EventEmitter {
     threadId: string,
     expectedRevision: number | 'current-legacy-review',
     change: (thread: DelegationThread) => void,
+    cleanupToken?: string,
+    runExitProof?: { runId: string; operationId: string; generation: number },
   ): Promise<DelegationThread> {
     return this.withExecutionLock(threadId, async () => {
       this.ensureUpToDate();
@@ -882,7 +906,7 @@ export class TaskStore extends EventEmitter {
       if (!thread) {
         throw new Error(`Task thread not found: ${threadId}`);
       }
-      if (thread.cleanup && thread.cleanup.stage === 'in_progress') {
+      if (thread.cleanup && thread.cleanup.stage === 'in_progress' && cleanupToken !== thread.cleanup.token) {
         throw new Error(
           `Cannot transition execution for ${threadId}: task is reserved for cleanup (${thread.cleanup.action}) by token ${thread.cleanup.token}`,
         );
@@ -897,7 +921,18 @@ export class TaskStore extends EventEmitter {
           `Execution revision mismatch for task ${threadId}: expected revision ${expectedRevision}, but found ${currentRev}`,
         );
       }
+      const priorRun = thread.execution?.run;
       change(thread);
+      if (cleanupToken && priorRun && !thread.execution?.run) {
+        const cleanup = thread.cleanup;
+        if (!runExitProof || runExitProof.runId !== priorRun.id ||
+            runExitProof.operationId !== thread.execution?.operationId ||
+            runExitProof.generation !== thread.execution?.generation ||
+            cleanup?.runId !== priorRun.id || cleanup.operationId !== runExitProof.operationId || cleanup.generation !== runExitProof.generation) {
+          throw new Error(`Cannot settle cleanup run ${priorRun.id} without matching identity and exit proof.`);
+        }
+        cleanup.runExitProof = { ...runExitProof, confirmedAt: new Date().toISOString() };
+      }
       if (thread.execution) {
         thread.execution.revision = currentRev + 1;
       }
@@ -944,13 +979,23 @@ export class TaskStore extends EventEmitter {
       if (this.isTaskTombstoned(threadId)) {
         throw new Error(`Task ${threadId} has already been deleted and cannot be cleaned up`);
       }
-      if (thread.cleanup && thread.cleanup.token !== options?.token) {
+      if (thread.cleanup) {
+        const sameOwner = !!owner.birthId && !!thread.cleanup.owner.birthId &&
+          thread.cleanup.action === action && thread.cleanup.owner.pid === owner.pid &&
+          thread.cleanup.owner.birthId === owner.birthId;
+        if (sameOwner && thread.cleanup.stage === 'in_progress' &&
+            (!options?.token || options.token === thread.cleanup.token)) {
+          return { token: thread.cleanup.token, thread };
+        }
         throw new Error(
           `Task ${threadId} is already reserved for cleanup (${thread.cleanup.action}) by token ${thread.cleanup.token}`,
         );
       }
       if (action === 'archive' && !canArchiveTask(thread)) {
         throw new Error(`Task ${threadId} cannot be archived in its current status: ${thread.status}`);
+      }
+      if (action === 'archive' && thread.execution?.run) {
+        throw new Error(`Task ${threadId} cannot be archived while execution run ${thread.execution.run.id} is ${thread.execution.run.state}`);
       }
       const token = options?.token || `clean_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
       thread.cleanup = {
@@ -995,6 +1040,7 @@ export class TaskStore extends EventEmitter {
         forced?: boolean;
         nativeSessions?: any;
       };
+      cleanupManifest?: Record<string, unknown>;
     },
   ): Promise<boolean> {
     this.ensureUpToDate();
@@ -1051,6 +1097,9 @@ export class TaskStore extends EventEmitter {
         if (current.cleanup?.token !== token || current.cleanup?.action !== action) {
           console.warn(`[TaskStore] Cannot commit archive for ${threadId}: cleanup token/action mismatch under lock`);
           return false;
+        }
+        if (current.execution?.run) {
+          throw new Error(`Cannot commit deletion for ${threadId}: execution run ${current.execution.run.id} is still recorded.`);
         }
         if (
           current.execution &&
@@ -1111,6 +1160,15 @@ export class TaskStore extends EventEmitter {
             `Cannot commit cleanup for ${threadId}: cleanup token mismatch (expected ${token}, found ${current.cleanup?.token ?? 'none'})`,
           );
         }
+        if (current.execution?.run) {
+          throw new Error(`Cannot commit deletion for ${threadId}: execution run ${current.execution.run.id} is still recorded.`);
+        }
+        if (current.cleanup.runId && (!current.cleanup.runExitProof ||
+            current.cleanup.runExitProof.runId !== current.cleanup.runId ||
+            current.cleanup.runExitProof.operationId !== current.cleanup.operationId ||
+            current.cleanup.runExitProof.generation !== current.cleanup.generation)) {
+          throw new Error(`Cannot commit deletion for ${threadId}: cleanup run exit proof is missing or mismatched.`);
+        }
         const record = {
           threadId: current.threadId,
           title: current.title,
@@ -1123,6 +1181,7 @@ export class TaskStore extends EventEmitter {
           at: new Date().toISOString(),
           cleanupToken: token,
           nativeSessions: options?.tombstone?.nativeSessions,
+          cleanupManifest: options?.cleanupManifest,
         };
         this.appendTombstone(record);
         this.tasks.delete(threadId);
@@ -1137,6 +1196,28 @@ export class TaskStore extends EventEmitter {
       });
     }
     return false;
+  }
+
+  /** Clear a run that never reached spawn when cleanup won admission immediately after start CAS. */
+  public async releaseUnspawnedRunForCleanup(threadId: string, runId: string): Promise<boolean> {
+    return this.withExecutionLock(threadId, async () => {
+      const file = this.threadFilePath(threadId);
+      if (!fs.existsSync(file)) return false;
+      const thread = normalizeThread(JSON.parse(fs.readFileSync(file, 'utf8')) as DelegationThread);
+      const run = thread.execution?.run;
+      if (!thread.cleanup || !thread.cleanup.operationId || !Number.isSafeInteger(thread.cleanup.generation) ||
+          run?.id !== runId || run.state !== 'starting' || run.step === 'spawning' || run.spawnIntentAt) return false;
+      thread.execution!.run = undefined;
+      thread.cleanup!.runExitProof = { runId, operationId: thread.cleanup!.operationId!, generation: thread.cleanup!.generation!, confirmedAt: new Date().toISOString() };
+      thread.execution!.attempt = Math.max(0, thread.execution!.attempt - 1);
+      thread.execution!.revision += 1;
+      thread.updatedAt = new Date().toISOString();
+      this.persistThread(thread);
+      this.tasks.set(threadId, thread);
+      this.writeAggregate();
+      this.emit('changed', Array.from(this.tasks.values()), [threadId]);
+      return true;
+    });
   }
 
   /**
@@ -1202,16 +1283,84 @@ export class TaskStore extends EventEmitter {
    */
   public appendTombstone(record: any): void {
     const file = path.join(this.storageDir, 'deleted_tasks.log');
-    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const dir = path.dirname(file);
+    fs.mkdirSync(dir, { recursive: true });
+    const existed = fs.existsSync(file);
     const fd = fs.openSync(file, 'a');
     try {
-      fs.writeFileSync(fd, `${JSON.stringify(record)}\n`, 'utf8');
+      const line = Buffer.from(`${JSON.stringify(record)}\n`, 'utf8');
+      const written = fs.writeSync(fd, line, 0, line.length);
+      if (written !== line.length) throw new Error(`Short tombstone append: wrote ${written}/${line.length} bytes.`);
       fs.fsyncSync(fd);
     } finally {
       try {
         fs.closeSync(fd);
       } catch {}
     }
+    if (!existed) {
+      try {
+        const dirFd = fs.openSync(dir, 'r');
+        try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+      } catch {
+        // Directory fsync is unsupported on some platforms; the file record is
+        // still fsynced and append-only, so no concurrent writer can erase it.
+      }
+    }
+  }
+
+  /** Atomically claim the physical-cleanup phase of a durable v2 tombstone. */
+  public async claimTombstoneCleanup(threadId: string, token: string, owner: ProcessIdentity): Promise<'claimed' | 'busy' | 'complete' | 'missing'> {
+    const observed = this.readCleanupTombstone(threadId, token);
+    const observedManifest = observed?.cleanupManifest;
+    const observedOwner = observedManifest?.owner as ProcessIdentity | undefined;
+    const priorExited = observedManifest?.stage === 'running' && !!observedOwner?.pid && !!observedOwner.birthId &&
+      probeProcessIdentity(observedOwner.pid, observedOwner.birthId) === 'exited';
+    return this.withExecutionLock(threadId, async () => {
+      const latest = this.readCleanupTombstone(threadId, token);
+      if (!latest?.cleanupManifest) return 'missing';
+      if (latest.cleanupManifest.stage === 'complete' || latest.cleanupComplete) return 'complete';
+      if (latest.cleanupManifest.stage === 'running') {
+        const prior = latest.cleanupManifest.owner as ProcessIdentity | undefined;
+        if (!priorExited || prior?.pid !== observedOwner?.pid || prior?.birthId !== observedOwner?.birthId) return 'busy';
+      }
+      this.appendTombstone({ ...latest, at: new Date().toISOString(), cleanupManifest: { ...latest.cleanupManifest, stage: 'running', owner } });
+      return 'claimed';
+    });
+  }
+
+  /** Mark a claimed tombstone cleanup complete or retryable after a failed attempt. */
+  public async finishTombstoneCleanup(threadId: string, token: string, owner: ProcessIdentity, complete: boolean, nativeSessions?: unknown): Promise<boolean> {
+    return this.withExecutionLock(threadId, async () => {
+      const latest = this.readCleanupTombstone(threadId, token);
+      const manifest = latest?.cleanupManifest;
+      const currentOwner = manifest?.owner as ProcessIdentity | undefined;
+      if (!latest || manifest?.stage !== 'running' || currentOwner?.pid !== owner.pid || currentOwner.birthId !== owner.birthId) return false;
+      const durableNativeSessions = nativeSessions && typeof nativeSessions === 'object' && 'entries' in nativeSessions
+        ? {
+            removedFiles: Number((nativeSessions as any).removedCount) || 0,
+            sessions: Array.isArray((nativeSessions as any).entries)
+              ? (nativeSessions as any).entries.map((entry: any) => ({
+                  agent: entry.agent, sessionId: entry.sessionId, found: entry.found,
+                  removed: entry.removed || [], pruned: entry.pruned || [],
+                  ...(entry.error ? { error: entry.error } : {}),
+                }))
+              : [],
+          }
+        : nativeSessions;
+      this.appendTombstone({ ...latest, at: new Date().toISOString(), cleanupComplete: complete,
+        nativeSessions: durableNativeSessions ?? latest.nativeSessions,
+        cleanupManifest: { ...manifest, stage: complete ? 'complete' : 'pending' } });
+      return true;
+    });
+  }
+
+  private readCleanupTombstone(threadId: string, token: string): any | undefined {
+    const file = path.join(this.storageDir, 'deleted_tasks.log');
+    if (!fs.existsSync(file)) return undefined;
+    try {
+      return fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
+        .filter((record) => record.threadId === threadId && record.cleanupToken === token).slice(-1)[0];
+    } catch { return undefined; }
   }
 
   /**

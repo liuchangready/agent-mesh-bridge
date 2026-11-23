@@ -106,7 +106,7 @@ describe('native conversation cleanup on task deletion', () => {
     );
   });
 
-  test('Codex: removes the rollout and its session_index entry', () => {
+  test('Codex: retains rollout and writer lock while native writer protection exists', () => {
     const rollout = path.join(
       home,
       '.codex',
@@ -132,22 +132,29 @@ describe('native conversation cleanup on task deletion', () => {
     const result = cleanup(makeThread({ targetAgent: 'codex', receiverSessionId: SESSION_CODEX }));
 
     assert.strictEqual(result.entries[0].agent, 'codex');
-    assert.strictEqual(result.entries[0].error, undefined);
-    assert.strictEqual(fs.existsSync(rollout), false);
-    assert.strictEqual(
-      fs.existsSync(path.join(home, '.codex', 'thread-writer-locks', `${SESSION_CODEX}.lock`)),
-      false,
-    );
+    assert.match(result.entries[0].error || '', /Shared native index retained/);
+    assert.strictEqual(fs.existsSync(rollout), true);
+    assert.strictEqual(fs.existsSync(path.join(home, '.codex', 'thread-writer-locks', `${SESSION_CODEX}.lock`)), true);
+    assert.match(result.entries[0].error || '', /native writer lock exists/);
 
     const lines = fs
       .readFileSync(index, 'utf8')
       .split('\n')
       .filter((line) => line.trim());
-    assert.strictEqual(lines.length, 1);
-    assert.deepStrictEqual(JSON.parse(lines[0]), unrelated);
+    assert.strictEqual(lines.length, 2);
+    assert.deepStrictEqual(JSON.parse(lines[0]), { id: SESSION_CODEX, thread_name: 'deleted task' });
+    assert.deepStrictEqual(JSON.parse(lines[1]), unrelated);
   });
 
-  test('Antigravity: removes the DB, brain, annotations, implicit record and cache entries', () => {
+  test('Codex: removes only a matching session rollout when no native writer lock exists', () => {
+    const rollout = path.join(home, '.codex', 'sessions', '2026', '10', '24', `rollout-2026-10-24T10-00-00-${SESSION_CODEX}.jsonl`);
+    writeFile(rollout);
+    const result = cleanup(makeThread({ targetAgent: 'codex', receiverSessionId: SESSION_CODEX }));
+    assert.equal(fs.existsSync(rollout), false);
+    assert.equal(result.entries[0].error, undefined);
+  });
+
+  test('Antigravity: removes conversation files and retains shared cache indexes', () => {
     const cliRoot = path.join(home, '.gemini', 'antigravity-cli');
     const desktopRoot = path.join(home, '.gemini', 'antigravity');
 
@@ -173,7 +180,7 @@ describe('native conversation cleanup on task deletion', () => {
       makeThread({ targetAgent: 'antigravity', receiverSessionId: SESSION_ANTI }),
     );
 
-    assert.strictEqual(result.entries[0].error, undefined);
+    assert.match(result.entries[0].error || '', /Shared native index retained/);
     for (const root of [cliRoot, desktopRoot]) {
       assert.strictEqual(
         fs.existsSync(path.join(root, 'conversations', `${SESSION_ANTI}.db`)),
@@ -187,13 +194,13 @@ describe('native conversation cleanup on task deletion', () => {
       assert.strictEqual(fs.existsSync(path.join(root, 'implicit', `${SESSION_ANTI}.pb`)), false);
 
       const metadata = readJson(path.join(root, 'cache', 'conversation_metadata.json'));
-      assert.deepStrictEqual(Object.keys(metadata.conversations), [SESSION_OTHER]);
+      assert.deepStrictEqual(Object.keys(metadata.conversations).sort(), [SESSION_ANTI, SESSION_OTHER].sort());
       const last = readJson(path.join(root, 'cache', 'last_conversations.json'));
-      assert.deepStrictEqual(last, { [WORKSPACE_B]: SESSION_OTHER });
+      assert.deepStrictEqual(last, { [WORKSPACE_A]: SESSION_ANTI, [WORKSPACE_B]: SESSION_OTHER });
     }
   });
 
-  test('DeepSeek Harness: removes the session dir, projcache and workspace references', () => {
+  test('DeepSeek Harness: removes session files and retains the shared workspace index', () => {
     const workspaceSlug = '--bridge-workspace-a--';
     const sessionDir = path.join(home, '.dsh', 'sessions', workspaceSlug, SESSION_DSH);
     writeSessionDir(sessionDir);
@@ -224,16 +231,16 @@ describe('native conversation cleanup on task deletion', () => {
       makeThread({ targetAgent: 'deepseek_harness', receiverSessionId: SESSION_DSH }),
     );
 
-    assert.strictEqual(result.entries[0].error, undefined);
+    assert.match(result.entries[0].error || '', /Shared native index retained/);
     assert.strictEqual(fs.existsSync(sessionDir), false);
     assert.strictEqual(fs.existsSync(path.join(projcache, `${SESSION_DSH}.json`)), false);
     assert.ok(fs.existsSync(path.join(home, '.dsh', 'sessions', workspaceSlug, SESSION_OTHER)));
     assert.ok(fs.existsSync(path.join(projcache, `${SESSION_OTHER}.json`)));
 
     const workspace = readJson(workspaceJson);
-    assert.deepStrictEqual(workspace.global.archivedSessionIds, [SESSION_OTHER]);
-    assert.deepStrictEqual(workspace.global.pinnedSessionIds, []);
-    assert.deepStrictEqual(workspace.tables.workspaces.w1.sessionIds, [SESSION_OTHER]);
+    assert.deepStrictEqual(workspace.global.archivedSessionIds, [SESSION_DSH, SESSION_OTHER]);
+    assert.deepStrictEqual(workspace.global.pinnedSessionIds, [SESSION_DSH]);
+    assert.deepStrictEqual(workspace.tables.workspaces.w1.sessionIds, [SESSION_DSH, SESSION_OTHER]);
     assert.deepStrictEqual(workspace.tables.workspaces.w2.sessionIds, [SESSION_OTHER]);
   });
 

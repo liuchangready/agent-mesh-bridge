@@ -43,19 +43,38 @@ export interface ProcessIdentity {
   birthId?: string;
 }
 
+export interface ExecutionSubtreeEvidence {
+  root: ProcessIdentity;
+  descendants: ProcessIdentity[];
+  /** Wall-clock time of the latest cumulative observation, for audit and recovery ordering. */
+  sampledAt?: string;
+}
+
 export type ExecutionVersion = 1 | 2;
 
 export interface ExecutionRun {
   id: string;
   owner: ProcessIdentity;
   child?: ProcessIdentity;
+  /** Durable identities captured under each spawned child root for crash recovery. */
+  subtrees?: ExecutionSubtreeEvidence[];
   step: string;
   state: 'starting' | 'active' | 'stopping';
   startedAt: string;
   role?: 'developer' | 'reviewer';
+  purpose?: 'native_maintenance';
+    /** Native maintenance call returned, but its captured process tree still needs exit confirmation. */
+    settlementPending?: boolean;
   spawnIntentAt?: string;
   registeredAt?: string;
   unconfirmed?: boolean;
+  mergeLockHelper?: {
+    pid?: number;
+    birthId?: string;
+    channelPath: string;
+    reason: string;
+    observedAt: string;
+  };
 }
 
 export interface ExecutionNext {
@@ -70,6 +89,7 @@ export interface ExecutionQueue {
     | 'role'
     | 'session'
     | 'merge_lock'
+    | 'merge_lock_error'
     | 'capacity'
     | 'backoff'
     | 'quota'
@@ -87,6 +107,7 @@ export interface TaskCleanupState {
   operationId?: string;
   generation?: number;
   runId?: string;
+  runExitProof?: { runId: string; operationId: string; generation: number; confirmedAt: string };
 }
 
 export interface ExecutionControl {
@@ -115,6 +136,11 @@ export interface ExecutionControl {
   };
 }
 
+export interface NativeSessionAssignments {
+  developer?: { namespace: string; sessionEpoch: number };
+  reviewer?: { namespace: string; sessionEpoch: number };
+}
+
 export type TaskDecisionResumePoint =
   | 'continue_develop'
   | 'continue_review'
@@ -123,6 +149,8 @@ export type TaskDecisionResumePoint =
 
 export interface TaskDecisionRecord {
   id: string;
+  /** v2 run whose first decision this record reserves. */
+  sourceRunId?: string;
   operationId: string;
   generation: number;
   phase: ExecutionPhase;
@@ -466,6 +494,8 @@ export interface NativeSessionCompactionOperation {
   revision: number;
   startedAt: string;
   finishedAt?: string;
+  /** Host-suspension-adjusted active time charged to the shared execution budget. */
+  activeDurationMs?: number;
   nativeTurnId?: string;
   errorCode?: string;
   error?: string;
@@ -903,6 +933,8 @@ export interface DelegationThread {
    * existing wake path resumes the reviewer conversation.
    */
   reviewerSessionId?: string;
+  /** Native storage identity is pinned on first v2 claim and never follows global config drift. */
+  nativeSessionAssignments?: NativeSessionAssignments;
   reviewerSessionCaptured?: boolean;
 
   /** Dedicated-reviewer bootstrap state (undefined for legacy tasks). */

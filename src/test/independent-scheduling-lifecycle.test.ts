@@ -127,7 +127,7 @@ describe('dedicated reviewer bootstrap pause/resume lifecycle', () => {
 
       const cancellation = new CancellationRegistry(dir);
       const taskControl = new TaskControlService(store, runner as any, cancellation, dir);
-      assert.equal(taskControl.pauseTask(id, 'pause before reviewer confirmation').status, 'PAUSED');
+      assert.equal((await taskControl.pauseTask(id, 'pause before reviewer confirmation')).status, 'PAUSED');
 
       const originalSupervisorState = TaskSupervisor.isSupervisorActive;
       (TaskSupervisor as any).isSupervisorActive = () => true;

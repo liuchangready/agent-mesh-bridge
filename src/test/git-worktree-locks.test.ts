@@ -241,7 +241,7 @@ test('immediate and post-spawn lock cancellation settle in an independent Node p
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-lock-immediate-cancel-'));
   try {
     const helper = path.resolve(__dirname, '../bridge/merge-coordinator.js');
-    const script = `const fs=require('fs'),path=require('path'),{MeshFileLock}=require(process.argv[1]);(async()=>{const firstPath=process.argv[2];const first=await new MeshFileLock(firstPath).acquire(undefined,()=>true);if(first!==undefined)throw new Error('immediate cancellation acquired the lock');if(fs.readdirSync(path.dirname(firstPath)).some(name=>name.includes('.mutex-helper.ps1')))throw new Error('immediate cancellation spawned a helper');console.log('CANCEL RESULT:undefined');let checks=0;const second=await new MeshFileLock(process.argv[3]).acquire(undefined,()=>++checks>1);if(second!==undefined)throw new Error('post-spawn cancellation acquired the lock');console.log('RACE CANCEL RESULT:undefined');console.log('PROCESS SURVIVED')})().catch(e=>{console.error(e);process.exitCode=1})`;
+    const script = `const fs=require('fs'),path=require('path'),{MeshFileLock}=require(process.argv[1]);(async()=>{const firstPath=process.argv[2];const first=await new MeshFileLock(firstPath).acquire(undefined,()=>true);if(first!==undefined)throw new Error('immediate cancellation acquired the lock');if(fs.readdirSync(path.dirname(firstPath)).some(name=>name.includes('.mutex-helper.ps1')))throw new Error('immediate cancellation spawned a helper');console.log('CANCEL RESULT:undefined');const lock=new MeshFileLock(process.argv[3]);const original=lock.startLockHelper.bind(lock);let channel;lock.startLockHelper=(token,value,tryOnly)=>{channel=value;return original(token,value,tryOnly)};let cancelled=false;const pending=lock.acquire(undefined,()=>cancelled);const deadline=Date.now()+8000;while((!channel||!fs.existsSync(channel+'.helper-birth'))&&Date.now()<deadline)await new Promise(r=>setTimeout(r,10));if(!channel||!fs.existsSync(channel+'.helper-birth'))throw new Error('worker helper did not publish its identity');cancelled=true;const second=await pending;if(second!==undefined)throw new Error('post-spawn cancellation acquired the lock');console.log('RACE CANCEL RESULT:undefined');console.log('PROCESS SURVIVED')})().catch(e=>{console.error(e);process.exitCode=1})`;
     const firstPath = path.join(root, 'immediate.lock');
     const secondPath = path.join(root, 'race.lock');
     const result = spawnSync(process.execPath, ['-e', script, helper, firstPath, secondPath], { encoding: 'utf8', timeout: 10_000, windowsHide: true });
@@ -258,7 +258,7 @@ test('cancelling a started lock waiter settles readiness and lets its Node proce
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-lock-cancel-ready-cleanup-'));
   try {
     const helper = path.resolve(__dirname, '../bridge/merge-coordinator.js');
-    const script = `const fs=require('fs'),path=require('path'),{Atomics,Int32Array,SharedArrayBuffer}=global,{MeshFileLock}=require(process.argv[1]);const lockPath=process.argv[2],dir=path.dirname(lockPath);(async()=>{const lock=new MeshFileLock(lockPath),release=await lock.acquire();let cancelled=false;const waiting=lock.acquire(undefined,()=>cancelled);const deadline=Date.now()+8000;while(fs.readdirSync(dir).filter(n=>n.endsWith('.helper-pid')).length<2){if(Date.now()>deadline)throw new Error('waiter helper did not start');await new Promise(r=>setTimeout(r,10))}cancelled=true;if(await waiting!==undefined)throw new Error('cancelled waiter acquired the lock');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,1600);release();console.log('CANCEL SETTLED');console.log('END OF SCRIPT; ACTIVE RESOURCES:'+JSON.stringify(process.getActiveResourcesInfo()))})().catch(e=>{console.error(e);process.exitCode=1})`;
+    const script = `const fs=require('fs'),path=require('path'),{Atomics,Int32Array,SharedArrayBuffer}=global,{MeshFileLock}=require(process.argv[1]);const lockPath=process.argv[2],dir=path.dirname(lockPath);(async()=>{const lock=new MeshFileLock(lockPath),release=await lock.acquire();let cancelled=false;const waiting=lock.acquire(undefined,()=>cancelled);const deadline=Date.now()+8000;while(fs.readdirSync(dir).filter(n=>n.endsWith('.helper-birth')).length<2){if(Date.now()>deadline)throw new Error('waiter worker did not publish its identity');await new Promise(r=>setTimeout(r,10))}cancelled=true;if(await waiting!==undefined)throw new Error('cancelled waiter acquired the lock');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,1600);release();console.log('CANCEL SETTLED');console.log('END OF SCRIPT; ACTIVE RESOURCES:'+JSON.stringify(process.getActiveResourcesInfo()))})().catch(e=>{console.error(e);process.exitCode=1})`;
     const result = spawnSync(process.execPath, ['-e', script, helper, path.join(root, 'merge.lock')], { encoding: 'utf8', timeout: 12_000, windowsHide: true });
     assert.equal(result.status, 0, result.error?.message || result.stderr);
     assert.match(result.stdout, /CANCEL SETTLED/);
@@ -331,15 +331,24 @@ test('cancelling a same-instance lock waiter leaves the current owner lease inta
   const helper = path.resolve(__dirname, '../bridge/merge-coordinator.js');
   const successor = spawn(process.execPath, ['-e', successorCode, helper, lockPath, acquiredFile], { stdio: 'ignore' });
   let cancelled = false;
+  const waitingLock = lock as any;
+  const originalStartLockHelper = waitingLock.startLockHelper.bind(lock);
+  let waitingChannel: string | undefined;
+  waitingLock.startLockHelper = (token: string, channel: string, tryOnly: boolean) => {
+    waitingChannel = channel;
+    return originalStartLockHelper(token, channel, tryOnly);
+  };
   const waiting = lock.acquire(undefined, () => cancelled);
   t.after(async () => {
+    waitingLock.startLockHelper = originalStartLockHelper;
     if (protectedChild.exitCode === null) protectedChild.kill('SIGKILL');
     if (successor.exitCode === null) successor.kill('SIGKILL');
     await Promise.all([protectedChild, successor].map(waitForExit));
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.ok(waitingChannel);
+  await waitFor(`${waitingChannel}.helper-birth`, 1500);
   cancelled = true;
   assert.equal(await waiting, undefined, 'the waiting helper is cancelled without acquiring the mutex');
   await lock.attachChildPid(protectedChild.pid);
@@ -362,9 +371,21 @@ test('pause cancels an approved merge while it is waiting for the global lock', 
   const lockPath = path.join(root, 'merge.lock'); const lockOwner = new MeshFileLock(lockPath); const release = await lockOwner.acquire(); assert.ok(release);
   const helperPid = (lockOwner as unknown as { activeLease: { helperPid: number } }).activeLease.helperPid;
   t.after(async () => { store.dispose(); release(); await waitForProcessExit(helperPid); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
-  const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(lockPath));
+  const waiterLock = new MeshFileLock(lockPath);
+  const originalStartLockHelper = (waiterLock as any).startLockHelper.bind(waiterLock);
+  let waiterChannel: string | undefined;
+  let publishWaiterChannel!: (channel: string) => void;
+  const waiterStarted = new Promise<string>((resolve) => { publishWaiterChannel = resolve; });
+  (waiterLock as any).startLockHelper = (token: string, channel: string, tryOnly: boolean) => {
+    waiterChannel = channel;
+    publishWaiterChannel(channel);
+    return originalStartLockHelper(token, channel, tryOnly);
+  };
+  const coordinator = new MergeCoordinator(store, storage, waiterLock);
   const pending = coordinator.mergeApproved('thread_cancel_lock_wait');
-  await new Promise((resolve) => setTimeout(resolve, 200));
+  waiterChannel = await waiterStarted;
+  assert.ok(waiterChannel);
+  await waitFor(`${waiterChannel}.helper-birth`, 1500);
   new TaskControlService(store, undefined, undefined, storage, undefined, new MeshFileLock(lockPath)).pauseTask('thread_cancel_lock_wait', 'cancel lock wait', 'test');
   assert.equal((await pending).status, 'stale');
   assert.equal(fs.existsSync(path.join(storage, 'merge-transactions', 'thread_cancel_lock_wait.json')), false);
@@ -381,8 +402,20 @@ test('forced deletion cancels a queued merge before the global lock is released'
   const store = new TaskStore(storage); store.upsertTask(thread('thread_delete_lock_wait', worktree));
   const lockPath = path.join(root, 'merge.lock'); const owner = new MeshFileLock(lockPath); const release = await owner.acquire(); assert.ok(release);
   t.after(() => { release(); store.dispose(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
-  const pending = new MergeCoordinator(store, storage, new MeshFileLock(lockPath)).mergeApproved('thread_delete_lock_wait');
-  await new Promise((resolve) => setTimeout(resolve, 200));
+  const waiterLock = new MeshFileLock(lockPath);
+  const originalStartLockHelper = (waiterLock as any).startLockHelper.bind(waiterLock);
+  let waiterChannel: string | undefined;
+  let publishWaiterChannel!: (channel: string) => void;
+  const waiterStarted = new Promise<string>((resolve) => { publishWaiterChannel = resolve; });
+  (waiterLock as any).startLockHelper = (token: string, channel: string, tryOnly: boolean) => {
+    waiterChannel = channel;
+    publishWaiterChannel(channel);
+    return originalStartLockHelper(token, channel, tryOnly);
+  };
+  const pending = new MergeCoordinator(store, storage, waiterLock).mergeApproved('thread_delete_lock_wait');
+  waiterChannel = await waiterStarted;
+  assert.ok(waiterChannel);
+  await waitFor(`${waiterChannel}.helper-birth`, 1500);
   assert.equal(store.getTask('thread_delete_lock_wait')?.status, 'queued');
   const deleting = new TaskControlService(store, undefined, undefined, storage, undefined, new MeshFileLock(lockPath))
     .deleteTask('thread_delete_lock_wait', 'discard', 'test', true);
@@ -591,7 +624,8 @@ test('pause and delete terminate a running Git process tree and record cancelled
     (childProcess as any).spawn = (command: string, args: string[], options: any) => {
       if (!intercepted && command === gitExe) {
         intercepted = true;
-        return originalSpawn(command, ['-c', `alias.meshhold=!node "${helper.replace(/\\/g, '/')}"`, 'meshhold'], options);
+        const node = process.execPath.replace(/\\/g, '/');
+        return originalSpawn(command, ['-c', `alias.meshhold=!"${node}" "${helper.replace(/\\/g, '/')}"`, 'meshhold'], options);
       }
       return originalSpawn(command, args, options);
     };

@@ -12,6 +12,7 @@ import {
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { TaskRoleLock } from '../bridge/task-role-lock';
 import { NativeSessionLock } from '../bridge/native-session-lock';
+import { nativeSessionNamespace, SessionOwnershipStore } from '../bridge/session-ownership';
 import { MeshFileLock } from '../bridge/mesh-file-lock';
 import { WindowsTaskLock } from '../bridge/windows-process-helper';
 import {
@@ -21,8 +22,11 @@ import {
   ExecutionRun,
 } from '../bridge/types';
 import {
+  bindSpawnedChildIdentity,
   confirmProcessTreeExit,
   getProcessBirthId,
+  getProcessBirthIds,
+  IS_WINDOWS,
   killPidTree,
   killProcessTree,
   probeProcessIdentity,
@@ -76,7 +80,7 @@ function createV2Thread(
   overrides?: Partial<DelegationThread>,
 ): DelegationThread {
   const now = new Date().toISOString();
-  return {
+  const thread: DelegationThread = {
     threadId,
     title: `Test ${threadId}`,
     initiatorAgent: 'claude_code',
@@ -125,9 +129,50 @@ function createV2Thread(
     },
     ...overrides,
   };
+  const ownership = new SessionOwnershipStore(storageDir);
+  if (thread.reviewerSessionCaptured && thread.reviewerSessionId) {
+    ownership.claim({
+      agent: thread.initiatorAgent,
+      namespace: thread.nativeSessionAssignments?.reviewer?.namespace || nativeSessionNamespace(thread.initiatorAgent),
+      sessionId: thread.reviewerSessionId,
+      threadId: thread.threadId,
+      role: 'reviewer',
+      sessionEpoch: thread.nativeSessionAssignments?.reviewer?.sessionEpoch || 1,
+    });
+  }
+  if (thread.receiverSessionCaptured && thread.receiverSessionId) {
+    ownership.claim({
+      agent: thread.targetAgent,
+      namespace: thread.nativeSessionAssignments?.developer?.namespace || nativeSessionNamespace(thread.targetAgent),
+      sessionId: thread.receiverSessionId,
+      threadId: thread.threadId,
+      role: 'developer',
+      sessionEpoch: thread.nativeSessionAssignments?.developer?.sessionEpoch || 1,
+    });
+  }
+  return thread;
 }
 
 describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
+  test('Windows descendant birth IDs use one bounded batch query', { skip: !IS_WINDOWS }, async () => {
+    const mutableChildProcess = require('node:child_process');
+    const originalExecFileSync = mutableChildProcess.execFileSync;
+    let calls = 0;
+    try {
+      mutableChildProcess.execFileSync = (command: string, args: string[], options: any) => {
+        assert.equal(command, 'powershell.exe');
+        assert.equal(options.timeout, 8_000);
+        calls++;
+        assert.match(args[args.indexOf('-Command') + 1], /11,22/);
+        return '11:1001\r\n22:2002\r\n';
+      };
+      assert.deepEqual([...(await getProcessBirthIds([11, 22, 11, 0]))], [[11, '1001'], [22, '2002']]);
+      assert.equal(calls, 1, 'one PowerShell process resolves the whole descendant batch');
+    } finally {
+      mutableChildProcess.execFileSync = originalExecFileSync;
+    }
+  });
+
 
   // -------------------------------------------------------------------------
   // Acceptance Criterion 1: Two real control processes concurrent competition
@@ -139,6 +184,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
     const holdFile = path.join(storageDir, 'release-child');
     const registeredFile = path.join(storageDir, 'child-registered');
     const spawnedFile = path.join(storageDir, 'child-spawned');
+    const spawnedBirthFile = path.join(storageDir, 'child-spawned-birth');
     const workers: child_process.ChildProcess[] = [];
 
     try {
@@ -158,6 +204,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         `--hold-file=${holdFile}`,
         `--registered-file=${registeredFile}`,
         `--spawned-file=${spawnedFile}`,
+        `--spawned-birth-file=${spawnedBirthFile}`,
       ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
       workers.push(proc1);
 
@@ -170,6 +217,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         `--hold-file=${holdFile}`,
         `--registered-file=${registeredFile}`,
         `--spawned-file=${spawnedFile}`,
+        `--spawned-birth-file=${spawnedBirthFile}`,
       ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
       workers.push(proc2);
 
@@ -195,7 +243,14 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
 
       // Release barrier so both invoke startExecution simultaneously.
       fs.writeFileSync(barrierFile, 'start', 'utf8');
-      await waitForFile(registeredFile, 60_000);
+      try {
+        await waitForFile(registeredFile, 60_000);
+      } catch (error: any) {
+        store.ensureUpToDate();
+        let events = '';
+        try { events = fs.readFileSync(`${registeredFile}.events`, 'utf8'); } catch {}
+        throw new Error(`${error?.message || error}; events=${events}; worker1 stdout=${out1}; stderr=${err1}; worker2 stdout=${out2}; stderr=${err2}; ledger=${JSON.stringify(store.getTask(threadId)?.execution)}`);
+      }
       store.ensureUpToDate();
       assert.strictEqual(store.getTask(threadId)?.execution?.run?.state, 'active', 'winner registration must finish before its child is released');
       fs.writeFileSync(holdFile, 'release', 'utf8');
@@ -259,6 +314,337 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       for (const worker of workers) {
         if (worker.exitCode === null && worker.signalCode === null) try { worker.kill(); } catch {}
       }
+      let forcedCloseTimer: NodeJS.Timeout | undefined;
+      await Promise.race([
+        Promise.all(workers.map((worker) => new Promise<void>((resolve) => {
+          if (worker.exitCode !== null || worker.signalCode !== null) return resolve();
+          worker.once('close', () => resolve());
+        }))),
+        new Promise<void>((resolve) => { forcedCloseTimer = setTimeout(resolve, 5_000); }),
+      ]);
+      if (forcedCloseTimer) clearTimeout(forcedCloseTimer);
+      try {
+        if (fs.existsSync(spawnedFile) && fs.existsSync(spawnedBirthFile)) {
+          const pid = Number(fs.readFileSync(spawnedFile, 'utf8').trim());
+          const birthId = fs.readFileSync(spawnedBirthFile, 'utf8').trim();
+          if (Number.isSafeInteger(pid) && pid > 0 && birthId && probeProcessIdentity(pid, birthId) !== 'exited') {
+            await stopVerifiedChildTree(pid, true, undefined, birthId, 5_000, [], true);
+          }
+        }
+      } catch {}
+      cleanTempDir(storageDir);
+    }
+  });
+
+  test('two real control processes recover one exited owner with a durable review decision and next', async () => {
+    const storageDir = createTempDir('orphan-next-processes');
+    const threadId = 'thread_orphan_next_processes';
+    const barrierFile = path.join(storageDir, 'recovery.start');
+    const holdFile = path.join(storageDir, 'recovery.release');
+    const registeredFile = path.join(storageDir, 'recovery.child-registered');
+    const spawnedFile = path.join(storageDir, 'recovery.child-pid');
+    const spawnedBirthFile = path.join(storageDir, 'recovery.child-birth');
+    const workers: child_process.ChildProcess[] = [];
+    const store = new TaskStore(storageDir);
+
+    try {
+      const thread = createV2Thread(threadId, storageDir, 'review');
+      const now = new Date().toISOString();
+      thread.status = 'running';
+      thread.execution = {
+        ...thread.execution!,
+        revision: 10,
+        operationId: 'review-operation-before-crash',
+        phase: 'review',
+        round: 1,
+        run: {
+          id: 'review-run-before-crash',
+          role: 'reviewer',
+          owner: { pid: 99_999_999, birthId: 'dead-review-owner' },
+          child: { pid: 99_999_998, birthId: 'dead-review-child' },
+          subtrees: [{
+            root: { pid: 99_999_998, birthId: 'dead-review-child' },
+            descendants: [],
+          }],
+          state: 'active',
+          step: 'executing',
+          startedAt: now,
+          registeredAt: now,
+        },
+        next: { phase: 'develop', round: 2, sourceRunId: 'review-run-before-crash' },
+      };
+      thread.currentRound = 1;
+      const decision = {
+        id: 'durable-rework-decision',
+        operationId: 'review-operation-before-crash',
+        generation: 1,
+        phase: 'review' as const,
+        round: 1,
+        question: 'Make a correction',
+        resumePoint: 'continue_develop' as const,
+        createdAt: now,
+        answer: 'rework requested',
+        answeredAt: now,
+        answeredBy: 'reviewer-session',
+      };
+      thread.decision = decision;
+      thread.decisions = [decision];
+      store.upsertTask(thread);
+      assert.equal(probeProcessIdentity(99_999_999, 'dead-review-owner'), 'exited');
+      assert.equal(probeProcessIdentity(99_999_998, 'dead-review-child'), 'exited');
+
+      const workerScript = path.resolve(__dirname, 'fixtures/two-process-runner.js');
+      const launchWorker = (workerId: string) => {
+        const worker = child_process.spawn(process.execPath, [
+          workerScript,
+          `--storage-dir=${storageDir}`,
+          `--thread-id=${threadId}`,
+          `--worker-id=${workerId}`,
+          '--phase=develop',
+          `--barrier-file=${barrierFile}`,
+          `--hold-file=${holdFile}`,
+          `--registered-file=${registeredFile}`,
+          `--spawned-file=${spawnedFile}`,
+          `--spawned-birth-file=${spawnedBirthFile}`,
+        ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+        workers.push(worker);
+        return worker;
+      };
+      const first = launchWorker('recovery_1');
+      const second = launchWorker('recovery_2');
+      let firstOut = ''; let secondOut = ''; let firstErr = ''; let secondErr = '';
+      first.stdout?.on('data', (data) => { firstOut += data.toString(); });
+      second.stdout?.on('data', (data) => { secondOut += data.toString(); });
+      first.stderr?.on('data', (data) => { firstErr += data.toString(); });
+      second.stderr?.on('data', (data) => { secondErr += data.toString(); });
+      const firstClosed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
+        first.once('close', (code, signal) => resolve({ code, signal })));
+      const secondClosed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
+        second.once('close', (code, signal) => resolve({ code, signal })));
+
+      await Promise.all([
+        waitForFile(`${barrierFile}.recovery_1.ready`, 60_000),
+        waitForFile(`${barrierFile}.recovery_2.ready`, 60_000),
+      ]);
+      const controlIdentities = [first, second].map((worker) => ({
+        pid: worker.pid!, birthId: getProcessBirthId(worker.pid!),
+      }));
+      assert.ok(controlIdentities.every((identity) => identity.birthId), 'both control processes have captured PID+birthId');
+      fs.writeFileSync(barrierFile, 'start', 'utf8');
+      try {
+        await waitForFile(registeredFile, 60_000);
+      } catch (error: any) {
+        store.ensureUpToDate();
+        let events = '';
+        try { events = fs.readFileSync(`${registeredFile}.events`, 'utf8'); } catch {}
+        throw new Error(`${error?.message || error}; events=${events}; first stdout=${firstOut}; stderr=${firstErr}; second stdout=${secondOut}; stderr=${secondErr}; ledger=${JSON.stringify(store.getTask(threadId)?.execution)}`);
+      }
+
+      const recovering = store.reloadTask(threadId)!;
+      const run = recovering.execution?.run;
+      const childPid = Number(fs.readFileSync(spawnedFile, 'utf8'));
+      const childBirthId = fs.readFileSync(spawnedBirthFile, 'utf8');
+      assert.equal(recovering.execution?.phase, 'develop');
+      assert.equal(recovering.execution?.round, 2);
+      assert.equal(recovering.execution?.operationId === 'review-operation-before-crash', false);
+      assert.equal(run?.id === 'review-run-before-crash', false);
+      assert.equal(run?.role, 'developer');
+      assert.equal(run?.child?.pid, childPid);
+      assert.equal(run?.child?.birthId, childBirthId);
+      assert.equal(run?.state, 'active', 'child binding ACK is durable before it is released');
+      assert.equal(recovering.execution?.next, undefined, 'durable next is consumed with the new starting run');
+      assert.equal(recovering.decision?.id, decision.id, 'persisted reviewer decision survives recovery');
+      assert.equal(recovering.decisions?.at(-1)?.id, decision.id);
+      assert.equal(probeProcessIdentity(childPid, childBirthId), 'alive');
+      const winnerOwner = controlIdentities.find((identity) => identity.pid === run?.owner?.pid);
+      assert.ok(winnerOwner, 'recovered run belongs to one of the real control processes');
+      assert.equal(run?.owner?.birthId, winnerOwner.birthId);
+      assert.equal(controlIdentities.filter((identity) => identity.pid === run?.owner?.pid).length, 1);
+
+      const stale = await store.reportRoundEvidence(threadId, 2, { output: 'stale pre-crash review callback' }, {
+        operationId: 'review-operation-before-crash', generation: 1, runId: 'review-run-before-crash',
+      });
+      assert.equal(stale, undefined, 'old source operation cannot write evidence into the recovered developer run');
+      assert.notEqual(store.reloadTask(threadId)?.rounds.find((round) => round.round === 2)?.output, 'stale pre-crash review callback');
+
+      fs.writeFileSync(holdFile, 'release', 'utf8');
+      const [firstExit, secondExit] = await Promise.all([firstClosed, secondClosed]);
+      assert.equal(firstExit.code, 0, `first controller failed: ${firstErr}; ${firstOut}`);
+      assert.equal(secondExit.code, 0, `second controller failed: ${secondErr}; ${secondOut}`);
+      const parse = (output: string) => {
+        const line = output.split('\n').find((value) => value.startsWith('RESULT:'));
+        return line ? JSON.parse(line.slice(7)) : undefined;
+      };
+      const results = [parse(firstOut), parse(secondOut)];
+      assert.ok(results.every(Boolean), `both controls must report outcomes: ${firstOut} ${secondOut}`);
+      assert.equal(results.filter((result) => result.started).length, 1);
+      assert.equal(results.reduce((sum, result) => sum + result.spawnCount, 0), 1);
+      assert.ok(results.some((result) => result.reason === 'run_busy'));
+      assert.equal(probeProcessIdentity(childPid, childBirthId), 'exited', 'the registered child is confirmed exited after release');
+      const finished = store.reloadTask(threadId)!;
+      assert.equal(finished.execution?.next, undefined);
+      assert.equal(finished.decision?.id, decision.id);
+    } finally {
+      try { fs.writeFileSync(holdFile, 'release', 'utf8'); } catch {}
+      for (const worker of workers) if (worker.exitCode === null && worker.signalCode === null) try { worker.kill(); } catch {}
+      const workersClosed = Promise.all(workers.map((worker) => new Promise<void>((resolve) => {
+        if (worker.exitCode !== null || worker.signalCode !== null) return resolve();
+        worker.once('close', () => resolve());
+      })));
+      let closeTimer: NodeJS.Timeout | undefined;
+      const closed = await Promise.race([
+        workersClosed.then(() => true),
+        new Promise<boolean>((resolve) => { closeTimer = setTimeout(() => resolve(false), 15_000); }),
+      ]);
+      if (closeTimer) clearTimeout(closeTimer);
+      if (!closed) {
+        for (const worker of workers) if (worker.exitCode === null && worker.signalCode === null) try { worker.kill(); } catch {}
+        let finalCloseTimer: NodeJS.Timeout | undefined;
+        await Promise.race([
+          workersClosed,
+          new Promise<void>((resolve) => { finalCloseTimer = setTimeout(resolve, 5_000); }),
+        ]);
+        if (finalCloseTimer) clearTimeout(finalCloseTimer);
+      }
+      try {
+        if (fs.existsSync(spawnedFile) && fs.existsSync(spawnedBirthFile)) {
+          const pid = Number(fs.readFileSync(spawnedFile, 'utf8'));
+          const birthId = fs.readFileSync(spawnedBirthFile, 'utf8').trim();
+          if (pid > 0 && birthId && probeProcessIdentity(pid, birthId) !== 'exited') {
+            await stopVerifiedChildTree(pid, true, undefined, birthId, 5_000, [], true);
+          }
+        }
+      } catch {}
+      store.dispose();
+      cleanTempDir(storageDir);
+    }
+  });
+
+  test('two real controls retain durable next while a captured grandchild survives exited owner and child', async () => {
+    const storageDir = createTempDir('orphan-next-live-grandchild');
+    const threadId = 'thread_orphan_next_live_grandchild';
+    const barrierFile = path.join(storageDir, 'grandchild-recovery.start');
+    const holdFile = path.join(storageDir, 'grandchild-recovery.release');
+    const registeredFile = path.join(storageDir, 'grandchild-recovery.registered');
+    const spawnedFile = path.join(storageDir, 'grandchild-recovery.pid');
+    const spawnedBirthFile = path.join(storageDir, 'grandchild-recovery.birth');
+    const descendantFile = path.join(storageDir, 'grandchild.pid');
+    const workers: child_process.ChildProcess[] = [];
+    const store = new TaskStore(storageDir);
+    let oldOwner: child_process.ChildProcess | undefined;
+    let oldChildPid: number | undefined;
+    let oldChildBirthId: string | undefined;
+    let grandchildPid: number | undefined;
+    let grandchildBirthId: string | undefined;
+
+    try {
+      const grandchildScript = 'setInterval(()=>{},1000)';
+      const oldChildScript = `const cp=require('child_process');const fs=require('fs');const d=cp.spawn(process.execPath,['-e',${JSON.stringify(grandchildScript)}],{detached:true,windowsHide:true,stdio:'ignore'});d.unref();fs.writeFileSync(${JSON.stringify(descendantFile)},String(d.pid));setInterval(()=>{},1000);`;
+      oldOwner = child_process.spawn(process.execPath, ['-e', `const cp=require('child_process');const c=cp.spawn(process.execPath,['-e',${JSON.stringify(oldChildScript)}],{detached:true,windowsHide:true,stdio:'ignore'});c.unref();process.stdout.write(String(c.pid));setInterval(()=>{},1000);`], {
+        windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      let childText = '';
+      oldOwner.stdout?.on('data', (chunk) => { childText += chunk.toString(); });
+      await waitForFile(descendantFile, 30_000);
+      const actualChildPidDeadline = Date.now() + 10_000;
+      while (!childText.trim() && Date.now() < actualChildPidDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      const actualChildPid = Number(childText.trim());
+      oldChildPid = actualChildPid;
+      grandchildPid = Number(fs.readFileSync(descendantFile, 'utf8'));
+      const ownerPid = oldOwner.pid!;
+      const ownerBirthId = getProcessBirthId(ownerPid);
+      const childBirthId = getProcessBirthId(actualChildPid);
+      oldChildBirthId = childBirthId;
+      grandchildBirthId = getProcessBirthId(grandchildPid);
+      assert.ok(ownerBirthId && childBirthId && grandchildBirthId, 'old owner, root child, and captured grandchild identities are observable');
+      // Stop the recorded owner and child roots while keeping the detached grandchild alive.
+      try { oldOwner.kill(); } catch {}
+      await new Promise<void>((resolve) => oldOwner!.once('close', () => resolve()));
+      // The child root is detached; terminate only that exact PID after its birthId was captured.
+      try { process.kill(actualChildPid, 'SIGKILL'); } catch {}
+      const childExitedDeadline = Date.now() + 10_000;
+      while (probeProcessIdentity(actualChildPid, childBirthId) !== 'exited' && Date.now() < childExitedDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(probeProcessIdentity(ownerPid, ownerBirthId), 'exited');
+      assert.equal(probeProcessIdentity(actualChildPid, childBirthId), 'exited');
+      assert.equal(probeProcessIdentity(grandchildPid, grandchildBirthId), 'alive');
+
+      const thread = createV2Thread(threadId, storageDir, 'review');
+      const now = new Date().toISOString();
+      thread.status = 'running';
+      thread.execution = {
+        ...thread.execution!,
+        revision: 10,
+        operationId: 'review-operation-grandchild',
+        phase: 'review',
+        round: 1,
+        run: {
+          id: 'review-run-grandchild', role: 'reviewer',
+          owner: { pid: ownerPid, birthId: ownerBirthId },
+          child: { pid: actualChildPid, birthId: childBirthId },
+          subtrees: [{ root: { pid: actualChildPid, birthId: childBirthId }, descendants: [{ pid: grandchildPid, birthId: grandchildBirthId }] }],
+          state: 'active', step: 'executing', startedAt: now, registeredAt: now,
+        },
+        next: { phase: 'develop', round: 2, sourceRunId: 'review-run-grandchild' },
+      };
+      thread.currentRound = 1;
+      const decision = {
+        id: 'durable-rework-grandchild', operationId: 'review-operation-grandchild', generation: 1,
+        phase: 'review' as const, round: 1, question: 'Make a correction', resumePoint: 'continue_develop' as const,
+        createdAt: now, answer: 'rework requested', answeredAt: now, answeredBy: 'reviewer-session',
+      };
+      thread.decision = decision;
+      thread.decisions = [decision];
+      store.upsertTask(thread);
+
+      const workerScript = path.resolve(__dirname, 'fixtures/two-process-runner.js');
+      const launchWorker = (workerId: string) => {
+        const worker = child_process.spawn(process.execPath, [
+          workerScript, `--storage-dir=${storageDir}`, `--thread-id=${threadId}`, `--worker-id=${workerId}`,
+          '--phase=develop', `--barrier-file=${barrierFile}`, `--hold-file=${holdFile}`,
+          `--registered-file=${registeredFile}`, `--spawned-file=${spawnedFile}`, `--spawned-birth-file=${spawnedBirthFile}`,
+        ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+        workers.push(worker);
+        return worker;
+      };
+      const first = launchWorker('grandchild_1');
+      const second = launchWorker('grandchild_2');
+      let firstOut = ''; let secondOut = '';
+      first.stdout?.on('data', (chunk) => { firstOut += chunk.toString(); });
+      second.stdout?.on('data', (chunk) => { secondOut += chunk.toString(); });
+      const closed = (worker: child_process.ChildProcess) => new Promise<number | null>((resolve) => worker.once('close', resolve));
+      const firstClosed = closed(first); const secondClosed = closed(second);
+      await Promise.all([waitForFile(`${barrierFile}.grandchild_1.ready`, 30_000), waitForFile(`${barrierFile}.grandchild_2.ready`, 30_000)]);
+      fs.writeFileSync(barrierFile, 'start', 'utf8');
+      const [firstCode, secondCode] = await Promise.all([firstClosed, secondClosed]);
+      assert.equal(firstCode, 0, firstOut);
+      assert.equal(secondCode, 0, secondOut);
+      const parse = (output: string) => {
+        const line = output.split('\n').find((value) => value.startsWith('RESULT:'));
+        return line ? JSON.parse(line.slice(7)) : undefined;
+      };
+      const results = [parse(firstOut), parse(secondOut)];
+      assert.ok(results.every(Boolean), `both controls report: ${firstOut} ${secondOut}`);
+      assert.ok(results.every((result) => !result.started && result.reason === 'run_busy' && result.spawnCount === 0));
+      const retained = store.reloadTask(threadId)!;
+      assert.equal(retained.execution?.run?.id, 'review-run-grandchild');
+      assert.equal(retained.execution?.next?.sourceRunId, 'review-run-grandchild');
+      assert.equal(retained.decision?.id, decision.id);
+      assert.equal(probeProcessIdentity(grandchildPid, grandchildBirthId), 'alive');
+    } finally {
+      try { fs.writeFileSync(holdFile, 'release', 'utf8'); } catch {}
+      for (const worker of workers) if (worker.exitCode === null && worker.signalCode === null) try { worker.kill(); } catch {}
+      await Promise.all(workers.map((worker) => new Promise<void>((resolve) => {
+        if (worker.exitCode !== null || worker.signalCode !== null) return resolve();
+        worker.once('close', () => resolve());
+      })));
+      if (grandchildPid && grandchildBirthId) {
+        try { await killPidTree(grandchildPid); } catch {}
+      }
+      if (oldChildPid && oldChildBirthId && probeProcessIdentity(oldChildPid, oldChildBirthId) !== 'exited') {
+        try { process.kill(oldChildPid, 'SIGKILL'); } catch {}
+      }
+      if (oldOwner && oldOwner.exitCode === null && oldOwner.signalCode === null) try { oldOwner.kill(); } catch {}
+      store.dispose();
       cleanTempDir(storageDir);
     }
   });
@@ -446,7 +832,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       );
 
       const result = await controller.startExecution(threadId);
-      assert.strictEqual(result.started, true);
+      assert.strictEqual(result.started, true, `${JSON.stringify(result)} ${JSON.stringify(store.getTask(threadId)?.failure)}`);
       assert.strictEqual(result.reason, 'already_running');
 
       store.ensureUpToDate();
@@ -609,15 +995,15 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       const registry = new TaskExecutionRegistry(path.join(storageDir, 'registry'));
       const roleLock = new TaskRoleLock(storageDir);
       const sessionLock = new NativeSessionLock(storageDir);
-      const originalAttachChild = sessionLock.attachChild.bind(sessionLock);
-      (sessionLock as any).attachChild = async (lease: any, pid?: number) => {
+      const originalAttachChild = registry.attachChildPid.bind(registry);
+      (registry as any).attachChildPid = async (pid: number | undefined, registration: any) => {
         if (pid === undefined) unbindCalls++;
         else if (pid === pidA) {
           attachCalls++;
           resolveAckReached();
           await ackBarrier;
         }
-        return originalAttachChild(lease, pid);
+        return originalAttachChild(pid, registration);
       };
       const originalTransition = store.transitionExecution.bind(store);
       store.transitionExecution = async (...args: any[]) => {
@@ -645,6 +1031,8 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
           birthA = getProcessBirthId(pidA);
           birthB = getProcessBirthId(pidB);
           assert.ok(birthA && birthB);
+          bindSpawnedChildIdentity(childA, birthA);
+          bindSpawnedChildIdentity(childB, birthB);
           const closedA = new Promise<void>((resolve) => childA!.once('close', () => resolve()));
           const registrationA = opts.onChildPid(pidA, childA, birthA);
           await ackReached;
@@ -701,8 +1089,8 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       await bAttempted;
       assert.ok(bError, 'the different-PID callback is rejected instead of borrowing A\'s promise');
       assert.strictEqual(bError.code, 'CHILD_BINDING_IN_PROGRESS');
-      assert.strictEqual(attachCalls, 1, 'only A may send the session lease ACK');
-      assert.strictEqual(unbindCalls, 0, 'B cannot unbind A');
+      assert.strictEqual(attachCalls, 1, 'only A may complete the controller process-binding ACK');
+      assert.strictEqual(unbindCalls, 0, 'B cannot clear A\'s process binding');
       assert.strictEqual(probeProcessIdentity(pidA!, birthA), 'alive', 'A remains alive and owned by its original binding');
       assert.strictEqual(probeProcessIdentity(pidB!, birthB), 'exited', 'B is stopped using its own captured identity');
       store.ensureUpToDate();
@@ -1058,14 +1446,15 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       const unbindAck = new Promise<void>((resolve) => { resolveUnbindAck = resolve; });
       let resolvePhaseOutcome!: () => void;
       const phaseOutcome = new Promise<void>((resolve) => { resolvePhaseOutcome = resolve; });
-      (sessionLock as any).attachChild = async (_lease: any, pid?: number) => {
+      const originalAttachChildPid = registry.attachChildPid.bind(registry);
+      (registry as any).attachChildPid = async (pid: number | undefined, registration: any) => {
         if (pid === undefined) {
           resolveUnbindAck();
-          return true;
+          return originalAttachChildPid(pid, registration);
         }
         resolveRegistrationWaiting();
         await registrationAckBarrier;
-        return true;
+        return originalAttachChildPid(pid, registration);
       };
 
       const mockRunner: any = {
@@ -1074,7 +1463,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         isTransientError: () => false,
         isRateLimitOrQuotaError: () => false,
         execute: async (opts: any) => {
-          // Close the real child while the registration callback is held at the lease ACK.
+          // Close the real child while the durable run-child registration ACK is held.
           const child = child_process.spawn(
             process.execPath,
             ['-e', 'setInterval(() => {}, 1000)'],
@@ -1084,6 +1473,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
           registeredPid = child.pid;
           const closePromise = new Promise<void>((resolve) => child.once('close', () => resolve()));
           const childBirthId = child.pid ? getProcessBirthId(child.pid) : undefined;
+          bindSpawnedChildIdentity(child, childBirthId);
           const registration = opts.onChildPid(child.pid, child, childBirthId);
           await closePromise;
           childClosedFirst = true;
@@ -1136,9 +1526,9 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       };
 
       const result = await controller.startExecution(threadId);
-      assert.strictEqual(result.started, true);
+      assert.strictEqual(result.started, true, `${JSON.stringify(result)} ${JSON.stringify(store.getTask(threadId)?.failure)}`);
 
-      // Wait until the persisted binding reaches its explicit lease-ACK barrier;
+      // Wait until the persisted binding reaches its explicit run-child ACK barrier;
       // the child remains alive here, so startup timing cannot race registration.
       await registrationWaiting;
       store.ensureUpToDate();
@@ -1171,7 +1561,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
     }
   });
 
-  test('V2 execution stays stopping/unconfirmed when session or merge lock release is not confirmed', async () => {
+  test('V2 leaves stale Bridge session leases untouched and retains runs when merge release is unconfirmed', async () => {
     const runReleaseFailure = async (kind: 'session' | 'merge') => {
       const storageDir = createTempDir(`release-unconfirmed-${kind}`);
       const threadId = `thread_release_unconfirmed_${kind}`;
@@ -1184,6 +1574,8 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         const registry = new TaskExecutionRegistry(path.join(storageDir, 'registry'));
         const roleLock = new TaskRoleLock(storageDir);
         const sessionLock = new NativeSessionLock(storageDir);
+        let staleSessionLease: ReturnType<NativeSessionLock['acquire']> | undefined;
+        let staleSessionLeaseBytes: string | undefined;
         let releaseAttempted = false;
         let releaseRequested = false;
         let outcomeCount = 0;
@@ -1209,6 +1601,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         };
         const fakeMergeLock: any = {
           acquire: async () => () => { releaseRequested = true; },
+          getActiveHelperEvidence: () => ({ pid: process.pid, birthId: getProcessBirthId(process.pid), channelPath: path.join(storageDir, 'fake-helper-channel') }),
           attachChildPid: async () => undefined,
           dispose: () => undefined,
           releaseAndConfirm: async (release: (() => void) | undefined) => {
@@ -1229,6 +1622,9 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
           { storageDir, standingScanIntervalMs: 0 },
         );
         if (kind === 'session') {
+          staleSessionLease = sessionLock.acquire(thread.targetAgent, thread.receiverSessionId!);
+          assert.ok(staleSessionLease);
+          staleSessionLeaseBytes = fs.readFileSync(staleSessionLease.path, 'utf8');
           (sessionLock as any).release = () => { releaseAttempted = true; return false; };
         } else {
           (controller as any).executeMergeAdapter = async () => ({ ok: true });
@@ -1237,6 +1633,16 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
 
         const started = await controller.startExecution(threadId, kind === 'merge' ? 'merge' : undefined);
         assert.strictEqual(started.started, true);
+        if (kind === 'session') {
+          const deadline = Date.now() + 10_000;
+          while (outcomeCount === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+          assert.strictEqual(outcomeCount, 1, 'the v2 developer run completes without consulting a Bridge session lease');
+          assert.strictEqual(releaseAttempted, false, 'v2 must not release or rewrite a legacy session lease');
+          assert.strictEqual(fs.readFileSync(staleSessionLease!.path, 'utf8'), staleSessionLeaseBytes);
+          assert.strictEqual(roleLock.getOwner(threadId), undefined, 'v2 must not create a Bridge role lock');
+          controller.dispose();
+          return;
+        }
         await unconfirmed;
         store.ensureUpToDate();
         const stopped = store.getTask(threadId);
@@ -1701,6 +2107,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       const replacementBirthId = getProcessBirthId(replacementRoot.pid!);
       const replacementChildBirthId = getProcessBirthId(replacementChildPid);
       assert.ok(replacementBirthId && replacementChildBirthId);
+      bindSpawnedChildIdentity(replacementRoot, replacementBirthId);
       assert.strictEqual(probeProcessIdentity(replacementRoot.pid!, capturedBirthId), 'exited');
       assert.strictEqual(probeProcessIdentity(replacementRoot.pid!, replacementBirthId), 'alive');
       assert.strictEqual(probeProcessIdentity(replacementChildPid, replacementChildBirthId), 'alive');
@@ -2078,11 +2485,29 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
     }
   });
 
-  test('Defect 1: scanAndDrain skips v2 tasks, startExecutionV2 marks visible LAUNCH_UNCONFIRMED and retains run', async () => {
+  test('Defect 1: scanAndDrain routes orphan v2 runs through launch recovery and retains unconfirmed identity', async () => {
     const storageDir = createTempDir('v2-scan-isolation');
     const threadId = 'thread_v2_scan_isolation';
 
     try {
+      const deadOwner = child_process.spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+        windowsHide: true, stdio: 'ignore',
+      });
+      await new Promise<void>((resolve, reject) => {
+        deadOwner.once('error', reject);
+        deadOwner.once('spawn', () => resolve());
+      });
+      const deadOwnerPid = deadOwner.pid!;
+      let deadOwnerBirthId = getProcessBirthId(deadOwnerPid);
+      for (let i = 0; !deadOwnerBirthId && i < 20; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        deadOwnerBirthId = getProcessBirthId(deadOwnerPid);
+      }
+      assert.ok(deadOwnerBirthId, 'test owner must have a verifiable birth identity');
+      const deadOwnerClosed = new Promise<void>((resolve) => deadOwner.once('close', () => resolve()));
+      deadOwner.kill();
+      await deadOwnerClosed;
+
       const store = new TaskStore(storageDir);
       const thread = createV2Thread(threadId, storageDir, 'develop');
       const now = new Date().toISOString();
@@ -2090,7 +2515,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       thread.execution!.run = {
         id: 'run_crashed_owner',
         role: 'developer',
-        owner: { pid: 999997, birthId: 'dead_owner_birth' },
+        owner: { pid: deadOwnerPid, birthId: deadOwnerBirthId },
         state: 'starting',
         step: 'spawning',
         spawnIntentAt: now,
@@ -2113,23 +2538,25 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         { storageDir, standingScanIntervalMs: 0 },
       );
 
-      // 1. scanAndDrain should completely skip v2 tasks; must NOT convert to failed(OWNER_LOST) or erase execution.run
+      // The scanner uses the v2 recovery classifier; an indeterminate spawn is
+      // made visible and retained rather than erased or replaced.
       await controller.scanAndDrain();
 
       store.ensureUpToDate();
       let current = store.getTask(threadId);
-      assert.strictEqual(current?.status, 'running', 'scanAndDrain must not mutate status of v2 tasks');
-      assert.strictEqual(current?.execution?.run?.id, 'run_crashed_owner', 'scanAndDrain must not erase v2 run');
-      assert.strictEqual(current?.failure?.code, undefined, 'scanAndDrain must not set OWNER_LOST on v2 tasks');
+      assert.strictEqual(current?.status, 'failed', 'orphan spawn intent must become a visible failure');
+      assert.strictEqual(current?.failure?.code, 'LAUNCH_UNCONFIRMED');
+      assert.strictEqual(current?.execution?.run?.id, 'run_crashed_owner', 'scanAndDrain must preserve uncertain run identity');
+      assert.strictEqual(current?.execution?.run?.state, 'stopping');
 
-      // 2. Controlled v2 entry: startExecutionV2 detects indeterminate crash window, records LAUNCH_UNCONFIRMED, retains run
+      // Explicit entry agrees and cannot replace the uncertain run.
       const result = await controller.startExecution(threadId);
       assert.strictEqual(result.started, false);
-      assert.strictEqual(result.reason, 'run_busy');
+      assert.strictEqual(result.reason, 'terminal');
 
       store.ensureUpToDate();
       current = store.getTask(threadId);
-      assert.strictEqual(current?.status, 'failed', 'Task must enter visible failed status');
+      assert.strictEqual(current?.status, 'failed', 'Task must remain visibly failed');
       assert.strictEqual(current?.failure?.code, 'LAUNCH_UNCONFIRMED', 'Failure code must be LAUNCH_UNCONFIRMED');
       assert.strictEqual(current?.execution?.run?.state, 'stopping', 'Run state must be stopping');
       assert.strictEqual(current?.execution?.run?.unconfirmed, true, 'Run must be marked unconfirmed');
@@ -2144,6 +2571,37 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
     } finally {
       cleanTempDir(storageDir);
     }
+  });
+
+  test('captured v2 session without static ownership evidence is rejected before spawn', async () => {
+    const storageDir = createTempDir('captured-session-no-binding');
+    const threadId = 'thread_captured_session_no_binding';
+    let spawnAttempted = false;
+    try {
+      const store = new TaskStore(storageDir);
+      const thread = createV2Thread(threadId, storageDir, 'develop');
+      thread.receiverSessionCaptured = true;
+      fs.rmSync(path.join(storageDir, 'session-bindings'), { recursive: true, force: true });
+      thread.nativeSessionAssignments = {
+        developer: { namespace: nativeSessionNamespace('codex'), sessionEpoch: 4 },
+      };
+      store.upsertTask(thread);
+      const runner: any = { execute: async () => { spawnAttempted = true; return { exitCode: 0 }; } };
+      const controller = new ExecutionController(
+        store, runner, {} as any, undefined,
+        new TaskRoleLock(storageDir), new NativeSessionLock(storageDir),
+        new TaskExecutionRegistry(storageDir), { storageDir, standingScanIntervalMs: 0 },
+      );
+
+      const result = await controller.startExecution(threadId, 'develop');
+      assert.equal(result.started, false);
+      assert.equal(result.reason, 'SESSION_OWNERSHIP_UNVERIFIED');
+      assert.equal(spawnAttempted, false);
+      assert.equal(fs.existsSync(path.join(storageDir, 'session-bindings')), false, 'verification must not create an implicit claim');
+      assert.equal(store.getTask(threadId)?.receiverSessionCaptured, true);
+      controller.dispose();
+      store.dispose();
+    } finally { cleanTempDir(storageDir); }
   });
 
   test('Defect 1: Real control process crash between spawn and registration leaves run stopping/unconfirmed and blocks replacement', async () => {
@@ -2593,6 +3051,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
     const fixture = path.resolve(__dirname, 'fixtures/two-process-runner.js');
     const holdFile = path.join(storageDir, 'release-winner');
     const spawnedFile = path.join(storageDir, 'winner-spawned');
+    const spawnedBirthFile = path.join(storageDir, 'winner-spawned-birth');
     const registeredFile = path.join(storageDir, 'winner-registered');
     const registrationGateFile = path.join(storageDir, 'release-registration');
     let store: TaskStore | undefined;
@@ -2625,6 +3084,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       const winnerChild = launch('winner', [
         `--hold-file=${holdFile}`,
         `--spawned-file=${spawnedFile}`,
+        `--spawned-birth-file=${spawnedBirthFile}`,
         `--registered-file=${registeredFile}`,
         `--registration-gate-file=${registrationGateFile}`,
       ]);
@@ -2689,6 +3149,15 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
     } finally {
       try { fs.writeFileSync(registrationGateFile, 'release', 'utf8'); } catch {}
       try { fs.writeFileSync(holdFile, 'release', 'utf8'); } catch {}
+      try {
+        if (fs.existsSync(spawnedFile) && fs.existsSync(spawnedBirthFile)) {
+          const pid = Number(fs.readFileSync(spawnedFile, 'utf8').trim());
+          const birthId = fs.readFileSync(spawnedBirthFile, 'utf8').trim();
+          if (Number.isSafeInteger(pid) && pid > 0 && birthId && probeProcessIdentity(pid, birthId) !== 'exited') {
+            await stopVerifiedChildTree(pid, true, undefined, birthId, 5_000, [], true);
+          }
+        }
+      } catch {}
       if (winnerExitPromise) {
         try { await waitBounded(winnerExitPromise, 10_000, 'Winner did not settle after fixture barriers were released'); }
         catch {
@@ -2705,7 +3174,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
     }
   });
 
-  test('Defect 3: Child subtree plus pending lease ACK and unconfirmed exit keeps the cross-task session lease', async () => {
+  test('Defect 3: Child subtree plus pending run binding ACK and unconfirmed exit keeps durable ownership', async () => {
     const storageDir = createTempDir('subtree-unconfirmed-lease');
     const threadId = 'thread_subtree_unconfirmed';
     const readyFile = path.join(storageDir, 'grandchild-ready');
@@ -2727,19 +3196,33 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
     try {
       const store = new TaskStore(storageDir);
       const thread = createV2Thread(threadId, storageDir, 'develop');
+      thread.receiverSessionCaptured = true;
+      thread.nativeSessionAssignments = {
+        developer: { namespace: nativeSessionNamespace('codex'), sessionEpoch: 1 },
+      };
+      const ownership = new SessionOwnershipStore(storageDir);
+      const claimed = ownership.claim({
+        agent: 'codex',
+        namespace: thread.nativeSessionAssignments!.developer!.namespace,
+        sessionId: thread.receiverSessionId!,
+        threadId,
+        role: 'developer',
+        sessionEpoch: 1,
+      });
+      assert.equal(claimed.ok, true);
       store.upsertTask(thread);
 
       const registry = new TaskExecutionRegistry(path.join(storageDir, 'registry'));
       const roleLock = new TaskRoleLock(storageDir);
       const sessionLock = new NativeSessionLock(storageDir);
-      const originalAttachChild = sessionLock.attachChild.bind(sessionLock);
-      (sessionLock as any).attachChild = async (lease: any, pid?: number) => {
+      const originalAttachChild = registry.attachChildPid.bind(registry);
+      (registry as any).attachChildPid = async (pid: number | undefined, registration: any) => {
         if (pid === undefined) unbindCalled = true;
         else {
           resolveBindingWaiting();
           await registrationAck;
         }
-        return originalAttachChild(lease, pid);
+        return originalAttachChild(pid, registration);
       };
       const originalTransition = store.transitionExecution.bind(store);
       store.transitionExecution = async (...args: any[]) => {
@@ -2783,11 +3266,12 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
           const childPid = child.pid;
           if (!childPid) throw new Error('The controlled child process did not receive a PID.');
           const childBirthId = getProcessBirthId(childPid);
+          bindSpawnedChildIdentity(child, childBirthId);
 
           const registration = opts.onChildPid(childPid, child, childBirthId);
           await bindingWaiting;
-          // The binding record and descendant identities now exist, while the
-          // session lease ACK remains blocked. Close only the root; the grandchild
+          // The run child binding and descendant identities are being durably
+          // registered. Close only the root while its binding ACK is blocked; the grandchild
           // is deliberately reparented and must still be tracked and stopped.
           child.kill();
           await close;
@@ -2819,12 +3303,12 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         await bindingWaiting;
         store.ensureUpToDate();
         const binding = store.getTask(threadId);
-        assert.ok(binding?.execution?.run?.child?.pid, 'the root PID is persisted before the lease ACK');
+        assert.ok(binding?.execution?.run?.child?.pid, 'the root PID is persisted before the run binding ACK');
         assert.strictEqual(binding?.execution?.run?.step, 'binding');
 
         await childClosed;
         assert.strictEqual(probeProcessIdentity(parentProc!.pid!), 'exited', 'the controlled root closed before ACK release');
-        assert.strictEqual(workerFinished, false, 'worker cannot settle while the lease ACK is held');
+        assert.strictEqual(workerFinished, false, 'worker cannot settle while the run binding ACK is held');
 
         releaseRegistrationAck();
         await runnerFinished;
@@ -2834,12 +3318,20 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         const task = store.getTask(threadId);
         assert.strictEqual(task?.execution?.run?.state, 'stopping');
         assert.strictEqual(task?.execution?.run?.unconfirmed, true);
-        assert.strictEqual(unbindCalled, false, 'unbinding and release must not run before subtree exit is confirmed');
+        assert.strictEqual(unbindCalled, false, 'run binding is not released before subtree exit is confirmed');
         assert.ok(grandchildPid, 'the detached descendant PID was captured');
         assert.strictEqual(probeProcessIdentity(grandchildPid!), 'exited', 'the captured descendant was stopped independently of the root');
 
-        const anotherLease = sessionLock.acquire('codex', thread.receiverSessionId!);
-        assert.strictEqual(anotherLease, undefined, 'another task must not acquire this native-session lease');
+        const otherThreadClaim = ownership.claim({
+          agent: 'codex',
+          namespace: thread.nativeSessionAssignments!.developer!.namespace,
+          sessionId: thread.receiverSessionId!,
+          threadId: `${threadId}_other`,
+          role: 'developer',
+          sessionEpoch: 1,
+        });
+        assert.strictEqual(otherThreadClaim.ok, false, 'static ownership prevents another thread from claiming the session');
+        assert.strictEqual(otherThreadClaim.code, 'SESSION_OWNERSHIP_CONFLICT');
       } finally {
         releaseRegistrationAck();
         setConfirmProcessTreeExitProvider(undefined);

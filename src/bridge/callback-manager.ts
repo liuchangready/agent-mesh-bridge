@@ -35,8 +35,9 @@ import { ReviewerLogWriter, createReviewerLogWriter } from './reviewer-log';
 import { cachedCodexResumeSupport, codexResumeArgument, extractCodexThreadId } from './codex-session';
 import { assertCanExecute } from './agent-capabilities';
 import { AutonomousRunner } from './autonomous-runner';
-import { NativeSessionCompactor } from './native-session-compactor';
+import { NativeSessionCompactor, NativeRunPreparationContext } from './native-session-compactor';
 import { NativeSessionLock } from './native-session-lock';
+import { nativeSessionNamespace, SessionOwnershipStore } from './session-ownership';
 import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 import { CancellationRegistry } from './cancellation-registry';
 import { noteMergeFailure } from './merge-recovery';
@@ -608,6 +609,7 @@ export class CallbackManager extends EventEmitter {
   public async launchReviewerBootstrap(
     thread: DelegationThread,
     onChildPid?: (pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>,
+    executionIdentity?: NativeRunPreparationContext,
   ): Promise<{ confirmed: boolean; error?: string; transient?: boolean }> {
     assertDedicatedTask(thread);
     assertCanExecute(thread.initiatorAgent, 'bootstrap as a reviewer', 'initiator');
@@ -619,7 +621,7 @@ export class CallbackManager extends EventEmitter {
     }
 
     const resumeReviewerSession = thread.reviewerSessionCaptured === true && !!thread.reviewerSessionId;
-    const preassigned = resumeReviewerSession ? thread.reviewerSessionId! : crypto.randomUUID();
+    const preassigned = resumeReviewerSession ? thread.reviewerSessionId! : thread.reviewerSessionId || crypto.randomUUID();
     const prompt = buildReviewerBootstrapPrompt(thread, tokenRecord.token);
     const runner = this.runner || new AutonomousRunner(this.detector);
 
@@ -636,6 +638,14 @@ export class CallbackManager extends EventEmitter {
       nativeSessionRole: 'reviewer',
       model: thread.reviewerModel,
       role: 'bootstrap',
+      executionIdentity: executionIdentity ? {
+        runId: executionIdentity.runId,
+        operationId: executionIdentity.operationId,
+        generation: executionIdentity.generation,
+        phase: executionIdentity.phase,
+        round: executionIdentity.round,
+        role: 'reviewer',
+      } : undefined,
       markAsReceiver: false,
       maxRetries: 0,
       extraEnv: {
@@ -646,7 +656,9 @@ export class CallbackManager extends EventEmitter {
       },
       onChildPid: async (pid, childProc, childBirthId) => {
         if (pid && root) recordReviewerBootstrapHostPid(thread.threadId, pid, root, thread.artifactDir);
-        if (pid) await onChildPid?.(pid, childProc, childBirthId);
+        // The undefined notification is the runner's exit confirmation. Forward
+        // it so v2 can clear the child binding and consume its durable handoff.
+        await onChildPid?.(pid, childProc, childBirthId);
       },
     });
 
@@ -658,6 +670,36 @@ export class CallbackManager extends EventEmitter {
         (thread.initiatorAgent === 'claude_code' ? preassigned : undefined) ||
         (resumeReviewerSession ? preassigned : undefined);
       if (sessionId && store) {
+        if (fresh.execution?.version === 2) {
+          const assignment = fresh.nativeSessionAssignments?.reviewer;
+          if (!assignment) return { confirmed: false, error: 'SESSION_OWNERSHIP_UNVERIFIED: reviewer namespace was not pinned.' };
+          if (assignment.namespace !== nativeSessionNamespace(fresh.initiatorAgent)) {
+            return { confirmed: false, error: 'SESSION_OWNERSHIP_UNVERIFIED: pinned reviewer namespace does not match the CLI storage root.' };
+          }
+          const ownershipStore = new SessionOwnershipStore(root);
+          const ownershipInput = {
+            agent: fresh.initiatorAgent,
+            namespace: assignment.namespace,
+            sessionId,
+            threadId: fresh.threadId,
+            role: 'reviewer',
+            sessionEpoch: assignment.sessionEpoch,
+          } as const;
+          const ownership = fresh.reviewerSessionCaptured === true
+            ? ownershipStore.verify(ownershipInput)
+            : ownershipStore.claim(ownershipInput);
+          if (!ownership.ok) return { confirmed: false, error: `${ownership.code}: ${ownership.reason}` };
+          await store.transitionExecution(fresh.threadId, fresh.execution.revision, (current) => {
+            if (current.execution?.run?.id !== fresh.execution?.run?.id || current.cleanup) {
+              throw new Error('Reviewer bootstrap run changed before session binding was persisted.');
+            }
+            current.reviewerSessionId = sessionId;
+            current.reviewerSessionCaptured = true;
+            current.callerSessionId = sessionId;
+          });
+          if (root) clearReviewerBootstrapToken(fresh.threadId, root, fresh.artifactDir);
+          return { confirmed: true };
+        }
         fresh.reviewerSessionId = sessionId;
         fresh.reviewerSessionCaptured = true;
         fresh.callerSessionId = sessionId;
@@ -681,6 +723,7 @@ export class CallbackManager extends EventEmitter {
     thread: DelegationThread,
     round: DelegationRound,
     onChildPid?: (pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>,
+    executionIdentity?: NativeRunPreparationContext,
   ): Promise<{ success: boolean; error?: string; exitCode?: number }>;
   public launchCaller(
     thread: DelegationThread,
@@ -698,23 +741,25 @@ export class CallbackManager extends EventEmitter {
     thread: DelegationThread,
     callerSessionIdOrRound: string | DelegationRound,
     promptMessageOrOnChildPid?: string | ((pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>),
-    roundParam?: DelegationRound,
+    roundParam?: DelegationRound | NativeRunPreparationContext,
     wakeKind?: 'review' | 'failure',
     release?: () => void,
     onChildPid?: (pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>,
     recoveryVersion?: string,
     mergeWakeId?: string,
     roleToken?: string,
+    executionIdentity?: NativeRunPreparationContext,
   ): boolean | Promise<{ success: boolean; error?: string; exitCode?: number }> {
     assertDedicatedTask(thread);
     if (typeof callerSessionIdOrRound !== 'string') {
       const round = callerSessionIdOrRound;
       const childPidCb = typeof promptMessageOrOnChildPid === 'function' ? promptMessageOrOnChildPid : undefined;
-      return this.launchCallerAsync(thread, round, childPidCb);
+      return this.launchCallerAsync(thread, round, childPidCb,
+        (roundParam && 'runId' in roundParam) ? roundParam : executionIdentity);
     }
     const callerSessionId = callerSessionIdOrRound;
     const promptMessage = promptMessageOrOnChildPid as string;
-    const round = roundParam!;
+    const round = roundParam as DelegationRound;
     return this.launchCallerSync(thread, callerSessionId, promptMessage, round, wakeKind!, release!, onChildPid, recoveryVersion, mergeWakeId, roleToken);
   }
 
@@ -722,6 +767,7 @@ export class CallbackManager extends EventEmitter {
     thread: DelegationThread,
     round: DelegationRound,
     onChildPid?: (pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>,
+    executionIdentity?: NativeRunPreparationContext,
   ): Promise<{ success: boolean; error?: string; exitCode?: number }> {
     assertCanExecute(thread.initiatorAgent, 'resume as a reviewer', 'initiator');
     const callerSessionId = this.resolveCallerSession(thread);
@@ -736,6 +782,55 @@ export class CallbackManager extends EventEmitter {
     const codexModelArgs = senderModel ? ['-c', `model="${senderModel}"`] : [];
 
     const wakeMessage = this.buildReviewWakeMessage(thread, round);
+
+    if (thread.execution?.version === 2) {
+      const identity = executionIdentity;
+      if (!identity || identity.role !== 'reviewer' || identity.phase !== 'review' ||
+          identity.runId !== thread.execution.run?.id || identity.operationId !== thread.execution.operationId ||
+          identity.generation !== thread.execution.generation || identity.round !== thread.execution.round) {
+        return Promise.resolve({ success: false, error: 'V2 reviewer wake has no matching durable run identity.', exitCode: -1 });
+      }
+      const runner = this.runner || new AutonomousRunner(this.detector, undefined, undefined, this.taskStore);
+      return runner.execute({
+        agent: initiator,
+        prompt: wakeMessage,
+        isRework: true,
+        receiverSessionId: callerSessionId,
+        title: `Review: ${thread.title}`,
+        cwd,
+        taskThreadId: thread.threadId,
+        artifactDir: thread.artifactDir,
+        taskRound: round.round,
+        nativeSessionRole: 'reviewer',
+        model: senderModel,
+        role: 'reviewer',
+        executionIdentity: { ...identity },
+        markAsReceiver: false,
+        maxRetries: 0,
+        extraEnv: {
+          MESH_REVIEW_SESSION_ID: callerSessionId,
+          MESH_REVIEW_THREAD_ID: thread.threadId,
+          MESH_CALLER_AGENT: initiator,
+        },
+        preSpawnGuard: () => {
+          this.taskStore?.loadFromDisk();
+          const fresh = this.taskStore?.getTask(thread.threadId);
+          const current = fresh?.execution;
+          if (!fresh || fresh.cleanup || fresh.status !== 'reviewing' || current?.version !== 2 ||
+              current.run?.id !== identity.runId || current.operationId !== identity.operationId ||
+              current.generation !== identity.generation || current.phase !== 'review' || current.round !== identity.round ||
+              current.run.state === 'stopping' || current.run.unconfirmed) {
+            return { ok: false, reason: 'V2 reviewer run or task state changed before spawn.' };
+          }
+          return { ok: true };
+        },
+        onChildPid,
+      }).then((result: any) => ({
+        success: result.exitCode === 0 && result.assessment?.success === true,
+        exitCode: result.exitCode,
+        error: result.error,
+      }));
+    }
 
     const callbackEnv: NodeJS.ProcessEnv = {
       ...process.env,

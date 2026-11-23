@@ -1,5 +1,5 @@
 import { testWorkspace } from './workspace-fixture';
-import { test, describe, beforeEach, afterEach } from 'node:test';
+import { test, describe, beforeEach, afterEach, after } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -36,9 +36,17 @@ import { AsyncDispatcher } from '../bridge/async-dispatcher';
 import { ReworkController } from '../bridge/rework-controller';
 import { TaskSupervisor } from '../bridge/task-supervisor';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
+import { NativeSessionLock } from '../bridge/native-session-lock';
 import { getBridgeHome, invalidateConfiguredModelCache, saveModelDefaults } from '../bridge/model-catalog';
 import { clearReviewerBootstrapToken } from '../bridge/reviewer-bootstrap';
 import { DelegationThread, describeModelRouting, shouldResumeNativeSession } from '../bridge/types';
+
+const inheritedCallerAgent = process.env.MESH_CALLER_AGENT;
+delete process.env.MESH_CALLER_AGENT;
+after(() => {
+  if (inheritedCallerAgent === undefined) delete process.env.MESH_CALLER_AGENT;
+  else process.env.MESH_CALLER_AGENT = inheritedCallerAgent;
+});
 
 describe('AsyncDispatcher and ReworkController Tests', () => {
   let tempDir: string;
@@ -121,6 +129,44 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     void (dispatcher as any).executeBackgroundRound(task, 1, task.rounds[0].prompt, false);
     return result;
   };
+
+  test('v2 paused approved merge resumes through the run CAS without Bridge role/session admission', async () => {
+    const threadId = 'thread_v2_paused_merge_resume_no_old_locks';
+    const now = new Date().toISOString();
+    const sessionId = 'reviewer-session-paused-merge';
+    const thread: any = {
+      threadId, title: 'Paused approved merge', initiatorAgent: 'codex', targetAgent: 'claude_code',
+      status: 'paused', currentRound: 1, createdAt: now, updatedAt: now, reviewFlow: 'dedicated',
+      reviewerSessionId: sessionId, callerSessionId: sessionId, reviewerSessionCaptured: true,
+      reviewBootstrap: { phase: 'confirmed', attempts: 1 },
+      workspace: testWorkspace(process.cwd()),
+      worktree: { path: process.cwd(), taskBranch: 'mesh/task/test', targetRef: 'refs/heads/test/source',
+        approvedCommit: 'a'.repeat(40), integration: { phase: 'waiting', updatedAt: now } },
+      summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
+      rounds: [{ round: 1, type: 'initial', prompt: 'work', status: 'completed', durationMs: 1, timestamp: now }],
+      execution: { version: 2, revision: 1, operationId: 'paused-merge-op', phase: 'merge', round: 1, generation: 5,
+        attempt: 0, autoRetriesUsed: 0, budget: { limitMs: 120_000, spentActiveMs: 20_000, maxAutoRetries: 2 } },
+    };
+    taskStore.upsertTask(thread);
+    const oldLock = new NativeSessionLock(tempDir);
+    const legacyLease = oldLock.acquire('codex', sessionId);
+    assert.ok(legacyLease);
+    const legacyBytes = fs.readFileSync(legacyLease.path, 'utf8');
+
+    const round = await reworkController.resumePausedTask(threadId);
+    taskStore.loadFromDisk();
+    const resumed = taskStore.getTask(threadId)!;
+    assert.equal(round.round, 1);
+    assert.equal(resumed.status, 'queued');
+    assert.equal(resumed.queuePhase, 'merge');
+    assert.equal(resumed.execution?.phase, 'merge');
+    assert.equal(resumed.execution?.generation, 5);
+    assert.equal(resumed.execution?.run, undefined);
+    assert.equal(resumed.execution?.next, undefined);
+    assert.equal(fs.readFileSync(legacyLease.path, 'utf8'), legacyBytes, 'resume ignored and did not refresh the old native lock');
+    assert.equal(fs.existsSync(path.join(tempDir, 'roles', `${threadId}.json`)), false, 'resume did not publish a Bridge role lease');
+    oldLock.release(legacyLease);
+  });
 
   test('does not capture a Claude session after a silent first-launch failure', async () => {
     runner.execute = async () => ({ exitCode: 1, stdout: '', stderr: 'startup failed', extractedOutput: '', durationMs: 1 });
@@ -665,6 +711,45 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     const thread = taskStore.getTask(dispatchRes.threadId);
     assert.ok(thread);
     assert.strictEqual(thread.status, 'completed');
+  });
+
+  test('rework and approval cannot replace a reviewer run durable handoff', async () => {
+    const makeReview = async (title: string) => {
+      const dispatched = await dispatchReady({ targetAgent: 'antigravity', title, prompt: 'Implement the task.' });
+      await waitForStatus(dispatched.threadId, 'reviewing');
+      const task = taskStore.getTask(dispatched.threadId)!;
+      task.execution = {
+        ...task.execution!, version: 2, phase: 'review', round: task.currentRound, generation: 3,
+        operationId: `review-op-${task.threadId}`,
+        next: { phase: 'develop', round: task.currentRound + 1, sourceRunId: `review-run-${task.threadId}` },
+        run: {
+          id: `review-run-${task.threadId}`, role: 'reviewer', owner: { pid: process.pid, birthId: require('../bridge/platform').getProcessBirthId(process.pid) },
+          state: 'active', step: 'executing', startedAt: new Date().toISOString(), registeredAt: new Date().toISOString(),
+        },
+      } as any;
+      taskStore.upsertTask(task);
+      return task;
+    };
+
+    const reworkTask = await makeReview('No duplicate rework decision');
+    const originalRework = taskStore.reloadTask(reworkTask.threadId)!.execution!.next;
+    await assert.rejects(reworkController.requestRework({
+      threadId: reworkTask.threadId, feedback: 'Apply a second review decision.', callerSessionId: reworkTask.reviewerSessionId,
+    }), /already has a durable handoff/);
+    let saved = taskStore.reloadTask(reworkTask.threadId)!;
+    assert.deepEqual(saved.execution?.next, originalRework);
+    assert.equal(saved.currentRound, reworkTask.currentRound);
+    assert.equal(saved.execution?.run?.id, `review-run-${reworkTask.threadId}`);
+
+    const approveTask = await makeReview('No approval over pending rework');
+    const originalNext = taskStore.reloadTask(approveTask.threadId)!.execution!.next;
+    await assert.rejects(async () => {
+      await reworkController.approveTask({ threadId: approveTask.threadId, remarks: 'Approve despite the committed rework handoff.' } as any);
+    }, /already has a durable handoff/);
+    saved = taskStore.reloadTask(approveTask.threadId)!;
+    assert.deepEqual(saved.execution?.next, originalNext);
+    assert.equal(saved.execution?.run?.id, `review-run-${approveTask.threadId}`);
+    assert.equal(saved.status, 'reviewing');
   });
 
   test('rework cannot replace the captured reviewer with caller-supplied IDs', async () => {

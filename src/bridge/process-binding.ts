@@ -15,6 +15,7 @@ import {
   confirmProcessTreeExit,
   getProcessBirthId,
   getProcessBirthIds,
+  getSpawnedChildIdentity,
   isProcessStrictDescendant,
   probeProcessIdentity,
   probeProcessIdentityAsync,
@@ -259,7 +260,7 @@ export async function recordLaunchRecoveryFailure(
   expected?: LaunchRecoveryExpectation,
 ): Promise<boolean> {
   taskStore.ensureUpToDate();
-  const current = taskStore.getTask(threadId);
+  const current = taskStore.reloadTask(threadId);
   if (!current?.execution?.run || current.execution.run.id !== runId) {
     return false;
   }
@@ -355,7 +356,12 @@ export function verifySubtreeOwnership(
   // exact spawned root is still alive before walking its descendants.
   if (childProcess && childProcess.pid) {
     if (childProcess.exitCode !== null || childProcess.signalCode !== null) return false;
-    if (expectedRootBirthId && probeProcessIdentity(childProcess.pid, expectedRootBirthId) !== 'alive') return false;
+    const spawnBoundBirthId = getSpawnedChildIdentity(childProcess);
+    if (spawnBoundBirthId && expectedRootBirthId && spawnBoundBirthId !== expectedRootBirthId) return false;
+    // The exact ChildProcess handle plus the immutable identity captured by the
+    // spawn adapter already proves this root. Avoid a second synchronous OS
+    // birth-time query on Windows before the durable child-binding CAS.
+    if (expectedRootBirthId && !spawnBoundBirthId && probeProcessIdentity(childProcess.pid, expectedRootBirthId) !== 'alive') return false;
     if (childProcess.pid === candidatePid) return true;
     return isProcessStrictDescendant(candidatePid, childProcess.pid);
   }
@@ -571,7 +577,7 @@ async function markLaunchFailureUnderCas(
       : (reason.split(':')[0].trim() || 'PROCESS_STOP_UNCONFIRMED'));
   for (let attempt = 0; attempt < 3; attempt++) {
     taskStore.ensureUpToDate();
-    const current = taskStore.getTask(threadId);
+    const current = taskStore.reloadTask(threadId);
     if (!current) return;
     const rev = current.execution?.revision ?? 0;
     try {
@@ -638,7 +644,7 @@ export async function registerRunChildV2(
   // Fast idempotency gate: a repeated callback for a child already durably
   // binding/registered must not reach ownership discovery, lease ACK, or cleanup.
   taskStore.ensureUpToDate();
-  const snapshot = taskStore.getTask(threadId);
+  const snapshot = taskStore.reloadTask(threadId);
   const control = snapshot?.execution;
   const currentRun = control?.run;
   const currentChild = currentRun?.child;
@@ -648,6 +654,31 @@ export async function registerRunChildV2(
     control.operationId === identity.operationId &&
     control.phase === identity.phase &&
     control.round === identity.round;
+
+  // Reject stale callbacks before inspecting, attaching, or stopping the
+  // supplied process. A callback from an older run must not gain authority
+  // over the current run's process tree, and identity errors should not depend
+  // on whether a short-lived child happened to exit during OS process probing.
+  if (!sameExecution) {
+    if (!snapshot) return { success: false, error: 'Task not found' };
+    if (!control || control.version !== 2) return { success: false, error: 'Not a v2 task' };
+    if (currentRun?.id !== identity.runId) {
+      return { success: false, error: `Run ID mismatch: expected ${identity.runId}, found ${currentRun?.id}` };
+    }
+    if (control.generation !== identity.generation) {
+      return { success: false, error: `Generation mismatch: expected ${identity.generation}, found ${control.generation}` };
+    }
+    if (control.operationId !== identity.operationId) {
+      return { success: false, error: `OperationId mismatch: expected ${identity.operationId}, found ${control.operationId}` };
+    }
+    if (control.phase !== identity.phase) {
+      return { success: false, error: `Phase mismatch: expected ${identity.phase}, found ${control.phase}` };
+    }
+    if (control.round !== identity.round) {
+      return { success: false, error: `Round mismatch: expected ${identity.round}, found ${control.round}` };
+    }
+  }
+
   if (sameExecution && currentRun && currentChild?.pid) {
     if (currentRun.state === 'stopping' || currentRun.unconfirmed) {
       return { success: false, inProgress: true, error: 'Child binding is stopping or unconfirmed' };
@@ -688,8 +719,12 @@ export async function registerRunChildV2(
     return { success: false, error, unconfirmed: true };
   };
 
-  // A closed handle cannot authorize fresh subtree discovery.
-  const belongsToRunnerChild = verifySubtreeOwnership(childPid, options.childProcess);
+  // A live exact ChildProcess handle establishes root ownership; its immutable
+  // captured birthId is checked against the OS immediately below. Descendants
+  // still require a full process-tree ownership walk.
+  const belongsToRunnerChild = childHandleMatches
+    ? options.childProcess?.exitCode === null && options.childProcess?.signalCode === null
+    : verifySubtreeOwnership(childPid, options.childProcess);
   if (!belongsToRunnerChild) {
     return failUnconfirmed(
       `Process ${childPid} does not belong to a live runner child handle`,
@@ -739,7 +774,7 @@ export async function registerRunChildV2(
 
   for (let attempt = 0; attempt < 5; attempt++) {
     taskStore.ensureUpToDate();
-    const current = taskStore.getTask(threadId);
+    const current = taskStore.reloadTask(threadId);
     if (!current) {
       phase1Error = 'Task not found';
       break;
@@ -816,6 +851,20 @@ export async function registerRunChildV2(
           pid: childPid,
           birthId: effectiveBirthId,
         };
+        const subtrees = t.execution.run.subtrees || (t.execution.run.subtrees = []);
+        const rootKey = `${childPid}:${effectiveBirthId}`;
+        let subtree = subtrees.find((item) => `${item.root.pid}:${item.root.birthId || 'unknown'}` === rootKey);
+        if (!subtree) {
+          subtree = { root: { pid: childPid, birthId: effectiveBirthId }, descendants: [] };
+          subtrees.push(subtree);
+        }
+        const knownDescendants = new Map(
+          subtree.descendants.map((item) => [`${item.pid}:${item.birthId || 'unknown'}`, item] as const),
+        );
+        for (const descendant of options.childDescendants || []) {
+          knownDescendants.set(`${descendant.pid}:${descendant.birthId || 'unknown'}`, structuredClone(descendant));
+        }
+        subtree.descendants = [...knownDescendants.values()];
         t.execution.run.state = 'starting';
         t.execution.run.registeredAt = undefined;
         t.execution.run.step = 'binding';
@@ -902,7 +951,7 @@ export async function registerRunChildV2(
 
   for (let attempt = 0; attempt < 5; attempt++) {
     taskStore.ensureUpToDate();
-    const current = taskStore.getTask(threadId);
+    const current = taskStore.reloadTask(threadId);
     if (!current) {
       phase3Error = 'Task not found';
       break;

@@ -1,6 +1,6 @@
 # 锁与队列精简设计
 
-状态：设计修订完成，尚未完成全部生产接线。修订日期：2026 年 11 月 20 日。本次源码对照基线：`01da18f`（1.2.36）；原设计检视基线为 `3830923`，统一执行实现来自 `940a993`。本次新增“唯一 run 替代独立原生会话锁”设计，不把已交付的 v2 基础能力误记为全部上线。
+状态：实施未完成，未通过切换验收。修订日期：2026 年 11 月 22 日。本次源码对照基线：`01da18f`（1.2.36）；原设计检视基线为 `3830923`，统一执行实现来自 `940a993`。本次新增“唯一 run 替代独立原生会话锁”设计，不把已交付的 v2 基础能力误记为全部上线。本工作树已将独立 MCP 与扩展宿主派发入口接到 v2、加入历史执行禁入和只读停机预检；会话锁/角色锁仍被部分 v2 runner、reviewer 和自动维护路径使用，清理及旧锁完全退出、standalone stdio v2 全生命周期与完整故障验收仍未闭环，以下实施验收仍全部有效。
 
 本方案在[统一执行设计](UNIFIED_EXECUTION_LIFECYCLE_DESIGN.md)之上继续收敛：最终只保留全局合入锁与按任务短写锁，独立角色锁和 Bridge 原生会话锁均由唯一 run 及固定会话归属替代，所有待执行工作从同一份账本派生。开发、检视和合并共用入口；阶段交接立即启动，实际受阻才排队。
 
@@ -12,7 +12,7 @@
 
 ## 零 当前实现与本次检视结论
 
-统一执行控制器、v2 短写/CAS 与清理标记、v2 唯一 run 启动及进程绑定已有实现和专项测试；生产派发仍创建 `execution.version=1`，`scanAndDrain` 仍跳过 v2，其他入口尚未完全收口。新版上线前由旧版完成所有无 execution 或使用 v1 的任务，新版仅将它们作为历史记录读取。
+统一执行控制器、v2 短写/CAS 与清理标记、v2 唯一 run 启动及进程绑定已有实现和专项测试；扩展宿主与 standalone MCP 在准入通过时将新派发写为 `execution.version=2`，未通过时只开放历史读取与安全清理。`scanAndDrain` 已把可确认退出 owner 的 v2 孤儿 run 送入 fail-closed 启动恢复分类，并扫描有效 next；完整生产阶段接线、维护/清理与旧锁退出尚未收口。新版上线前由旧版完成所有无 execution 或使用 v1 的任务，新版仅将它们作为历史记录读取。
 
 | 当前代码事实 | 实际作用与仍需处理的内容 |
 | --- | --- |
@@ -234,6 +234,10 @@ flowchart TD
 6. 用受控任务验证 bootstrap → develop → review → merge、历史查询/归档/删除和暂停恢复后开放正常使用。v2 自身重启恢复继续使用统一控制器。
 
 扩展宿主、Supervisor 和独立 MCP 初始化时，必须在启用调度、恢复扫描和派发前完成预检；预检不能与后台自动恢复同时运行。新版每个入口仍需拒绝旧任务执行，后台扫描也只选择 v2；这是执行资格校验，不是旧版路由。发现未完成旧任务时，返回具体 threadId 和需要回旧版处理的事项，禁止静默跳过后继续派发。日常重启遇到合法 v2 在飞记录走正常恢复，不要求所有 v2 任务再次清空。
+
+当前提供只读命令 `node bin/agent-bridge-preflight.cjs --component extension-host=<实际版本>`。命令读取 per-thread 账本、活动执行登记和合入 helper owner，不实例化会创建目录或写账本的服务；未提供扩展宿主版本、版本不一致、任务未交付、进程/子树身份未知或仍存活时以阻断项退出。扩展宿主版本必须来自实际加载进程的路径/版本核验，不能把包内期望版本当成运行版本。
+
+新版本入口另以 `node bin/agent-bridge-preflight.cjs --startup-admission` 检查本地实际组件路径和版本，并要求运维预先写入只读证据文件 `~/.agent-mesh-bridge/v2-runtime-components.json`。文件 schema 为 `{schemaVersion:1,cutoverApproved:true,components:[{component,version,packageRoot,path,completeProcessInventory:true,previousProcesses:[{pid,birthId,version,path}]}]}`；组件必须同时包含 `extension-host` 与 `standalone-mcp`。清单缺失、组件路径/版本不符、旧进程 PID+birthId 仍存活或状态未知时，两个入口都不启用派发与恢复扫描；历史读取和经过现有 run/cleanup 保护的安全清理仍可用。终态旧任务仍检查账本中的 run/owner/child/后代、next、cleanup 和 Git 恢复状态；已完成 Git 交付要求固定本地 branch ref 可达 approved commit，不能单凭 `integration.phase=merged` 放行。日常 v2 重启允许继续恢复，但活跃 merge helper 必须以 ledger run owner、helper PID+birthId、channel token/path 及被登记子树做精确关联，后续退出 ACK 仍由控制器处理。该清单是切换操作的外部证据，由运维在停机预检和实际进程盘点后提供，命令本身不创建或修改它。合法 v2 任务仍可按统一恢复分类重启，无须清空账本。当前仓库尚未提供清单生成器，也未完成所有旧角色/原生会话锁的退出；因此这只是 fail-closed 启动闸门，不代表 A→D 或切换验收已完成。
 
 ### 7.4 开发与回退
 

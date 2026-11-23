@@ -248,7 +248,7 @@ test('TaskStore does not archive while a native session write lease is active', 
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('TaskArchiveService archives terminal tasks beyond the retention window', () => {
+test('TaskArchiveService archives terminal tasks beyond the retention window', async () => {
   const dir = makeTempDir('bridge-archive-service-');
   const store = new TaskStore(dir);
   for (let i = 0; i < 6; i++) {
@@ -262,7 +262,7 @@ test('TaskArchiveService archives terminal tasks beyond the retention window', (
     );
   }
   const service = new TaskArchiveService(store, { keepRecent: 3 });
-  const archived = service.run();
+  const archived = await service.run();
   assert.deepStrictEqual(archived.sort(), [
     'thread_service_0',
     'thread_service_1',
@@ -270,6 +270,44 @@ test('TaskArchiveService archives terminal tasks beyond the retention window', (
   ]);
   const hot = store.getAllTasks().filter((t) => !t.archivedAt);
   assert.strictEqual(hot.length, 3);
+  store.dispose();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('TaskArchiveService uses a durable cleanup reservation for completed v2 tasks', async () => {
+  const dir = makeTempDir('bridge-archive-v2-');
+  const threadId = 'thread_archive_v2';
+  const artifactDir = path.join(dir, 'tasks', threadId);
+  fs.mkdirSync(path.join(artifactDir, 'worker_log'), { recursive: true });
+  fs.writeFileSync(path.join(artifactDir, 'worker_log', `${threadId}_round_1.log`), 'worker output');
+  const store = new TaskStore(dir);
+  store.upsertTask(makeThread({
+    threadId,
+    artifactDir,
+    status: 'completed',
+    execution: {
+      version: 2,
+      revision: 1,
+      operationId: 'merge_1',
+      phase: 'merge',
+      round: 1,
+      generation: 1,
+      attempt: 1,
+      autoRetriesUsed: 0,
+      budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 },
+    },
+  }));
+
+  const archived = await new TaskArchiveService(store, { keepRecent: 0 }).run();
+  assert.deepStrictEqual(archived, [threadId]);
+  const result = store.getTask(threadId)!;
+  assert.ok(result.archivedAt);
+  assert.deepStrictEqual(result.rounds, []);
+  assert.equal(result.execution?.version, 2);
+  assert.equal(result.cleanup, undefined);
+  assert.ok(fs.existsSync(path.join(artifactDir, 'Archive', `${threadId}_archive.tar.gz`)));
+  assert.ok(fs.existsSync(path.join(artifactDir, 'Archive', `${threadId}_archive.json`)));
+  assert.equal(fs.existsSync(path.join(artifactDir, 'worker_log', `${threadId}_round_1.log`)), false);
   store.dispose();
   fs.rmSync(dir, { recursive: true, force: true });
 });

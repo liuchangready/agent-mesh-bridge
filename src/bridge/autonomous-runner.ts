@@ -19,7 +19,7 @@ import {
 import { AgentDetector } from './agent-detector';
 import { buildDshHeadlessCommand } from './deepseek-harness';
 import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
-import { defaultBinary, getProcessBirthId, killProcessTree, needsShellWrapper } from './platform';
+import { bindSpawnedChildIdentity, defaultBinary, getProcessBirthId, killPidTree, killProcessTree, needsShellWrapper } from './platform';
 import { normalizeModelId, resolveConfiguredModel, writeDshModelOverlay } from './model-catalog';
 import { accumulateTokenUsage, collectTokenUsage } from './token-usage-collector';
 import {
@@ -32,6 +32,7 @@ import { assertCanExecute } from './agent-capabilities';
 import { NativeSessionCompactor } from './native-session-compactor';
 import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
 import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
+import { SessionOwnershipStore, nativeSessionNamespace } from './session-ownership';
 
 /** Default silence watchdog: 10 minutes (long model reasoning is not a hang). */
 export const DEFAULT_SILENCE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -317,6 +318,15 @@ export interface RunOptions {
   timeoutMs?: number; // Overall process timeout, default 2 hours (120 mins)
   silenceTimeoutMs?: number; // Silence watchdog timeout, default 10 minutes
   sessionLease?: NativeSessionLease;
+  /** The durable v2 run that owns every native process started for this turn. */
+  executionIdentity?: {
+    runId: string;
+    operationId: string;
+    generation: number;
+    phase: 'develop' | 'review' | 'merge';
+    round: number;
+    role: 'developer' | 'reviewer';
+  };
   /**
    * How to treat an output gap that exceeds the threshold while the process
    * still exited 0 with a real final answer. Default `warn`: keep the round
@@ -843,6 +853,8 @@ export class AutonomousRunner {
     let nativeLease: NativeSessionLease | undefined;
     let recoveryVersion: string | undefined;
     let preparationExecution: { registry: TaskExecutionRegistry; registration: TaskExecutionRegistration; owned: boolean } | undefined;
+    let sessionCaptureChain: Promise<void> = Promise.resolve();
+    let sessionCaptureError: string | undefined;
     const runId = `${taskThreadId || 'run'}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
     if (taskThreadId) {
@@ -860,7 +872,11 @@ export class AutonomousRunner {
             return this.buildInterruptedResult(pending);
           }
           try {
-            prepared = await compactor.prepareBeforeResume(taskThreadId, nativeRole, options.model, nativeRole === 'reviewer' && options.taskRound === 0, options.sessionLease);
+            prepared = await compactor.prepareBeforeResume(
+              taskThreadId, nativeRole, options.model, nativeRole === 'reviewer' && options.taskRound === 0,
+              options.sessionLease,
+              options.executionIdentity ? { ...options.executionIdentity, onChildPid: options.onChildPid } : undefined,
+            );
             break;
           } catch (error: any) {
             if (!String(error?.message || error).includes('already owned by another Bridge process')) throw error;
@@ -881,17 +897,58 @@ export class AutonomousRunner {
         preparationExecution = prepared.executionLease;
         recoveryVersion = prepared.recoveryVersion;
         if (prepared.warning) console.warn(`[AutonomousRunner] ${prepared.warning}`);
-        const sessionLock = new NativeSessionLock(path.dirname(this.taskStore.getStoragePath()));
+        const sessionLock = options.executionIdentity ? undefined : new NativeSessionLock(path.dirname(this.taskStore.getStoragePath()));
         const originalOnChildPid = options.onChildPid;
         const originalOnNativeSessionId = options.onNativeSessionId;
         const captureSession = (sessionId: string, childPid?: number) => {
           if (!isValidSessionId(sessionId)) throw new Error('Agent emitted an invalid native session id.');
           if (nativeSessionId && nativeSessionId !== sessionId) throw new Error('Native session id changed during one task execution.');
+          if (options.executionIdentity) {
+            sessionCaptureChain = sessionCaptureChain.then(async () => {
+              this.taskStore!.loadFromDisk();
+              const current = this.taskStore!.getTask(taskThreadId);
+              const boundAgent = nativeRole === 'developer' ? current?.targetAgent : current?.initiatorAgent;
+              const assignment = current?.nativeSessionAssignments?.[nativeRole];
+              const executionIdentity = options.executionIdentity!;
+              if (!current || current.archivedAt || current.cleanup || !boundAgent || !assignment ||
+                  assignment.namespace !== nativeSessionNamespace(boundAgent) || !Number.isSafeInteger(assignment.sessionEpoch) ||
+                  current.execution?.version !== 2 || current.execution.run?.id !== executionIdentity.runId ||
+                  current.execution.operationId !== executionIdentity.operationId || current.execution.generation !== executionIdentity.generation ||
+                  current.execution.phase !== executionIdentity.phase || current.execution.round !== executionIdentity.round) {
+                throw new Error('V2 run, cleanup, or pinned native-session assignment changed before session capture.');
+              }
+              const ownership = new SessionOwnershipStore(path.dirname(this.taskStore!.getStoragePath())).claim({
+                agent: boundAgent, namespace: assignment.namespace, sessionId, threadId: taskThreadId,
+                role: nativeRole, sessionEpoch: assignment.sessionEpoch,
+              });
+              if (!ownership.ok) throw new Error(`${ownership.code}: ${ownership.reason}`);
+              await this.taskStore!.transitionExecution(taskThreadId, current.execution.revision, (fresh) => {
+                if (fresh.cleanup || fresh.execution?.version !== 2 || fresh.execution.run?.id !== executionIdentity.runId ||
+                    fresh.execution.operationId !== executionIdentity.operationId || fresh.execution.generation !== executionIdentity.generation ||
+                    fresh.execution.phase !== executionIdentity.phase || fresh.execution.round !== executionIdentity.round) {
+                  throw new Error('V2 run identity changed before publishing its native session ID.');
+                }
+                if (nativeRole === 'developer') {
+                  if (fresh.receiverSessionCaptured && fresh.receiverSessionId !== sessionId) throw new Error('Captured developer session changed during this run.');
+                  fresh.receiverSessionId = sessionId; fresh.receiverSessionCaptured = true;
+                } else {
+                  if (fresh.reviewerSessionCaptured && fresh.reviewerSessionId !== sessionId) throw new Error('Captured reviewer session changed during this run.');
+                  fresh.reviewerSessionId = sessionId; fresh.reviewerSessionCaptured = true; fresh.callerSessionId = sessionId;
+                }
+              });
+              nativeSessionId = sessionId;
+            }).catch((error: any) => {
+              sessionCaptureError = String(error?.message || error);
+              if (childPid) { try { killPidTree(childPid); } catch {} }
+            });
+            originalOnNativeSessionId?.(sessionId, childPid);
+            return;
+          }
           this.taskStore!.loadFromDisk();
           const boundAgent = nativeRole === 'developer' ? options.agent : this.taskStore!.getTask(taskThreadId)?.initiatorAgent;
           if (!boundAgent) throw new Error('Task disappeared before the first native session id could be bound.');
           if (!nativeLease) {
-            nativeLease = sessionLock.acquire(boundAgent, sessionId, childPid);
+            nativeLease = sessionLock!.acquire(boundAgent, sessionId, childPid);
             if (!nativeLease) throw new Error(`Native session ${sessionId} is already owned by another Bridge process.`);
             nativeSessionId = sessionId;
             this.taskStore!.loadFromDisk();
@@ -906,8 +963,8 @@ export class AutonomousRunner {
               : current.status === 'queued' || current.status === 'reviewing');
             if (cancel || !current || current.archivedAt || currentAgent !== boundAgent ||
                 currentModel !== options.model || !allowedStatus || (currentCaptured && currentSession !== sessionId)) {
-              if (!options.sessionLease) {
-                sessionLock.release(nativeLease);
+              if (!options.executionIdentity && !options.sessionLease && nativeLease) {
+                sessionLock!.release(nativeLease);
               }
               nativeLease = undefined;
               throw new Error('Task binding or state changed before the first native session id could be published.');
@@ -915,14 +972,15 @@ export class AutonomousRunner {
             if (nativeRole === 'developer') {
               current.receiverSessionId = sessionId;
               current.receiverSessionCaptured = true;
+              this.taskStore!.upsertTask(current);
             } else {
               current.reviewerSessionId = sessionId;
               current.reviewerSessionCaptured = true;
               current.callerSessionId = sessionId;
+              this.taskStore!.upsertTask(current);
             }
-            this.taskStore!.upsertTask(current);
           } else if (nativeLease) {
-            sessionLock.attachChild(nativeLease, childPid);
+            sessionLock!.attachChild(nativeLease, childPid);
           }
           originalOnNativeSessionId?.(sessionId, childPid);
         };
@@ -932,7 +990,7 @@ export class AutonomousRunner {
             ? `<bridge_recovery_document version="${prepared.recoveryVersion}">\n${prepared.recoveryPrefix}\n</bridge_recovery_document>\n\n<CURRENT_INSTRUCTION>\n${options.prompt}\n</CURRENT_INSTRUCTION>`
             : options.prompt,
           onChildPid: async (pid, childProc, childBirthId) => {
-            if (nativeLease && pid) sessionLock.attachChild(nativeLease, pid);
+            if (!options.executionIdentity && nativeLease && pid) sessionLock!.attachChild(nativeLease, pid);
             if (preparationExecution && pid) preparationExecution.registry.attachChildPid(pid, preparationExecution.registration);
             if (originalOnChildPid) await originalOnChildPid(pid, childProc, childBirthId);
           },
@@ -961,6 +1019,23 @@ export class AutonomousRunner {
         }
 
         const result = await this.executeOnce(attemptOptions);
+        await sessionCaptureChain;
+        if (sessionCaptureError) {
+          result.error = result.error || sessionCaptureError;
+          result.actualSessionId = undefined;
+          // A CLI exit code cannot override failed durable session ownership.
+          // Keep the stream evidence for diagnostics, but make the business
+          // assessment fail so the controller cannot persist a successful
+          // round after the captured session was rejected.
+          result.assessment = {
+            ...(result.assessment || {} as any),
+            success: false,
+            errorCode: sessionCaptureError.includes('SESSION_OWNERSHIP_CONFLICT')
+              ? 'SESSION_OWNERSHIP_CONFLICT'
+              : 'SESSION_OWNERSHIP_UNVERIFIED',
+            exitCode: result.exitCode,
+          } as any;
+        }
         const eventSessionId = result.actualSessionId || nativeSessionId;
         if (taskThreadId && compactor && eventSessionId && !(nativeRole === 'reviewer' && options.taskRound === 0)) {
           compactor.recordNativeAutoCompactionEvents(taskThreadId, nativeRole, eventSessionId, result.stdout || '');
@@ -980,7 +1055,9 @@ export class AutonomousRunner {
           if (taskThreadId && compactor && sessionId) {
             if (!nativeLease && !nativeSessionId) {
               // Some CLIs emit the session id only in their final chunk; bind it after process exit before publishing.
-              nativeLease = new NativeSessionLock(path.dirname(this.taskStore!.getStoragePath())).acquire(options.agent, sessionId);
+              if (!options.executionIdentity) {
+                nativeLease = new NativeSessionLock(path.dirname(this.taskStore!.getStoragePath())).acquire(options.agent, sessionId);
+              }
             }
             if (!(nativeRole === 'reviewer' && options.taskRound === 0)) {
               compactor.recordBusinessSuccess(taskThreadId, nativeRole, sessionId, `${runId}:${attempt}`, recoveryVersion);
@@ -1604,7 +1681,9 @@ export class AutonomousRunner {
         });
       }
       if (options.onChildPid) {
-        this.childBirthIds.set(child, child.pid ? getProcessBirthId(child.pid) : undefined);
+        const birthId = child.pid ? getProcessBirthId(child.pid) : undefined;
+        this.childBirthIds.set(child, birthId);
+        bindSpawnedChildIdentity(child, birthId);
       }
 
       // CRITICAL: Close stdin so no CLI waits on interactive input. Agents that

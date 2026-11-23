@@ -31,7 +31,8 @@
   ],
   "main": "./out/extension.js",
   "bin": {
-    "agent-bridge-mcp": "./bin/agent-bridge-mcp.cjs"
+    "agent-bridge-mcp": "./bin/agent-bridge-mcp.cjs",
+    "agent-bridge-preflight": "./bin/agent-bridge-preflight.cjs"
   },
   "activationEvents": [
     "onStartupFinished"

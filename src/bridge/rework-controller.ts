@@ -50,6 +50,7 @@ import { createMergeLog, noteMergeFailure, resetMergeBudget } from './merge-reco
 import { NativeSessionLock } from './native-session-lock';
 import { CancellationRegistry } from './cancellation-registry';
 import { ExecutionController } from './execution-controller';
+import { requireV2ExecutionEligibility } from './execution-gate';
 
 export class ReworkController {
   private taskStore: TaskStore;
@@ -62,6 +63,8 @@ export class ReworkController {
   /** Moves a task to another agent/model when rework/retry/resume asks for it. */
   private readonly retargetService: TaskRetargetService;
   private readonly mergeCoordinator: MergeCoordinator;
+  private readonly requireV2Execution: boolean;
+  private readonly executionAdmission: boolean;
   private readonly mergeWorkers = new Set<string>();
   private readonly blockedMergeRetries = new Map<string, string>();
   private readonly mergePersistenceRetries = new Map<string, { attempts: number; timer: NodeJS.Timeout }>();
@@ -74,30 +77,34 @@ export class ReworkController {
     detector?: AgentDetector,
     executionRegistry?: TaskExecutionRegistry,
     residentMergeOwner = false,
+    requireV2Execution = false,
+    executionAdmission = true,
   ) {
     this.taskStore = taskStore;
     this.runner = runner;
     this.callbackManager = callbackManager;
     this.detector = detector;
+    this.requireV2Execution = requireV2Execution;
+    this.executionAdmission = executionAdmission;
     this.storageDir = path.dirname(taskStore.getStoragePath());
     this.mergeCoordinator = new MergeCoordinator(taskStore, this.storageDir, undefined, (thread) => {
       const reviewRound = [...(thread.rounds || [])].reverse().find((round) => round.type !== 'approval');
       if (reviewRound) void this.callbackManager.notifyCaller(thread, reviewRound);
     });
-    if (residentMergeOwner) {
+    if (residentMergeOwner && this.executionAdmission) {
       this.taskStore.on('changed', () => this.resumePendingMerges());
       this.mergeWatch = setInterval(() => this.resumePendingMerges(), 1_000);
       this.mergeWatch.unref();
     }
     this.executionRegistry = executionRegistry || new TaskExecutionRegistry(this.storageDir);
-    this.retargetService = new TaskRetargetService(taskStore);
+    this.retargetService = new TaskRetargetService(taskStore, requireV2Execution, executionAdmission);
     this.queueDrainer = new QueueDrainer(
       this.taskStore,
       this.executionRegistry,
       () => TaskSupervisor.isSupervisorActive(),
       (target: QueuedExecution) => this.executeQueuedRound(target),
     );
-    if (residentMergeOwner) {
+    if (residentMergeOwner && this.executionAdmission) {
       // Recover transactions already on disk once all controller services exist.
       this.resumePendingMerges();
     }
@@ -107,12 +114,19 @@ export class ReworkController {
     return this.mergeCoordinator;
   }
 
+  private assertExecutionAdmission(action: string): void {
+    if (!this.executionAdmission) throw new Error(`V2_STARTUP_BLOCKED: runtime component preflight has not passed; cannot ${action}.`);
+  }
+
   /** Answer model-switch confirmations raised by an executor switch. */
   public setModelApprovalHandler(handler: ModelApprovalHandler | undefined): void {
     this.retargetService.setModelApprovalHandler(handler);
   }
 
   public retargetTask(threadId: string, overrides: ExecutorOverride, reason: string, by = 'caller') {
+    this.assertExecutionAdmission('retarget this task');
+    const thread = this.taskStore.getTask(threadId);
+    if (this.requireV2Execution) requireV2ExecutionEligibility(thread, 'retarget this task');
     return this.retargetService.retargetTask({ threadId, ...overrides, reason, by });
   }
 
@@ -144,11 +158,13 @@ export class ReworkController {
    * follow (see `TaskRetargetService`).
    */
   public async requestRework(params: RequestReworkParams): Promise<RequestReworkResult> {
+    this.assertExecutionAdmission('request rework');
     let thread = this.taskStore.getTask(params.threadId);
     if (thread) assertDedicatedTask(thread);
     if (!thread) {
       throw new Error(`Task thread not found: ${params.threadId}`);
     }
+    if (this.requireV2Execution) requireV2ExecutionEligibility(thread, 'request rework for this task');
     // `completed` is terminal: a stale reviewer must not resurrect an archived
     // task by submitting a late rework.
     if (thread.status === 'completed' || thread.archivedAt) {
@@ -301,6 +317,9 @@ export class ReworkController {
                   `Cannot request rework: execution run changed concurrently (expected ${expectedRunId}, found ${t.execution.run?.id})`,
                 );
               }
+              if (t.execution.version === 2 && t.execution.next) {
+                throw new Error(`Cannot request rework: run ${t.execution.next.sourceRunId || 'unknown'} already has a durable handoff.`);
+              }
               if (!expectedRunId && t.execution.run) {
                 throw new Error(
                   `Cannot request rework: a new execution run (${t.execution.run.id}) started concurrently`,
@@ -356,8 +375,12 @@ export class ReworkController {
             };
 
             if (t.execution) {
-              t.execution.round = nextRound;
-              if (!currentHasActiveRun) {
+              if (t.execution.version === 2) {
+                t.execution.next = { phase: 'develop', round: nextRound, sourceRunId: expectedRunId };
+              } else {
+                t.execution.round = nextRound;
+              }
+              if (!currentHasActiveRun && t.execution.version !== 2) {
                 t.execution.phase = 'develop';
                 t.execution.run = undefined;
                 t.execution.queue = undefined;
@@ -466,12 +489,14 @@ export class ReworkController {
     threadId: string,
     overrides: ExecutorOverride = {},
   ): Promise<DelegationRound> {
+    this.assertExecutionAdmission('retry this task');
     this.taskStore.loadFromDisk();
     let thread = this.taskStore.getTask(threadId);
     if (thread) assertDedicatedTask(thread);
     if (!thread) {
       throw new Error(`Task thread not found: ${threadId}`);
     }
+    if (this.requireV2Execution) requireV2ExecutionEligibility(thread, 'retry this task');
     assertCanExecute(overrides.targetAgent || thread.targetAgent, 'receive retried work');
 
     if (thread.archivedAt || thread.status === 'completed') {
@@ -584,12 +609,14 @@ export class ReworkController {
     threadId: string,
     overrides: ExecutorOverride = {},
   ): Promise<DelegationRound> {
+    this.assertExecutionAdmission('resume this task');
     this.taskStore.loadFromDisk();
     let thread = this.taskStore.getTask(threadId);
     if (thread) assertDedicatedTask(thread);
     if (!thread) {
       throw new Error(`Task thread not found: ${threadId}`);
     }
+    if (this.requireV2Execution) requireV2ExecutionEligibility(thread, 'resume this task');
     assertCanExecute(overrides.targetAgent || thread.targetAgent, 'resume work');
 
     if (thread.archivedAt) {
@@ -627,6 +654,37 @@ export class ReworkController {
         [...thread.rounds].reverse().find((round) => round.type !== 'approval')?.status !== 'paused') {
       if (this.retargetService.hasOverride(overrides)) {
         throw new Error(`Cannot change the executor while resuming approved integration for ${threadId}.`);
+      }
+      if (thread.execution?.version === 2) {
+        const currentRound = [...thread.rounds].reverse().find((entry) => entry.type !== 'approval') || thread.rounds[thread.rounds.length - 1];
+        const integrationPhase = thread.worktree?.integration?.phase || '';
+        const resumedStatus = ['conflict', 'validation_failed', 'blocked'].includes(integrationPhase) ? 'reviewing' : 'queued';
+        const revision = thread.execution.revision;
+        const operationId = thread.execution.operationId;
+        const generation = thread.execution.generation;
+        thread = await this.taskStore.transitionExecution(threadId, revision, (current) => {
+          if (current.execution?.version !== 2 || current.execution.run || current.execution.next || current.cleanup ||
+              current.archivedAt || current.status !== 'paused' ||
+              current.execution.operationId !== operationId || current.execution.generation !== generation ||
+              current.worktree?.integration?.phase !== integrationPhase) {
+            throw new Error(`Cannot resume ${threadId}: v2 run, handoff, cleanup, or integration state changed.`);
+          }
+          current.interruption = undefined;
+          current.status = resumedStatus;
+          current.queuePhase = resumedStatus === 'queued' ? 'merge' : undefined;
+          current.execution.phase = resumedStatus === 'queued' ? 'merge' : 'review';
+          current.execution.queue = undefined;
+          current.updatedAt = new Date().toISOString();
+        });
+        this.runner.clearPendingCancellation(threadId);
+        const cancellations = new CancellationRegistry(this.storageDir);
+        cancellations.clear(threadId);
+        if (cancellations.peek(threadId)) throw new Error(`Cannot resume ${threadId}: cancellation request could not be cleared.`);
+        const round = currentRound;
+        if (round && resumedStatus === 'reviewing') {
+          void ExecutionController.getInstance()?.startExecution(threadId, 'review');
+        }
+        return round;
       }
       const roles = new TaskRoleLock(this.storageDir);
       const nativeLock = new NativeSessionLock(this.storageDir);
@@ -888,11 +946,13 @@ export class ReworkController {
     waitingForThreadId?: string;
     by?: string;
   }): { threadId: string; status: ThreadStatus; waitingForThreadId?: string; message: string } {
+    this.assertExecutionAdmission('change review state');
     const thread = this.taskStore.getTask(params.threadId);
     if (thread) assertDedicatedTask(thread);
     if (!thread) {
       throw new Error(`Task thread not found: ${params.threadId}`);
     }
+    if (this.requireV2Execution) requireV2ExecutionEligibility(thread, 'change the review state of this task');
     if (thread.status !== 'reviewing') {
       throw new Error(
         `Cannot block review: thread ${params.threadId} is "${thread.status}", not "reviewing".`,
@@ -938,11 +998,13 @@ export class ReworkController {
    * working, burning tokens on an orphaned round.
    */
   public approveTask(params: ApproveTaskParams): ApproveResult {
+    this.assertExecutionAdmission('approve this task');
     const thread = this.taskStore.getTask(params.threadId);
     if (thread) assertDedicatedTask(thread);
     if (!thread) {
       throw new Error(`Task thread not found: ${params.threadId}`);
     }
+    if (this.requireV2Execution) requireV2ExecutionEligibility(thread, 'approve this task');
     if (thread.archivedAt) throw new Error(`Cannot approve archived task ${params.threadId}.`);
     if (thread.status === 'failed' && thread.failure?.stage === 'bootstrap') throw new Error('Cannot approve before the reviewer bootstrap handoff.');
 
@@ -1074,6 +1136,9 @@ export class ReworkController {
                     `Cannot approve task: execution run changed concurrently (expected ${expectedRunId}, found ${t.execution.run?.id})`,
                   );
                 }
+                if (t.execution.version === 2 && t.execution.next) {
+                  throw new Error(`Cannot approve task: run ${t.execution.next.sourceRunId || 'unknown'} already has a durable handoff.`);
+                }
                 if (!expectedRunId && t.execution.run) {
                   throw new Error(
                     `Cannot approve task: a new execution run (${t.execution.run.id}) started concurrently`,
@@ -1124,7 +1189,9 @@ export class ReworkController {
                 };
               }
               if (t.execution) {
-                if (!currentHasActiveRun) {
+                if (t.execution.version === 2 && status === 'QUEUED') {
+                  t.execution.next = { phase: 'merge', round: t.currentRound || t.execution.round, sourceRunId: expectedRunId };
+                } else if (!currentHasActiveRun) {
                   t.execution.run = undefined;
                   t.execution.queue = undefined;
                   if (status === 'QUEUED') {
@@ -1175,13 +1242,17 @@ export class ReworkController {
   }
 
   public mergeApproved(threadId: string): Promise<MergeResult> {
+    this.assertExecutionAdmission('merge this task');
+    if (this.requireV2Execution) requireV2ExecutionEligibility(this.taskStore.getTask(threadId), 'merge this task');
     return this.mergeCoordinator.mergeApproved(threadId);
   }
 
   public async requestMergeDecision(threadId: string, question: string, background: string, suggestion: string, conflictFiles: string[] = [], logPath?: string): Promise<{ threadId: string; status: 'wait_decision'; decisionId: string; nextAction: string; message: string }> {
+    this.assertExecutionAdmission('request a merge decision');
     const current = this.taskStore.getTask(threadId);
     if (current) assertDedicatedTask(current);
     if (!current || current.status !== 'reviewing' || !question?.trim()) throw new Error('An active review and a non-empty question are required.');
+    if (this.requireV2Execution) requireV2ExecutionEligibility(current, 'request a merge decision for this task');
     if (current.execution && ExecutionController.getInstance()) {
       const decision = await ExecutionController.getInstance()!.requestTaskDecision(threadId, {
         question: question.trim(),
@@ -1219,9 +1290,11 @@ export class ReworkController {
   }
 
   public submitMergeDecision(threadId: string, answer: string): { threadId: string; status: 'reviewing'; decisionId: string } {
+    this.assertExecutionAdmission('submit a merge decision');
     const current = this.taskStore.getTask(threadId);
     if (current) assertDedicatedTask(current);
     if (!current || current.status !== 'wait_decision' || !answer?.trim()) throw new Error('A pending merge decision and a non-empty answer are required.');
+    if (this.requireV2Execution) requireV2ExecutionEligibility(current, 'submit a merge decision for this task');
     if (current.execution && ExecutionController.getInstance()) {
       const decisionId = current.decision?.id || current.mergeControl?.pendingDecisionId || '';
       void ExecutionController.getInstance()!.submitTaskDecision(threadId, decisionId, answer);
@@ -1243,9 +1316,11 @@ export class ReworkController {
   }
 
   public retryMerge(threadId: string): { threadId: string; status: 'queued' | 'reviewing'; retryGeneration: number } {
+    this.assertExecutionAdmission('retry merge');
     const current = this.taskStore.getTask(threadId);
     if (current) assertDedicatedTask(current);
     if (!current || current.archivedAt || current.status !== 'failed' || current.failure?.stage !== 'merge') throw new Error('Only a merge failure can restart its merge budget.');
+    if (this.requireV2Execution) requireV2ExecutionEligibility(current, 'retry merge for this task');
     if (current.execution && ExecutionController.getInstance()) {
       void ExecutionController.getInstance()!.retryOperation(threadId);
       return { threadId, status: 'queued', retryGeneration: (current.execution.generation || 1) + 1 };
@@ -1270,8 +1345,10 @@ export class ReworkController {
   }
 
   public submitMergeResolution(threadId: string): { threadId: string; status: 'QUEUED'; message: string } {
+    this.assertExecutionAdmission('submit merge resolution');
     const thread = this.taskStore.getTask(threadId);
     if (thread) assertDedicatedTask(thread);
+    if (this.requireV2Execution) requireV2ExecutionEligibility(thread, 'submit a merge resolution for this task');
     const worktree = thread?.worktree;
     if (!thread || !isMergeReview(thread) || !worktree?.approvedCommit || !worktree.mergeResolutionPath || !worktree.integration?.targetOldCommit) {
       throw new Error('No approved merge resolution workspace is awaiting submission.');
@@ -1304,9 +1381,11 @@ export class ReworkController {
   }
 
   public resumePendingMerges(): void {
+    if (!this.executionAdmission) return;
     this.taskStore.loadFromDisk();
     for (const thread of this.taskStore.getAllTasks()) {
       if (thread.reviewFlow !== 'dedicated') continue;
+      if (this.requireV2Execution && thread.execution?.version !== 2) continue;
       if (thread.execution || !(thread.status === 'queued' && thread.queuePhase === 'merge') && thread.status !== 'merging') continue;
       if (['blocked', 'conflict', 'validation_failed'].includes(thread.worktree?.integration?.phase || '')) continue;
       const blockedAt = this.blockedMergeRetries.get(thread.threadId);

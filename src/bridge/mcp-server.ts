@@ -13,6 +13,7 @@ import { AutonomousRunner } from './autonomous-runner';
 import { TaskSupervisor } from './task-supervisor';
 import { TaskControlService } from './task-control';
 import { ExecutionController } from './execution-controller';
+import { requireV2ExecutionEligibility } from './execution-gate';
 import { CallerPollGuard, progressSignature } from './caller-poll-guard';
 import { TaskRoleLock } from './task-role-lock';
 import { TaskExecutionRegistry } from './task-execution-registry';
@@ -90,6 +91,14 @@ const CONTROL_TOOLS = new Set([
   'retry_merge',
 ]);
 
+// These actions can advance execution, change its identity, or record a new
+// review/merge decision. Legacy and unknown records are read-only in this host.
+const V2_EXECUTION_TOOLS = new Set([
+  'resume_task', 'retry_task', 'retarget_task', 'request_rework', 'approve_task',
+  'request_merge_decision', 'submit_merge_decision', 'request_task_decision',
+  'submit_task_decision', 'retry_merge', 'submit_merge_resolution',
+]);
+
 
 export class MCPServer {
   private dispatcher: AsyncDispatcher;
@@ -98,6 +107,8 @@ export class MCPServer {
   private detector: AgentDetector;
   private resolver: ActiveAgentResolver;
   private runner: AutonomousRunner;
+  private readonly requireV2Execution: boolean;
+  private readonly v2StartupBlockReason?: string;
   private taskControl: TaskControlService;
   private modelCatalog: ModelCatalog;
   /** Starves polling loops on tasks this process dispatched itself. */
@@ -116,6 +127,8 @@ export class MCPServer {
     detector: AgentDetector,
     resolver: ActiveAgentResolver,
     runner: AutonomousRunner,
+    requireV2Execution = false,
+    v2StartupBlockReason?: string,
   ) {
     this.dispatcher = dispatcher;
     this.reworkController = reworkController;
@@ -123,6 +136,8 @@ export class MCPServer {
     this.detector = detector;
     this.resolver = resolver;
     this.runner = runner;
+    this.requireV2Execution = requireV2Execution;
+    this.v2StartupBlockReason = v2StartupBlockReason;
     this.taskControl = new TaskControlService(taskStore, runner);
     this.modelCatalog = new ModelCatalog(detector);
   }
@@ -1135,11 +1150,11 @@ export class MCPServer {
    * Confirmation only marks the task runnable — the developer starts after the
    * bootstrap service has persisted the native reviewer session.
    */
-  private confirmReviewerBootstrap(
+  private async confirmReviewerBootstrap(
     threadId: string,
     credential: { token?: string; hostPid?: number },
-  ): any {
-    const thread = confirmReviewerBootstrapTask(this.taskStore, threadId, credential);
+  ): Promise<any> {
+    const thread = await confirmReviewerBootstrapTask(this.taskStore, threadId, credential);
 
     const stopInstruction =
       'STOP NOW — the task is dispatched. End your turn immediately; the bridge resumes THIS ' +
@@ -1167,6 +1182,15 @@ export class MCPServer {
   private assertActiveReviewerRole(threadId: string): void {
     const thread = this.taskStore.getTask(threadId);
     if (thread) assertCanExecute(thread.initiatorAgent, 'review or approve tasks', 'initiator');
+    if (thread?.execution?.version === 2) {
+      const run = thread.execution.run;
+      const ownSession = (process.env.MESH_REVIEW_SESSION_ID || '').trim();
+      if (!run || run.role !== 'reviewer' || !['starting', 'active'].includes(run.state) ||
+          !thread.reviewerSessionCaptured || ownSession !== thread.reviewerSessionId) {
+        throw new Error(`[Agent Mesh Bridge] Refusing review action for thread ${threadId}: current v2 reviewer run and fixed reviewer session do not match.`);
+      }
+      return;
+    }
     const owner = new TaskRoleLock().getOwner(threadId);
     if (!owner || owner.role !== 'reviewer') {
       throw new Error(
@@ -1294,6 +1318,12 @@ export class MCPServer {
   public async handleToolCall(name: string, args: any): Promise<any> {
     this.assertReceiverMayCall(name, args);
     const controlledTask = typeof args?.threadId === 'string' ? this.taskStore.getTask(args.threadId) : undefined;
+    if (this.requireV2Execution && controlledTask && V2_EXECUTION_TOOLS.has(name)) {
+      requireV2ExecutionEligibility(controlledTask, `perform ${name}`);
+    }
+    if (this.v2StartupBlockReason && (name === 'dispatch_task' || name.startsWith('invoke_') || V2_EXECUTION_TOOLS.has(name))) {
+      throw new Error(`V2_STARTUP_BLOCKED: ${this.v2StartupBlockReason}`);
+    }
     if (controlledTask?.status === 'failed' && controlledTask.failure?.stage === 'merge' && name !== 'retry_merge' && name !== 'delete_task' &&
         (CONTROL_TOOLS.has(name) || name === 'request_rework' || name === 'approve_task')) {
       throw new Error('A failed merge only permits retry_merge or delete_task.');
@@ -1320,7 +1350,7 @@ export class MCPServer {
         // arguments are ignored so the brief cannot drift.
         const bootstrap = this.resolveReviewerBootstrapIdentity(args);
         if (bootstrap) {
-          return this.confirmReviewerBootstrap(bootstrap.threadId, bootstrap);
+          return await this.confirmReviewerBootstrap(bootstrap.threadId, bootstrap);
         }
         if (Object.prototype.hasOwnProperty.call(args, 'workspacePath')) throw new Error('workspacePath is not supported; use workspaceRoot or workspaceId');
 

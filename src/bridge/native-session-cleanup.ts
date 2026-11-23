@@ -63,6 +63,8 @@ export interface NativeSessionCleanupOptions {
   homeDir?: string;
   /** Override environment lookups (`CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `DSH_HOME`). */
   env?: NodeJS.ProcessEnv;
+  /** V2's pinned Antigravity CLI namespace excludes the desktop app store. */
+  onlyPinnedNamespace?: boolean;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -121,7 +123,7 @@ export function cleanupThreadNativeSessions(
   const home = options.homeDir || os.homedir();
   const env = options.env || process.env;
 
-  const entries = collectThreadSessionRefs(thread).map((ref) => cleanupSession(ref, home, env));
+  const entries = collectThreadSessionRefs(thread).map((ref) => cleanupSession(ref, home, env, options));
 
   return {
     entries,
@@ -147,6 +149,7 @@ function cleanupSession(
   ref: NativeSessionRef,
   home: string,
   env: NodeJS.ProcessEnv,
+  options: NativeSessionCleanupOptions,
 ): NativeSessionCleanupEntry {
   const entry: NativeSessionCleanupEntry = {
     agent: ref.agent,
@@ -165,7 +168,7 @@ function cleanupSession(
         cleanupCodexSession(home, env, ref.sessionId, entry);
         break;
       case 'antigravity':
-        cleanupAntigravitySession(home, ref.sessionId, entry);
+        cleanupAntigravitySession(home, ref.sessionId, entry, options.onlyPinnedNamespace === true);
         break;
       case 'deepseek_harness':
         cleanupDshSession(home, env, ref.sessionId, entry);
@@ -233,18 +236,16 @@ function cleanupCodexSession(
 ): void {
   const root = resolveConfigRoot(env, 'CODEX_HOME', path.join(home, '.codex'));
 
-  for (const rollout of findCodexRollouts(path.join(root, 'sessions'), sessionId)) {
-    removeArtifact(rollout, entry);
+  const writerLock = path.join(root, 'thread-writer-locks', `${sessionId}.lock`);
+  if (fs.existsSync(writerLock)) {
+    entry.error = `Codex native writer lock exists; rollout and lock retained: ${writerLock}`;
+  } else {
+    for (const rollout of findCodexRollouts(path.join(root, 'sessions'), sessionId)) {
+      removeArtifact(rollout, entry);
+    }
   }
 
-  removeArtifact(path.join(root, 'thread-writer-locks', `${sessionId}.lock`), entry);
-
-  pruneJsonLines(
-    path.join(root, 'session_index.jsonl'),
-    (record) =>
-      record.id === sessionId || record.thread_id === sessionId || record.sessionId === sessionId,
-    entry,
-  );
+  retainSharedIndex(path.join(root, 'session_index.jsonl'), entry);
 }
 
 /**
@@ -256,8 +257,9 @@ function cleanupAntigravitySession(
   home: string,
   sessionId: string,
   entry: NativeSessionCleanupEntry,
+  onlyPinnedNamespace = false,
 ): void {
-  for (const appDir of ['antigravity-cli', 'antigravity']) {
+  for (const appDir of onlyPinnedNamespace ? ['antigravity-cli'] : ['antigravity-cli', 'antigravity']) {
     const root = path.join(home, '.gemini', appDir);
 
     for (const suffix of ['.db', '.db-wal', '.db-shm', '.db-journal']) {
@@ -267,33 +269,8 @@ function cleanupAntigravitySession(
     removeArtifact(path.join(root, 'annotations', `${sessionId}.pbtxt`), entry);
     removeArtifact(path.join(root, 'implicit', `${sessionId}.pb`), entry);
 
-    pruneJsonObject(
-      path.join(root, 'cache', 'conversation_metadata.json'),
-      (data) => {
-        const conversations = data.conversations;
-        if (!conversations || typeof conversations !== 'object') return false;
-        const table = conversations as JsonObject;
-        if (!Object.prototype.hasOwnProperty.call(table, sessionId)) return false;
-        delete table[sessionId];
-        return true;
-      },
-      entry,
-    );
-
-    pruneJsonObject(
-      path.join(root, 'cache', 'last_conversations.json'),
-      (data) => {
-        let changed = false;
-        for (const [key, value] of Object.entries(data)) {
-          if (value === sessionId) {
-            delete data[key];
-            changed = true;
-          }
-        }
-        return changed;
-      },
-      entry,
-    );
+    retainSharedIndex(path.join(root, 'cache', 'conversation_metadata.json'), entry);
+    retainSharedIndex(path.join(root, 'cache', 'last_conversations.json'), entry);
   }
 }
 
@@ -324,41 +301,15 @@ function cleanupDshSession(
     entry,
   );
 
-  pruneJsonObject(
-    path.join(dshHome, 'storages', 'workspace.json'),
-    (data) => {
-      let changed = false;
+  retainSharedIndex(path.join(dshHome, 'storages', 'workspace.json'), entry);
+}
 
-      const global = data.global;
-      if (global && typeof global === 'object') {
-        for (const key of ['archivedSessionIds', 'pinnedSessionIds']) {
-          const list = (global as JsonObject)[key];
-          if (Array.isArray(list) && list.includes(sessionId)) {
-            (global as JsonObject)[key] = list.filter((id) => id !== sessionId);
-            changed = true;
-          }
-        }
-      }
-
-      const tables = data.tables;
-      const workspaces =
-        tables && typeof tables === 'object' ? (tables as JsonObject).workspaces : undefined;
-      if (workspaces && typeof workspaces === 'object') {
-        for (const workspace of Object.values(workspaces as JsonObject)) {
-          if (!workspace || typeof workspace !== 'object') continue;
-          const record = workspace as JsonObject;
-          const ids = record.sessionIds;
-          if (Array.isArray(ids) && ids.includes(sessionId)) {
-            record.sessionIds = ids.filter((id) => id !== sessionId);
-            changed = true;
-          }
-        }
-      }
-
-      return changed;
-    },
-    entry,
-  );
+/** App-owned indexes are shared writers; without their locking API retain them. */
+function retainSharedIndex(file: string, entry: NativeSessionCleanupEntry): void {
+  if (!fs.existsSync(file)) return;
+  const note = `Shared native index retained without an app-safe update API: ${file}`;
+  if (!entry.error) entry.error = note;
+  else if (!entry.error.includes(note)) entry.error = `${entry.error}; ${note}`;
 }
 
 /** Environment override wins, otherwise `<home>/<defaultName>`. */

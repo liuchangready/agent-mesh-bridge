@@ -10,7 +10,7 @@ import { ExecutionController } from '../../bridge/execution-controller';
 import { TaskExecutionRegistry } from '../../bridge/task-execution-registry';
 import { TaskRoleLock } from '../../bridge/task-role-lock';
 import { NativeSessionLock } from '../../bridge/native-session-lock';
-import { getProcessBirthId } from '../../bridge/platform';
+import { bindSpawnedChildIdentity, getProcessBirthId } from '../../bridge/platform';
 
 const args = process.argv.slice(2);
 let storageDir = '';
@@ -21,6 +21,14 @@ let holdFile = '';
 let registeredFile = '';
 let spawnedFile = '';
 let registrationGateFile = '';
+let spawnedBirthFile = '';
+let recoveryPhase = '';
+let scanOnly = false;
+
+function trace(event: string): void {
+  if (!registeredFile) return;
+  try { fs.appendFileSync(`${registeredFile}.events`, `${Date.now()} ${process.pid} ${event}\n`, 'utf8'); } catch {}
+}
 
 for (const arg of args) {
   if (arg.startsWith('--storage-dir=')) storageDir = arg.split('=')[1];
@@ -31,6 +39,9 @@ for (const arg of args) {
   if (arg.startsWith('--registered-file=')) registeredFile = arg.split('=')[1];
   if (arg.startsWith('--spawned-file=')) spawnedFile = arg.split('=')[1];
   if (arg.startsWith('--registration-gate-file=')) registrationGateFile = arg.split('=')[1];
+  if (arg.startsWith('--spawned-birth-file=')) spawnedBirthFile = arg.split('=')[1];
+  if (arg.startsWith('--phase=')) recoveryPhase = arg.split('=')[1];
+  if (arg === '--scan-only') scanOnly = true;
 }
 
 if (!storageDir || !threadId) {
@@ -50,6 +61,40 @@ async function main() {
   let resolveRunnerDone: (() => void) | undefined;
   const runnerDone = new Promise<void>((resolve) => { resolveRunnerDone = resolve; });
 
+  const originalTransitionExecution = store.transitionExecution.bind(store);
+  (store as any).transitionExecution = async (
+    transitionThreadId: string,
+    revision: number,
+    change: (thread: any) => void,
+    cleanupToken?: string,
+    runExitProof?: any,
+  ) => {
+    const run = store.getTask(threadId)?.execution?.run;
+    const isBinding = run?.step === 'binding';
+    if (isBinding) trace(`binding-transition-enter:${run.id}`);
+    try {
+      const result = await originalTransitionExecution(transitionThreadId, revision, change, cleanupToken, runExitProof);
+      if (isBinding) trace(`binding-transition-exit:${result.execution?.run?.step || 'cleared'}`);
+      return result;
+    } catch (error: any) {
+      if (isBinding) trace(`binding-transition-error:${error?.message || error}`);
+      throw error;
+    }
+  };
+
+  const originalAttachChildPid = registry.attachChildPid.bind(registry);
+  (registry as any).attachChildPid = async (pid: number | undefined, registration: any) => {
+    trace(`registry-attach-enter:${pid || 'clear'}`);
+    try {
+      const result = await originalAttachChildPid(pid, registration);
+      trace(`registry-attach-exit:${pid || 'clear'}`);
+      return result;
+    } catch (error: any) {
+      trace(`registry-attach-error:${error?.message || error}`);
+      throw error;
+    }
+  };
+
   // Mock runner that spawns a real controlled node child process if execute is reached
   const mockRunner: any = {
     clearPendingCancellation: () => undefined,
@@ -58,6 +103,7 @@ async function main() {
     isRateLimitOrQuotaError: () => false,
     execute: async (opts: any) => {
       spawnCount++;
+      trace('runner-execute-enter');
       // The optional file barrier keeps the winner in starting/binding until
       // the competing control process has attempted its start.
       const child = spawn(process.execPath, [
@@ -83,12 +129,19 @@ async function main() {
       }
 
       if (opts.onChildPid && child.pid) {
+        trace(`child-callback-before:${child.pid}`);
         const childBirthId = getProcessBirthId(child.pid);
+        bindSpawnedChildIdentity(child, childBirthId);
+        if (spawnedBirthFile && childBirthId) fs.writeFileSync(spawnedBirthFile, childBirthId, 'utf8');
         await opts.onChildPid(child.pid, child, childBirthId);
+        trace(`child-callback-after:${child.pid}`);
       }
       if (registeredFile) fs.writeFileSync(registeredFile, 'registered', 'utf8');
+      trace('runner-child-registered');
 
+      trace('runner-child-close-wait');
       await new Promise((resolve) => child.on('close', resolve));
+      trace('runner-child-close');
       resolveRunnerDone?.();
       return {
         exitCode: 0,
@@ -131,6 +184,22 @@ async function main() {
     { storageDir, defaultBudgetLimitMs: 60_000, ...(registrationGateFile ? { streamSyncIntervalMs: 60_000 } : {}) },
   );
 
+  if (scanOnly) {
+    await controller.scanAndDrain();
+    const saved = store.getTask(threadId);
+    console.log('RESULT:' + JSON.stringify({
+      workerId,
+      scanned: true,
+      runId: saved?.execution?.run?.id,
+      revision: saved?.execution?.revision,
+    }));
+    controller.dispose();
+    roleLock.dispose();
+    registry.dispose();
+    store.dispose();
+    return;
+  }
+
   // Synchronize on barrier file if provided
   if (barrierFile) {
     const readyFile = `${barrierFile}.${workerId}.ready`;
@@ -144,7 +213,10 @@ async function main() {
   }
 
   // Attempt to start execution
-  const res = await controller.startExecution(threadId);
+  const res = recoveryPhase
+    ? await controller.startExecutionV2(threadId, recoveryPhase as any)
+    : await controller.startExecution(threadId);
+  trace(`controller-start-return:${res.started ? 'started' : res.reason || 'not-started'}`);
 
   // startExecution is intentionally non-blocking; keep this control process
   // alive until its background round has settled when it owns the run.
@@ -163,6 +235,7 @@ async function main() {
     runId: res.run?.id,
     spawnCount,
     childPid: spawnedSubprocessPid,
+    controlPid: process.pid,
   }));
 
   try { controller.dispose(); } catch {}

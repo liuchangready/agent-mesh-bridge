@@ -130,6 +130,18 @@ export type ExecutionEligibilityResult =
       reason: string;
     };
 
+/** Throw a stable, explicit error at execution entry points for historical or
+ * unknown records. Read, archive, delete, and stop paths must not call this. */
+export function requireV2ExecutionEligibility(
+  thread: DelegationThread | undefined | null,
+  action: string,
+): asserts thread is DelegationThread {
+  const result = validateV2ExecutionEligibility(thread);
+  if (!result.eligible) {
+    throw new Error(`HISTORICAL_TASK_READ_ONLY: Cannot ${action}: ${result.code}: ${result.reason}`);
+  }
+}
+
 /**
  * Validate execution eligibility under the v2 execution architecture.
  *

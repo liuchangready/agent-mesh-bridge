@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { resolveGitRepository, createTaskWorktree, commitTaskChanges, gitOutput, removeTaskWorktree, snapshotTaskWorktree } from '../bridge/git-worktree';
+import * as gitWorktree from '../bridge/git-worktree';
 import { MergeCoordinator, MeshFileLock, validationNodeDirs } from '../bridge/merge-coordinator';
 import { TaskRoleLock } from '../bridge/task-role-lock';
 import { TaskStore } from '../bridge/task-store';
@@ -395,7 +396,16 @@ test('two tasks edit the same file in independent worktrees and integrate serial
   assert.notStrictEqual(a.headCommit, b.headCommit);
 
   const store = new TaskStore(storage);
-  t.after(() => { store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
+  let mergeA: Promise<any> | undefined;
+  t.after(() => {
+    // Always release the test-owned validation child, including when dispatch
+    // fails before reaching the normal release point below.
+    try { fs.writeFileSync(path.join(signals, 'thread_merge_A.release'), 'cleanup'); } catch {}
+    return Promise.race([
+      mergeA?.catch(() => undefined) || Promise.resolve(),
+      new Promise((resolve) => setTimeout(resolve, 5_000)),
+    ]).finally(() => { store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
+  });
   store.upsertTask(thread('thread_merge_A', a));
   store.upsertTask(thread('thread_merge_B', b));
   const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));
@@ -403,11 +413,12 @@ test('two tasks edit the same file in independent worktrees and integrate serial
   const previousHoldThread = process.env.MESH_VALIDATION_HOLD_THREAD;
   process.env.MESH_VALIDATION_SIGNAL_DIR = signals;
   process.env.MESH_VALIDATION_HOLD_THREAD = 'thread_merge_A';
-  const mergeA = coordinator.mergeApproved('thread_merge_A');
+  const mergePromiseA = coordinator.mergeApproved('thread_merge_A');
+  mergeA = mergePromiseA;
   let mergeB: ReturnType<typeof coordinator.mergeApproved> | undefined;
   const releaseA = () => fs.writeFileSync(path.join(signals, 'thread_merge_A.release'), 'go');
   try {
-  await waitForValidationStart(path.join(signals, 'thread_merge_A.entered'), mergeA);
+  await waitForValidationStart(path.join(signals, 'thread_merge_A.entered'), mergePromiseA);
   assert.equal(new TaskRoleLock(storage).tryAcquire('thread_merge_A', 'reviewer'), null, 'reviewer cannot overlap merge validation');
 
   // A is inside its real combined verification while holding the mesh mutex.
@@ -416,10 +427,21 @@ test('two tasks edit the same file in independent worktrees and integrate serial
   runner.execute = async () => ({ exitCode: 0, stdout: 'done', stderr: '', extractedOutput: 'done', durationMs: 1 });
   const callback = new CallbackManager(detector, storage); const registry = new TaskExecutionRegistry(storage);
   const dispatcher = new AsyncDispatcher(store, new ActiveAgentResolver(detector), runner, callback, detector, registry);
-  const dispatchResult = await Promise.race([
-    dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'dispatch during validation', prompt: 'independent task', workspaceRoot: repository }),
-    new Promise<never>((_, reject) => { const timer = setTimeout(() => reject(new Error('new dispatch waited on final integration lock')), 3_000); timer.unref(); }),
-  ]);
+  const originalCreateTaskWorktree = gitWorktree.createTaskWorktree;
+  let announceWorktreeStart!: () => void;
+  const worktreeStart = new Promise<void>((resolve) => { announceWorktreeStart = resolve; });
+  (gitWorktree as any).createTaskWorktree = (...args: Parameters<typeof createTaskWorktree>) => {
+    announceWorktreeStart();
+    return originalCreateTaskWorktree(...args);
+  };
+  let dispatchResult;
+  try {
+    const dispatch = dispatcher.dispatchTask({ targetAgent: 'claude_code', title: 'dispatch during validation', prompt: 'independent task', workspaceRoot: repository });
+    await worktreeStart;
+    dispatchResult = await dispatch;
+  } finally {
+    (gitWorktree as any).createTaskWorktree = originalCreateTaskWorktree;
+  }
   const admitted = store.getTask(dispatchResult.threadId)!;
   assert.notEqual(path.resolve(admitted.worktree!.path), path.resolve(a.path));
   assert.notEqual(path.resolve(admitted.worktree!.path), path.resolve(b.path));

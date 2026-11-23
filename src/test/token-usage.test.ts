@@ -4,7 +4,7 @@ import * as assert from 'node:assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 
 import {
   accumulateTokenUsage,
@@ -25,6 +25,8 @@ import { TaskRoleLock } from '../bridge/task-role-lock';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { saveBridgePolicy } from '../bridge/bridge-policy';
 import { DelegationRound, DelegationThread, TokenUsageMetrics } from '../bridge/types';
+import { SessionOwnershipStore, nativeSessionNamespace } from '../bridge/session-ownership';
+import { getProcessBirthIdAsync, probeProcessIdentity } from '../bridge/platform';
 
 const cleanups: Array<() => void> = [];
 
@@ -890,6 +892,374 @@ describe('token usage - durability', () => {
     if (prepared.executionLease?.owned) prepared.executionLease.registry.end(prepared.executionLease.registration);
     prepared.executionLease?.registry.dispose();
     roleLock.release(roleLease);
+  });
+
+  test('paused maintenance refuses a captured session without durable static ownership before adapter or artifacts', async () => {
+    const { store, dir } = makeStore();
+    const sessionId = 'dfabfca6-0e2d-4093-9e15-733390baac28';
+    const thread = makeThread([{ round: 1, type: 'initial', prompt: 'maintain me', durationMs: 1, status: 'completed', timestamp: new Date().toISOString() }]);
+    thread.status = 'paused'; thread.targetAgent = 'codex'; thread.targetModel = 'gpt-6-luna';
+    thread.receiverSessionId = sessionId; thread.receiverSessionCaptured = true;
+    thread.nativeSessionAssignments = { developer: { namespace: nativeSessionNamespace('codex'), sessionEpoch: 3 } };
+    thread.execution = { version: 2, revision: 4, operationId: 'operation-maintenance', phase: 'develop', round: 1,
+      generation: 7, attempt: 2, autoRetriesUsed: 1, budget: { limitMs: 120_000, spentActiveMs: 33_000, maxAutoRetries: 2 } };
+    store.upsertTask(thread);
+    let calls = 0;
+    const compactor = new NativeSessionCompactor(store, {} as any, () => 'certified');
+    (compactor as any).capabilityIdentity = () => { throw new Error('capability probe must not run without ownership evidence'); };
+    (compactor as any).codex = { compact: async () => { calls++; throw new Error('adapter must not run'); } };
+    await assert.rejects(compactor.compactPausedTask(thread.threadId, 'developer'), /SESSION_OWNERSHIP_UNVERIFIED/);
+    assert.equal(calls, 0);
+    const after = store.getTask(thread.threadId)!;
+    assert.equal(after.execution!.run, undefined);
+    assert.equal(after.rounds[0].nativeSessionCompactions, undefined);
+    const taskDir = path.join(dir, thread.threadId);
+    assert.equal(fs.existsSync(taskDir), false, 'refusal occurs before creating maintenance business artifacts');
+  });
+
+  test('paused native maintenance occupies the v2 run in the ledger and settles without resuming business', async () => {
+    const { store, dir } = makeStore();
+    const sessionId = '2f79e67e-31a4-4d83-a75b-9650e9b59b13';
+    const thread = makeThread([{ round: 1, type: 'initial', prompt: 'maintain me', durationMs: 1, status: 'completed', timestamp: new Date().toISOString() }]);
+    thread.status = 'paused'; thread.targetAgent = 'codex'; thread.targetModel = 'gpt-6-luna';
+    thread.receiverSessionId = sessionId; thread.receiverSessionCaptured = true;
+    const namespace = nativeSessionNamespace('codex');
+    thread.nativeSessionAssignments = { developer: { namespace, sessionEpoch: 5 } };
+    thread.execution = { version: 2, revision: 9, operationId: 'business-operation', phase: 'develop', round: 1,
+      generation: 12, attempt: 3, autoRetriesUsed: 1, budget: { limitMs: 120_000, spentActiveMs: 44_000, maxAutoRetries: 2 } };
+    store.upsertTask(thread);
+    assert.equal(new SessionOwnershipStore(dir).claim({ agent: 'codex', namespace, sessionId, threadId: thread.threadId, role: 'developer', sessionEpoch: 5 }).ok, true);
+    const compactor = new NativeSessionCompactor(store, { resolveExecutable: () => process.execPath } as any, () => 'certified');
+    (compactor as any).capabilityIdentity = () => ({ agent: 'codex', executablePath: process.execPath, executableVersion: 'fixture', providerRoute: 'subscription-default', providerId: 'openai', model: 'gpt-6-luna' });
+    let observedRun: any;
+    (compactor as any).codex = { compact: async (request: any) => {
+      const active = store.getTask(thread.threadId)!;
+      observedRun = active.execution!.run;
+      assert.equal(active.status, 'paused');
+      assert.equal(active.execution!.purpose, undefined, 'business execution purpose is not rewritten');
+      assert.equal(active.execution!.generation, 12);
+      assert.equal(active.execution!.budget.spentActiveMs, 44_000);
+      assert.equal(active.execution!.run!.purpose, 'native_maintenance');
+      assert.equal(active.execution!.run!.role, 'developer');
+      assert.equal(active.execution!.run!.step, 'native_maintenance');
+      assert.equal(active.execution!.run!.state, 'starting');
+      assert.ok(active.execution!.run!.spawnIntentAt);
+      assert.equal(request.sessionId, sessionId);
+      assert.ok(request.timeoutMs > 0 && request.timeoutMs <= 76_000, 'native RPC receives only the remaining task budget and maintenance cap');
+      await request.onSpawnNotStarted();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return { threadId: sessionId, nativeTurnId: 'fixture-turn', model: request.model, provider: 'fixture', processExitCode: 0,
+        usage: { id: request.operationId, kind: 'native_compaction', role: 'developer', agent: 'codex', model: request.model, uncachedInputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 2, source: 'native_reported', available: true } };
+    } };
+    const operation = await compactor.compactPausedTask(thread.threadId, 'developer');
+    assert.equal(observedRun?.purpose, 'native_maintenance');
+    assert.equal(operation.phase, 'succeeded');
+    const after = store.getTask(thread.threadId)!;
+    assert.equal(after.status, 'paused');
+    assert.equal(after.execution!.run, undefined);
+    assert.equal(after.execution!.generation, 12);
+    assert.ok(after.execution!.budget.spentActiveMs > 44_000, 'active maintenance time is charged to the shared budget');
+    assert.ok(after.execution!.budget.spentActiveMs <= 120_000);
+    assert.equal(after.execution!.next, undefined);
+    assert.equal(after.rounds[0].nativeSessionCompactions?.[0].phase, 'succeeded');
+    assert.ok(after.rounds[0].nativeSessionCompactions?.[0].activeDurationMs! > 0);
+    assert.equal(after.rounds[0].tokenUsage?.components?.some((component) => component.id === operation.id), true);
+    assert.equal(fs.existsSync(path.join(dir, 'roles')), false, 'v2 native maintenance is admitted by its run, not a Bridge role lock');
+    assert.equal(fs.existsSync(path.join(dir, 'native-sessions')), false, 'v2 native maintenance does not create a Bridge session lease');
+  });
+
+  test('paused native maintenance refuses an exhausted task budget before artifacts, capability probe, or RPC', async () => {
+    const { store, dir } = makeStore();
+    const sessionId = 'c4eab133-e622-4e9f-a282-202b6a31a750';
+    const thread = makeThread([{ round: 1, type: 'initial', prompt: 'maintain me', durationMs: 1, status: 'completed', timestamp: new Date().toISOString() }]);
+    thread.status = 'paused'; thread.targetAgent = 'codex'; thread.targetModel = 'gpt-6-luna';
+    thread.receiverSessionId = sessionId; thread.receiverSessionCaptured = true;
+    const namespace = nativeSessionNamespace('codex');
+    thread.nativeSessionAssignments = { developer: { namespace, sessionEpoch: 8 } };
+    thread.execution = { version: 2, revision: 1, operationId: 'budget-exhausted', phase: 'develop', round: 1,
+      generation: 4, attempt: 1, autoRetriesUsed: 0, budget: { limitMs: 60_000, spentActiveMs: 60_000, maxAutoRetries: 2 } };
+    store.upsertTask(thread);
+    assert.equal(new SessionOwnershipStore(dir).claim({ agent: 'codex', namespace, sessionId, threadId: thread.threadId, role: 'developer', sessionEpoch: 8 }).ok, true);
+    let adapterCalls = 0;
+    const compactor = new NativeSessionCompactor(store, {} as any, () => 'certified');
+    (compactor as any).capabilityIdentity = () => { throw new Error('capability probe must not run with exhausted budget'); };
+    (compactor as any).codex = { compact: async () => { adapterCalls++; throw new Error('adapter must not run'); } };
+    await assert.rejects(compactor.compactPausedTask(thread.threadId, 'developer'), /NATIVE_MAINTENANCE_BUDGET_EXHAUSTED/);
+    assert.equal(adapterCalls, 0);
+    const after = store.getTask(thread.threadId)!;
+    assert.equal(after.execution!.run, undefined);
+    assert.equal(after.rounds[0].nativeSessionCompactions, undefined);
+    assert.equal(fs.existsSync(path.join(dir, thread.threadId)), false, 'exhaustion is checked before maintenance artifacts');
+  });
+
+  test('manual maintenance keeps detached descendants until exit and refuses success or forced cleanup', async () => {
+    const { store, dir } = makeStore();
+    const sessionId = '46fca4fd-b457-48f0-a876-3bb2d6920e1b';
+    const thread = makeThread([{ round: 1, type: 'initial', prompt: 'maintain me', durationMs: 1, status: 'completed', timestamp: new Date().toISOString() }]);
+    thread.status = 'paused'; thread.targetAgent = 'codex'; thread.targetModel = 'gpt-6-luna';
+    thread.receiverSessionId = sessionId; thread.receiverSessionCaptured = true;
+    const namespace = nativeSessionNamespace('codex');
+    thread.nativeSessionAssignments = { developer: { namespace, sessionEpoch: 9 } };
+    thread.execution = { version: 2, revision: 2, operationId: 'subtree-business-op', phase: 'develop', round: 1,
+      generation: 5, attempt: 1, autoRetriesUsed: 0, budget: { limitMs: 120_000, spentActiveMs: 15_000, maxAutoRetries: 2 } };
+    store.upsertTask(thread);
+    assert.equal(new SessionOwnershipStore(dir).claim({ agent: 'codex', namespace, sessionId, threadId: thread.threadId, role: 'developer', sessionEpoch: 9 }).ok, true);
+    const compactor = new NativeSessionCompactor(store, { resolveExecutable: () => process.execPath } as any, () => 'certified');
+    (compactor as any).capabilityIdentity = () => ({ agent: 'codex', executablePath: process.execPath, executableVersion: 'fixture', providerRoute: 'subscription-default', providerId: 'openai', model: 'gpt-6-luna' });
+    const grandchildPidFile = path.join(dir, 'grandchild.pid');
+    const stopRootFile = path.join(dir, 'root.stop');
+    let root: ReturnType<typeof spawn> | undefined;
+    let grandchildPid: number | undefined;
+    let grandchildBirthId: string | undefined;
+    let adapterCalls = 0;
+    let ignoredCloseError: string | undefined;
+    let notifyChildExit: (() => Promise<void>) | undefined;
+    const waitUntil = async (predicate: () => boolean, label: string): Promise<void> => {
+      const deadline = Date.now() + 8_000;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.fail(`Timed out waiting for ${label}`);
+    };
+    (compactor as any).codex = { compact: async (request: any) => {
+      adapterCalls++;
+      notifyChildExit = async () => { await request.onChildPid(undefined); };
+      const childCode = `const fs=require('fs'),cp=require('child_process');const p=cp.spawn(process.execPath,['-e',${JSON.stringify('setInterval(()=>{},1000)')}],{detached:true,stdio:'ignore'});p.unref();fs.writeFileSync(${JSON.stringify(grandchildPidFile)},String(p.pid));const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(stopRootFile)})){clearInterval(t);process.exit(0)}},10);`;
+      root = spawn(process.execPath, ['-e', childCode], { stdio: 'ignore', windowsHide: true });
+      const rootPid = root.pid!;
+      const rootBirthId = await getProcessBirthIdAsync(rootPid);
+      assert.ok(rootBirthId, 'root process has a captured birth ID');
+      await request.onChildPid(rootPid, rootBirthId);
+      await waitUntil(() => fs.existsSync(grandchildPidFile), 'detached grandchild creation');
+      grandchildPid = Number(fs.readFileSync(grandchildPidFile, 'utf8'));
+      grandchildBirthId = await getProcessBirthIdAsync(grandchildPid!);
+      assert.ok(grandchildBirthId, 'grandchild process has a captured birth ID');
+      await waitUntil(() => !!store.getTask(thread.threadId)?.execution?.run?.subtrees?.some((tree: any) =>
+        tree.descendants.some((entry: any) => entry.pid === grandchildPid && entry.birthId === grandchildBirthId)), 'durable grandchild evidence');
+      const revisionBeforeRootExit = store.getTask(thread.threadId)!.execution!.revision;
+      const stopAt = Date.now();
+      const rootClosed = new Promise<void>((resolve) => {
+        if (root!.exitCode !== null || root!.signalCode !== null) resolve();
+        else root!.once('close', () => resolve());
+      });
+      fs.writeFileSync(stopRootFile, 'exit');
+      await rootClosed;
+      await waitUntil(() => {
+        const currentTask = store.getTask(thread.threadId);
+        const current = currentTask?.execution?.run;
+        return !!currentTask && !!current && (current.subtrees || []).some((tree: any) => tree.sampledAt && Date.parse(tree.sampledAt) >= stopAt) &&
+          currentTask.execution!.revision > revisionBeforeRootExit;
+      }, 'post-root-exit maintenance sample');
+      const sampled = store.getTask(thread.threadId)!.execution!.run!;
+      assert.equal(probeProcessIdentity(grandchildPid!, grandchildBirthId), 'alive');
+      assert.ok(sampled.subtrees?.some((tree: any) => tree.root.pid === rootPid && tree.root.birthId === rootBirthId));
+      assert.ok(sampled.subtrees?.some((tree: any) => tree.descendants.some((entry: any) => entry.pid === grandchildPid && entry.birthId === grandchildBirthId)), 'prior descendant survives the root-exit sample');
+      try { await request.onChildPid(undefined); } catch (error: any) { ignoredCloseError = String(error?.message || error); }
+      return { threadId: sessionId, nativeTurnId: 'untrusted-success', model: request.model, provider: 'fixture', processExitCode: 0 };
+    } };
+
+    try {
+      const operation = await compactor.compactPausedTask(thread.threadId, 'developer');
+      assert.equal(adapterCalls, 1);
+      assert.match(ignoredCloseError || '', /subtree|unconfirmed/i);
+      assert.equal(operation.phase, 'unknown', 'a structured adapter result cannot override a live captured descendant');
+      const blocked = store.getTask(thread.threadId)!;
+      assert.equal(blocked.status, 'paused');
+      assert.equal(blocked.execution!.run!.state, 'stopping');
+      assert.equal(blocked.execution!.run!.unconfirmed, true);
+      assert.ok(blocked.execution!.run!.subtrees?.some((tree) => tree.descendants.some((entry) => entry.pid === grandchildPid && entry.birthId === grandchildBirthId)));
+      const cleanup = await store.markTaskCleanup(thread.threadId, 'delete', { pid: process.pid, birthId: await getProcessBirthIdAsync(process.pid) });
+      await assert.rejects(store.commitTaskCleanup(thread.threadId, cleanup.token, 'delete'), /execution run .* is still recorded/);
+      await assert.rejects(compactor.compactPausedTask(thread.threadId, 'developer'), /Another developer|run, handoff, cleanup|run|cleanup/i);
+      assert.equal(adapterCalls, 1, 'an unconfirmed previous subtree cannot start the next maintenance step');
+      assert.equal(probeProcessIdentity(grandchildPid!, grandchildBirthId), 'alive');
+    } finally {
+      if (root?.pid && root.exitCode === null) { try { root.kill(); } catch {} }
+      const known = store.getTask(thread.threadId)?.execution?.run?.subtrees?.flatMap((tree) => [tree.root, ...tree.descendants]) || [];
+      for (const identity of known) if (identity.birthId && probeProcessIdentity(identity.pid, identity.birthId) === 'alive') {
+        try { process.kill(identity.pid); } catch {}
+      }
+      if (root?.pid && root.exitCode === null) await new Promise<void>((resolve) => root!.once('close', () => resolve()));
+      if (notifyChildExit && grandchildPid && grandchildBirthId) {
+        const deadline = Date.now() + 8_000;
+        const allKnownExited = () => known.every((identity) => !!identity.birthId && probeProcessIdentity(identity.pid, identity.birthId) === 'exited');
+        while (!allKnownExited() && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        if (allKnownExited()) {
+          let lateError: string | undefined;
+          await notifyChildExit().catch((error: any) => { lateError = String(error?.message || error); });
+          const run = store.getTask(thread.threadId)?.execution?.run;
+          assert.equal(run, undefined, `durable run settles exactly once after the retained descendant exits; error=${lateError}; run=${JSON.stringify(run)}`);
+        }
+      }
+    }
+  });
+
+  test('manual maintenance settles once only after every captured process exits', async () => {
+    const { store, dir } = makeStore();
+    const sessionId = 'f3ad1786-7f5d-4f10-a4bf-197f7db0e91c';
+    const thread = makeThread([{ round: 1, type: 'initial', prompt: 'maintain me', durationMs: 1, status: 'completed', timestamp: new Date().toISOString() }]);
+    thread.status = 'paused'; thread.targetAgent = 'codex'; thread.targetModel = 'gpt-6-luna';
+    thread.receiverSessionId = sessionId; thread.receiverSessionCaptured = true;
+    const namespace = nativeSessionNamespace('codex');
+    thread.nativeSessionAssignments = { developer: { namespace, sessionEpoch: 10 } };
+    thread.execution = { version: 2, revision: 2, operationId: 'all-exit-business-op', phase: 'develop', round: 1,
+      generation: 6, attempt: 1, autoRetriesUsed: 0, budget: { limitMs: 120_000, spentActiveMs: 10_000, maxAutoRetries: 2 } };
+    store.upsertTask(thread);
+    assert.equal(new SessionOwnershipStore(dir).claim({ agent: 'codex', namespace, sessionId, threadId: thread.threadId, role: 'developer', sessionEpoch: 10 }).ok, true);
+    const compactor = new NativeSessionCompactor(store, { resolveExecutable: () => process.execPath } as any, () => 'certified');
+    (compactor as any).capabilityIdentity = () => ({ agent: 'codex', executablePath: process.execPath, executableVersion: 'fixture', providerRoute: 'subscription-default', providerId: 'openai', model: 'gpt-6-luna' });
+    let root: ReturnType<typeof spawn> | undefined;
+    let grandchildPid: number | undefined;
+    let grandchildBirthId: string | undefined;
+    let adapterCalls = 0;
+    const grandchildFile = path.join(dir, 'exited-grandchild.pid');
+    const stopRootFile = path.join(dir, 'exited-root.stop');
+    (compactor as any).codex = { compact: async (request: any) => {
+      adapterCalls++;
+      const childCode = `const fs=require('fs'),cp=require('child_process');const p=cp.spawn(process.execPath,['-e',${JSON.stringify('setInterval(()=>{},1000)')}],{detached:true,stdio:'ignore'});p.unref();fs.writeFileSync(${JSON.stringify(grandchildFile)},String(p.pid));const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(stopRootFile)})){clearInterval(t);process.exit(0)}},10);`;
+      root = spawn(process.execPath, ['-e', childCode], { stdio: 'ignore', windowsHide: true });
+      const rootPid = root.pid!;
+      const rootBirthId = await getProcessBirthIdAsync(rootPid);
+      assert.ok(rootBirthId);
+      await request.onChildPid(rootPid, rootBirthId);
+      const deadline = Date.now() + 8_000;
+      while (!fs.existsSync(grandchildFile) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.ok(fs.existsSync(grandchildFile), 'detached descendant was created');
+      grandchildPid = Number(fs.readFileSync(grandchildFile, 'utf8'));
+      grandchildBirthId = await getProcessBirthIdAsync(grandchildPid);
+      assert.ok(grandchildBirthId);
+      const close = new Promise<void>((resolve) => root!.once('close', () => resolve()));
+      fs.writeFileSync(stopRootFile, 'exit');
+      await close;
+      const childExitDeadline = Date.now() + 8_000;
+      while (probeProcessIdentity(grandchildPid, grandchildBirthId) !== 'exited' && Date.now() < childExitDeadline) {
+        try { process.kill(grandchildPid); } catch {}
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.equal(probeProcessIdentity(grandchildPid, grandchildBirthId), 'exited', 'captured descendant exit is verified before adapter close');
+      await request.onChildPid(undefined);
+      return { threadId: sessionId, nativeTurnId: 'all-exited-turn', model: request.model, provider: 'fixture', processExitCode: 0 };
+    } };
+    try {
+      const operation = await compactor.compactPausedTask(thread.threadId, 'developer');
+      assert.equal(adapterCalls, 1);
+      assert.equal(operation.phase, 'succeeded', operation.error || operation.errorCode);
+      const settled = store.getTask(thread.threadId)!;
+      assert.equal(settled.status, 'paused');
+      assert.equal(settled.execution!.run, undefined);
+      assert.equal(settled.rounds[0].nativeSessionCompactions?.filter((item) => item.id === operation.id).length, 1);
+      assert.equal(probeProcessIdentity(grandchildPid!, grandchildBirthId!), 'exited');
+    } finally {
+      if (root?.pid && root.exitCode === null) { try { root.kill(); } catch {} }
+      if (grandchildPid && grandchildBirthId && probeProcessIdentity(grandchildPid, grandchildBirthId) === 'alive') { try { process.kill(grandchildPid); } catch {} }
+    }
+  });
+
+  test('second control process cannot physically clean a paused task while its maintenance child is alive', async () => {
+    const { store, dir } = makeStore();
+    const sessionId = '82de43ee-262a-4e91-a548-021731e52130';
+    const thread = makeThread([{ round: 1, type: 'initial', prompt: 'maintain me', durationMs: 1, status: 'completed', timestamp: new Date().toISOString() }]);
+    thread.status = 'paused'; thread.targetAgent = 'codex'; thread.targetModel = 'gpt-6-luna';
+    thread.receiverSessionId = sessionId; thread.receiverSessionCaptured = true;
+    const namespace = nativeSessionNamespace('codex');
+    thread.nativeSessionAssignments = { developer: { namespace, sessionEpoch: 2 } };
+    thread.execution = { version: 2, revision: 2, operationId: 'business-operation', phase: 'develop', round: 1,
+      generation: 3, attempt: 1, autoRetriesUsed: 0, budget: { limitMs: 120_000, spentActiveMs: 9_000, maxAutoRetries: 2 } };
+    store.upsertTask(thread);
+    assert.equal(new SessionOwnershipStore(dir).claim({ agent: 'codex', namespace, sessionId, threadId: thread.threadId, role: 'developer', sessionEpoch: 2 }).ok, true);
+    const compactor = new NativeSessionCompactor(store, { resolveExecutable: () => process.execPath } as any, () => 'certified');
+    (compactor as any).capabilityIdentity = () => ({ agent: 'codex', executablePath: process.execPath, executableVersion: 'fixture', providerRoute: 'subscription-default', providerId: 'openai', model: 'gpt-6-luna' });
+    let child: ReturnType<typeof spawn> | undefined;
+    let releaseChild!: () => void;
+    let announceChild!: () => void;
+    const childReady = new Promise<void>((resolve) => { announceChild = resolve; });
+    const permitExit = new Promise<void>((resolve) => { releaseChild = resolve; });
+    (compactor as any).codex = { compact: async (request: any) => {
+      child = spawn(process.execPath, ['-e', 'setInterval(()=>{},10000)'], { stdio: 'ignore', windowsHide: true });
+      const birthId = await getProcessBirthIdAsync(child.pid!);
+      await request.onChildPid(child.pid, birthId);
+      announceChild();
+      await permitExit;
+      const closed = new Promise<void>((resolve) => child!.once('close', () => resolve()));
+      try { child!.kill(); } catch {}
+      await closed;
+      await request.onChildPid(undefined);
+      return { threadId: sessionId, nativeTurnId: 'fixture-turn', model: request.model, provider: 'fixture', processExitCode: 0 };
+    } };
+    const compacting = compactor.compactPausedTask(thread.threadId, 'developer');
+    try {
+      await childReady;
+      const script = `const {TaskStore}=require(${JSON.stringify(path.resolve('out/bridge/task-store.js'))});const {getProcessBirthId}=require(${JSON.stringify(path.resolve('out/bridge/platform.js'))});(async()=>{const s=new TaskStore(${JSON.stringify(dir)});const x=await s.markTaskCleanup(${JSON.stringify(thread.threadId)},'delete',{pid:process.pid,birthId:getProcessBirthId(process.pid)});let blocked=false;try{await s.commitTaskCleanup(${JSON.stringify(thread.threadId)},x.token,'delete')}catch(e){blocked=/execution run/.test(String(e&&e.message||e))}console.log(JSON.stringify({token:x.token,blocked,run:x.thread.execution.run&&x.thread.execution.run.id}));s.dispose()})().catch(e=>{console.error(e);process.exitCode=1})`;
+      const result = spawnSync(process.execPath, ['-e', script], { cwd: process.cwd(), encoding: 'utf8', timeout: 10_000, windowsHide: true });
+      assert.equal(result.status, 0, result.stderr || result.error?.message);
+      const evidence = JSON.parse(result.stdout.trim());
+      assert.equal(evidence.blocked, true, 'a second control process must not physically delete while the maintenance run is recorded');
+      assert.equal(store.getTask(thread.threadId)!.execution!.run!.purpose, 'native_maintenance');
+      releaseChild();
+      const operation = await compacting;
+      assert.equal(operation.phase, 'unknown', 'cleanup reservation races the adapter result and prevents a success commit');
+      const stored = store.getTask(thread.threadId);
+      if (stored?.execution?.run) {
+        assert.equal(stored.execution.run.state, 'stopping', 'an unverified captured descendant keeps the run protected after its root closes');
+        assert.equal(stored.execution.run.unconfirmed, true);
+        await assert.rejects(store.commitTaskCleanup(thread.threadId, evidence.token, 'delete'), /execution run .* is still recorded/);
+        assert.ok(store.getTask(thread.threadId), 'physical deletion is refused while subtree evidence is incomplete');
+      } else {
+        assert.deepEqual(stored?.cleanup?.runExitProof && {
+          runId: stored.cleanup.runExitProof.runId,
+          operationId: stored.cleanup.runExitProof.operationId,
+          generation: stored.cleanup.runExitProof.generation,
+        }, { runId: evidence.run, operationId: 'business-operation', generation: 3 });
+        assert.equal(await store.commitTaskCleanup(thread.threadId, evidence.token, 'delete'), true);
+        assert.equal(store.getTask(thread.threadId), undefined);
+      }
+    } finally {
+      releaseChild();
+      if (child?.pid && child.exitCode === null) { try { child.kill(); } catch {} }
+      await compacting.catch(() => undefined);
+    }
+  });
+
+  test('automatic native maintenance is a serial step on the existing v2 business run', async () => {
+    const { store, dir } = makeStore();
+    const sessionId = 'c12a45fe-3f57-4c5a-8950-05da31b0f866';
+    const thread = makeThread([{ round: 1, type: 'initial', prompt: 'continue', durationMs: 1, status: 'running', timestamp: new Date().toISOString() }]);
+    thread.status = 'running'; thread.targetAgent = 'codex'; thread.targetModel = 'gpt-6-luna';
+    thread.receiverSessionId = sessionId; thread.receiverSessionCaptured = true;
+    thread.execution = { version: 2, revision: 2, operationId: 'live-business-op', phase: 'develop', round: 1, generation: 4,
+      attempt: 1, autoRetriesUsed: 0, budget: { limitMs: 120_000, spentActiveMs: 17_000, maxAutoRetries: 2 },
+      run: { id: 'live-run-id', owner: { pid: process.pid }, role: 'developer', step: 'develop', state: 'active', startedAt: new Date().toISOString() } };
+    thread.nativeSessionCompaction = { developer: { sessionId, turnsSinceCompaction: 4, revision: 4 } };
+    store.upsertTask(thread);
+    const roles = new TaskRoleLock(dir); const roleLease = roles.tryAcquire(thread.threadId, 'developer')!;
+    const native = new NativeSessionLock(dir); const nativeLease = native.acquire('codex', sessionId)!;
+    const compactor = new NativeSessionCompactor(store, { resolveExecutable: () => process.execPath } as any, () => 'certified');
+    let observations = 0;
+    (compactor as any).codex = { compact: async (request: any) => {
+      observations++;
+      const active = store.getTask(thread.threadId)!;
+      assert.equal(active.execution!.run!.id, 'live-run-id');
+      assert.equal(active.execution!.run!.step, 'native_maintenance');
+      assert.equal(active.execution!.operationId, 'live-business-op');
+      assert.equal(active.execution!.generation, 4);
+      return { threadId: sessionId, nativeTurnId: 'automatic-turn', model: request.model, provider: 'fixture', processExitCode: 0 };
+    } };
+    try {
+      const result = await (compactor as any).compactAutomatically(thread, 'developer', 'codex', 'gpt-6-luna', sessionId, nativeLease,
+        { sessionId, turnsSinceCompaction: 4, revision: 4 },
+        { agent: 'codex', executablePath: process.execPath, executableVersion: 'fixture', providerRoute: 'subscription-default', providerId: 'openai', model: 'gpt-6-luna' });
+      assert.equal(result.warning, undefined);
+      assert.equal(observations, 1);
+      const after = store.getTask(thread.threadId)!;
+      assert.equal(after.status, 'running');
+      assert.equal(after.execution!.run!.id, 'live-run-id');
+      assert.equal(after.execution!.run!.step, 'develop');
+      assert.equal(after.execution!.generation, 4);
+      assert.equal(after.execution!.budget.spentActiveMs, 17_000);
+    } finally { native.release(nativeLease); roles.release(roleLease); }
   });
 
   test('native automatic compaction events are consumed once and an immediate repeat disables auto maintenance', () => {

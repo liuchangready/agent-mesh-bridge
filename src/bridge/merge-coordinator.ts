@@ -163,14 +163,14 @@ export class MergeCoordinator {
     child.stderr!.on('data', (chunk: Buffer) => record(chunk, false));
     let resolveResult!: (result: { code: number | null; error?: Error }) => void;
     const completion = new Promise<{ code: number | null; error?: Error }>((resolve) => { resolveResult = resolve; });
-    const timer = setTimeout(() => killProcessTree(child, childBirthId, true), 30_000);
-    timer.unref?.();
     // An `error` event reports a failed spawn/pipe, not that the process is gone:
     // resolving on it would end the registration and detach the lock while a
     // spawned tree is still running. Record it and settle on `close` only.
     let childError: Error | undefined;
     child.once('error', (error) => { childError = error; });
     child.once('close', (code) => resolveResult({ code, error: childError }));
+    const timer = setTimeout(() => killProcessTree(child, childBirthId, true), 30_000);
+    timer.unref?.();
     try {
       const cancelled = () => !this.isMergeStillAllowed(threadId, thread.worktree!.approvedCommit!);
       if (windows && !trackingError) {
@@ -258,24 +258,27 @@ export class MergeCoordinator {
     const interruptionCount = thread.interruptions?.length || 0;
     const stillCurrent = () => this.isMergeStillAllowed(threadId, sourceCommit) &&
       (this.store.getTask(threadId)?.interruptions?.length || 0) === interruptionCount;
-    await this.waitForReviewerExit(thread, stillCurrent);
+    // A v2 caller holds the unique durable run through this merge. Reviewer
+    // exit was already proven before the merge run was admitted, so do not
+    // consult or create a legacy task-role lease on this production path.
+    if (!externalLease) await this.waitForReviewerExit(thread, stillCurrent);
     if (!stillCurrent()) return { status: 'stale', message: 'Task was paused or deleted before integration started.' };
-    const mergeRole = new TaskRoleLock(this.storageDir);
-    let roleLease = mergeRole.tryAcquire(threadId, 'reviewer', thread.reviewFlow === 'dedicated' ? thread.reviewerSessionId : undefined);
-    while (!roleLease && stillCurrent()) {
+    const mergeRole = externalLease ? undefined : new TaskRoleLock(this.storageDir);
+    let roleLease = mergeRole?.tryAcquire(threadId, 'reviewer', thread.reviewFlow === 'dedicated' ? thread.reviewerSessionId : undefined) || null;
+    while (mergeRole && !roleLease && stillCurrent()) {
       await sleep(250);
       if (stillCurrent()) roleLease = mergeRole.tryAcquire(threadId, 'reviewer', thread.reviewFlow === 'dedicated' ? thread.reviewerSessionId : undefined);
     }
-    if (!roleLease) return { status: 'stale', message: 'Task was paused or deleted while waiting for its role.' };
-    if (!stillCurrent()) { mergeRole.release(roleLease); return { status: 'stale', message: 'Task was paused before acquiring its role.' }; }
+    if (mergeRole && !roleLease) return { status: 'stale', message: 'Task was paused or deleted while waiting for its role.' };
+    if (!stillCurrent()) { if (roleLease) mergeRole?.release(roleLease); return { status: 'stale', message: 'Task was paused before acquiring its role.' }; }
     let release: (() => void) | undefined;
     if (externalLease) {
       release = () => {};
     } else {
       try { release = await this.lock.acquire(undefined, () => !this.isMergeStillAllowed(threadId, sourceCommit)); }
-      catch (error) { mergeRole.release(roleLease); throw error; }
+      catch (error) { if (roleLease) mergeRole?.release(roleLease); throw error; }
     }
-    if (!release) { mergeRole.release(roleLease); return { status: 'stale', message: 'Task was paused or deleted while waiting for local integration.' }; }
+    if (!release) { if (roleLease) mergeRole?.release(roleLease); return { status: 'stale', message: 'Task was paused or deleted while waiting for local integration.' }; }
     let startedTargetCommit = '';
     try {
       // This is intentionally the first target read in the critical section.
@@ -686,7 +689,7 @@ export class MergeCoordinator {
           this.store.upsertTask(updated);
         }
       } catch (error) { console.error(`[MergeCoordinator] Could not record cancellation for ${threadId}:`, error); }
-      this.attemptLogs.delete(threadId); release(); mergeRole.release(roleLease);
+      this.attemptLogs.delete(threadId); release(); if (roleLease) mergeRole?.release(roleLease);
     }
   }
 

@@ -40,6 +40,8 @@ import {
 } from './model-approval';
 import { normalizeModelId, resolveConfiguredModel } from './model-catalog';
 import { assertCanExecute } from './agent-capabilities';
+import { requireV2ExecutionEligibility } from './execution-gate';
+import { nativeSessionNamespace } from './session-ownership';
 
 export interface RetargetTaskParams extends ExecutorOverride {
   threadId: string;
@@ -50,10 +52,14 @@ export interface RetargetTaskParams extends ExecutorOverride {
 
 export class TaskRetargetService {
   private readonly taskStore: TaskStore;
+  private readonly requireV2Execution: boolean;
+  private readonly executionAdmission: boolean;
   private modelApprovalHandler?: ModelApprovalHandler;
 
-  constructor(taskStore: TaskStore) {
+  constructor(taskStore: TaskStore, requireV2Execution = false, executionAdmission = true) {
     this.taskStore = taskStore;
+    this.requireV2Execution = requireV2Execution;
+    this.executionAdmission = executionAdmission;
   }
 
   /** Answer model-switch confirmations; defaults to the cross-process channel. */
@@ -68,12 +74,14 @@ export class TaskRetargetService {
    * flight; also when the user declines the model switch.
    */
   public async retargetTask(params: RetargetTaskParams): Promise<RetargetTaskResult> {
+    if (!this.executionAdmission) throw new Error('V2_STARTUP_BLOCKED: runtime component preflight has not passed; cannot retarget this task.');
     this.taskStore.loadFromDisk();
     let thread = this.taskStore.getTask(params.threadId);
     if (thread) assertDedicatedTask(thread);
     if (!thread) {
       throw new Error(`Task thread not found: ${params.threadId}`);
     }
+    if (this.requireV2Execution) requireV2ExecutionEligibility(thread, 'retarget this task');
 
     const inFlight = findInFlightRound(thread);
     if (inFlight) {
@@ -217,6 +225,11 @@ export class TaskRetargetService {
       // fresh preallocated id (never resumed) keeps the runner contract intact.
       thread.receiverSessionId = crypto.randomUUID();
       thread.receiverSessionCaptured = false;
+      const oldAssignment = thread.nativeSessionAssignments?.developer;
+      thread.nativeSessionAssignments = {
+        ...(thread.nativeSessionAssignments || {}),
+        developer: { namespace: nativeSessionNamespace(nextAgent), sessionEpoch: (oldAssignment?.sessionEpoch || 0) + 1 },
+      };
     }
 
     thread.targetAgent = nextAgent;
@@ -248,7 +261,29 @@ export class TaskRetargetService {
       .join(', ');
     thread.summary.lastOutputSnippet = `Executor switched: ${direction}`;
 
-    this.taskStore.upsertTask(thread);
+    if (thread.execution?.version === 2) {
+      await this.taskStore.transitionExecution(thread.threadId, thread.execution.revision, (fresh) => {
+        if (fresh.execution?.version !== 2 || fresh.execution.run || fresh.execution.next || fresh.cleanup ||
+            fresh.status !== thread.status || fresh.targetAgent !== previousAgent || fresh.targetModel !== previousModel ||
+            fresh.receiverSessionId !== (sessionReset ? previousReceiverSessionId : thread.receiverSessionId)) {
+          throw new Error(`Task ${thread.threadId} changed while retargeting; retry against its latest state.`);
+        }
+        fresh.targetAgent = nextAgent;
+        fresh.targetModel = nextModel;
+        fresh.modelNotice = notice;
+        if (resolution.approval) fresh.modelApproval = resolution.approval;
+        if (sessionReset) {
+          fresh.receiverSessionId = thread.receiverSessionId;
+          fresh.receiverSessionCaptured = false;
+          fresh.nativeSessionAssignments = thread.nativeSessionAssignments;
+        }
+        fresh.retargets = [...(fresh.retargets || []), record];
+        fresh.summary.lastOutputSnippet = thread.summary.lastOutputSnippet;
+        fresh.updatedAt = nowIso;
+      });
+    } else {
+      this.taskStore.upsertTask(thread);
+    }
 
     return {
       threadId: thread.threadId,

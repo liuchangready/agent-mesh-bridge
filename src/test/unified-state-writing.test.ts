@@ -1226,6 +1226,7 @@ describe('Unified State Writing (Task 01) Tests', () => {
       const { disk } = setupReviewFixture(taskStore, tempDir);
       await taskStore.transitionExecution('review_test', 0, (t) => {
         t.status = 'completed';
+        if (t.execution) t.execution.run = undefined;
       });
       const { token } = await taskStore.markTaskCleanup('review_test', 'archive', { pid: process.pid });
       await assert.rejects(
@@ -1315,6 +1316,7 @@ describe('Unified State Writing (Task 01) Tests', () => {
       const { disk } = setupReviewFixture(taskStore, tempDir);
       await taskStore.transitionExecution('review_test', 0, (t) => {
         t.status = 'completed';
+        if (t.execution) t.execution.run = undefined;
       });
       const { token } = await taskStore.markTaskCleanup('review_test', 'archive', { pid: process.pid });
       assert.strictEqual(taskStore.deleteTask('review_test', token), false);
@@ -1325,6 +1327,7 @@ describe('Unified State Writing (Task 01) Tests', () => {
       const { disk } = setupReviewFixture(taskStore, tempDir);
       await taskStore.transitionExecution('review_test', 0, (t) => {
         t.status = 'completed';
+        if (t.execution) t.execution.run = undefined;
         delete (t as any).execution;
       });
       const { token } = await taskStore.markTaskCleanup('review_test', 'archive', { pid: process.pid });
@@ -1386,6 +1389,7 @@ describe('Unified State Writing (Task 01) Tests', () => {
       const { disk } = setupReviewFixture(taskStore, tempDir);
       await taskStore.transitionExecution('review_test', 0, (t) => {
         t.status = 'completed';
+        if (t.execution) t.execution.run = undefined;
       });
       const { token } = await taskStore.markTaskCleanup('review_test', 'archive', { pid: process.pid });
       let refused = false;
@@ -1445,6 +1449,7 @@ describe('Unified State Writing (Task 01) Tests', () => {
       const { disk } = setupReviewFixture(taskStore, tempDir);
       await taskStore.transitionExecution('review_test', 0, (t) => {
         t.status = 'completed';
+        if (t.execution) t.execution.run = undefined;
       });
       const { token } = await taskStore.markTaskCleanup('review_test', 'archive', { pid: process.pid });
       try {
@@ -1458,6 +1463,7 @@ describe('Unified State Writing (Task 01) Tests', () => {
       const { disk } = setupReviewFixture(taskStore, tempDir);
       await taskStore.transitionExecution('review_test', 0, (t) => {
         t.status = 'completed';
+        if (t.execution) t.execution.run = undefined;
       });
       const { token } = await taskStore.markTaskCleanup('review_test', 'archive', { pid: process.pid });
       try {
@@ -1496,6 +1502,7 @@ describe('Unified State Writing (Task 01) Tests', () => {
 
       await taskStore.transitionExecution('review_test', 0, (t) => {
         t.status = 'completed';
+        if (t.execution) t.execution.run = undefined;
         t.artifactDir = artifactDir;
         t.taskDataDir = artifactDir;
         t.rounds[0].output = 'completed output';
@@ -1618,6 +1625,7 @@ describe('Unified State Writing (Task 01) Tests', () => {
       const { disk } = setupReviewFixture(taskStore, tempDir);
       await taskStore.transitionExecution('review_test', 0, (t) => {
         t.status = 'completed';
+        if (t.execution) t.execution.run = undefined;
       });
       const { token } = await taskStore.markTaskCleanup('review_test', 'archive', { pid: process.pid });
       try {
@@ -1635,6 +1643,7 @@ describe('Unified State Writing (Task 01) Tests', () => {
       const { disk } = setupReviewFixture(taskStore, tempDir);
       await taskStore.transitionExecution('review_test', 0, (t) => {
         t.status = 'completed';
+        if (t.execution) t.execution.run = undefined;
       });
       const { token } = await taskStore.markTaskCleanup('review_test', 'archive', { pid: process.pid });
       const fake = path.join(tempDir, 'fake.tar.gz');
@@ -1700,6 +1709,7 @@ describe('Unified State Writing (Task 01) Tests', () => {
 
       await taskStore.transitionExecution('review_test', 0, (t) => {
         t.status = 'completed';
+        if (t.execution) t.execution.run = undefined;
         t.artifactDir = artifactDir;
         t.taskDataDir = artifactDir;
         t.rounds[0].output = 'completed worker output';
@@ -1728,6 +1738,7 @@ describe('Unified State Writing (Task 01) Tests', () => {
       const { disk } = setupReviewFixture(taskStore, tempDir);
       await taskStore.transitionExecution('review_test', 0, (t) => {
         t.status = 'completed';
+        if (t.execution) t.execution.run = undefined;
         delete t.execution;
       });
 
@@ -1761,6 +1772,7 @@ describe('Unified State Writing (Task 01) Tests', () => {
 
       await taskStore.transitionExecution('review_test', 0, (t) => {
         t.status = 'completed';
+        if (t.execution) t.execution.run = undefined;
         t.artifactDir = artifactDir;
         t.taskDataDir = artifactDir;
         t.rounds[0].output = 'completed worker output';

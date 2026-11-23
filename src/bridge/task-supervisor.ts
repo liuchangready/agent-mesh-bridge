@@ -65,6 +65,8 @@ export class TaskSupervisor extends EventEmitter {
   private streamSyncIntervalMs: number = 30000;
   private executionRegistry: TaskExecutionRegistry;
   private readonly storageDir: string;
+  private readonly requireV2Execution: boolean;
+  private readonly admissionEnabled: boolean;
   /**
    * Re-entrancy guard: `taskStore.upsertTask()` emits `changed` synchronously,
    * which calls back into `checkPendingTasks()`. Without this flag that nested
@@ -78,6 +80,8 @@ export class TaskSupervisor extends EventEmitter {
     callbackManager: CallbackManager,
     detector?: AgentDetector,
     executionRegistry?: TaskExecutionRegistry,
+    requireV2Execution = false,
+    admissionEnabled = true,
   ) {
     super();
     TaskSupervisor.instance = this;
@@ -87,6 +91,8 @@ export class TaskSupervisor extends EventEmitter {
     this.detector = detector;
     this.storageDir = path.dirname(taskStore.getStoragePath());
     this.executionRegistry = executionRegistry || new TaskExecutionRegistry(this.storageDir);
+    this.requireV2Execution = requireV2Execution;
+    this.admissionEnabled = admissionEnabled;
     const storageDir = this.storageDir;
     if (!fs.existsSync(storageDir)) {
       try {
@@ -95,8 +101,10 @@ export class TaskSupervisor extends EventEmitter {
     }
     this.lockFilePath = path.join(storageDir, 'supervisor.json');
 
-    this.startHeartbeat();
-    this.startWatching();
+    if (this.admissionEnabled) {
+      this.startHeartbeat();
+      this.startWatching();
+    }
   }
 
   public static getInstance(): TaskSupervisor | undefined {
@@ -216,7 +224,7 @@ export class TaskSupervisor extends EventEmitter {
    * best-effort count limits, but neither imposes workspace or FIFO exclusion.
    */
   public checkPendingTasks(): void {
-    if (this.isDisposed || this.startingThreadId) return;
+    if (this.isDisposed || !this.admissionEnabled || this.startingThreadId) return;
 
     this.taskStore.loadFromDisk();
     const allTasks = this.taskStore.getAllTasks();
@@ -258,6 +266,8 @@ export class TaskSupervisor extends EventEmitter {
     const candidates = allTasks
       .filter((thread) => {
         if (!thread || !thread.threadId || thread.reviewFlow !== 'dedicated' || this.activeTasks.has(thread.threadId)) return false;
+        if (this.requireV2Execution && thread.execution?.version !== 2) return false;
+        if (thread.execution?.version === 2) return false; // v2 execution is owned by ExecutionController
         if (thread.status === 'paused' || thread.status === 'reviewing') return false;
         if (thread.queuePhase === 'merge' || thread.reviewBlocked || isReviewerBootstrapPending(thread)) return false;
         return thread.status === 'running' || thread.status === 'queued';
@@ -345,6 +355,7 @@ export class TaskSupervisor extends EventEmitter {
     this.taskStore.upsertTask(fresh);
   }
   public executeThreadRound(thread: DelegationThread, round: DelegationRound): Promise<void> {
+    if (!this.admissionEnabled) return Promise.reject(new Error('V2_STARTUP_BLOCKED: runtime component preflight has not passed.'));
     if (this.activeTasks.has(thread.threadId)) {
       return this.activeTasks.get(thread.threadId)!;
     }

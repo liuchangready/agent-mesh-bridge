@@ -19,8 +19,10 @@ import { ReworkController } from '../bridge/rework-controller';
 import { MCPServer } from '../bridge/mcp-server';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { getBridgeHome } from '../bridge/model-catalog';
+import { getProcessBirthId } from '../bridge/platform';
 import {
   clearReviewerBootstrapToken,
+  confirmReviewerBootstrapTask,
   readReviewerBootstrapToken,
   writeReviewerBootstrapToken,
 } from '../bridge/reviewer-bootstrap';
@@ -167,6 +169,38 @@ describe('dedicated reviewer bootstrap identity', () => {
       assert.strictEqual(taskStore.getTask(threadId)?.reviewBootstrap?.phase, 'pending');
       assert.strictEqual(readReviewerBootstrapToken(threadId, getBridgeHome())?.token, 'token-before-pause');
     } finally {
+      clearReviewerBootstrapToken(threadId, getBridgeHome());
+      taskStore.dispose();
+    }
+  });
+
+  test('a v2 bootstrap CAS failure keeps its credential reusable until confirmation commits', async () => {
+    const threadId = 'thread_bootstrap_cas_retry';
+    prepareTask(threadId, 'cas-retry-token');
+    const thread = taskStore.getTask(threadId)!;
+    thread.execution = {
+      version: 2, revision: 3, operationId: 'review_bootstrap_1', phase: 'review', round: 1,
+      purpose: 'bootstrap', generation: 1, attempt: 1, autoRetriesUsed: 0,
+      budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 },
+      run: {
+        id: 'review_bootstrap_run_1', role: 'reviewer',
+        owner: { pid: process.pid, birthId: getProcessBirthId(process.pid) },
+        state: 'active', step: 'executing', startedAt: new Date().toISOString(),
+      },
+    };
+    taskStore.upsertTask(thread);
+    const transition = taskStore.transitionExecution.bind(taskStore);
+    (taskStore as any).transitionExecution = async () => { throw new Error('Execution revision mismatch'); };
+    try {
+      await assert.rejects(confirmReviewerBootstrapTask(taskStore, threadId, { token: 'cas-retry-token' }, getBridgeHome()), /revision mismatch/i);
+      assert.equal(readReviewerBootstrapToken(threadId, getBridgeHome())?.token, 'cas-retry-token');
+      assert.equal(taskStore.getTask(threadId)?.reviewBootstrap?.phase, 'pending');
+      (taskStore as any).transitionExecution = transition;
+      const confirmed = await confirmReviewerBootstrapTask(taskStore, threadId, { token: 'cas-retry-token' }, getBridgeHome());
+      assert.equal(confirmed.reviewBootstrap?.phase, 'confirmed');
+      assert.equal(readReviewerBootstrapToken(threadId, getBridgeHome()), undefined);
+    } finally {
+      (taskStore as any).transitionExecution = transition;
       clearReviewerBootstrapToken(threadId, getBridgeHome());
       taskStore.dispose();
     }

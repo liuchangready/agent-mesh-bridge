@@ -35,7 +35,9 @@ const LAYER_MAPPING = {
     'model-catalog.test.js',
     'rate-limit-tracker.test.js',
     'reviewer-bootstrap-credentials.test.js',
+    'session-ownership.test.js',
     'reviewer-log.test.js',
+    'shutdown-preflight.test.js',
     'rework-lifecycle-fixes.test.js',
     'rework-loop-guard.test.js',
     'round-invariant.test.js',
@@ -161,10 +163,39 @@ const files = targetFiles
 if (requestedLayer) {
   console.log(`[Layer: ${requestedLayer}] Running ${files.length} test suite(s)...`);
 } else {
-  console.log(`[Full Suite] Running ${files.length} test suite(s) across all layers...`);
+  console.log(`[Full Suite] Running ${files.length} test suite(s) across all layers; Windows process-ownership suite runs in its own final wave.`);
 }
 
-run({ files, concurrency: 4 })
-  .on('test:fail', () => { process.exitCode = 1; })
-  .compose(spec)
-  .pipe(process.stdout);
+const configuredConcurrency = Number.parseInt(process.env.MESH_TEST_CONCURRENCY || '4', 10);
+const concurrency = Number.isSafeInteger(configuredConcurrency) && configuredConcurrency > 0
+  ? Math.min(configuredConcurrency, 8)
+  : 4;
+
+async function runBatch(batchFiles, batchConcurrency) {
+  if (!batchFiles.length) return;
+  const result = run({ files: batchFiles, concurrency: batchConcurrency });
+  result.on('test:fail', () => { process.exitCode = 1; });
+  const formatted = result.compose(spec);
+  formatted.pipe(process.stdout);
+  await new Promise((resolve, reject) => {
+    formatted.once('end', resolve);
+    formatted.once('error', reject);
+  });
+}
+
+(async () => {
+  if (requestedLayer) {
+    await runBatch(files, concurrency);
+    return;
+  }
+  // unique-run-launch starts multiple real Node and PowerShell processes and
+  // exercises cross-process CAS. Keep those two-process barriers intact while
+  // avoiding unrelated full-suite workers competing for Windows helper startup.
+  const ownershipFiles = files.filter((file) => basename(file) === 'unique-run-launch.test.js');
+  const concurrentFiles = files.filter((file) => basename(file) !== 'unique-run-launch.test.js');
+  await runBatch(concurrentFiles, concurrency);
+  await runBatch(ownershipFiles, 1);
+})().catch((error) => {
+  console.error('[Full Suite] Test runner failed:', error);
+  process.exitCode = 1;
+});

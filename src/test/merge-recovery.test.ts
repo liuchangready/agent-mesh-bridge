@@ -125,7 +125,7 @@ test('pending stash metadata recovery survives stale writes and pause/resume wit
   assert.throws(() => controller.approveTask({ threadId: thread.threadId }), /stash metadata recovery/i);
   await assert.rejects(() => controller.requestMergeDecision(thread.threadId, 'Choose?', '', ''), /stash metadata recovery/i);
   const control = new TaskControlService(store, undefined, undefined, root);
-  assert.equal(control.pauseTask(thread.threadId, 'pause', 'test').status, 'PAUSED');
+  assert.equal((await control.pauseTask(thread.threadId, 'pause', 'test')).status, 'PAUSED');
   await controller.resumePausedTask(thread.threadId);
   assert.equal(store.getTask(thread.threadId)!.status, 'reviewing');
   assert.equal(store.getTask(thread.threadId)!.worktree!.integration!.stashRecoveryLockHeld, true);

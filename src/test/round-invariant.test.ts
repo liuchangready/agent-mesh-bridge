@@ -317,6 +317,10 @@ describe('Round invariant - supervisor repairs and guards', () => {
       };
     };
     const callbackManager = new CallbackManager(detector);
+    // This suite exercises TaskSupervisor admission and round bookkeeping only.
+    // Never let completion launch the user's configured reviewer CLI/MCP stack.
+    callbackManager.notifyCaller = async () => true;
+    callbackManager.notifyCallerOfFailure = async () => false;
     supervisor = new TaskSupervisor(taskStore, runner, callbackManager, detector);
   });
 

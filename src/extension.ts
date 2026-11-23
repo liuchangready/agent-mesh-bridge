@@ -12,6 +12,7 @@ import { ActiveAgentResolver, applyConfiguredAgentDefault } from './bridge/activ
 import { AutonomousRunner } from './bridge/autonomous-runner';
 import { CallbackManager } from './bridge/callback-manager';
 import { ReviewWakeScheduler } from './bridge/review-wake-scheduler';
+import { inspectV2RuntimeActivation, loadShutdownPreflightSnapshot } from './bridge/shutdown-preflight';
 import { reopenFailedReview } from './bridge/review-wake';
 import { AsyncDispatcher } from './bridge/async-dispatcher';
 import { ReworkController } from './bridge/rework-controller';
@@ -280,6 +281,21 @@ export function activate(context: vscode.ExtensionContext) {
 
   // 2. Initialize Core Services
   const taskStore = TaskStore.getInstance();
+  const storageDir = path.dirname(taskStore.getStoragePath());
+  const packageVersion = String(context.extension.packageJSON.version || '');
+  const runtimeAdmission = inspectV2RuntimeActivation({
+    ...loadShutdownPreflightSnapshot(storageDir), storageDir,
+    components: [
+      { component: 'extension-host', version: packageVersion, packageRoot: context.extensionPath,
+        path: path.join(context.extensionPath, 'out', 'extension.js') },
+      { component: 'standalone-mcp', version: packageVersion, packageRoot: context.extensionPath,
+        path: path.join(context.extensionPath, 'bin', 'agent-bridge-mcp.cjs') },
+    ],
+  });
+  if (!runtimeAdmission.ready) {
+    const evidence = runtimeAdmission.blockers.slice(0, 3).map((item) => item.evidence).join(' | ');
+    vscode.window.showWarningMessage(`[Agent Bridge] V2 scheduling is held by the read-only cutover preflight: ${evidence}`);
+  }
   const workspaceStorage = path.dirname(taskStore.getStoragePath());
   const workspaceRegistry = new WorkspaceRegistry(workspaceStorage);
   const currentWindowRoots = (): string[] => (vscode.workspace.workspaceFolders || []).flatMap((folder) => {
@@ -308,11 +324,11 @@ export function activate(context: vscode.ExtensionContext) {
     archiveTimer = setTimeout(() => {
       archiveTimer = undefined;
       try {
-        archiveService.run(
+        void archiveService.run(
           vscode.workspace
             .getConfiguration('agentMeshBridge')
             .get<number>('archive.keepRecentTasks', 20),
-        );
+        ).catch((e: any) => console.warn('[AgentBridge] Archival pass failed:', e?.message || e));
       } catch (e: any) {
         console.warn('[AgentBridge] Archival pass failed:', e?.message || e);
       }
@@ -427,15 +443,16 @@ export function activate(context: vscode.ExtensionContext) {
     .get<number>('reviewStallTimeoutMinutes', 10);
   const reviewWakeScheduler = new ReviewWakeScheduler(taskStore, callbackManager, {
     stallTimeoutMs: Math.max(1, reviewStallMinutes) * 60_000,
+    requireV2Execution: true,
   });
-  reviewWakeScheduler.start();
+  if (runtimeAdmission.ready) reviewWakeScheduler.start();
   context.subscriptions.push({ dispose: () => reviewWakeScheduler.dispose() });
   // A restart kills whatever reviewer was mid-flight: the wake was launched by
   // the previous host, so no exit event will ever arrive and no stall would be
   // recorded until the next full timeout. One pass on activation surfaces those
   // tasks immediately (it only flags reviews that are already past the stall
   // threshold and have no live reviewer, so healthy ones are untouched).
-  void reviewWakeScheduler.runWatchdog();
+  if (runtimeAdmission.ready) void reviewWakeScheduler.runWatchdog();
   reviewWakeScheduler.on('retryLaunched', ({ thread, round }) => {
     vscode.window.showInformationMessage(
       `🔁 [Agent Bridge] 已重新唤醒 ${thread.initiatorAgent} 检视任务【${thread.title}】(Round ${round.round})。`,
@@ -482,6 +499,8 @@ export function activate(context: vscode.ExtensionContext) {
     detector,
     executionRegistry,
     true,
+    true,
+    runtimeAdmission.ready,
   );
   context.subscriptions.push({ dispose: () => reworkController.dispose() });
   const executionController = new ExecutionController(
@@ -492,7 +511,9 @@ export function activate(context: vscode.ExtensionContext) {
     undefined,
     undefined,
     executionRegistry,
+    { requireV2Execution: true, ...(!runtimeAdmission.ready ? { standingScanIntervalMs: 0 } : {}) },
   );
+  if (runtimeAdmission.ready) _dispatcher.enableV2Dispatch();
   context.subscriptions.push({ dispose: () => executionController.dispose() });
   const taskControl = new TaskControlService(taskStore, runner);
   const configSync = new ConfigSyncService(undefined, dshProvider);
@@ -503,6 +524,8 @@ export function activate(context: vscode.ExtensionContext) {
     callbackManager,
     detector,
     executionRegistry,
+    true,
+    runtimeAdmission.ready,
   );
   context.subscriptions.push({ dispose: () => supervisor.dispose() });
 
@@ -513,14 +536,17 @@ export function activate(context: vscode.ExtensionContext) {
     runner,
     detector,
     executionRegistry,
+    requireV2Execution: true,
     onSettled: () => {
       // The supervisor observes ledger changes, but a direct nudge removes the
       // up-to-one-poll delay after the bootstrap records its session handoff.
       supervisor.checkPendingTasks();
     },
   });
-  reworkController.resumePendingMerges();
-  reviewerBootstrap.start();
+  if (runtimeAdmission.ready) {
+    reworkController.resumePendingMerges();
+    reviewerBootstrap.start();
+  }
   context.subscriptions.push({ dispose: () => reviewerBootstrap.stop() });
 
   supervisor.on('taskStarted', ({ thread, round }) => {
@@ -999,6 +1025,10 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand(
       'agent-mesh-bridge.compactNativeSession',
       async (itemOrThreadId?: TaskTreeItem | string) => {
+        if (!runtimeAdmission.ready) {
+          vscode.window.showWarningMessage('Native maintenance is held until the runtime component cutover preflight passes.');
+          return;
+        }
         let threadId = typeof itemOrThreadId === 'string' ? itemOrThreadId : itemOrThreadId?.thread?.threadId;
         if (!threadId) {
           taskStore.loadFromDisk();
@@ -1064,7 +1094,7 @@ export function activate(context: vscode.ExtensionContext) {
         if (reason === undefined) return;
 
         try {
-          const result = taskControl.pauseTask(threadId, reason, 'user');
+          const result = await taskControl.pauseTask(threadId, reason, 'user');
           vscode.window.showInformationMessage(result.message);
           taskStore.loadFromDisk();
           activeTreeProvider.refresh();
@@ -1248,7 +1278,7 @@ export function activate(context: vscode.ExtensionContext) {
 
         // The user is picking here, so this click IS the model-switch consent:
         // answer the approval gate inline instead of asking again.
-        const retargetService = new TaskRetargetService(taskStore);
+        const retargetService = new TaskRetargetService(taskStore, true, runtimeAdmission.ready);
         retargetService.setModelApprovalHandler(async (request) => ({
           id: request.id,
           status: 'approved',

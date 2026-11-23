@@ -6,6 +6,8 @@
 
 > 2026-11-20 下一版设计授权：用户已要求实施[唯一 run 替代独立原生会话锁](docs/LOCK_AND_QUEUE_SIMPLIFICATION_DESIGN.md)。该后续任务以固定会话归属、唯一 v2 run、真实子树退出和受保护 cleanup 替代 Bridge 的角色/会话运行租约，最终仅保留全局合入锁及任务短写锁；CLI 自带写保护不删。下文 roles、session 租约及交接即释放的实现约束在下一版目标中以上述设计为准，单任务单角色、同会话连续性和模型/原生维护证据不变。此授权不代表已上线：当前 dedicated/v1 任务及实施任务自身必须用现版安全收尾，不迁移、不重置会话，不自动安装/重载或停止生产进程；仅在设计前提、验收和停机预检全部满足后切换。
 
+> 2026-11-22 实施状态：本地独立 MCP 与扩展宿主入口已具备 v2 启动准入闸门；缺少已核验组件清单时，入口只开放历史读取及安全清理，不启用恢复扫描或新派发。只读停机预检覆盖合入 helper/验证子进程、任务目录 bootstrap 凭证、终态 ledger run/next/cleanup，以及旧 Git 交付必须由固定 ref 证明 approved commit 可达；日常 v2 重启只在 merge owner/helper/channel 与 ledger run/子树精确匹配时准入。v2 reviewer/runner/自动维护仍部分依赖 Bridge 角色锁或 NativeSessionLock；受保护维护/清理竞争、真实 stdio v2 全生命周期和完整故障验收仍未闭环，因此不能切换或宣称验收通过。当前运行的 dedicated/v1 账本、会话、worktree、分支与 execution.version 保持原样。
+
 ---
 
 ## 1. 项目定位与核心特性
@@ -327,3 +329,5 @@ code --install-extension "./agent-mesh-bridge-$version.vsix" --force
 
 17. **文件归属互斥不可绕过**：
    - 每个轮次必须用 `captureWorkspaceSnapshot()` / `diffWorkspaceSnapshots()` 记录 `round.touchedFiles`；非 git 工作区允许为空（`available: false`，不得因此把整棵树当成"全被改动"）。
+
+> 2026-11-23 实施进展（未验收）：控制器直接持有的 v2 develop/review/bootstrap 已将 AutonomousRunner、CallbackManager、原生准备接到当前 run identity；这些路径使用固定 session-bindings 与 PID+birthId 子树记录，不申请 Bridge 角色锁或 NativeSessionLock。v1 收尾仍保留旧锁路径。此改动已覆盖实际 runner.execute 的受控返修与 reviewer 测试，但 standalone stdio 全生命周期、扩展宿主完整验收以及 cleanup/维护竞争的总体验收仍未闭环；不得据此切换生产。

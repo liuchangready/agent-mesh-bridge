@@ -20,6 +20,19 @@ export const IS_WINDOWS = process.platform === 'win32';
 /** List separator used by `PATH` on this platform. */
 export const PATH_DELIMITER = IS_WINDOWS ? ';' : ':';
 
+// Spawn adapters bind the identity they captured for an exact ChildProcess
+// handle. Registration can then distinguish a trusted spawn-time identity from
+// an arbitrary/stale birthId passed with a numerically matching PID.
+const spawnedChildBirthIds = new WeakMap<object, string>();
+
+export function bindSpawnedChildIdentity(child: object, birthId: string | undefined): void {
+  if (birthId?.trim()) spawnedChildBirthIds.set(child, birthId.trim());
+}
+
+export function getSpawnedChildIdentity(child: object): string | undefined {
+  return spawnedChildBirthIds.get(child);
+}
+
 /**
  * Extensions the Windows loader appends when resolving a bare command.
  * `PATHEXT` is authoritative when the host defines it.
@@ -430,6 +443,12 @@ export async function getProcessBirthIds(pids: number[]): Promise<Map<number, st
   return identities;
 }
 
+/** Capture a launched child's OS identity without blocking close delivery on Windows. */
+export async function getProcessBirthIdAsync(pid: number): Promise<string | undefined> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  return (await getProcessBirthIds([pid])).get(pid);
+}
+
 export type ProcessProbeProvider = (pid: number, expectedBirthId?: string) => 'alive' | 'exited' | 'unknown';
 let customProbeProvider: ProcessProbeProvider | undefined;
 
@@ -518,13 +537,15 @@ export async function confirmProcessTreeExit(
     knownProcessBirthIds.set(`${item.pid}:${item.birthId ?? 'unknown'}`, item);
   }
 
-  const scanDescendants = () => {
+  const scanDescendants = async () => {
     // A numeric PID can be reused as soon as the original root exits. Only
     // enumerate a fresh tree while the exact root birth ID is still alive.
     if (!allowFreshRootScan || !expectedBirthId || probeProcessIdentity(pid, expectedBirthId) !== 'alive') return;
     try {
-      for (const descendantPid of collectDescendants(pid)) {
-        const birthId = getProcessBirthId(descendantPid);
+      const descendantPids = collectDescendants(pid);
+      const birthIds = await getProcessBirthIds(descendantPids);
+      for (const descendantPid of descendantPids) {
+        const birthId = birthIds.get(descendantPid);
         const key = `${descendantPid}:${birthId ?? 'unknown'}`;
         if (!knownProcessBirthIds.has(key)) {
           knownProcessBirthIds.set(key, { pid: descendantPid, birthId });
@@ -533,22 +554,40 @@ export async function confirmProcessTreeExit(
     } catch {}
   };
 
-  scanDescendants();
-  while (Date.now() < deadline) {
-    scanDescendants();
-    let allExited = true;
-    for (const identity of knownProcessBirthIds.values()) {
-      if (!identity.birthId || probeProcessIdentity(identity.pid, identity.birthId) !== 'exited') {
-        allExited = false;
-        break;
+  // Windows process start-time lookup crosses into PowerShell/WMI. Query the
+  // complete retained tree in one bounded batch per poll instead of launching
+  // one shell for every PID; missing/ambiguous birth IDs remain unknown.
+  const allConfirmedExited = async (): Promise<boolean> => {
+    const identities = [...knownProcessBirthIds.values()];
+    if (customProbeProvider || identities.some((identity) => !identity.birthId)) {
+      return identities.every((identity) =>
+        Boolean(identity.birthId) && probeProcessIdentity(identity.pid, identity.birthId) === 'exited',
+      );
+    }
+    const present: Array<{ pid: number; birthId: string }> = [];
+    for (const identity of identities) {
+      try {
+        process.kill(identity.pid, 0);
+        present.push({ pid: identity.pid, birthId: identity.birthId! });
+      } catch (error: any) {
+        if (error?.code === 'EPERM') return false;
+        if (error?.code !== 'ESRCH') return false;
+        // The exact PID is absent, so the recorded process identity exited.
       }
     }
-    if (allExited) return true;
+    if (present.length === 0) return true;
+    const currentBirthIds = await getProcessBirthIds(present.map((identity) => identity.pid));
+    return present.every((identity) => {
+      const actual = currentBirthIds.get(identity.pid);
+      return actual !== undefined && actual !== identity.birthId;
+    });
+  };
+
+  await scanDescendants();
+  while (Date.now() < deadline) {
+    await scanDescendants();
+    if (await allConfirmedExited()) return true;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-
-  for (const identity of knownProcessBirthIds.values()) {
-    if (!identity.birthId || probeProcessIdentity(identity.pid, identity.birthId) !== 'exited') return false;
-  }
-  return true;
+  return allConfirmedExited();
 }
