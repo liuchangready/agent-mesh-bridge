@@ -165,7 +165,12 @@ async function fixture(t: TestContext, scenario: MockScenario) {
 
 test('mock agents: real MCP bootstrap, three worker/reviewer rounds and validated Git delivery', { timeout: 420_000 }, async t => {
   const f = await fixture(t, { rounds: 3, reviewerTailMs: 200 });
-  const task = await waitForTask(f.root, f.threadId, task => task.status === 'completed' && task.worktree?.integration?.phase === 'merged' && !task.execution?.run);
+  const task = await waitForTask(
+    f.root,
+    f.threadId,
+    task => task.status === 'completed' && task.worktree?.integration?.phase === 'merged' && !task.execution?.run,
+    80_000,
+  );
   const events = trace(f.root);
   const agents = events.filter(entry => entry.kind === 'agent.start');
   const workers = agents.filter(entry => entry.role === 'worker');
