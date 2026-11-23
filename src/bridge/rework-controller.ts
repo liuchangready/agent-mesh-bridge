@@ -282,7 +282,7 @@ export class ReworkController {
         if (!freshTask) {
           throw new Error(`Task thread not found: ${thread.threadId}`);
         }
-        const currentRev = freshTask.execution?.revision ?? 0;
+        const currentRev = thread.execution?.version === 1 ? 'current-legacy-review' : freshTask.execution?.revision ?? 0;
         try {
           await this.taskStore.transitionExecution(thread.threadId, currentRev, (t) => {
             if (t.execution) {
@@ -1055,7 +1055,7 @@ export class ReworkController {
           if (!freshTask) {
             throw new Error(`Task thread not found: ${thread.threadId}`);
           }
-          const currentRev = freshTask.execution?.revision ?? 0;
+          const currentRev = thread.execution?.version === 1 ? 'current-legacy-review' : freshTask.execution?.revision ?? 0;
           try {
             return await this.taskStore.transitionExecution(thread.threadId, currentRev, (t) => {
               if (t.execution) {

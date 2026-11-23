@@ -510,7 +510,8 @@ describe('Unified Execution Boundary Tests', () => {
         if (threadId === 'thread_s30_rework' && !injectedReworkRace) {
           injectedReworkRace = true;
           // Concurrent writer commits generation 2 with active run!
-          await originalTransition(threadId, expectedRev, (t: DelegationThread) => {
+          const revision = fixture.store.getTask(threadId)!.execution!.revision;
+          await originalTransition(threadId, revision, (t: DelegationThread) => {
             if (t.execution) {
               t.execution.generation = 2;
               t.execution.operationId = 'op_s30_gen2';
@@ -569,7 +570,8 @@ describe('Unified Execution Boundary Tests', () => {
         if (threadId === 'thread_s30_approve' && !injectedApproveRace) {
           injectedApproveRace = true;
           // Concurrent writer commits generation 2 with active run!
-          await originalTransition(threadId, expectedRev, (t: DelegationThread) => {
+          const revision = fixture.store.getTask(threadId)!.execution!.revision;
+          await originalTransition(threadId, revision, (t: DelegationThread) => {
             if (t.execution) {
               t.execution.generation = 2;
               t.execution.operationId = 'op_s30_approve_gen2';
@@ -666,7 +668,7 @@ describe('Unified Execution Boundary Tests', () => {
         /wait_decision/,
       );
 
-      // 5. Unrelated checkpoint retry: same generation and run, but revision bumped by checkpoint
+      // 5. An unrelated checkpoint may advance the revision while keeping the same decision identity
       fixture.store.transitionExecution = originalTransition;
 
       const threadCheckpoint = createThread('thread_s30_cp', 'review');
@@ -693,11 +695,14 @@ describe('Unified Execution Boundary Tests', () => {
       fixture.store.upsertTask(threadCheckpoint);
 
       let injectedCheckpoint = false;
+      let decisionAttempts = 0;
       fixture.store.transitionExecution = (async (threadId: string, expectedRev: number, change: (t: any) => void) => {
+        if (threadId === 'thread_s30_cp') decisionAttempts++;
         if (threadId === 'thread_s30_cp' && !injectedCheckpoint) {
           injectedCheckpoint = true;
           // Unrelated checkpoint: budget updated, revision bumped to 2
-          await originalTransition(threadId, expectedRev, (t: DelegationThread) => {
+          const revision = fixture.store.getTask(threadId)!.execution!.revision;
+          await originalTransition(threadId, revision, (t: DelegationThread) => {
             if (t.execution) {
               t.execution.budget.spentActiveMs = 2000;
             }
@@ -706,16 +711,26 @@ describe('Unified Execution Boundary Tests', () => {
         return await originalTransition(threadId, expectedRev, change);
       }) as any;
 
-      // requestRework should succeed on retry because operation/generation/run identity matched!
+      // The decision should use the latest record and preserve the checkpoint.
       const reworkRes = await reworkController.requestRework({
         threadId: 'thread_s30_cp',
-        feedback: 'Valid rework on retry',
+        feedback: 'Valid rework after a budget checkpoint',
       });
       assert.strictEqual(reworkRes.status, 'REWORK_DISPATCHED');
       const taskAfterCp = fixture.store.getTask('thread_s30_cp');
       // Has active run was preserved because reviewer is still running!
       assert.strictEqual(taskAfterCp?.execution?.run?.id, 'run-cp');
       assert.strictEqual(taskAfterCp?.currentRound, 2);
+      assert.strictEqual(taskAfterCp?.execution?.budget.spentActiveMs, 2000);
+      assert.strictEqual(decisionAttempts, 1);
+
+      const v2 = createThread('thread_s30_v2', 'review');
+      v2.execution!.version = 2;
+      fixture.store.upsertTask(v2);
+      await assert.rejects(
+        fixture.store.transitionExecution(v2.threadId, 'current-legacy-review', () => assert.fail('must reject v2 before mutation')),
+        /requires eligible legacy execution/,
+      );
     } finally {
       await fixture.cleanup();
     }

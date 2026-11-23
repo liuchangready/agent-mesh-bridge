@@ -860,10 +860,11 @@ export class TaskStore extends EventEmitter {
    * Sole gateway for protected execution control, lifecycle, and decision transitions.
    * Runs inside a short OS file lock, reads fresh state from disk, validates expected revision,
    * applies change, increments revision, and atomically writes.
+   * Legacy reviewer decisions recheck their run and round in change under this same lock.
    */
   public async transitionExecution(
     threadId: string,
-    expectedRevision: number,
+    expectedRevision: number | 'current-legacy-review',
     change: (thread: DelegationThread) => void,
   ): Promise<DelegationThread> {
     return this.withExecutionLock(threadId, async () => {
@@ -886,7 +887,11 @@ export class TaskStore extends EventEmitter {
         );
       }
       const currentRev = thread.execution?.revision ?? 0;
-      if (currentRev !== expectedRevision) {
+      if (expectedRevision === 'current-legacy-review') {
+        if (thread.execution?.version !== 1 || thread.execution.run?.state === 'stopping' || thread.execution.run?.unconfirmed) {
+          throw new Error('A review transition against the current record requires eligible legacy execution.');
+        }
+      } else if (currentRev !== expectedRevision) {
         throw new Error(
           `Execution revision mismatch for task ${threadId}: expected revision ${expectedRevision}, but found ${currentRev}`,
         );
