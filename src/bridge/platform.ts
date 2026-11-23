@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { ProcessIdentity } from './types';
+import { requestWindowsProcessHelper } from './windows-process-helper';
 
 /**
  * Platform facts the bridge needs at runtime.
@@ -407,6 +408,28 @@ export function getProcessBirthId(pid: number): string | undefined {
   return undefined;
 }
 
+/** Reads fresh OS identities and preserves the FILETIME strings used by older records. */
+export async function getProcessBirthIds(pids: number[]): Promise<Map<number, string>> {
+  const unique = [...new Set(pids.filter(pid => Number.isSafeInteger(pid) && pid > 0))];
+  const identities = new Map<number, string>();
+  if (!unique.length) return identities;
+  if (IS_WINDOWS && !customBirthIdProvider) {
+    try {
+      const reply = await requestWindowsProcessHelper({ operation: 'birthIds', pids: unique }) as Record<string, string>;
+      for (const pid of unique) {
+        const birthId = reply[pid];
+        if (typeof birthId === 'string' && /^\d+$/.test(birthId)) identities.set(pid, birthId);
+      }
+      return identities;
+    } catch {}
+  }
+  for (const pid of unique) {
+    const birthId = getProcessBirthId(pid);
+    if (birthId) identities.set(pid, birthId);
+  }
+  return identities;
+}
+
 export type ProcessProbeProvider = (pid: number, expectedBirthId?: string) => 'alive' | 'exited' | 'unknown';
 let customProbeProvider: ProcessProbeProvider | undefined;
 
@@ -443,6 +466,18 @@ export function probeProcessIdentity(
     return 'unknown';
   }
   return actualBirthId === expectedBirthId ? 'alive' : 'exited';
+}
+
+export async function probeProcessIdentityAsync(
+  pid: number,
+  expectedBirthId: string,
+): Promise<'alive' | 'exited' | 'unknown'> {
+  if (!IS_WINDOWS || customProbeProvider || customBirthIdProvider) return probeProcessIdentity(pid, expectedBirthId);
+  const observed = probeProcessIdentity(pid);
+  if (observed !== 'alive') return observed;
+  const actual = (await getProcessBirthIds([pid])).get(pid);
+  if (!actual) return probeProcessIdentity(pid) === 'exited' ? 'exited' : 'unknown';
+  return actual === expectedBirthId ? 'alive' : 'exited';
 }
 
 export type ConfirmProcessTreeExitProvider = (

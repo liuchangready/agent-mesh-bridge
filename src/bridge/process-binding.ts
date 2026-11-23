@@ -14,8 +14,10 @@ import {
   collectDescendants,
   confirmProcessTreeExit,
   getProcessBirthId,
+  getProcessBirthIds,
   isProcessStrictDescendant,
   probeProcessIdentity,
+  probeProcessIdentityAsync,
 } from './platform';
 
 export interface RunIdentity {
@@ -368,6 +370,16 @@ export function verifySubtreeOwnership(
   return false;
 }
 
+export async function verifyCapturedSubtreeOwnership(
+  pid: number,
+  child: ChildProcess | undefined,
+  birthId?: string,
+): Promise<boolean> {
+  if (!child?.pid || (birthId && await probeProcessIdentityAsync(child.pid, birthId) !== 'alive')) return false;
+  if (!verifySubtreeOwnership(pid, child)) return false;
+  return pid === child.pid || !birthId || await probeProcessIdentityAsync(child.pid, birthId) === 'alive';
+}
+
 export interface RegisterChildOptions {
   taskStore: TaskStore;
   threadId: string;
@@ -394,10 +406,14 @@ export interface RegisterChildResult {
 const CHILD_BINDING_IN_PROGRESS = Symbol('CHILD_BINDING_IN_PROGRESS');
 const CHILD_BINDING_ALREADY_REGISTERED = Symbol('CHILD_BINDING_ALREADY_REGISTERED');
 
-export function captureChildDescendants(rootPid: number, expectedRootBirthId?: string): ProcessIdentity[] {
+export async function captureChildDescendants(rootPid: number, expectedRootBirthId?: string): Promise<ProcessIdentity[]> {
   const rootBirthId = expectedRootBirthId || getProcessBirthId(rootPid);
-  if (!rootBirthId || probeProcessIdentity(rootPid, rootBirthId) !== 'alive') return [];
-  return collectDescendants(rootPid).map((pid) => ({ pid, birthId: getProcessBirthId(pid) }));
+  if (!rootBirthId || await probeProcessIdentityAsync(rootPid, rootBirthId) !== 'alive') return [];
+  const pids = collectDescendants(rootPid);
+  if (!pids.length) return [];
+  const birthIds = await getProcessBirthIds([rootPid, ...pids]);
+  const verifiedRoot = birthIds.get(rootPid) === rootBirthId;
+  return pids.map(pid => ({ pid, birthId: verifiedRoot ? birthIds.get(pid) : undefined }));
 }
 
 /**
@@ -438,33 +454,32 @@ export async function stopVerifiedChildTree(
   // birthId no longer matches, it exited or the PID was reused: never enumerate
   // children of that numeric PID, even when a new process currently owns it.
   const rootStatus = trustedBirthId
-    ? probeProcessIdentity(childPid, trustedBirthId)
+    ? await probeProcessIdentityAsync(childPid, trustedBirthId)
     : 'unknown';
   const rootWasVerifiedAlive = allowFreshSubtreeEnumeration && rootStatus === 'alive';
   let allIdentitiesKnown = Boolean(trustedBirthId) && rootStatus !== 'unknown';
 
   // 2. Retain only full identities already captured for this run when the root
   // is gone. Add fresh descendants only while the exact root identity is alive.
-  const descendantsByIdentity = new Map<string, ProcessIdentity>();
-  const addDescendant = (pid: number, birthId?: string, enumeratedFromLiveRoot = false) => {
+  const descendantsByIdentity = new Map<string, Required<ProcessIdentity>>();
+  const addDescendant = (pid: number, birthId?: string) => {
     if (!pid || pid === childPid || pid === process.pid) return;
     // Once the root is gone, an identity-less recorded descendant cannot be
     // resolved from its numeric PID: it may now name an unrelated process.
-    if (!birthId && !enumeratedFromLiveRoot) {
+    if (!birthId) {
       allIdentitiesKnown = false;
       return;
     }
-    const identity = birthId ? { pid, birthId } : { pid, birthId: getProcessBirthId(pid) };
-    if (!identity.birthId) {
-      if (probeProcessIdentity(pid) !== 'exited') allIdentitiesKnown = false;
-      return;
-    }
-    descendantsByIdentity.set(`${pid}:${identity.birthId}`, identity);
+    descendantsByIdentity.set(`${pid}:${birthId}`, { pid, birthId });
   };
   for (const item of knownDescendants) addDescendant(item.pid, item.birthId);
   if (rootWasVerifiedAlive) {
     try {
-      for (const descendantPid of collectDescendants(childPid)) addDescendant(descendantPid, undefined, true);
+      for (const descendant of await captureChildDescendants(childPid, trustedBirthId)) {
+        if (descendant.birthId || probeProcessIdentity(descendant.pid) !== 'exited') {
+          addDescendant(descendant.pid, descendant.birthId);
+        }
+      }
     } catch {
       allIdentitiesKnown = false;
     }
@@ -473,12 +488,12 @@ export async function stopVerifiedChildTree(
 
   // 3. Stop only captured descendants whose complete identity still matches.
   for (const item of descendantsToKill) {
-    const status = probeProcessIdentity(item.pid, item.birthId);
+    const status = await probeProcessIdentityAsync(item.pid, item.birthId);
     if (status === 'unknown') {
       allIdentitiesKnown = false;
       continue;
     }
-    if (status === 'alive' && probeProcessIdentity(item.pid, item.birthId) === 'alive') {
+    if (status === 'alive' && await probeProcessIdentityAsync(item.pid, item.birthId) === 'alive') {
       try { process.kill(item.pid, 'SIGKILL'); } catch {}
     }
   }
@@ -486,8 +501,8 @@ export async function stopVerifiedChildTree(
   // Re-check and stop the root only if the original identity is still alive.
   // On a missing/mismatched identity, a ChildProcess handle is not a reason to
   // enumerate or kill by PID; retain the unresolved result instead.
-  if (rootWasVerifiedAlive) {
-    const beforeRootStop = probeProcessIdentity(childPid, trustedBirthId);
+  if (rootWasVerifiedAlive && trustedBirthId) {
+    const beforeRootStop = await probeProcessIdentityAsync(childPid, trustedBirthId);
     if (beforeRootStop === 'alive') {
       try {
         if (hasValidChildHandle) childProcess!.kill('SIGKILL');
@@ -511,7 +526,7 @@ export async function stopVerifiedChildTree(
   while (Date.now() < deadline) {
     let allExited = true;
     for (const identity of allTargetsToCheck) {
-      if (!identity.birthId || probeProcessIdentity(identity.pid, identity.birthId) !== 'exited') {
+      if (!identity.birthId || await probeProcessIdentityAsync(identity.pid, identity.birthId) !== 'exited') {
         allExited = false;
         break;
       }
@@ -531,7 +546,7 @@ export async function stopVerifiedChildTree(
   // Final check at deadline. A missing or unknown captured identity must never
   // be treated as proof that its process tree exited.
   for (const identity of allTargetsToCheck) {
-    if (!identity.birthId || probeProcessIdentity(identity.pid, identity.birthId) !== 'exited') return false;
+    if (!identity.birthId || await probeProcessIdentityAsync(identity.pid, identity.birthId) !== 'exited') return false;
   }
   return allIdentitiesKnown;
 }
@@ -646,7 +661,7 @@ export async function registerRunChildV2(
       return { success: false, inProgress: true, error: 'Child binding already has an owner' };
     }
     const existingStatus = currentChild.birthId
-      ? probeProcessIdentity(currentChild.pid, currentChild.birthId)
+      ? await probeProcessIdentityAsync(currentChild.pid, currentChild.birthId)
       : 'unknown';
     if (existingStatus === 'alive' || existingStatus === 'unknown') {
       return { success: false, inProgress: true, error: `Run already owns child ${currentChild.pid}` };
@@ -690,24 +705,23 @@ export async function registerRunChildV2(
   }
 
   // Current OS identity validates the immutable spawn-time value only.
-  const realBirthId = getProcessBirthId(childPid);
+  const realBirthId = (await getProcessBirthIds([childPid])).get(childPid);
   if (realBirthId && realBirthId.trim() !== capturedBirthId) {
     return failUnconfirmed(
       `BirthId mismatch for PID ${childPid}: captured ${capturedBirthId}, current ${realBirthId}`,
       `PID_BIRTHID_MISMATCH: Child PID ${childPid} birthId mismatch`,
     );
   }
-  if (probeProcessIdentity(childPid, capturedBirthId) !== 'alive') {
+  if (await probeProcessIdentityAsync(childPid, capturedBirthId) !== 'alive') {
     return failUnconfirmed(
       `Could not verify the captured child identity ${childPid}/${capturedBirthId}`,
       `CHILD_IDENTITY_UNVERIFIABLE: Captured child ${childPid} is no longer verified alive`,
     );
   }
 
-  const belongsToSubtree = verifySubtreeOwnership(
+  const belongsToSubtree = await verifyCapturedSubtreeOwnership(
     childPid,
     options.childProcess,
-    undefined,
     capturedBirthId,
   );
   if (!belongsToSubtree) {

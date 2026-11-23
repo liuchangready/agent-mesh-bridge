@@ -35,6 +35,7 @@ import { cleanupThreadNativeSessions, collectThreadSessionRefs } from './native-
 import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
 import { removeTaskDataDir } from './task-data-dir';
 import { MeshFileLock } from './mesh-file-lock';
+import { WindowsTaskLock } from './windows-process-helper';
 import {
   validateV2ExecutionEligibility,
   ExecutionEligibilityResult,
@@ -50,7 +51,7 @@ export {
 export const MAX_STORED_TASKS = 1000;
 
 export type ExecutionLockFactory = (lockPath: string) => {
-  acquire(onWait?: () => void, cancelled?: () => boolean, timeoutMs?: number): Promise<(() => void) | undefined>;
+  acquire(onWait?: () => void, cancelled?: () => boolean, timeoutMs?: number): Promise<(() => void | Promise<void>) | undefined>;
   dispose(): void;
 };
 
@@ -795,8 +796,7 @@ export class TaskStore extends EventEmitter {
 
   /**
    * Sole gateway for acquiring the per-task execution OS lock.
-   * Reuses MeshFileLock (or test lockFactory) across processes and uses
-   * an in-process queue to strictly serialize concurrent transitions within the same process.
+   * Both Windows helpers and legacy writers contend for the same OS mutex.
    */
   private async withExecutionLock<T>(threadId: string, fn: () => T | Promise<T>): Promise<T> {
     const prev = this.taskExecutionQueues.get(threadId) || Promise.resolve();
@@ -807,18 +807,19 @@ export class TaskStore extends EventEmitter {
     await prev;
     try {
       const lockFile = this.taskLockFilePath(threadId);
-      const lock = this.lockFactory ? this.lockFactory(lockFile) : new MeshFileLock(lockFile);
+      const lock = this.lockFactory?.(lockFile) ??
+        (process.platform === 'win32' ? new WindowsTaskLock(lockFile) : new MeshFileLock(lockFile));
       this.activeLocks.add(lock);
-      const release = await lock.acquire(undefined, undefined, 15_000);
-      if (!release) {
-        this.activeLocks.delete(lock);
-        throw new Error(`Timed out acquiring task execution lock for ${threadId}: ${lockFile}`);
-      }
       try {
-        return await fn();
+        const release = await lock.acquire(undefined, undefined, 15_000);
+        if (!release) throw new Error(`Timed out acquiring task execution lock for ${threadId}: ${lockFile}`);
+        try {
+          return await fn();
+        } finally {
+          await release();
+        }
       } finally {
         this.activeLocks.delete(lock);
-        release();
         lock.dispose();
       }
     } finally {

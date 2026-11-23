@@ -13,6 +13,7 @@ import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { TaskRoleLock } from '../bridge/task-role-lock';
 import { NativeSessionLock } from '../bridge/native-session-lock';
 import { MeshFileLock } from '../bridge/mesh-file-lock';
+import { WindowsTaskLock } from '../bridge/windows-process-helper';
 import {
   DelegationThread,
   ExecutionControl,
@@ -681,7 +682,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         roleLock,
         sessionLock,
         registry,
-        { storageDir, standingScanIntervalMs: 0 },
+        { storageDir, standingScanIntervalMs: 0, streamSyncIntervalMs: 60_000 },
       );
       (controller as any).handlePhaseOutcome = async () => {
         phaseOutcomeCount++;
@@ -744,6 +745,30 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       if (pidA && birthA && probeProcessIdentity(pidA, birthA) === 'alive') {
         try { process.kill(pidA, 'SIGKILL'); } catch {}
       }
+      cleanTempDir(storageDir);
+    }
+  });
+
+  test('Windows task helper retains exclusivity while serving other mutexes', { skip: process.platform !== 'win32' }, async () => {
+    const storageDir = createTempDir('windows-task-lock');
+    const first = new WindowsTaskLock(path.join(storageDir, 'first.lock'));
+    const same = new WindowsTaskLock(path.join(storageDir, 'first.lock'));
+    const other = new WindowsTaskLock(path.join(storageDir, 'other.lock'));
+    try {
+      const releaseFirst = await first.acquire();
+      assert.ok(releaseFirst);
+      const releaseOther = await other.acquire();
+      assert.ok(releaseOther);
+      await releaseOther();
+      assert.strictEqual(await same.acquire(undefined, undefined, 100), undefined);
+      await releaseFirst();
+      const releaseSame = await same.acquire();
+      assert.ok(releaseSame);
+      await releaseSame();
+    } finally {
+      first.dispose();
+      same.dispose();
+      other.dispose();
       cleanTempDir(storageDir);
     }
   });
@@ -2260,7 +2285,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       assert.ok(pid > 0, `Grandchild must have been spawned; got "${grandchildPidStr}"`);
 
       const parentBirthId = getProcessBirthId(parentPid);
-      const capturedDescendants = captureChildDescendants(parentPid);
+      const capturedDescendants = await captureChildDescendants(parentPid);
       assert.ok(capturedDescendants.some((identity) => identity.pid === pid), 'the grandchild identity is captured before the root exits');
       const knownBirthIds = new Map<number, string | undefined>([
         [parentPid, parentBirthId],

@@ -57,7 +57,7 @@ import {
   registerRunChildV2,
   recordLaunchRecoveryFailure,
   stopVerifiedChildTree,
-  verifySubtreeOwnership,
+  verifyCapturedSubtreeOwnership,
   RunIdentity,
 } from './process-binding';
 import { validateV2ExecutionEligibility } from './execution-gate';
@@ -954,10 +954,11 @@ export class ExecutionController {
     let registrationUnconfirmed = false;
     let stopTrackedInFlight: Promise<boolean> | undefined;
     const processIdentityKey = (identity: ProcessIdentity) => `${identity.pid}:${identity.birthId ?? 'unknown'}`;
-    const refreshDescendants = (tracked: TrackedChild) => {
-      if (!tracked.belongsToSubtree || !tracked.birthId || probeProcessIdentity(tracked.pid, tracked.birthId) !== 'alive') return;
+    const refreshDescendants = async (tracked: TrackedChild) => {
+      if (!tracked.belongsToSubtree || !tracked.birthId) return;
+      const captured = await captureChildDescendants(tracked.pid, tracked.birthId);
       const known = new Map(tracked.descendants.map((identity) => [processIdentityKey(identity), identity]));
-      for (const identity of captureChildDescendants(tracked.pid, tracked.birthId)) {
+      for (const identity of captured) {
         known.set(processIdentityKey(identity), identity);
       }
       tracked.descendants.splice(0, tracked.descendants.length, ...known.values());
@@ -972,7 +973,7 @@ export class ExecutionController {
             allStopped = false;
             continue;
           }
-          refreshDescendants(tracked);
+          await refreshDescendants(tracked);
           let stopped = false;
           try {
             stopped = await stopVerifiedChildTree(
@@ -998,7 +999,8 @@ export class ExecutionController {
     };
     const checkpointTimer = setInterval(async () => {
       if (aborted || this.isDisposed) return;
-      for (const tracked of trackedChildren.values()) refreshDescendants(tracked);
+      for (const tracked of trackedChildren.values()) await refreshDescendants(tracked);
+      if (aborted || this.isDisposed) return;
       const now = this.monotonicNow();
       guard.sync();
       const suspended = guard.suspendedWithin(lastMonotonic, now);
@@ -1056,19 +1058,20 @@ export class ExecutionController {
       // identity before gathering any subtree evidence. A rejected candidate
       // must never contribute PIDs to the stop set.
       const candidateBirthId = childBirthId?.trim() || undefined;
-      const belongsToSubtree = verifySubtreeOwnership(pid, childProcess, undefined, candidateBirthId);
-      const descendants = belongsToSubtree && candidateBirthId
-        ? captureChildDescendants(pid, candidateBirthId)
-        : [];
       const tracked: TrackedChild = {
         pid,
         birthId: candidateBirthId,
         process: childProcess,
-        descendants,
-        belongsToSubtree,
+        descendants: [],
+        belongsToSubtree: false,
         stopConfirmed: false,
       };
       trackedChildren.set(trackedKey, tracked);
+      const belongsToSubtree = await verifyCapturedSubtreeOwnership(pid, childProcess, candidateBirthId);
+      if (belongsToSubtree && candidateBirthId) {
+        tracked.descendants = await captureChildDescendants(pid, candidateBirthId);
+      }
+      tracked.belongsToSubtree = belongsToSubtree;
 
       const reg = await registerRunChildV2({
         taskStore: this.taskStore,
@@ -1086,7 +1089,7 @@ export class ExecutionController {
         childDescendants: tracked.descendants,
         childProcess,
         attachLeases: async (p) => {
-          if (sessionLease) this.sessionLock.attachChild(sessionLease, p);
+          if (sessionLease) await this.sessionLock.attachChild(sessionLease, p);
           if (mergeRelease) await this.mergeLock.attachChildPid(p, undefined, candidateBirthId);
           this.executionRegistry.attachChildPid(p, registration);
         },

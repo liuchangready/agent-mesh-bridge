@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { spawn } from 'child_process';
+import { windowsMeshMutexName } from './windows-process-helper';
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const CHILD_ACK_TIMEOUT_MS = 10_000;
@@ -407,8 +408,8 @@ export class MeshFileLock {
   }
 
   private startLockHelper(token: string, channelPath: string): import('child_process').ChildProcess {
-    const mutexName = `AgentMeshMerge_${crypto.createHash('sha256').update(path.resolve(this.lockPath).toLowerCase()).digest('hex').slice(0, 32)}`;
     if (process.platform === 'win32') {
+      const mutexName = windowsMeshMutexName(this.lockPath);
       const helperPath = `${this.lockPath}.${token}.mutex-helper.ps1`;
       const script = `$ErrorActionPreference = 'Stop'
 $mutex = [System.Threading.Mutex]::new($false, $args[0])
