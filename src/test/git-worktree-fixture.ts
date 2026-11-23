@@ -100,6 +100,24 @@ export async function waitFor(file: string, attempts = 300): Promise<void> {
   throw new Error(`Timed out waiting for ${file}`);
 }
 
+export async function waitForValidationStart(
+  signal: string,
+  merge: Promise<{ status: string; message: string }>,
+  timeoutMs = 60_000,
+): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  let settled: Error | undefined;
+  void merge.then(
+    result => { settled = new Error(`Merge finished before validation started (${result.status}): ${result.message}`); },
+    error => { settled = new Error('Merge rejected before validation started', { cause: error }); },
+  );
+  while (!fs.existsSync(signal)) {
+    if (settled) throw settled;
+    if (performance.now() >= deadline) throw new Error(`Timed out after ${timeoutMs} ms waiting for validation start: ${signal}`);
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+}
+
 export async function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   await new Promise<void>((resolve) => child.once('exit', () => resolve()));

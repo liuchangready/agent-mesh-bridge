@@ -15,7 +15,7 @@ import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { ReworkController } from '../bridge/rework-controller';
-import { git, assertSameExistingPath, initRepo, thread, waitFor } from './git-worktree-fixture';
+import { git, assertSameExistingPath, initRepo, thread, waitFor, waitForValidationStart } from './git-worktree-fixture';
 
 function reviewStub(detector: AgentDetector, storage: string): CallbackManager {
   const manager = new CallbackManager(detector, storage);
@@ -407,7 +407,7 @@ test('two tasks edit the same file in independent worktrees and integrate serial
   let mergeB: ReturnType<typeof coordinator.mergeApproved> | undefined;
   const releaseA = () => fs.writeFileSync(path.join(signals, 'thread_merge_A.release'), 'go');
   try {
-  await waitFor(path.join(signals, 'thread_merge_A.entered'), 60_000);
+  await waitForValidationStart(path.join(signals, 'thread_merge_A.entered'), mergeA);
   assert.equal(new TaskRoleLock(storage).tryAcquire('thread_merge_A', 'reviewer'), null, 'reviewer cannot overlap merge validation');
 
   // A is inside its real combined verification while holding the mesh mutex.
@@ -437,7 +437,7 @@ test('two tasks edit the same file in independent worktrees and integrate serial
   assert.strictEqual(resultA.status, 'merged');
   const commitA = resultA.commit!;
 
-  await waitFor(path.join(signals, 'thread_merge_B.entered'));
+  await waitForValidationStart(path.join(signals, 'thread_merge_B.entered'), mergeB);
   assert.equal(store.getTask('thread_merge_B')?.status, 'merging');
   process.env.MESH_VALIDATION_HOLD_THREAD = '';
   const resultB = await mergeB;

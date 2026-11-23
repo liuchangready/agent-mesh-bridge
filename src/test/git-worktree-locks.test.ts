@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -6,7 +6,7 @@ import * as path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import { createRequire } from 'module';
 import { resolveGitRepository, createTaskWorktree, commitTaskChanges, gitOutput } from '../bridge/git-worktree';
-import { buildPosixLockHelperCommand, MergeCoordinator, MeshFileLock } from '../bridge/merge-coordinator';
+import { buildPosixLockHelperCommand, MergeCoordinator, MeshFileLock, type MergeResult } from '../bridge/merge-coordinator';
 import { TaskRoleLock } from '../bridge/task-role-lock';
 import { TaskStore } from '../bridge/task-store';
 import { DelegationThread } from '../bridge/types';
@@ -17,7 +17,47 @@ import { CallbackManager } from '../bridge/callback-manager';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { ReworkController } from '../bridge/rework-controller';
 import { getProcessBirthId } from '../bridge/platform';
-import { gitExe, git, initRepo, thread, waitFor, waitForExit, waitForProcessExit } from './git-worktree-fixture';
+import { gitExe, git, initRepo, thread, waitFor, waitForExit, waitForProcessExit, waitForValidationStart } from './git-worktree-fixture';
+
+function trackValidationMerges(
+  t: TestContext, root: string, signals: string, store: TaskStore, control: TaskControlService,
+) {
+  const active = new Map<string, Promise<MergeResult>>();
+  t.after(async () => {
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      const outstanding = [...active];
+      for (const [threadId] of outstanding) {
+        const status = store.getTask(threadId)?.status;
+        try {
+          if (status === 'queued' || status === 'merging') control.pauseTask(threadId, 'Validation fixture teardown', 'test');
+        } finally {
+          fs.writeFileSync(path.join(signals, `${threadId}.release`), 'release');
+        }
+      }
+      if (outstanding.length) {
+        await Promise.race([
+          Promise.allSettled(outstanding.map(([, merge]) => merge)),
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => reject(new Error(`Merge cleanup timed out; fixture retained at ${root}`)), 60_000);
+          }),
+        ]);
+      }
+    } finally {
+      clearTimeout(timeout);
+      store.dispose();
+      delete process.env.MESH_VALIDATION_SIGNAL_DIR;
+      delete process.env.MESH_VALIDATION_HOLD_THREAD;
+    }
+    await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  return (threadId: string, merge: Promise<MergeResult>) => {
+    active.set(threadId, merge);
+    const done = () => { active.delete(threadId); };
+    void merge.then(done, done);
+    return merge;
+  };
+}
 
 test('unpublished child command files survive helper scans without losing child protection', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-lock-unpublished-'));
@@ -416,24 +456,27 @@ test('a dead lock worker rejects child registration, stops validation, and leave
   fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A worker failed\nmiddle\nbeta\n');
   worktree.headCommit = commitTaskChanges(worktree, 'approved with dead helper');
   const store = new TaskStore(storage);
-  t.after(() => { store.dispose(); delete process.env.MESH_VALIDATION_SIGNAL_DIR; delete process.env.MESH_VALIDATION_HOLD_THREAD; fs.rmSync(root, { recursive: true, force: true }); });
   store.upsertTask(thread('thread_merge_A', worktree));
   process.env.MESH_VALIDATION_SIGNAL_DIR = signals;
   process.env.MESH_VALIDATION_HOLD_THREAD = 'thread_merge_A';
   const lock = new MeshFileLock(path.join(root, 'merge.lock'));
+  const control = new TaskControlService(store, undefined, undefined, storage, undefined, lock);
+  const track = trackValidationMerges(t, root, signals, store, control);
   const originalAttach = lock.attachChildPid.bind(lock);
   let validationPid: number | undefined;
+  let started: Promise<void>;
   lock.attachChildPid = async (pid, cancelled) => {
     if (new TaskExecutionRegistry(storage).getOwner('thread_merge_A')?.agent !== 'merge-validation') return originalAttach(pid, cancelled);
     validationPid = pid;
-    await waitFor(path.join(signals, 'thread_merge_A.entered'));
+    await started;
     const helperPid = JSON.parse(fs.readFileSync(`${lock.lockPath}.owner.json`, 'utf8')).helperPid as number;
     process.kill(helperPid, 'SIGKILL');
     await originalAttach(pid, cancelled);
   };
   const coordinator = new MergeCoordinator(store, storage, lock);
-  const resultPromise = coordinator.mergeApproved('thread_merge_A');
-  await waitFor(path.join(signals, 'thread_merge_A.entered'));
+  const resultPromise = track('thread_merge_A', coordinator.mergeApproved('thread_merge_A'));
+  started = waitForValidationStart(path.join(signals, 'thread_merge_A.entered'), resultPromise);
+  await started;
   const result = await resultPromise;
   assert.equal(result.status, 'validation_failed');
   assert.match(result.message, /helper exited|acknowledge|timed out/i);
@@ -494,13 +537,14 @@ test('pause stops combined validation and forced delete waits for it before clea
   const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); const signals = path.join(root, 'signals');
   fs.mkdirSync(signals); initRepo(repository);
   const target = resolveGitRepository(repository, storage); const store = new TaskStore(storage);
-  t.after(() => { store.dispose(); delete process.env.MESH_VALIDATION_SIGNAL_DIR; delete process.env.MESH_VALIDATION_HOLD_THREAD; fs.rmSync(root, { recursive: true, force: true }); });
   process.env.MESH_VALIDATION_SIGNAL_DIR = signals;
   const lock = new MeshFileLock(path.join(root, 'merge.lock')); const coordinator = new MergeCoordinator(store, storage, lock);
   const control = new TaskControlService(store, undefined, undefined, storage, undefined, lock);
+  const track = trackValidationMerges(t, root, signals, store, control);
   const a = createTaskWorktree(target, 'thread_merge_A', storage); fs.writeFileSync(path.join(a.path, 'shared.txt'), 'A paused\nmiddle\nbeta\n'); a.headCommit = commitTaskChanges(a, 'A');
   store.upsertTask(thread('thread_merge_A', a)); process.env.MESH_VALIDATION_HOLD_THREAD = 'thread_merge_A';
-  const mergeA = coordinator.mergeApproved('thread_merge_A'); await waitFor(path.join(signals, 'thread_merge_A.entered'));
+  const mergeA = track('thread_merge_A', coordinator.mergeApproved('thread_merge_A'));
+  await waitForValidationStart(path.join(signals, 'thread_merge_A.entered'), mergeA);
   control.pauseTask('thread_merge_A', 'stop validation', 'test');
   assert.equal((await mergeA).status, 'stale');
   const cancelledValidation = store.getTask('thread_merge_A')!.worktree!.validation!;
@@ -512,7 +556,8 @@ test('pause stops combined validation and forced delete waits for it before clea
 
   const b = createTaskWorktree(target, 'thread_merge_B', storage); fs.writeFileSync(path.join(b.path, 'shared.txt'), 'alpha\nmiddle\nB cancelled\n'); b.headCommit = commitTaskChanges(b, 'B');
   store.upsertTask(thread('thread_merge_B', b)); process.env.MESH_VALIDATION_HOLD_THREAD = 'thread_merge_B';
-  const mergeB = coordinator.mergeApproved('thread_merge_B'); await waitFor(path.join(signals, 'thread_merge_B.entered'));
+  const mergeB = track('thread_merge_B', coordinator.mergeApproved('thread_merge_B'));
+  await waitForValidationStart(path.join(signals, 'thread_merge_B.entered'), mergeB);
   const deleting = control.deleteTask('thread_merge_B', 'discard failed validation', 'test', true);
   assert.equal((await mergeB).status, 'stale');
   assert.equal((await deleting).status, 'DELETED');
