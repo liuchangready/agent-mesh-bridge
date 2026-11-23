@@ -51,6 +51,7 @@ import { NativeSessionLock } from './native-session-lock';
 import { CancellationRegistry } from './cancellation-registry';
 import { ExecutionController } from './execution-controller';
 import { requireV2ExecutionEligibility } from './execution-gate';
+import { reviewDependencyIssue } from './review-wake';
 
 export class ReworkController {
   private taskStore: TaskStore;
@@ -940,12 +941,12 @@ export class ReworkController {
    * Unlike `pause_task` this is not a user interruption: it records no
    * `interruption`, keeps the review round intact, and needs no manual resume.
    */
-  public blockReview(params: {
+  public async blockReview(params: {
     threadId: string;
     reason?: string;
     waitingForThreadId?: string;
     by?: string;
-  }): { threadId: string; status: ThreadStatus; waitingForThreadId?: string; message: string } {
+  }): Promise<{ threadId: string; status: ThreadStatus; waitingForThreadId?: string; message: string }> {
     this.assertExecutionAdmission('change review state');
     const thread = this.taskStore.getTask(params.threadId);
     if (thread) assertDedicatedTask(thread);
@@ -963,21 +964,41 @@ export class ReworkController {
       throw new Error(`Cannot block review: ${describeRoundInFlight(thread, inFlight)}`);
     }
 
-    const nowIso = new Date().toISOString();
-    thread.reviewBlocked = {
-      waitingForThreadId: params.waitingForThreadId,
-      reason: params.reason?.slice(0, 500),
-      at: nowIso,
-      by: params.by || 'caller',
+    const park = (task: DelegationThread) => {
+      const nowIso = new Date().toISOString();
+      task.reviewBlocked = {
+        waitingForThreadId: params.waitingForThreadId,
+        reason: params.reason?.slice(0, 500),
+        at: nowIso,
+        by: params.by || 'caller',
+      };
+      task.reviewWake = undefined;
+      task.updatedAt = nowIso;
+      task.summary.lastOutputSnippet = params.waitingForThreadId
+        ? `Blocked: waiting for ${params.waitingForThreadId}`
+        : 'Blocked: waiting for an external dependency';
     };
-    // The review is not stalled — it is deliberately parked. Clearing the wake
-    // plan keeps the watchdog and the retry timer out of the way.
-    thread.reviewWake = undefined;
-    thread.updatedAt = nowIso;
-    thread.summary.lastOutputSnippet = params.waitingForThreadId
-      ? `Blocked: waiting for ${params.waitingForThreadId}`
-      : 'Blocked: waiting for an external dependency';
-    this.taskStore.upsertTask(thread);
+
+    if (thread.execution?.version === 2) {
+      await this.taskStore.transitionExecution(thread.threadId, thread.execution.revision, fresh => {
+        const execution = fresh.execution;
+        if (execution?.version !== 2 || execution.phase !== 'review' || execution.next || fresh.cleanup ||
+            execution.run?.state === 'stopping' || execution.run?.unconfirmed || fresh.status !== 'reviewing') {
+          throw new Error('Cannot block review: the current review changed before it could be parked.');
+        }
+        const issue = reviewDependencyIssue(fresh.threadId, params.waitingForThreadId, id => this.taskStore.getTask(id));
+        if (issue) throw new Error(`Cannot block review: ${issue}`);
+        const sameDependency = fresh.reviewBlocked?.waitingForThreadId === params.waitingForThreadId;
+        const queue = execution.queue;
+        const enteredAt = sameDependency && queue?.reason === 'dependency' ? queue.enteredAt : undefined;
+        park(fresh);
+        execution.queue = { reason: 'dependency', notBefore: queue?.notBefore,
+          enteredAt: enteredAt ?? fresh.reviewBlocked!.at };
+      });
+    } else {
+      park(thread);
+      this.taskStore.upsertTask(thread);
+    }
 
     return {
       threadId: thread.threadId,

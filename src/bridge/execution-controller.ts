@@ -33,7 +33,7 @@ import {
   shouldResumeNativeSession,
 } from './types';
 import { TaskStore } from './task-store';
-import { reopenFailedReview } from './review-wake';
+import { applyReviewFailure, reopenFailedReview, reviewBlockDependencyId, reviewDependencyIssue } from './review-wake';
 import { AutonomousRunner, RunResult } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
 import { MergeCoordinator, MergeResult } from './merge-coordinator';
@@ -48,6 +48,7 @@ import {
   isProcessDescendant,
   killPidTree,
   probeProcessIdentity,
+  probeProcessIdentityAsync,
 } from './platform';
 import { gitOutput } from './git-worktree';
 import { ConcurrencyPolicy, concurrencyPolicy } from './bridge-policy';
@@ -77,6 +78,24 @@ interface StartExecutionOptions {
   operationId?: string;
   generation?: number;
   allowStates?: ThreadStatus[];
+  onMergeAdmission?: () => void;
+}
+
+function v2SlotAgent(task: DelegationThread): AgentId | undefined {
+  const execution = task.execution;
+  if (execution?.version !== 2 || !execution.run) return undefined;
+  if (execution.run.purpose === 'native_maintenance') {
+    return execution.run.role === 'reviewer' ? task.initiatorAgent : task.targetAgent;
+  }
+  if (execution.phase === 'develop') return task.targetAgent;
+  if (execution.phase === 'review') return task.initiatorAgent;
+  return undefined;
+}
+
+function mergeQueueTime(task: DelegationThread): number {
+  const enteredAt = Date.parse(task.execution?.queue?.enteredAt ?? '');
+  const createdAt = Date.parse(task.createdAt);
+  return Number.isFinite(enteredAt) ? enteredAt : Number.isFinite(createdAt) ? createdAt : Number.MAX_SAFE_INTEGER;
 }
 
 export interface ExecutionControllerOptions {
@@ -116,6 +135,8 @@ export class ExecutionController {
   private readonly backoffTimers = new Map<string, NodeJS.Timeout>();
   private readonly threadTransitionChains = new Map<string, Promise<any>>();
   private standingScanTimer: NodeJS.Timeout | undefined;
+  private drainInFlight?: Promise<void>;
+  private releaseWake?: NodeJS.Immediate;
   private isDisposed = false;
 
   /** Legacy v1 locks are constructed only if a v1 path actually needs them. */
@@ -173,6 +194,7 @@ export class ExecutionController {
         }
       }, scanInterval);
       this.standingScanTimer.unref?.();
+      this.taskStore.on('changed', this.onDependencyChanged);
     }
   }
 
@@ -310,13 +332,55 @@ export class ExecutionController {
         task = await this.transitionTask(threadId, (fresh) => {
           if (!canWake(fresh)) throw new Error('Review is no longer available for wake.');
           reopenFailedReview(fresh);
-          if (unblock) fresh.reviewBlocked = undefined;
+          if (unblock) {
+            fresh.reviewBlocked = undefined;
+            if (fresh.execution?.queue?.reason === 'dependency') fresh.execution.queue = undefined;
+          }
         });
       } catch { return false; }
     }
-    return (await this.startExecutionV2(threadId, 'review', {
+    return (await this.startExecution(threadId, 'review', {
       operationId: task.execution!.operationId, generation: task.execution!.generation, allowStates: ['reviewing'],
     })).started;
+  }
+
+  private v2DependencyResult(task: DelegationThread, phase: ExecutionPhase): 'completed' | 'failed' | undefined {
+    const dependencyId = reviewBlockDependencyId(task);
+    if (phase !== 'review' || !dependencyId || dependencyId === task.threadId) return undefined;
+    const dependency = this.taskStore.getTask(dependencyId);
+    if (dependency?.execution?.run) return undefined;
+    return dependency?.status === 'completed' || dependency?.status === 'failed' ? dependency.status : undefined;
+  }
+
+  private async failInvalidV2Dependency(thread: DelegationThread): Promise<void> {
+    await this.taskStore.transitionExecution(thread.threadId, thread.execution!.revision, task => {
+      const execution = task.execution;
+      if (execution?.version !== 2 || execution.phase !== 'review' || execution.run || execution.next ||
+          task.cleanup || !['reviewing', 'queued'].includes(task.status)) {
+        throw new Error('The parked review changed.');
+      }
+      const reason = reviewDependencyIssue(task.threadId, reviewBlockDependencyId(task), id => this.taskStore.getTask(id));
+      if (!reason) throw new Error('The dependency is available again.');
+      task.status = 'reviewing';
+      task.reviewBlocked = undefined;
+      if (execution.queue?.reason === 'dependency') execution.queue = undefined;
+      applyReviewFailure(task, { kind: 'unresolvable_park', reason, by: 'execution_controller' });
+    });
+  }
+
+  private v2StartBlocker(task: DelegationThread, phase: ExecutionPhase): string | undefined {
+    const queue = task.execution?.queue;
+    if (queue?.notBefore !== undefined) {
+      const notBefore = Date.parse(queue.notBefore);
+      if (!Number.isFinite(notBefore)) return 'not_before_unverifiable';
+      if (this.wallClockNow() < notBefore) return 'not_before';
+    }
+    if (queue?.reason === 'merge_lock_error') return 'merge_lock_error_requires_intervention';
+    if ((task.reviewBlocked || queue?.reason === 'dependency') && !this.v2DependencyResult(task, phase)) {
+      return 'dependency_pending';
+    }
+    if (phase === 'develop' && isReviewerBootstrapPending(task)) return 'reviewer_bootstrap_pending';
+    return undefined;
   }
 
   private async startExecutionAttempt(
@@ -686,27 +750,6 @@ export class ExecutionController {
       }
       return { started: false, reason: 'merge_lock_error_requires_intervention' };
     }
-    if (thread.execution?.queue?.notBefore) {
-      const notBefore = Date.parse(thread.execution.queue.notBefore);
-      if (!Number.isFinite(notBefore)) return { started: false, reason: 'not_before_unverifiable' };
-      if (this.wallClockNow() < notBefore) return { started: false, reason: 'not_before' };
-    }
-    if (thread.execution?.queue?.reason === 'merge_lock_error') {
-      return { started: false, reason: 'merge_lock_error_requires_intervention' };
-    }
-    const elapsedBackoff = this.backoffTimers.get(threadId);
-    if (elapsedBackoff) {
-      clearTimeout(elapsedBackoff);
-      this.backoffTimers.delete(threadId);
-    }
-
-    // Budget exhaustion pre-check
-    const limitMs = thread.execution?.budget?.limitMs ?? this.defaultBudgetLimitMs;
-    const spentActiveMs = thread.execution?.budget?.spentActiveMs ?? 0;
-    if (spentActiveMs >= limitMs) {
-      return { started: false, reason: 'budget_exhausted' };
-    }
-
     // A persisted next handoff is consumed only by the CAS that claims the target run.
     const pendingNext = thread.execution?.next;
     // Determine target phase and role
@@ -721,10 +764,18 @@ export class ExecutionController {
           : 'develop');
     const role: 'developer' | 'reviewer' = phase === 'develop' ? 'developer' : 'reviewer';
 
-    // Dedicated reviewer bootstrap check
-    if (phase === 'develop' && isReviewerBootstrapPending(thread)) {
-      return { started: false, reason: 'reviewer_bootstrap_pending' };
+    if (options?.onMergeAdmission && phase !== 'merge') return { started: false, reason: 'candidate_changed' };
+    const blocker = this.v2StartBlocker(thread, phase);
+    if (blocker) return { started: false, reason: blocker };
+
+    const elapsedBackoff = this.backoffTimers.get(threadId);
+    if (elapsedBackoff) {
+      clearTimeout(elapsedBackoff);
+      this.backoffTimers.delete(threadId);
     }
+    const limitMs = thread.execution?.budget?.limitMs ?? this.defaultBudgetLimitMs;
+    const spentActiveMs = thread.execution?.budget?.spentActiveMs ?? 0;
+    if (spentActiveMs >= limitMs) return { started: false, reason: 'budget_exhausted' };
 
     // Check owner identity
     const ownerPid = process.pid;
@@ -781,10 +832,23 @@ export class ExecutionController {
     const initialOperationId = pendingNext ? undefined : options?.operationId ?? thread.execution?.operationId;
     const initialPhase = phase;
     const initialRound = pendingNext?.round ?? thread.execution?.round ?? thread.currentRound ?? 1;
+    const policy = phase === 'merge' ? undefined : concurrencyPolicy(this.storageDir);
+    const exitedRuns = new Map<string, number>();
+    if (policy?.enabled) {
+      // Probe before the short write lock. Newly published runs still count
+      // when the capacity check re-reads the ledger inside the CAS.
+      await Promise.all(this.taskStore.getAllTasks().map(async task => {
+        const run = task.execution?.run;
+        if (task.threadId === threadId || !v2SlotAgent(task) || !run?.owner?.birthId || run.unconfirmed ||
+            await this.probeRunOwner(run.owner) !== 'exited') return;
+        if (this.probeRun(task.threadId, run) === 'exited') exitedRuns.set(task.threadId, task.execution!.revision);
+      }));
+    }
 
     // Unique run acquisition under task short lock
     const runId = crypto.randomUUID();
     let isDuplicateRequest = false;
+    let capacityBlocker: 'capacity_limit' | 'capacity_limit_agent' | undefined;
     let runBusyError: string | undefined;
     let finalRunId: string = runId;
     let finalGeneration = initialGeneration;
@@ -814,11 +878,8 @@ export class ExecutionController {
           if (t.cleanup) {
             throw new Error('CLEANUP_IN_PROGRESS');
           }
-          if (t.execution?.queue?.notBefore) {
-            const notBefore = Date.parse(t.execution.queue.notBefore);
-            if (!Number.isFinite(notBefore)) throw new Error('NOT_BEFORE_UNVERIFIABLE');
-            if (this.wallClockNow() < notBefore) throw new Error('NOT_BEFORE');
-          }
+          const currentBlocker = this.v2StartBlocker(t, phase);
+          if (currentBlocker) throw new Error(currentBlocker);
           if (t.execution?.generation !== initialGeneration) {
             throw new Error(`GENERATION_MISMATCH: expected ${initialGeneration}, found ${t.execution?.generation}`);
           }
@@ -863,6 +924,31 @@ export class ExecutionController {
             }
           }
 
+          if (policy?.enabled) {
+            const occupied = this.taskStore.getAllTasks()
+              .filter(task => task.threadId !== threadId && task.execution?.revision !== exitedRuns.get(task.threadId))
+              .map(v2SlotAgent).filter(agent => agent !== undefined);
+            const agent = phase === 'develop' ? t.targetAgent : t.initiatorAgent;
+            capacityBlocker = occupied.length >= policy.maxConcurrentTasks ? 'capacity_limit'
+              : occupied.filter(owner => owner === agent).length >= policy.maxConcurrentPerAgent ? 'capacity_limit_agent'
+              : undefined;
+            if (capacityBlocker) {
+              if (t.status === 'queued' && !t.execution!.run && t.execution!.queue?.reason === 'capacity') {
+                throw new Error(capacityBlocker);
+              }
+              t.execution!.run = undefined;
+              t.execution!.queue = { reason: 'capacity', enteredAt: this.queueEnteredAt(t.execution!) };
+              t.status = 'queued';
+              clearTaskFailure(t);
+              return;
+            }
+          }
+
+          const dependencyResult = this.v2DependencyResult(t, phase);
+          if (dependencyResult) {
+            t.summary.lastOutputSnippet = `Dependency ${t.reviewBlocked!.waitingForThreadId} ${dependencyResult}; review resumed.`;
+            t.reviewBlocked = undefined;
+          }
           finalGeneration = initialGeneration;
           finalOperationId = pendingNext
             ? `${phase}_${initialRound}_${this.wallClockNow()}`
@@ -896,7 +982,7 @@ export class ExecutionController {
               state: 'starting',
               startedAt: new Date().toISOString(),
             },
-            queue: undefined,
+            queue: t.execution?.queue?.reason === 'dependency' ? undefined : t.execution?.queue,
             next: undefined,
           };
           if (phase !== 'merge') {
@@ -912,9 +998,10 @@ export class ExecutionController {
               ? 'running'
               : phase === 'review'
                 ? t.execution.purpose === 'bootstrap' ? 'queued' : 'reviewing'
-                : 'merging';
+                : 'queued';
           clearTaskFailure(t);
         });
+        if (capacityBlocker) return { started: false, reason: capacityBlocker };
         break;
       } catch (err: any) {
         const msg = String(err?.message || err);
@@ -1034,6 +1121,7 @@ export class ExecutionController {
         }
       }
     } else if (phase === 'merge') {
+      options?.onMergeAdmission?.();
       const ownerFile = `${this.mergeLock.lockPath}.owner.json`;
       let ownerText: string | undefined;
       try {
@@ -1160,6 +1248,7 @@ export class ExecutionController {
         }
         t.execution.run.step = 'spawning';
         t.execution.run.spawnIntentAt = new Date().toISOString();
+        t.execution.queue = undefined;
       });
     } catch (spawnIntentErr: any) {
       const helper = mergeRelease ? this.mergeLock.getActiveHelperEvidence() : undefined;
@@ -1318,7 +1407,7 @@ export class ExecutionController {
               t.status = 'queued';
               t.execution.queue = {
                 reason: reason === 'session' ? 'session' : reason === 'merge_lock' || reason === 'merge_lock_error' ? reason : 'capacity',
-                enteredAt: new Date().toISOString(),
+                enteredAt: this.queueEnteredAt(t.execution),
               };
             }
           }
@@ -1331,6 +1420,11 @@ export class ExecutionController {
         break;
       }
     }
+  }
+
+  private queueEnteredAt(execution: ExecutionControl): string {
+    const enteredAt = execution.queue?.enteredAt;
+    return enteredAt && Number.isFinite(Date.parse(enteredAt)) ? enteredAt : new Date(this.wallClockNow()).toISOString();
   }
 
   private async recordMergeLockError(threadId: string, reason: string): Promise<void> {
@@ -1807,6 +1901,7 @@ export class ExecutionController {
         }
       }
     }
+    this.wakeQueuedTasks();
   }
 
   private cleanupAcquired(
@@ -3134,7 +3229,7 @@ export class ExecutionController {
       });
 
       if (updated.execution?.run) return updated;
-      await this.startExecutionV2(threadId, targetPhase, { allowStates: ['queued'] });
+      await this.startExecution(threadId, targetPhase, { allowStates: ['queued'] });
       return this.taskStore.getTask(threadId) || updated;
     }
 
@@ -3612,12 +3707,60 @@ export class ExecutionController {
     }
   }
 
+  private wakeQueuedTasks(): void {
+    if (!this.standingScanTimer || this.isDisposed || this.releaseWake) return;
+    this.releaseWake = setImmediate(() => {
+      this.releaseWake = undefined;
+      if (this.drainInFlight) {
+        void this.drainInFlight.then(() => this.wakeQueuedTasks(), () => this.wakeQueuedTasks());
+      } else {
+        void this.scanAndDrain().catch(() => {});
+      }
+    });
+    this.releaseWake.unref?.();
+  }
+
+  private probeRunOwner(owner: ExecutionRun['owner']): Promise<'alive' | 'exited' | 'unknown'> | 'alive' | 'exited' | 'unknown' {
+    if (!owner?.pid || !owner.birthId) return 'unknown';
+    return owner.pid === process.pid
+      ? probeProcessIdentity(owner.pid, owner.birthId)
+      : probeProcessIdentityAsync(owner.pid, owner.birthId);
+  }
+
+  private readonly onDependencyChanged = (tasks: DelegationThread[], changedThreadIds?: string[]): void => {
+    if (!changedThreadIds?.length) return;
+    const settled = new Set(tasks.filter(task => changedThreadIds.includes(task.threadId) && !task.execution?.run &&
+      (task.status === 'completed' || task.status === 'failed')).map(task => task.threadId));
+    if (settled.size && tasks.some(task => task.execution?.version === 2 && task.reviewBlocked?.waitingForThreadId &&
+        settled.has(task.reviewBlocked.waitingForThreadId))) this.wakeQueuedTasks();
+  };
+
   public async scanAndDrain(): Promise<void> {
     if (!this.admissionEnabled || this.isDisposed) return;
+    if (this.drainInFlight) return this.drainInFlight;
+    const drain = this.drainLedger();
+    this.drainInFlight = drain;
+    try {
+      await drain;
+    } finally {
+      this.drainInFlight = undefined;
+    }
+  }
+
+  private async drainLedger(): Promise<void> {
     this.taskStore.ensureUpToDate();
     const tasks = this.taskStore.getAllTasks();
+    const tasksById = new Map(tasks.map(task => [task.threadId, task]));
+    const mergeCandidates: DelegationThread[] = [];
+    let mergeAdmissionPending = false;
+    const scheduleQueuedV2 = (task: DelegationThread, phase: ExecutionPhase) => {
+      if (this.v2StartBlocker(task, phase)) return;
+      if (phase === 'merge') mergeCandidates.push(task);
+      else void this.startExecution(task.threadId, phase).catch(() => {});
+    };
 
     for (const thread of tasks) {
+      if (this.isDisposed) return;
       if (thread.reviewFlow !== 'dedicated') continue;
       // Production controllers are v2-only. Keep the legacy scanner branch
       // below for compatibility tests and explicitly constructed v1
@@ -3625,6 +3768,7 @@ export class ExecutionController {
       // never executes historical records.
       if (thread.execution?.version !== 2 && this.requireV2Execution) continue;
       if (thread.execution?.version === 2) {
+        const phase = thread.execution.next?.phase ?? thread.execution.phase;
         if (thread.execution.run?.purpose === 'native_maintenance' && thread.execution.run.settlementPending) {
           await this.settleReturnedNativeMaintenance(thread);
           continue;
@@ -3633,40 +3777,48 @@ export class ExecutionController {
         // classifier as an explicit start. Unknown identity remains untouched.
         if (thread.execution.run) {
           if (thread.execution.run.mergeLockHelper && thread.execution.run.state === 'stopping' && thread.execution.run.unconfirmed) {
-            await this.startExecutionV2(thread.threadId, thread.execution.next?.phase || thread.execution.phase);
+            await this.startExecution(thread.threadId, phase);
             continue;
           }
-          const { ownerStatus } = this.inspectRunProcesses(thread.execution.run);
-          if (ownerStatus === 'exited') {
-            await this.startExecutionV2(thread.threadId, thread.execution.next?.phase || thread.execution.phase);
+          const ownerStatus = await this.probeRunOwner(thread.execution.run.owner);
+          if (thread.execution.phase === 'merge' && thread.execution.run.state === 'starting' &&
+              !thread.execution.run.unconfirmed && thread.execution.run.purpose !== 'native_maintenance' && ownerStatus === 'alive') {
+            mergeAdmissionPending = true;
           }
+          if (ownerStatus === 'exited') {
+            if (phase === 'merge') scheduleQueuedV2(thread, phase);
+            else await this.startExecution(thread.threadId, phase);
+          }
+          continue;
+        }
+        const dependencyId = reviewBlockDependencyId(thread);
+        if (phase === 'review' && !thread.cleanup && !thread.execution.next &&
+            (thread.status === 'reviewing' || thread.status === 'queued') && dependencyId &&
+            reviewDependencyIssue(thread.threadId, dependencyId, id => tasksById.get(id))) {
+          void this.failInvalidV2Dependency(thread).catch(() => {});
           continue;
         }
         // Recover a durable handoff whose queue status was not persisted by an
         // older or interrupted controller. The CAS retains its source run.
         if (thread.execution.next && thread.status !== 'queued' && !['paused', 'wait_decision', 'completed', 'failed'].includes(thread.status)) {
+          if (this.v2StartBlocker(thread, phase)) continue;
           const revision = thread.execution.revision;
           try {
-            await this.taskStore.transitionExecution(thread.threadId, revision, (fresh) => {
-              if (fresh.execution?.version !== 2 || fresh.execution.run || !fresh.execution.next || fresh.cleanup) return;
+            const queued = await this.taskStore.transitionExecution(thread.threadId, revision, (fresh) => {
+              if (fresh.execution?.version !== 2 || fresh.execution.run || !fresh.execution.next || fresh.cleanup) {
+                throw new Error('The queued handoff changed.');
+              }
               fresh.execution.phase = fresh.execution.next.phase;
               fresh.execution.round = fresh.execution.next.round;
               fresh.execution.purpose = fresh.execution.next.purpose;
               fresh.status = 'queued';
             });
+            scheduleQueuedV2(queued, phase);
           } catch { continue; }
-          void this.startExecutionV2(thread.threadId, thread.execution.next.phase);
           continue;
         }
-        // V2 candidates come from this durable ledger scan; only an unoccupied
-        // queued run is admitted and notBefore remains authoritative.
-        if (thread.status === 'queued' && !thread.execution.run) {
-          if (thread.execution.queue?.reason === 'merge_lock_error') continue;
-          if (thread.execution.queue?.notBefore) {
-            const notBefore = Date.parse(thread.execution.queue.notBefore);
-          if (!Number.isFinite(notBefore) || this.wallClockNow() < notBefore) continue;
-          }
-          void this.startExecutionV2(thread.threadId, thread.execution.next?.phase || thread.execution.phase);
+        if (thread.status === 'queued' || (thread.status === 'reviewing' && phase === 'review' && thread.reviewBlocked)) {
+          scheduleQueuedV2(thread, phase);
         }
         continue;
       }
@@ -3865,6 +4017,23 @@ export class ExecutionController {
         });
       }
     }
+
+    if (mergeAdmissionPending || this.mergeLock.hasLocalOwner()) return;
+    mergeCandidates.sort((a, b) => mergeQueueTime(a) - mergeQueueTime(b) || a.threadId.localeCompare(b.threadId));
+    for (const candidate of mergeCandidates) {
+      let attempted = false;
+      const result = await this.startExecution(candidate.threadId, 'merge', { onMergeAdmission: () => { attempted = true; } });
+      // Skip a task that changed or was blocked on its own prerequisites.
+      // Once global-lock admission was attempted, wait for a release or next scan.
+      if (attempted || result.started || result.reason === 'merge_lock_busy' ||
+          result.reason === 'merge_lock_error' || result.reason === 'merge_lock_unconfirmed') break;
+      if (result.reason === 'run_busy') {
+        const current = this.taskStore.getTask(candidate.threadId)?.execution;
+        const run = current?.run;
+        if (current?.phase === 'merge' && run?.state === 'starting' && !run.unconfirmed &&
+            run.purpose !== 'native_maintenance' && await this.probeRunOwner(run.owner) === 'alive') break;
+      }
+    }
   }
 
   public async waitForActiveExecutions(timeoutMs = 5000): Promise<void> {
@@ -3880,6 +4049,11 @@ export class ExecutionController {
     if (this.standingScanTimer) {
       clearInterval(this.standingScanTimer);
       this.standingScanTimer = undefined;
+      this.taskStore.off('changed', this.onDependencyChanged);
+    }
+    if (this.releaseWake) {
+      clearImmediate(this.releaseWake);
+      this.releaseWake = undefined;
     }
     for (const [id, active] of this.activeExecutions) {
       active.abort();

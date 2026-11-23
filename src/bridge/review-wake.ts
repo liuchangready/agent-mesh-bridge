@@ -220,6 +220,23 @@ export function reviewBlockDependencyId(thread: DelegationThread): string | unde
   return typeof id === 'string' && id.trim() ? id.trim() : undefined;
 }
 
+export function reviewDependencyIssue(
+  threadId: string,
+  dependencyId: string | undefined,
+  getTask: (id: string) => DelegationThread | undefined,
+): string | undefined {
+  const visited = new Set([threadId]);
+  for (let id = dependencyId; id;) {
+    if (visited.has(id)) return `Review dependency ${id} would create a cycle.`;
+    visited.add(id);
+    const dependency = getTask(id);
+    if (!dependency) return `Review dependency ${id} was not found.`;
+    if (dependency.status === 'completed' || dependency.status === 'failed') return undefined;
+    id = reviewBlockDependencyId(dependency);
+  }
+  return undefined;
+}
+
 export interface ReviewFailureInput {
   kind: ReviewFailure['kind'];
   reason: string;

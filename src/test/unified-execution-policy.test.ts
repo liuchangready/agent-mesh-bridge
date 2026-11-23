@@ -9,6 +9,9 @@ import {
 } from '../bridge/execution-controller';
 import { DelegationThread, ExecutionControl } from '../bridge/types';
 import { getProcessBirthId } from '../bridge/platform';
+import { saveBridgePolicy } from '../bridge/bridge-policy';
+import { MeshFileLock } from '../bridge/mesh-file-lock';
+import { ReworkController } from '../bridge/rework-controller';
 import { testWorkspace } from './workspace-fixture';
 import {
   FastInMemoryLock,
@@ -18,6 +21,185 @@ import {
 } from './unified-execution-fixture';
 
 describe('Unified Execution Policy Tests', () => {
+  test('v2 scan makes one merge lock attempt in durable waiting order', async (t) => {
+    let now = Date.now();
+    const fixture = await setupFixture({ useFastLock: true, wallClockNow: () => now });
+    try {
+      const waiting = (id: string, waitedMs: number) => {
+        const task = createThread(id, 'merge');
+        task.execution!.version = 2;
+        task.execution!.queue = { reason: 'merge_lock', enteredAt: new Date(now - waitedMs).toISOString() };
+        return task;
+      };
+      const newer = waiting('thread_merge_newer', 500);
+      const first = waiting('thread_merge_first', 1_000);
+      const blocked = waiting('thread_merge_dependency', 3_000);
+      blocked.reviewBlocked = { waitingForThreadId: 'thread_external_dependency', at: blocked.createdAt, by: 'reviewer' };
+      const exhausted = waiting('thread_merge_exhausted', 2_000);
+      exhausted.execution!.budget.spentActiveMs = exhausted.execution!.budget.limitMs;
+      const delayed = waiting('thread_merge_delayed', 4_000);
+      delayed.execution!.queue!.notBefore = new Date(now + 120_000).toISOString();
+      for (const task of [newer, first, blocked, exhausted, delayed]) fixture.store.upsertTask(task);
+
+      const timers = (fixture.controller as unknown as { backoffTimers: Map<string, NodeJS.Timeout> }).backoffTimers;
+      const timer = setTimeout(() => {}, 120_000);
+      timer.unref();
+      timers.set(delayed.threadId, timer);
+
+      const attempted: string[] = [];
+      const lock = (fixture.controller as unknown as { mergeLock: MeshFileLock }).mergeLock;
+      t.mock.method(lock, 'acquire', async () => {
+        const claims = fixture.store.getAllTasks().filter(task => task.execution?.phase === 'merge' && task.execution.run);
+        assert.equal(claims.length, 1);
+        assert.equal(claims[0].status, 'queued', 'merging is published only after lock acquisition');
+        attempted.push(claims[0].threadId);
+        return undefined;
+      });
+
+      assert.equal((await fixture.controller.startExecution(blocked.threadId, 'merge')).reason, 'dependency_pending');
+      assert.equal((await fixture.controller.startExecution(delayed.threadId, 'merge')).reason, 'not_before');
+      assert.equal(timers.get(delayed.threadId), timer, 'an early wake keeps the deadline notification');
+      await Promise.all([fixture.controller.scanAndDrain(), fixture.controller.scanAndDrain()]);
+      now += 60_000;
+      await fixture.controller.scanAndDrain();
+      assert.deepEqual(attempted, [first.threadId, first.threadId]);
+      const held = fixture.store.getTask(first.threadId)!;
+      assert.equal(held.execution!.queue?.enteredAt, first.execution!.queue?.enteredAt);
+      assert.equal(held.execution!.attempt, first.execution!.attempt);
+      assert.equal(fixture.store.getTask(newer.threadId)?.execution?.revision, newer.execution!.revision);
+      await fixture.store.transitionExecution(held.threadId, held.execution!.revision, task => {
+        task.execution!.run = { id: 'merge-handshake', step: 'starting', state: 'starting',
+          startedAt: new Date(now).toISOString(), owner: { pid: process.pid, birthId: getProcessBirthId(process.pid)! } };
+      });
+      await fixture.controller.scanAndDrain();
+      assert.deepEqual(attempted, [first.threadId, first.threadId], 'a live merge handshake keeps peers from contending');
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  test('v2 Agent capacity uses durable runs and preserves queued handoffs', async (t) => {
+    const fixture = await setupFixture({ useFastLock: true });
+    let finish!: () => void;
+    const held = new Promise<void>((resolve) => { finish = resolve; });
+    try {
+      saveBridgePolicy({ concurrency: { enabled: true, maxConcurrentTasks: 2, maxConcurrentPerAgent: 1 } }, fixture.dir);
+      const task = (id: string, agent: DelegationThread['targetAgent']) => {
+        const thread = createThread(id);
+        thread.targetAgent = agent;
+        thread.execution!.version = 2;
+        thread.receiverSessionCaptured = false;
+        return thread;
+      };
+      const occupied = task('thread_slot_live', 'claude_code');
+      occupied.status = 'running';
+      occupied.execution!.run = { id: 'live-slot', role: 'developer', step: 'starting', state: 'starting',
+        startedAt: occupied.createdAt, owner: { pid: process.pid, birthId: getProcessBirthId(process.pid)! } };
+      const expired = task('thread_slot_exited', 'codex');
+      expired.status = 'running';
+      expired.execution!.run = { id: 'exited-slot', role: 'developer', step: 'starting', state: 'starting',
+        startedAt: expired.createdAt, owner: { pid: 99_999_995, birthId: 'exited-fixture' } };
+      const blocked = task('thread_slot_peer', 'claude_code');
+      blocked.execution!.next = { phase: 'develop', round: 1, sourceRunId: 'previous-review' };
+      blocked.execution!.budget.spentActiveMs = 12_345;
+      blocked.execution!.autoRetriesUsed = 1;
+      const independent = task('thread_slot_other_agent', 'codex');
+      const overflow = task('thread_slot_overflow', 'deepseek_harness');
+      for (const thread of [occupied, expired, blocked, independent, overflow]) fixture.store.upsertTask(thread);
+      const legacy = fixture.registry.begin('historical-observation', 1, 'codex');
+      t.after(() => fixture.registry.end(legacy));
+      t.mock.method(fixture.runner, 'execute', async () => {
+        await held;
+        return { exitCode: 1, error: 'controlled stop' };
+      });
+
+      assert.equal((await fixture.controller.startExecution(blocked.threadId)).reason, 'capacity_limit_agent');
+      const queued = fixture.store.getTask(blocked.threadId)!;
+      assert.equal(queued.execution!.queue?.reason, 'capacity');
+      assert.deepEqual(queued.execution!.next, blocked.execution!.next);
+      assert.deepEqual(queued.execution!.budget, blocked.execution!.budget);
+      assert.equal(queued.execution!.autoRetriesUsed, 1);
+      assert.equal((await fixture.controller.startExecution(independent.threadId)).started, true);
+      assert.equal((await fixture.controller.startExecution(overflow.threadId)).reason, 'capacity_limit');
+      assert.equal((await fixture.controller.startExecution(blocked.threadId)).started, false);
+      const stillQueued = fixture.store.getTask(blocked.threadId)?.execution;
+      assert.equal(stillQueued?.revision, queued.execution!.revision, 'still blocked does not write again');
+      assert.deepEqual(stillQueued?.queue, queued.execution!.queue);
+    } finally {
+      finish();
+      await fixture.cleanup();
+    }
+  });
+
+  test('v2 scheduler wakes a dependency-blocked review after its sibling settles', async (t) => {
+    const fixture = await setupFixture({ useFastLock: true, standingScanIntervalMs: 60_000 });
+    const rework = new ReworkController(fixture.store, fixture.runner as any, fixture.callbackManager);
+    try {
+      const dependency = createThread('thread_review_dependency');
+      dependency.execution!.version = 2;
+      dependency.status = 'running';
+      const review = createThread('thread_review_parked', 'review');
+      review.execution!.version = 2;
+      review.reviewerSessionCaptured = false;
+      review.status = 'reviewing';
+      review.rounds[0].status = 'completed';
+      fixture.store.upsertTask(dependency);
+      fixture.store.upsertTask(review);
+      const wake = t.mock.method(fixture.callbackManager, 'launchCaller');
+
+      await assert.rejects(rework.blockReview({ threadId: review.threadId, waitingForThreadId: 'missing' }), /not found/);
+      await assert.rejects(rework.blockReview({ threadId: review.threadId, waitingForThreadId: review.threadId }), /cycle/);
+      await rework.blockReview({ threadId: review.threadId, waitingForThreadId: dependency.threadId });
+      const parked = fixture.store.reloadTask(review.threadId)!;
+      assert.equal(parked.reviewBlocked?.waitingForThreadId, dependency.threadId);
+      assert.equal(parked.execution?.queue?.reason, 'dependency');
+      assert.equal((await fixture.controller.startExecution(review.threadId)).reason, 'dependency_pending');
+      await fixture.controller.scanAndDrain();
+      assert.equal(wake.mock.callCount(), 0);
+      await fixture.store.transitionExecution(dependency.threadId, dependency.execution!.revision, (task) => {
+        task.status = 'failed';
+      });
+
+      const deadline = Date.now() + 5_000;
+      while (!wake.mock.callCount() && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      assert.equal(wake.mock.callCount(), 1);
+      assert.equal(fixture.store.getTask(review.threadId)?.reviewBlocked, undefined);
+    } finally {
+      rework.dispose();
+      await fixture.cleanup();
+    }
+  });
+
+  test('v2 scheduler reports a missing persisted dependency without starting the parked review', async () => {
+    const fixture = await setupFixture({ useFastLock: true });
+    try {
+      const review = createThread('thread_review_lost_dependency', 'review');
+      review.status = 'reviewing';
+      review.rounds[0].status = 'completed';
+      review.execution!.version = 2;
+      review.execution!.queue = { reason: 'dependency' };
+      review.reviewBlocked = { waitingForThreadId: 'thread_removed', at: review.createdAt, by: 'reviewer' };
+      fixture.store.upsertTask(review);
+
+      await fixture.controller.scanAndDrain();
+      const deadline = Date.now() + 5_000;
+      let task = fixture.store.getTask(review.threadId);
+      while (task?.status !== 'failed' && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+        task = fixture.store.getTask(review.threadId);
+      }
+      assert.equal(task?.status, 'failed');
+      assert.equal(task?.reviewFailure?.kind, 'unresolvable_park');
+      assert.match(task?.reviewFailure?.reason || '', /thread_removed/);
+      assert.equal(task?.execution?.run, undefined);
+      assert.equal(task?.rounds[0].status, 'completed');
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   test('v1 develop preserves the runner-captured child birth identity', async () => {
     const fixture = await setupFixture({ useFastLock: true });
     let finishRun!: () => void;

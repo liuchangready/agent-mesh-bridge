@@ -650,37 +650,6 @@ export function activate(context: vscode.ExtensionContext) {
       }
     }
 
-    // A review parked with `blocked: true` is waiting on a sibling task, not on
-    // a timer: wake it the moment that dependency reaches a terminal state.
-    // Doing it here (instead of letting the reviewer poll with empty rework
-    // rounds) is what keeps a blocked batch from burning a slot every 15s.
-    if (!runtimeAdmission.ready) return;
-    const byThreadId = new Map<string, (typeof taskList)[number]>();
-    for (const t of taskList) byThreadId.set(t.threadId, t);
-    for (const t of taskList) {
-      const blocked = t.reviewBlocked;
-      if (!blocked?.waitingForThreadId) continue;
-      if (t.status !== 'reviewing' || t.execution?.version !== 2 || t.execution.run) continue;
-      const dependency = byThreadId.get(blocked.waitingForThreadId);
-      if (!dependency) continue;
-      if (dependency.status !== 'completed' && dependency.status !== 'failed') continue;
-
-      const reviewRound = [...(t.rounds || [])]
-        .reverse()
-        .find((r) => r.status === 'completed');
-      if (!reviewRound) continue;
-
-      void taskStore.transitionExecution(t.threadId, t.execution.revision, (fresh) => {
-        if (fresh.execution?.version !== 2 || fresh.execution.run || fresh.execution.next ||
-            fresh.status !== 'reviewing' || fresh.cleanup ||
-            fresh.reviewBlocked?.waitingForThreadId !== blocked.waitingForThreadId) {
-          throw new Error('Review dependency or task state changed.');
-        }
-        fresh.reviewBlocked = undefined;
-        fresh.summary.lastOutputSnippet =
-          `Dependency ${blocked.waitingForThreadId} ${dependency.status}; review resumed.`;
-      }).then(released => callbackManager.notifyCaller(released, reviewRound)).catch(() => {});
-    }
   });
 
   // 5. Notify in VSCode when tasks complete a round

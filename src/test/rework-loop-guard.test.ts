@@ -109,11 +109,11 @@ describe('review block and terminal state', () => {
     } catch {}
   });
 
-  test('blockReview parks the review without creating a round', () => {
+  test('blockReview parks the review without creating a round', async () => {
     store.upsertTask(makeThread());
     const before = store.getTask('thread_loop_1')!.rounds.length;
 
-    const result = controller.blockReview({
+    const result = await controller.blockReview({
       threadId: 'thread_loop_1',
       reason: 'waiting for the sibling PostgreSQL task',
       waitingForThreadId: 'thread_pg_1',
@@ -127,9 +127,9 @@ describe('review block and terminal state', () => {
     assert.match(result.message, /no rework round was created/);
   });
 
-  test('blockReview refuses a task that is not waiting for review', () => {
+  test('blockReview refuses a task that is not waiting for review', async () => {
     store.upsertTask(makeThread({ status: 'running' }));
-    assert.throws(
+    await assert.rejects(
       () => controller.blockReview({ threadId: 'thread_loop_1', reason: 'x' }),
       /not "reviewing"/,
     );

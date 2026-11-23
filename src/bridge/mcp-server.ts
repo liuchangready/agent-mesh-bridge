@@ -1402,7 +1402,7 @@ export class MCPServer {
         // "This task passed, but the batch still waits for X" is not a rework:
         // park it, and let the dependency's completion wake the review.
         if (args.blocked === true) {
-          const parked = this.reworkController.blockReview({
+          const parked = await this.reworkController.blockReview({
             threadId: args.threadId,
             reason: args.feedback,
             waitingForThreadId:
@@ -1411,7 +1411,7 @@ export class MCPServer {
                 : undefined,
             by: 'caller',
           });
-          new TaskRoleLock().releaseIfRole(args.threadId, 'reviewer');
+          if (controlledTask?.execution?.version !== 2) new TaskRoleLock().releaseIfRole(args.threadId, 'reviewer');
           this.pollGuard.forget(args.threadId);
           return parked;
         }
