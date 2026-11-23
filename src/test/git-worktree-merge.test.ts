@@ -399,10 +399,15 @@ test('two tasks edit the same file in independent worktrees and integrate serial
   store.upsertTask(thread('thread_merge_A', a));
   store.upsertTask(thread('thread_merge_B', b));
   const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));
+  const previousSignalDir = process.env.MESH_VALIDATION_SIGNAL_DIR;
+  const previousHoldThread = process.env.MESH_VALIDATION_HOLD_THREAD;
   process.env.MESH_VALIDATION_SIGNAL_DIR = signals;
   process.env.MESH_VALIDATION_HOLD_THREAD = 'thread_merge_A';
   const mergeA = coordinator.mergeApproved('thread_merge_A');
-  await waitFor(path.join(signals, 'thread_merge_A.entered'));
+  let mergeB: ReturnType<typeof coordinator.mergeApproved> | undefined;
+  const releaseA = () => fs.writeFileSync(path.join(signals, 'thread_merge_A.release'), 'go');
+  try {
+  await waitFor(path.join(signals, 'thread_merge_A.entered'), 60_000);
   assert.equal(new TaskRoleLock(storage).tryAcquire('thread_merge_A', 'reviewer'), null, 'reviewer cannot overlap merge validation');
 
   // A is inside its real combined verification while holding the mesh mutex.
@@ -420,14 +425,14 @@ test('two tasks edit the same file in independent worktrees and integrate serial
   assert.notEqual(path.resolve(admitted.worktree!.path), path.resolve(b.path));
   registry.dispose(); (dispatcher as any).queueDrainer?.dispose();
 
-  const mergeB = coordinator.mergeApproved('thread_merge_B');
+  mergeB = coordinator.mergeApproved('thread_merge_B');
   await new Promise((resolve) => setTimeout(resolve, 250));
   assert.equal(store.getTask('thread_merge_A')?.status, 'merging');
   assert.equal(store.getTask('thread_merge_B')?.status, 'queued');
   assert.equal(store.getTask('thread_merge_B')?.queuePhase, 'merge');
   assert.strictEqual(fs.existsSync(path.join(signals, 'thread_merge_B.entered')), false, 'B must not reach combined validation while A owns the global lock');
   assert.strictEqual(fs.existsSync(path.join(storage, 'merge-transactions', 'thread_merge_B.json')), false, 'B must not read/persist the target before acquiring the lock');
-  fs.writeFileSync(path.join(signals, 'thread_merge_A.release'), 'go');
+  releaseA();
   const resultA = await mergeA;
   assert.strictEqual(resultA.status, 'merged');
   const commitA = resultA.commit!;
@@ -455,6 +460,19 @@ test('two tasks edit the same file in independent worktrees and integrate serial
   assert.equal(validationCommit, resultB.commit);
   assert.equal(git(repository, 'show', `${validationCommit}:shared.txt`), 'A\nmiddle\nB');
   assert.equal(fs.existsSync(store.getTask('thread_merge_B')!.worktree!.validation!.path), false);
+  } finally {
+    releaseA();
+    process.env.MESH_VALIDATION_HOLD_THREAD = '';
+    const mergesSettled = Promise.allSettled([mergeA, ...(mergeB ? [mergeB] : [])]);
+    let cleanupTimer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([mergesSettled, new Promise<void>((resolve) => { cleanupTimer = setTimeout(resolve, 60_000); })]);
+    } finally { if (cleanupTimer) clearTimeout(cleanupTimer); }
+    if (previousSignalDir === undefined) delete process.env.MESH_VALIDATION_SIGNAL_DIR;
+    else process.env.MESH_VALIDATION_SIGNAL_DIR = previousSignalDir;
+    if (previousHoldThread === undefined) delete process.env.MESH_VALIDATION_HOLD_THREAD;
+    else process.env.MESH_VALIDATION_HOLD_THREAD = previousHoldThread;
+  }
 });
 
 test('target advancement before preflight restarts merge and validation', async (t) => {

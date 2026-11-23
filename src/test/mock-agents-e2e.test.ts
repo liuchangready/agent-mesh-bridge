@@ -114,7 +114,7 @@ async function fixture(t: TestContext, scenario: MockScenario) {
         const resolved = fs.realpathSync.native(root);
         const temp = fs.realpathSync.native(os.tmpdir()) + path.sep;
         assert.ok(resolved.startsWith(temp) && path.basename(resolved).startsWith('amb-e2e-'));
-        fs.rmSync(resolved, { recursive: true, force: true });
+        fs.rmSync(resolved, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
       } else t.diagnostic(`Mock E2E evidence retained: ${root}\n${client.stderr}`);
     } catch (error) { t.diagnostic(`Mock E2E cleanup evidence: ${root}`); throw error; }
   });

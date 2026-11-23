@@ -20,6 +20,7 @@ let barrierFile = '';
 let holdFile = '';
 let registeredFile = '';
 let spawnedFile = '';
+let registrationGateFile = '';
 
 for (const arg of args) {
   if (arg.startsWith('--storage-dir=')) storageDir = arg.split('=')[1];
@@ -29,6 +30,7 @@ for (const arg of args) {
   if (arg.startsWith('--hold-file=')) holdFile = arg.split('=')[1];
   if (arg.startsWith('--registered-file=')) registeredFile = arg.split('=')[1];
   if (arg.startsWith('--spawned-file=')) spawnedFile = arg.split('=')[1];
+  if (arg.startsWith('--registration-gate-file=')) registrationGateFile = arg.split('=')[1];
 }
 
 if (!storageDir || !threadId) {
@@ -61,7 +63,7 @@ async function main() {
       const child = spawn(process.execPath, [
         '-e',
         holdFile
-          ? `const fs=require('fs'); const p=${JSON.stringify(holdFile)}; const t=setInterval(()=>{if(fs.existsSync(p)){clearInterval(t);process.exit(0)}},20);`
+          ? `const fs=require('fs'); const p=${JSON.stringify(holdFile)}; const t=setInterval(()=>{if(fs.existsSync(p)){clearInterval(t);process.exit(0)}},20);setTimeout(()=>{clearInterval(t);process.exit(0)},60000);`
           : 'setTimeout(()=>{}, 3000)',
       ], {
         stdio: ['ignore', 'ignore', 'ignore'],
@@ -70,6 +72,15 @@ async function main() {
       spawnedSubprocessPid = child.pid ?? null;
       spawnedSubprocess = child;
       if (spawnedFile) fs.writeFileSync(spawnedFile, String(child.pid), 'utf8');
+
+      if (registrationGateFile) {
+        fs.writeFileSync(`${registrationGateFile}.entered`, 'waiting', 'utf8');
+        const deadline = Date.now() + 60_000;
+        while (!fs.existsSync(registrationGateFile) && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        if (!fs.existsSync(registrationGateFile)) throw new Error('Timed out waiting for the registration gate');
+      }
 
       if (opts.onChildPid && child.pid) {
         const childBirthId = getProcessBirthId(child.pid);
@@ -117,7 +128,7 @@ async function main() {
     roleLock,
     sessionLock,
     registry,
-    { storageDir, defaultBudgetLimitMs: 60_000 },
+    { storageDir, defaultBudgetLimitMs: 60_000, ...(registrationGateFile ? { streamSyncIntervalMs: 60_000 } : {}) },
   );
 
   // Synchronize on barrier file if provided

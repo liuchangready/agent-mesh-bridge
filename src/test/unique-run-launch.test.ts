@@ -2590,15 +2590,31 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
   test('Defect 1: Two control processes concurrency: loser arrives during winner starting/binding window, gets run_busy, and leaves winner intact without false interruption', async () => {
     const storageDir = createTempDir('concurrent-start-binding-window');
     const threadId = 'thread_concurrent_binding';
-
+    const fixture = path.resolve(__dirname, 'fixtures/two-process-runner.js');
+    const holdFile = path.join(storageDir, 'release-winner');
+    const spawnedFile = path.join(storageDir, 'winner-spawned');
+    const registeredFile = path.join(storageDir, 'winner-registered');
+    const registrationGateFile = path.join(storageDir, 'release-registration');
+    let store: TaskStore | undefined;
+    let winner: child_process.ChildProcess | undefined;
+    let loser: child_process.ChildProcess | undefined;
+    let winnerExitPromise: Promise<number> | undefined;
+    let loserExitPromise: Promise<number> | undefined;
+    let winnerOutput = '';
+    let loserOutput = '';
+    const waitBounded = async <T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); }),
+        ]);
+      } finally { if (timer) clearTimeout(timer); }
+    };
     try {
-      const store = new TaskStore(storageDir);
+      store = new TaskStore(storageDir);
       const thread = createV2Thread(threadId, storageDir, 'develop');
       store.upsertTask(thread);
-      const fixture = path.resolve(__dirname, 'fixtures/two-process-runner.js');
-      const holdFile = path.join(storageDir, 'release-winner');
-      const spawnedFile = path.join(storageDir, 'winner-spawned');
-      const registeredFile = path.join(storageDir, 'winner-registered');
       const launch = (workerId: string, extra: string[] = []) => child_process.spawn(process.execPath, [
         fixture,
         `--storage-dir=${storageDir}`,
@@ -2606,19 +2622,21 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         `--worker-id=${workerId}`,
         ...extra,
       ], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-      const winner = launch('winner', [
+      const winnerChild = launch('winner', [
         `--hold-file=${holdFile}`,
         `--spawned-file=${spawnedFile}`,
         `--registered-file=${registeredFile}`,
+        `--registration-gate-file=${registrationGateFile}`,
       ]);
-      let winnerOutput = '';
-      winner.stdout?.on('data', (data) => { winnerOutput += data.toString(); });
-      winner.stderr?.on('data', (data) => { winnerOutput += data.toString(); });
-      const winnerExitPromise = new Promise<number>((resolve, reject) => {
-        winner.once('error', reject);
-        winner.once('close', (code) => resolve(code ?? -1));
+      winner = winnerChild;
+      winnerChild.stdout?.on('data', (data) => { winnerOutput += data.toString(); });
+      winnerChild.stderr?.on('data', (data) => { winnerOutput += data.toString(); });
+      winnerExitPromise = new Promise<number>((resolve, reject) => {
+        winnerChild.once('error', reject);
+        winnerChild.once('close', (code) => resolve(code ?? -1));
       });
-      await waitForFile(spawnedFile);
+      await waitForFile(spawnedFile, 60_000);
+      await waitForFile(`${registrationGateFile}.entered`, 60_000);
 
       store.ensureUpToDate();
       const beforeLoser = store.getTask(threadId);
@@ -2628,15 +2646,15 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       const winnerRevision = beforeLoser?.execution?.revision;
       const winnerAttempt = beforeLoser?.execution?.attempt;
 
-      const loser = launch('loser');
-      let loserOutput = '';
-      loser.stdout?.on('data', (data) => { loserOutput += data.toString(); });
-      loser.stderr?.on('data', (data) => { loserOutput += data.toString(); });
-      const loserExitPromise = new Promise<number>((resolve, reject) => {
-        loser.once('error', reject);
-        loser.once('close', (code) => resolve(code ?? -1));
+      const loserChild = launch('loser');
+      loser = loserChild;
+      loserChild.stdout?.on('data', (data) => { loserOutput += data.toString(); });
+      loserChild.stderr?.on('data', (data) => { loserOutput += data.toString(); });
+      loserExitPromise = new Promise<number>((resolve, reject) => {
+        loserChild.once('error', reject);
+        loserChild.once('close', (code) => resolve(code ?? -1));
       });
-      const loserExit = await loserExitPromise;
+      const loserExit = await waitBounded(loserExitPromise, 60_000, 'Loser control process did not exit');
       assert.strictEqual(loserExit, 0, loserOutput);
       const loserResult = JSON.parse(loserOutput.split('\n').find((line) => line.startsWith('RESULT:'))!.slice(7));
       assert.strictEqual(loserResult.started, false);
@@ -2652,6 +2670,8 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       assert.strictEqual(afterLoser?.execution?.attempt, winnerAttempt, 'a competing start must not consume an attempt');
       assert.strictEqual(afterLoser?.interruption, undefined);
 
+      // Hold the winner after spawning but before registering the child so the loser observes `starting`.
+      fs.writeFileSync(registrationGateFile, 'release', 'utf8');
       // Let the child remain alive until the registration callback and lease ACK
       // have completed. Releasing the worker's child before this point races the
       // Windows FILETIME lookup and turns a healthy start into a false early exit.
@@ -2664,9 +2684,23 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       assert.strictEqual(afterRegistration?.interruption, undefined);
 
       fs.writeFileSync(holdFile, 'release', 'utf8');
-      const winnerExit = await winnerExitPromise;
+      const winnerExit = await waitBounded(winnerExitPromise, 60_000, 'Winner control process did not exit');
       assert.strictEqual(winnerExit, 0, winnerOutput);
     } finally {
+      try { fs.writeFileSync(registrationGateFile, 'release', 'utf8'); } catch {}
+      try { fs.writeFileSync(holdFile, 'release', 'utf8'); } catch {}
+      if (winnerExitPromise) {
+        try { await waitBounded(winnerExitPromise, 10_000, 'Winner did not settle after fixture barriers were released'); }
+        catch {
+          if (winner && winner.exitCode === null && winner.signalCode === null) try { winner.kill(); } catch {}
+          try { await waitBounded(winnerExitPromise, 5_000, 'Winner control process remained after cleanup'); } catch {}
+        }
+      }
+      if (loser && loserExitPromise) {
+        try { await waitBounded(loserExitPromise, 5_000, 'Loser control process remained after cleanup'); }
+        catch { if (loser.exitCode === null && loser.signalCode === null) try { loser.kill(); } catch {} }
+      }
+      store?.dispose();
       cleanTempDir(storageDir);
     }
   });
