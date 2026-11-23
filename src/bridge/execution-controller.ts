@@ -24,6 +24,7 @@ import {
   clearTaskFailure,
   enterTaskFailure,
   findInFlightRound,
+  isMergeReview,
   isReviewerBootstrapPending,
   isReviewerWakeEligible,
   isTaskUnfinished,
@@ -32,6 +33,7 @@ import {
   shouldResumeNativeSession,
 } from './types';
 import { TaskStore } from './task-store';
+import { reopenFailedReview } from './review-wake';
 import { AutonomousRunner, RunResult } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
 import { MergeCoordinator, MergeResult } from './merge-coordinator';
@@ -80,6 +82,7 @@ export interface ExecutionControllerOptions {
   storageDir?: string;
   /** Production hosts set this after v2 dispatch is wired; fixture/legacy controllers may inspect v1 behavior. */
   requireV2Execution?: boolean;
+  admissionEnabled?: boolean;
   defaultBudgetLimitMs?: number;
   streamSyncIntervalMs?: number;
   retryBackoffsMs?: number[];
@@ -101,6 +104,7 @@ export class ExecutionController {
   private readonly storageDir: string;
   private readonly defaultBudgetLimitMs: number;
   private readonly requireV2Execution: boolean;
+  private readonly admissionEnabled: boolean;
   private readonly checkpointIntervalMs: number;
   private readonly retryBackoffsMs: number[];
   private readonly monotonicNow: () => number;
@@ -139,6 +143,7 @@ export class ExecutionController {
     this.storageDir = options?.storageDir || path.dirname(taskStore.getStoragePath());
     this.defaultBudgetLimitMs = options?.defaultBudgetLimitMs ?? DEFAULT_EXECUTION_BUDGET_MS;
     this.requireV2Execution = options?.requireV2Execution === true;
+    this.admissionEnabled = options?.admissionEnabled !== false;
     this.checkpointIntervalMs = options?.streamSyncIntervalMs ?? 5_000;
     this.retryBackoffsMs = options?.retryBackoffsMs ?? AUTO_RETRY_BACKOFFS_MS;
     this.monotonicNow = options?.monotonicNow ?? monotonicNowMs;
@@ -160,7 +165,7 @@ export class ExecutionController {
     const scanInterval = options?.standingScanIntervalMs !== undefined
       ? options.standingScanIntervalMs
       : 5_000;
-    if (scanInterval > 0) {
+    if (this.admissionEnabled && scanInterval > 0) {
       this.standingScanTimer = setInterval(() => {
         if (!this.isDisposed) {
           void this.scanAndDrain().catch(() => {});
@@ -278,6 +283,7 @@ export class ExecutionController {
     targetPhase?: ExecutionPhase,
     options?: StartExecutionOptions,
   ): Promise<{ started: boolean; reason?: string; run?: ExecutionRun }> {
+    if (!this.admissionEnabled) return { started: false, reason: 'V2_STARTUP_BLOCKED' };
     const pending = this.startingExecutions.get(threadId);
     if (pending) return pending;
     // V1 acquires resources before CAS. Concurrent local callers must not share
@@ -286,6 +292,30 @@ export class ExecutionController {
     this.startingExecutions.set(threadId, starting);
     try { return await starting; }
     finally { if (this.startingExecutions.get(threadId) === starting) this.startingExecutions.delete(threadId); }
+  }
+
+  public async wakeReviewerV2(threadId: string, round: number, unblock = false): Promise<boolean> {
+    if (!this.admissionEnabled || this.isDisposed) return false;
+    const canWake = (task: DelegationThread) =>
+      task.execution?.version === 2 && task.reviewFlow === 'dedicated' &&
+      task.execution.phase === 'review' && task.execution.purpose !== 'bootstrap' &&
+      task.execution.round === round && !task.execution.run && !task.execution.next &&
+      !task.archivedAt && !task.cleanup && (unblock || !task.reviewBlocked) &&
+      (task.status === 'reviewing' || (task.status === 'failed' && task.failure?.stage === 'review'));
+    let task = this.taskStore.reloadTask(threadId);
+    if (!task || !canWake(task)) return false;
+    if (task.status === 'failed' || task.reviewBlocked) {
+      try {
+        task = await this.transitionTask(threadId, (fresh) => {
+          if (!canWake(fresh)) throw new Error('Review is no longer available for wake.');
+          reopenFailedReview(fresh);
+          if (unblock) fresh.reviewBlocked = undefined;
+        });
+      } catch { return false; }
+    }
+    return (await this.startExecutionV2(threadId, 'review', {
+      operationId: task.execution!.operationId, generation: task.execution!.generation, allowStates: ['reviewing'],
+    })).started;
   }
 
   private async startExecutionAttempt(
@@ -560,6 +590,7 @@ export class ExecutionController {
     targetPhase?: ExecutionPhase,
     options?: StartExecutionOptions,
   ): Promise<{ started: boolean; reason?: string; run?: ExecutionRun }> {
+    if (!this.admissionEnabled) return { started: false, reason: 'V2_STARTUP_BLOCKED' };
     if (this.isDisposed) return { started: false, reason: 'disposed' };
     this.taskStore.ensureUpToDate();
     let thread = this.taskStore.getTask(threadId);
@@ -2649,7 +2680,7 @@ export class ExecutionController {
             }
           });
           void this.startExecution(threadId, 'develop');
-        } else if (verdict === 'approve' || thread.worktree?.approvedCommit) {
+        } else if (verdict === 'approve' || (thread.execution.version !== 2 && thread.worktree?.approvedCommit)) {
           // Approved -> advance directly to merge!
           await this.transitionTask(threadId, (t) => {
             if (t.execution?.version === 2) recordNext(t, 'merge', t.execution.round);
@@ -2699,6 +2730,17 @@ export class ExecutionController {
 
     // FAILURE in this phase:
     const { code, reason, stage, quotaResetsAt, transient } = result;
+    if (phase === 'merge' && thread.execution.version === 2 && thread.status === 'reviewing' &&
+        !thread.worktree?.integration?.stashRecoveryPending) {
+      await this.transitionTask(threadId, (t) => {
+        if (t.status !== 'reviewing' || t.worktree?.integration?.stashRecoveryPending) {
+          throw new Error('Merge review is no longer available.');
+        }
+        recordNext(t, 'review', t.execution!.round, isMergeReview(t) ? 'merge_resolution' : undefined);
+      });
+      void this.startExecution(threadId, 'review');
+      return;
+    }
     const autoRetriesUsed = thread.execution.autoRetriesUsed || 0;
     const canRetry =
       Boolean(transient) &&
@@ -3141,6 +3183,7 @@ export class ExecutionController {
    * Manual retry: creates a new generation, resets autoRetriesUsed and spentActiveMs.
    */
   public async retryOperation(threadId: string, by = 'user'): Promise<DelegationThread> {
+    if (!this.admissionEnabled) throw new Error('V2_STARTUP_BLOCKED: runtime component preflight has not passed.');
     this.taskStore.ensureUpToDate();
     const thread = this.taskStore.getTask(threadId);
     if (thread) assertDedicatedTask(thread);
@@ -3219,6 +3262,7 @@ export class ExecutionController {
    * Manual resume: keeps current generation and remaining budget.
    */
   public async resumeOperation(threadId: string, by = 'user'): Promise<DelegationThread> {
+    if (!this.admissionEnabled) throw new Error('V2_STARTUP_BLOCKED: runtime component preflight has not passed.');
     this.taskStore.ensureUpToDate();
     const thread = this.taskStore.getTask(threadId);
     if (thread) assertDedicatedTask(thread);
@@ -3557,7 +3601,7 @@ export class ExecutionController {
   }
 
   public async scanAndDrain(): Promise<void> {
-    if (this.isDisposed) return;
+    if (!this.admissionEnabled || this.isDisposed) return;
     this.taskStore.ensureUpToDate();
     const tasks = this.taskStore.getAllTasks();
 

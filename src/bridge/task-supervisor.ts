@@ -356,6 +356,9 @@ export class TaskSupervisor extends EventEmitter {
   }
   public executeThreadRound(thread: DelegationThread, round: DelegationRound): Promise<void> {
     if (!this.admissionEnabled) return Promise.reject(new Error('V2_STARTUP_BLOCKED: runtime component preflight has not passed.'));
+    if (this.requireV2Execution || thread.execution?.version === 2) {
+      return Promise.reject(new Error('V2 rounds must be started by the execution controller.'));
+    }
     if (this.activeTasks.has(thread.threadId)) {
       return this.activeTasks.get(thread.threadId)!;
     }

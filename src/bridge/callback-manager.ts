@@ -41,6 +41,7 @@ import { nativeSessionNamespace, SessionOwnershipStore } from './session-ownersh
 import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 import { CancellationRegistry } from './cancellation-registry';
 import { noteMergeFailure } from './merge-recovery';
+import { ExecutionController } from './execution-controller';
 import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
 import {
   buildReviewerBootstrapPrompt,
@@ -145,6 +146,9 @@ export class CallbackManager extends EventEmitter {
    * Dispatches proactive notification callback to caller agent to resume original turn.
    */
   public async notifyCaller(thread: DelegationThread, round: DelegationRound): Promise<boolean> {
+    if (thread.execution?.version === 2) {
+      return await ExecutionController.getInstance()?.wakeReviewerV2(thread.threadId, round.round) ?? false;
+    }
     const callerSessionId = this.resolveCallerSession(thread);
     // A wake may be planned for an older round than the one actually delivered
     // last. Always review/report the newest completed WORK round, so a stale plan

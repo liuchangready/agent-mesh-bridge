@@ -824,6 +824,14 @@ export async function registerRunChildV2(
           if (sameCapturedIdentity || existingStatus !== 'exited') {
             throw CHILD_BINDING_IN_PROGRESS;
           }
+          if (identity.phase === 'merge') {
+            const previous = t.execution.run.subtrees?.find(({ root }) =>
+              root.pid === existingChild.pid && root.birthId === existingChild.birthId);
+            if (!previous || previous.descendants.some(({ pid, birthId }) =>
+              !birthId || probeProcessIdentity(pid, birthId) !== 'exited')) {
+              throw CHILD_BINDING_IN_PROGRESS;
+            }
+          }
         }
         if (t.cleanup) {
           throw new Error(`Task is reserved for cleanup (${t.cleanup.action})`);

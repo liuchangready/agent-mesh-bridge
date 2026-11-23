@@ -176,6 +176,7 @@ describe('MCPServer Protocol Tests', () => {
     callbackManager.setTaskStore(taskStore);
     callbackManager.setAutonomousRunner(runner);
     const host = createBridgeHost({ taskStore, detector, resolver, runner, callbackManager, registry,
+      v2StartupAdmission: { ready: true, blockers: [] },
       executionControllerOptions: { storageDir: tempDir, standingScanIntervalMs: 0, streamSyncIntervalMs: 60_000 } });
     dispatcher = host.dispatcher;
     reworkController = host.reworkController;
@@ -334,6 +335,9 @@ describe('MCPServer Protocol Tests', () => {
       await waitFor(() => developerCalls >= 2, 'next consumption after reviewer exit ACK');
       await waitFor(() => reviewCalls >= 2, 'second review');
       await waitFor(() => fs.existsSync(mergeActiveMarker), 'merge helper child to hold the global merge lock');
+      const mergeRun = taskStore.reloadTask(threadId)?.execution?.run;
+      assert.ok(mergeRun?.child?.birthId && mergeRun.mergeLockHelper?.birthId,
+        'the validation command starts only after both v2 run binding and merge lock helper acknowledgement');
       recordProcessEvent('merge_helper_active');
       const competingMergeLock = new MeshFileLock(meshMergeLockPath(tempDir));
       const stolenMergeLock = await competingMergeLock.acquire(undefined, undefined, 250);

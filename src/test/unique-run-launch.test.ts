@@ -154,23 +154,12 @@ function createV2Thread(
 }
 
 describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
-  test('Windows descendant birth IDs use one bounded batch query', { skip: !IS_WINDOWS }, async () => {
-    const mutableChildProcess = require('node:child_process');
-    const originalExecFileSync = mutableChildProcess.execFileSync;
-    let calls = 0;
-    try {
-      mutableChildProcess.execFileSync = (command: string, args: string[], options: any) => {
-        assert.equal(command, 'powershell.exe');
-        assert.equal(options.timeout, 8_000);
-        calls++;
-        assert.match(args[args.indexOf('-Command') + 1], /11,22/);
-        return '11:1001\r\n22:2002\r\n';
-      };
-      assert.deepEqual([...(await getProcessBirthIds([11, 22, 11, 0]))], [[11, '1001'], [22, '2002']]);
-      assert.equal(calls, 1, 'one PowerShell process resolves the whole descendant batch');
-    } finally {
-      mutableChildProcess.execFileSync = originalExecFileSync;
-    }
+  test('Windows descendant birth IDs use one batch request to the persistent helper', { skip: !IS_WINDOWS }, async (t) => {
+    const helper = require('../bridge/windows-process-helper') as typeof import('../bridge/windows-process-helper');
+    const batch = t.mock.method(helper, 'requestWindowsProcessHelper', async () => ({ 11: '1001', 22: '2002' }));
+    assert.deepEqual([...(await getProcessBirthIds([11, 22, 11, 0]))], [[11, '1001'], [22, '2002']]);
+    assert.equal(batch.mock.callCount(), 1);
+    assert.deepEqual(batch.mock.calls[0].arguments, [{ operation: 'birthIds', pids: [11, 22] }]);
   });
 
 

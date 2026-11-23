@@ -54,7 +54,6 @@ export class AsyncDispatcher {
   private queueDrainer: QueueDrainer;
   /** Answers model-switch confirmations; the file channel unless overridden. */
   private modelApprovalHandler?: ModelApprovalHandler;
-  private v2DispatchEnabled = false;
 
   constructor(
     taskStore: TaskStore,
@@ -63,6 +62,7 @@ export class AsyncDispatcher {
     callbackManager: CallbackManager,
     detector?: AgentDetector,
     executionRegistry?: TaskExecutionRegistry,
+    private readonly v2?: { controller: ExecutionController; admitted: boolean },
   ) {
     this.taskStore = taskStore;
     this.resolver = resolver;
@@ -81,9 +81,7 @@ export class AsyncDispatcher {
     // Standalone MCP processes have no supervisor. React to ledger changes so a
     // task approval/rework immediately releases the task-level queue instead of
     // waiting for the next periodic poll.
-    this.taskStore.on('changed', () => {
-      this.queueDrainer.schedule(150);
-    });
+    if (!this.v2) this.taskStore.on('changed', () => this.queueDrainer.schedule(150));
   }
 
   public setStreamSyncIntervalMs(ms: number): void {
@@ -99,13 +97,11 @@ export class AsyncDispatcher {
     this.modelApprovalHandler = handler;
   }
 
-  /** Production enables v2 only after its unified controller is fully wired. */
-  public enableV2Dispatch(): void { this.v2DispatchEnabled = true; }
-
   /**
    * Dispatches a new task asynchronously and non-blockingly.
    */
   public async dispatchTask(params: DispatchTaskParams): Promise<DispatchResult> {
+    if (this.v2 && !this.v2.admitted) throw new Error('V2_STARTUP_BLOCKED: runtime component preflight has not passed.');
     if (Object.prototype.hasOwnProperty.call(params, 'workspacePath')) throw new Error('workspacePath is not supported; use workspaceRoot or workspaceId');
     if (!params.title?.trim() || !params.prompt?.trim()) {
       throw new Error('A task title and prompt are required for a normal dispatch.');
@@ -262,7 +258,7 @@ export class AsyncDispatcher {
     const initialPhase: ExecutionPhase = 'review';
     const initialPurpose = 'bootstrap' as const;
     tempCandidate.execution = {
-      version: this.v2DispatchEnabled ? 2 : 1,
+      version: this.v2 ? 2 : 1,
       revision: 1,
       operationId: `${initialPhase}_1_${Date.now()}`,
       phase: initialPhase,
@@ -319,9 +315,8 @@ export class AsyncDispatcher {
     await this.taskStore.transitionExecution(threadId, this.taskStore.getTask(threadId)?.execution?.revision ?? thread.execution!.revision, (fresh) => {
       if (fresh.workspace) fresh.workspace.dispatchAccepted = true;
     });
-    if (ExecutionController.getInstance()) {
-      void ExecutionController.getInstance()!.startExecution(threadId, 'review', { purpose: 'bootstrap' });
-    }
+    if (this.v2) void this.v2.controller.startExecutionV2(threadId, 'review', { purpose: 'bootstrap' });
+    else void ExecutionController.getInstance()?.startExecution(threadId, 'review', { purpose: 'bootstrap' });
     const routing = getModelRouting(thread);
     const reviewerLine =
       `Dedicated reviewer ${initiatorAgent}` +
@@ -361,7 +356,7 @@ export class AsyncDispatcher {
     // The production v2 dispatcher has one execution owner: the durable run
     // controller. Never let the legacy queue pump execute v1, missing-version,
     // or unknown-version history after the host has enabled the cutover path.
-    if (this.v2DispatchEnabled || thread.execution?.version === 2) return;
+    if (this.v2 || thread.execution?.version === 2) return;
     // A dedicated task may not execute before its reviewer conversation has
     // dispatched it. The bootstrap service owns that first turn.
     if (isReviewerBootstrapPending(thread)) {

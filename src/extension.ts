@@ -13,8 +13,6 @@ import { AutonomousRunner } from './bridge/autonomous-runner';
 import { CallbackManager } from './bridge/callback-manager';
 import { ReviewWakeScheduler } from './bridge/review-wake-scheduler';
 import { inspectV2RuntimeActivation, loadShutdownPreflightSnapshot } from './bridge/shutdown-preflight';
-import { reopenFailedReview } from './bridge/review-wake';
-import { AsyncDispatcher } from './bridge/async-dispatcher';
 import { ReworkController } from './bridge/rework-controller';
 import { ExecutionController } from './bridge/execution-controller';
 import { ConfigSyncService } from './config/config-sync';
@@ -24,7 +22,6 @@ import { AgentNodesProvider, AgentNodeItem } from './ui/agent-nodes-provider';
 import { TaskDetailPanel } from './ui/detail-panel';
 import { ModelApprovalService } from './ui/model-approval-service';
 import { TaskRetargetService } from './bridge/task-retarget';
-import { TaskRoleLock } from './bridge/task-role-lock';
 import { AgentId, isValidSessionId, isMergePending } from './bridge/types';
 import { TaskSupervisor } from './bridge/task-supervisor';
 import { TaskControlService } from './bridge/task-control';
@@ -445,14 +442,12 @@ export function activate(context: vscode.ExtensionContext) {
     stallTimeoutMs: Math.max(1, reviewStallMinutes) * 60_000,
     requireV2Execution: true,
   });
-  if (runtimeAdmission.ready) reviewWakeScheduler.start();
   context.subscriptions.push({ dispose: () => reviewWakeScheduler.dispose() });
   // A restart kills whatever reviewer was mid-flight: the wake was launched by
   // the previous host, so no exit event will ever arrive and no stall would be
   // recorded until the next full timeout. One pass on activation surfaces those
   // tasks immediately (it only flags reviews that are already past the stall
   // threshold and have no live reviewer, so healthy ones are untouched).
-  if (runtimeAdmission.ready) void reviewWakeScheduler.runWatchdog();
   reviewWakeScheduler.on('retryLaunched', ({ thread, round }) => {
     vscode.window.showInformationMessage(
       `🔁 [Agent Bridge] 已重新唤醒 ${thread.initiatorAgent} 检视任务【${thread.title}】(Round ${round.round})。`,
@@ -484,14 +479,6 @@ export function activate(context: vscode.ExtensionContext) {
   });
   const executionRegistry = new TaskExecutionRegistry(path.dirname(taskStore.getStoragePath()));
   context.subscriptions.push({ dispose: () => executionRegistry.dispose() });
-  const _dispatcher = new AsyncDispatcher(
-    taskStore,
-    resolver,
-    runner,
-    callbackManager,
-    detector,
-    executionRegistry,
-  );
   const reworkController = new ReworkController(
     taskStore,
     runner,
@@ -511,9 +498,8 @@ export function activate(context: vscode.ExtensionContext) {
     undefined,
     undefined,
     executionRegistry,
-    { requireV2Execution: true, ...(!runtimeAdmission.ready ? { standingScanIntervalMs: 0 } : {}) },
+    { requireV2Execution: true, admissionEnabled: runtimeAdmission.ready },
   );
-  if (runtimeAdmission.ready) _dispatcher.enableV2Dispatch();
   context.subscriptions.push({ dispose: () => executionController.dispose() });
   const taskControl = new TaskControlService(taskStore, runner);
   const configSync = new ConfigSyncService(undefined, dshProvider);
@@ -544,7 +530,8 @@ export function activate(context: vscode.ExtensionContext) {
     },
   });
   if (runtimeAdmission.ready) {
-    reworkController.resumePendingMerges();
+    reviewWakeScheduler.start();
+    void reviewWakeScheduler.runWatchdog();
     reviewerBootstrap.start();
   }
   context.subscriptions.push({ dispose: () => reviewerBootstrap.stop() });
@@ -641,7 +628,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Another process (an agent's MCP server) may have recorded a stalled
     // review; re-arm the automatic retry so it is not left to a restart.
-    reviewWakeScheduler.reschedule();
+    if (runtimeAdmission.ready) reviewWakeScheduler.reschedule();
 
     const taskList = Array.isArray(allTasks) ? allTasks : taskStore.getAllTasks();
     for (const t of taskList) {
@@ -667,12 +654,13 @@ export function activate(context: vscode.ExtensionContext) {
     // a timer: wake it the moment that dependency reaches a terminal state.
     // Doing it here (instead of letting the reviewer poll with empty rework
     // rounds) is what keeps a blocked batch from burning a slot every 15s.
+    if (!runtimeAdmission.ready) return;
     const byThreadId = new Map<string, (typeof taskList)[number]>();
     for (const t of taskList) byThreadId.set(t.threadId, t);
     for (const t of taskList) {
       const blocked = t.reviewBlocked;
       if (!blocked?.waitingForThreadId) continue;
-      if (t.status !== 'reviewing') continue;
+      if (t.status !== 'reviewing' || t.execution?.version !== 2 || t.execution.run) continue;
       const dependency = byThreadId.get(blocked.waitingForThreadId);
       if (!dependency) continue;
       if (dependency.status !== 'completed' && dependency.status !== 'failed') continue;
@@ -682,12 +670,16 @@ export function activate(context: vscode.ExtensionContext) {
         .find((r) => r.status === 'completed');
       if (!reviewRound) continue;
 
-      const released = { ...t, reviewBlocked: undefined };
-      released.updatedAt = new Date().toISOString();
-      released.summary.lastOutputSnippet =
-        `Dependency ${blocked.waitingForThreadId} ${dependency.status}; review resumed.`;
-      taskStore.upsertTask(released);
-      void callbackManager.notifyCaller(released, reviewRound);
+      void taskStore.transitionExecution(t.threadId, t.execution.revision, (fresh) => {
+        if (fresh.execution?.version !== 2 || fresh.execution.run || fresh.execution.next ||
+            fresh.status !== 'reviewing' || fresh.cleanup ||
+            fresh.reviewBlocked?.waitingForThreadId !== blocked.waitingForThreadId) {
+          throw new Error('Review dependency or task state changed.');
+        }
+        fresh.reviewBlocked = undefined;
+        fresh.summary.lastOutputSnippet =
+          `Dependency ${blocked.waitingForThreadId} ${dependency.status}; review resumed.`;
+      }).then(released => callbackManager.notifyCaller(released, reviewRound)).catch(() => {});
     }
   });
 
@@ -737,7 +729,7 @@ export function activate(context: vscode.ExtensionContext) {
       autoRetryAt?: string;
       gaveUp?: boolean;
     }) => {
-      reviewWakeScheduler.reschedule();
+      if (runtimeAdmission.ready) reviewWakeScheduler.reschedule();
       const quotaLine = quotaExhausted
         ? `\n原因：${thread.initiatorAgent} 配额/限流不足${
             quotaResetsAtFormatted ? `（预计 ${quotaResetsAtFormatted} 恢复）` : ''
@@ -964,7 +956,7 @@ export function activate(context: vscode.ExtensionContext) {
           }
 
           const picks = tasks.map((t) => {
-            const isRunning = supervisor.isExecuting(t.threadId);
+            const isRunning = t.execution?.version === 2 ? Boolean(t.execution.run) : supervisor.isExecuting(t.threadId);
             const prefix = isRunning ? '⚡ [运行中] ' : t.status === 'queued' ? '⏳ [排队中] ' : '';
             return {
               label: `${prefix}${t.title}`,
@@ -1351,7 +1343,11 @@ export function activate(context: vscode.ExtensionContext) {
 
         // If currently running and has a round waiting to execute
         if (targetRound && targetRound.prompt) {
-          supervisor.executeThreadRound(thread, targetRound);
+          const result = await executionController.startExecution(threadId);
+          if (!result.started) {
+            vscode.window.showWarningMessage(`无法恢复执行任务 ${threadId}（${result.reason || '状态已改变'}）`);
+            return;
+          }
           vscode.window.showInformationMessage(
             `已恢复执行任务 ${threadId} 第 ${targetRound.round} 轮！`,
           );
@@ -1460,8 +1456,8 @@ export function activate(context: vscode.ExtensionContext) {
           return;
         }
 
-        if (thread.reviewFlow !== 'dedicated') {
-          vscode.window.showErrorMessage('Historical requester-review tasks cannot be resumed.');
+        if (!runtimeAdmission.ready || thread.execution?.version !== 2 || thread.reviewFlow !== 'dedicated') {
+          vscode.window.showErrorMessage('Review wake requires an admitted v2 task.');
           return;
         }
         {
@@ -1480,77 +1476,8 @@ export function activate(context: vscode.ExtensionContext) {
           }
         }
 
-        // Re-review is allowed whenever nobody is actually reviewing. A second
-        // wake during a live review would fight it for the same native session,
-        // but a crashed host (or a role lock whose owner already exited) is
-        // exactly when the user must be able to recover. Requiring a recorded
-        // `reviewWake` first made that impossible: a lost wake could only be
-        // fixed by editing the ledger by hand. A terminal `review_failed` task is
-        // precisely a review that needs another chance, so it re-opens here.
-        if (thread.status === 'failed' && thread.failure?.stage === 'review') {
-          reopenFailedReview(thread);
-          taskStore.upsertTask(thread);
-          vscode.window.showInformationMessage(
-            `【${thread.title}】上次检视失败（${thread.reviewFailure?.reason || '原因未记录'}），正在重新打开检视并唤醒下发者。`,
-          );
-        }
-        if (thread.status !== 'reviewing') {
-          vscode.window.showWarningMessage(
-            `任务【${thread.title}】当前状态为 ${thread.status}；只有处于“等待检视”的任务才能重新检视。`,
-          );
-          return;
-        }
-        const roleLock = new TaskRoleLock();
-        const liveReviewer = roleLock.getOwner(threadId);
-        if (liveReviewer?.role === 'reviewer') {
-          vscode.window.showInformationMessage(
-            `下发者 ${thread.initiatorAgent} 的检视仍在进行中（${roleLock.describe(
-              liveReviewer,
-            )}），无需重新唤醒。`,
-          );
-          return;
-        }
-
-        // An explicit manual re-review overrides the caller's `blocked` hold;
-        // `CallbackManager.notifyCaller` refuses to wake a parked task, so the
-        // park has to be released here (the user asked for it by name).
-        if (thread.reviewBlocked) {
-          const parkedOn = thread.reviewBlocked.waitingForThreadId || '外部依赖';
-          thread.reviewBlocked = undefined;
-          thread.updatedAt = new Date().toISOString();
-          taskStore.upsertTask(thread);
-          vscode.window.showInformationMessage(
-            `已解除【${thread.title}】的挂起（原本等待 ${parkedOn}），正在唤醒下发者重新检视。`,
-          );
-        }
-
-        const lastRound =
-          [...thread.rounds].reverse().find((r) => r.status === 'completed') ||
-          thread.rounds[thread.rounds.length - 1];
-        if (!lastRound) {
-          vscode.window.showErrorMessage(`任务无有效轮次: ${threadId}`);
-          return;
-        }
-
-        const success = await callbackManager.notifyCaller(thread, lastRound);
+        const success = await executionController.wakeReviewerV2(threadId, thread.execution.round, true);
         if (success) {
-          // Manual re-review accepted. Keep the stall visible until the caller's
-          // process ends cleanly, but do not let the scheduler fire a duplicate
-          // wake while this one is still running. A plan recorded for an OLDER
-          // round must not leak into this one.
-          const state = thread.reviewWake;
-          if (state && state.round !== (thread.currentRound || 1)) {
-            thread.reviewWake = undefined;
-            thread.updatedAt = new Date().toISOString();
-            taskStore.upsertTask(thread);
-          } else if (state) {
-            thread.reviewWake = {
-              ...state,
-              lastAttemptAt: new Date().toISOString(),
-              autoRetryAt: new Date(Date.now() + 10 * 60_000).toISOString(),
-            };
-            taskStore.upsertTask(thread);
-          }
           reviewWakeScheduler.reschedule();
           activeTreeProvider.refresh();
           recentTreeProvider.refresh();
@@ -1560,7 +1487,7 @@ export function activate(context: vscode.ExtensionContext) {
           );
         } else {
           vscode.window.showWarningMessage(
-            `唤醒下发者可能未成功，请检查 ${thread.initiatorAgent} 运行环境与会话有效性。`,
+            `任务【${thread.title}】当前无法重新检视，请查看任务状态和运行记录。`,
           );
         }
       },

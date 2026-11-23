@@ -126,6 +126,30 @@ export class MergeCoordinator {
   private readonly attemptLogs = new Map<string, { id: string; number: number; path: string; candidateTree?: string }>();
   private activeChildPidCallback?: (pid: number, childProcess?: ReturnType<typeof spawn>, childBirthId?: string) => void | Promise<void>;
 
+  private spawnMergeChild(command: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv, shell = false) {
+    if (!this.activeChildPidCallback) {
+      return { child: spawn(command, args, { cwd, env, shell, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }) };
+    }
+    // Keep the real command behind the run binding and the OS lock helper ACK.
+    // EOF without the start byte means the owner exited before admission.
+    const script = `
+      const { spawn } = require('node:child_process');
+      process.stdin.once('data', data => {
+        process.stdin.destroy();
+        if (data[0] !== 49) return;
+        const { command, args, shell } = JSON.parse(process.argv[1]);
+        const child = spawn(command, args, { shell, windowsHide: true, stdio: ['ignore', 'inherit', 'inherit'] });
+        child.on('error', error => console.error(error.message));
+        child.on('close', code => { process.exitCode = code ?? 1; });
+      });
+    `;
+    const node = process.versions.electron ? resolveNodeCommand() : process.execPath;
+    const child = spawn(node, ['-e', script, JSON.stringify({ command, args, shell })],
+      { cwd, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    child.stdin!.on('error', (error) => child.emit('error', error));
+    return { child, start: () => child.stdin!.end('1') };
+  }
+
   constructor(
     private readonly store: TaskStore,
     private readonly storageDir: string,
@@ -147,7 +171,8 @@ export class MergeCoordinator {
     if (logPath) fs.appendFileSync(logPath, `\n$ git ${args.join(' ')}\n`, 'utf8');
     const registration = this.executions.begin(threadId, thread?.currentRound || 0, 'merge-git', cwd);
     let child: ReturnType<typeof spawn>;
-    try { child = spawn(gitExecutable(), args, { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }); }
+    let start: (() => void) | undefined;
+    try { ({ child, start } = this.spawnMergeChild(gitExecutable(), args, cwd)); }
     catch (error) { this.executions.end(registration); throw error; }
     const windows = process.platform === 'win32';
     let childBirthId = !windows && child.pid ? getProcessBirthId(child.pid) : undefined;
@@ -203,6 +228,8 @@ export class MergeCoordinator {
       }
       try { if (!windows && !trackingError) await this.lock.attachChildPid(child.pid, cancelled); }
       catch (error) { trackingError = error as Error; killProcessTree(child, childBirthId, true); }
+      if (start && !trackingError) start();
+      else if (start) child.stdin!.end();
       const result = await completion;
       if (logPath) fs.appendFileSync(logPath, `\n[exit ${result.code}]\n`, 'utf8');
       if (trackingError || result.error || result.code !== 0) throw new Error(`Git command failed (${args.join(' ')}): ${trackingError?.message || result.error?.message || stderr.trim() || `exit ${result.code}`}`);
@@ -1186,7 +1213,7 @@ export class MergeCoordinator {
       const env = { ...process.env, [pathKey]: searchPath };
       const logPath = this.attemptLogs.get(threadId)?.path;
       if (logPath) fs.appendFileSync(logPath, `\n$ ${step.command} ${step.args.join(' ')}\n`, 'utf8');
-      const child = spawn(step.command, step.args, { cwd, env, windowsHide: true, shell: step.needsShell });
+      const { child, start } = this.spawnMergeChild(step.command, step.args, cwd, env, step.needsShell);
       const windows = process.platform === 'win32';
       let childBirthId = !windows && child.pid ? getProcessBirthId(child.pid) : undefined;
       let output = '';
@@ -1242,6 +1269,8 @@ export class MergeCoordinator {
         trackingError = error as Error;
         if (error?.code !== 'CHILD_BINDING_IN_PROGRESS') killProcessTree(child, childBirthId, true);
       }
+      if (start && !trackingError) start();
+      else if (start) child.stdin!.end();
       const result = await resultPromise;
       this.lock.detachChildPid(child.pid);
       const code = trackingError ? -1 : result.code;

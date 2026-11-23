@@ -339,7 +339,7 @@ export class MeshFileLock {
       const stopped = await this.stopUnleasedHelper(child, channelPath);
       throw new MeshLockAcquisitionError(String((error as Error)?.message || error), stopped.confirmed ? 'not_acquired' : 'unconfirmed', stopped.evidence, { cause: error });
     }
-    const lease: MeshLockLease = { token, helper: child, helperPid, channelPath, childAcks, childBirthIds, detachedChildren };
+    const lease: MeshLockLease = { token, helper: child, helperPid, helperBirthId, channelPath, childAcks, childBirthIds, detachedChildren };
     this.activeLease = lease;
     MeshFileLock.locallyHeldPaths.add(lockPathKey(this.lockPath));
     return () => {

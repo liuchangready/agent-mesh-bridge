@@ -91,6 +91,8 @@ export class ReviewWakeScheduler extends EventEmitter {
     this.isReviewerActive =
       options.isReviewerActive ??
       ((threadId: string) => {
+        const execution = this.taskStore.getTask(threadId)?.execution;
+        if (execution?.version === 2) return Boolean(execution.run);
         try {
           // getOwner() only reports a LIVE owner, so a killed extension host or
           // a crashed caller shows up as "no reviewer" once its heartbeat stops.
@@ -504,6 +506,7 @@ export class ReviewWakeScheduler extends EventEmitter {
    * task must wait for it to finish.
    */
   private isCallerSessionBusy(thread: DelegationThread): boolean {
+    if (thread.execution?.version === 2) return false;
     const key = callerSessionKey(thread.callerSessionId || '');
     if (!key) return false;
     try {

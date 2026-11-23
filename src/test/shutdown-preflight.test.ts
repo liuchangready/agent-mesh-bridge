@@ -10,6 +10,7 @@ import { getProcessBirthId, probeProcessIdentity } from '../bridge/platform';
 import { MeshFileLock } from '../bridge/mesh-file-lock';
 
 const mutableFs = require('node:fs') as typeof fs;
+const cliPackageVersion: string = require('../../package.json').version;
 
 const matchingVersions = [
   { component: 'extension-host', version: '1.2.36', source: 'test inventory' },
@@ -42,7 +43,7 @@ async function stopChild(child: ReturnType<typeof startHeldNode>): Promise<void>
   await Promise.race([closed, new Promise<void>((resolve) => setTimeout(resolve, 5000))]);
 }
 
-function runPreflightCli(home: string, version = '1.2.36') {
+function runPreflightCli(home: string, version = cliPackageVersion) {
   const entry = path.resolve(__dirname, '../../bin/agent-bridge-preflight.cjs');
   return spawnSync(process.execPath, [entry, '--component', `extension-host=${version}`], {
     encoding: 'utf8', windowsHide: true,
@@ -139,7 +140,7 @@ test('standalone preflight CLI is read-only and emits blocking evidence for miss
   const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-preflight-cli-'));
   const entry = path.resolve(__dirname, '../../bin/agent-bridge-preflight.cjs');
   try {
-    const result = spawnSync(process.execPath, [entry, '--component', 'extension-host=1.2.36'], {
+    const result = spawnSync(process.execPath, [entry, '--component', `extension-host=${cliPackageVersion}`], {
       encoding: 'utf8', windowsHide: true,
       env: { ...process.env, USERPROFILE: isolatedHome, HOME: isolatedHome },
     });

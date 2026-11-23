@@ -1,7 +1,7 @@
 import { spawn } from 'child_process';
 import { createHash, randomUUID } from 'crypto';
 import { Socket } from 'net';
-import { resolve } from 'path';
+import { parse, resolve } from 'path';
 import { createInterface } from 'readline';
 import { setTimeout as delay } from 'timers/promises';
 
@@ -74,9 +74,10 @@ interface Pending {
 
 function startHelper() {
   // stdin closes with the owner, so the PowerShell thread releases all its mutexes on owner exit.
+  // A process-lifetime helper must not keep a disposable task worktree open on Windows.
   const child = spawn('powershell.exe', [
     '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64'),
-  ], { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+  ], { cwd: parse(process.execPath).root, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
   const pending = new Map<number, Pending>();
   let sequence = 0;
   const failAll = (error: Error) => {

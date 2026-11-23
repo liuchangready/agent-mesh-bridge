@@ -20,6 +20,7 @@ import {
   confirmProcessTreeExit,
 } from '../bridge/platform';
 import { captureChildDescendants, registerRunChildV2 } from '../bridge/process-binding';
+import { SessionOwnershipStore } from '../bridge/session-ownership';
 import {
   createThread,
   setupFixture,
@@ -309,6 +310,10 @@ describe('Unified Execution Boundary Tests', () => {
         },
         next: { phase: 'develop', round: 1, sourceRunId: 'orphan-source-run' },
       };
+      assert.ok(new SessionOwnershipStore(fixture.dir).claim({
+        agent: thread.targetAgent, sessionId: thread.receiverSessionId, threadId: thread.threadId,
+        role: 'developer', sessionEpoch: 1,
+      }).ok, 'the captured worker session has a durable owner');
       fixture.store.upsertTask(thread);
       (fixture.runner as any).execute = async (options: any) => {
         developerChildren++;
@@ -365,6 +370,34 @@ describe('Unified Execution Boundary Tests', () => {
       secondController.dispose();
       secondRegistry.dispose();
       secondStore.dispose();
+      await fixture.cleanup();
+    }
+  });
+
+  test('v2 callback wake reads the fixed reviewer session and launches only through the current run', async () => {
+    const fixture = await setupFixture();
+    try {
+      const task = createThread('thread_v2_callback_wake', 'review');
+      task.status = 'reviewing';
+      task.rounds[0].status = 'completed';
+      task.execution!.version = 2;
+      assert.ok(new SessionOwnershipStore(fixture.dir).claim({
+        agent: task.initiatorAgent, sessionId: task.reviewerSessionId!, threadId: task.threadId,
+        role: 'reviewer', sessionEpoch: 1,
+      }).ok);
+      fixture.store.upsertTask(task);
+      let startedRun: string | undefined;
+      fixture.callbackManager.launchCaller = (async (_task: unknown, _round: unknown, _onChildPid: unknown, identity?: { runId: string }) => {
+        startedRun = identity?.runId;
+        assert.equal(startedRun, fixture.store.reloadTask(task.threadId)?.execution?.run?.id);
+        assert.ok(startedRun);
+        return { success: false, error: 'controlled reviewer returned without verdict' };
+      }) as typeof fixture.callbackManager.launchCaller;
+      assert.equal(await fixture.callbackManager.notifyCaller(task, task.rounds[0]), true);
+      await fixture.controller.waitForActiveExecutions(5_000);
+      assert.ok(startedRun);
+      assert.equal(fixture.roleLock.getOwner(task.threadId), undefined);
+    } finally {
       await fixture.cleanup();
     }
   });

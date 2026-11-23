@@ -331,3 +331,5 @@ code --install-extension "./agent-mesh-bridge-$version.vsix" --force
    - 每个轮次必须用 `captureWorkspaceSnapshot()` / `diffWorkspaceSnapshots()` 记录 `round.touchedFiles`；非 git 工作区允许为空（`available: false`，不得因此把整棵树当成"全被改动"）。
 
 > 2026-11-23 实施进展（未验收）：控制器直接持有的 v2 develop/review/bootstrap 已将 AutonomousRunner、CallbackManager、原生准备接到当前 run identity；这些路径使用固定 session-bindings 与 PID+birthId 子树记录，不申请 Bridge 角色锁或 NativeSessionLock。v1 收尾仍保留旧锁路径。此改动已覆盖实际 runner.execute 的受控返修与 reviewer 测试，但 standalone stdio 全生命周期、扩展宿主完整验收以及 cleanup/维护竞争的总体验收仍未闭环；不得据此切换生产。
+
+> 2026-11-23 合入验证分支：独立 MCP 放行后只创建 v2 任务，扩展的继续执行和重新检视也走同一 v2 控制器。阻断时控制器不派发、不恢复。审阅唤醒按账本 run 判占用，合入中的 Git 和验证命令收到 run 登记与全局锁助手确认后执行。生产切换仍须核验实际组件、停机证据及扩展宿主验收。
