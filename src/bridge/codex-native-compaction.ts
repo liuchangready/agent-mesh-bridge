@@ -2,7 +2,8 @@ import * as childProcess from 'child_process';
 import * as readline from 'readline';
 import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
 import { TokenUsageComponent } from './types';
-import { getProcessBirthIdAsync } from './platform';
+import { getProcessBirthId, getProcessBirthIdAsync } from './platform';
+import { requestWindowsJobStop, spawnWindowsJob, startWindowsJob, windowsJobOf } from './windows-job';
 
 export interface CodexCompactionRequest {
   executable: string;
@@ -14,7 +15,8 @@ export interface CodexCompactionRequest {
   role: 'developer' | 'reviewer';
   timeoutMs?: number;
   cancelled?: () => boolean;
-  onChildPid?: (pid: number | undefined, birthId?: string) => void | Promise<void>;
+  jobDirectory?: string;
+  onChildPid?: (pid: number | undefined, birthId?: string, child?: childProcess.ChildProcess) => void | Promise<void>;
   onSpawnNotStarted?: () => void | Promise<void>;
   onUsage?: (usage: TokenUsageComponent | undefined) => void;
 }
@@ -31,6 +33,22 @@ export interface CodexCompactionResult {
   usage?: TokenUsageComponent;
 }
 
+function spawnAppServer(request: CodexCompactionRequest, stderr: 'ignore' | 'pipe'): childProcess.ChildProcess {
+  const args = ['app-server', '--listen', 'stdio://', '-c', 'mcp_servers={}', '-c', 'hooks={}'];
+  const options: childProcess.SpawnOptions = {
+    cwd: request.cwd, windowsHide: true, stdio: ['pipe', 'pipe', stderr], env: { ...process.env },
+  };
+  return process.platform === 'win32' && request.jobDirectory
+    ? spawnWindowsJob(request.executable, args, options, request.jobDirectory, getProcessBirthId(process.pid) ?? '')
+    : childProcess.spawn(request.executable, args, options);
+}
+
+function stopAppServer(child: childProcess.ChildProcess): void {
+  const job = windowsJobOf(child);
+  if (job) requestWindowsJobStop(job);
+  else child.kill();
+}
+
 interface RpcMessage { id?: number | string; method?: string; result?: any; error?: { code?: number; message?: string }; params?: any; }
 
 /** A private stdio app-server client. It never starts a model-authored turn. */
@@ -44,15 +62,13 @@ export class CodexNativeCompaction {
       guard.sync(); const now = monotonicNowMs();
       return timeoutMs - (now - startedAt - guard.suspendedWithin(startedAt, now));
     };
-    const child = childProcess.spawn(request.executable, ['app-server', '--listen', 'stdio://', '-c', 'mcp_servers={}', '-c', 'hooks={}'], {
-      cwd: request.cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env },
-    });
+    const child = spawnAppServer(request, 'ignore');
     if (!child.stdin || !child.stdout) throw new Error('Codex recovery probe stdio is unavailable.');
     const reader = readline.createInterface({ input: child.stdout });
     const waiters = new Map<string, { resolve: (value: RpcMessage) => void; reject: (error: Error) => void }>();
     let id = 0; let processError: Error | undefined; let exited = false;
     reader.on('line', (line) => {
-      if (Buffer.byteLength(line, 'utf8') > 1 << 20) { processError = new Error('Codex recovery probe line exceeded 1 MiB.'); try { child.kill(); } catch {} return; }
+      if (Buffer.byteLength(line, 'utf8') > 1 << 20) { processError = new Error('Codex recovery probe line exceeded 1 MiB.'); try { stopAppServer(child); } catch {} return; }
       let message: RpcMessage; try { message = JSON.parse(line); } catch { return; }
       if (message.id !== undefined) {
         const waiter = waiters.get(String(message.id));
@@ -79,14 +95,15 @@ export class CodexNativeCompaction {
       reader.close(); child.stdin?.end();
       const closeStartedAt = monotonicNowMs();
       while (!exited && remaining() > timeoutMs - 2_000) await new Promise((resolve) => setTimeout(resolve, 25));
-      if (!exited) { try { child.kill(); } catch {} }
+      if (!exited) { try { stopAppServer(child); } catch {} }
       while (!exited && remaining() > timeoutMs - 7_000 && monotonicNowMs() - closeStartedAt < 7_000) await new Promise((resolve) => setTimeout(resolve, 25));
       if (!exited) throw new Error('Codex recovery probe process exit could not be confirmed.');
       await request.onChildPid?.(undefined);
     };
     try {
       const birthId = child.pid ? await getProcessBirthIdAsync(child.pid!) : undefined;
-      await request.onChildPid?.(child.pid, birthId);
+      await request.onChildPid?.(child.pid, birthId, child);
+      startWindowsJob(child);
       await rpc('initialize', { clientInfo: { name: 'agent-mesh-bridge', title: 'Agent Mesh Bridge', version: '1.0.0' }, capabilities: null });
       child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} })}\n`);
       const response = await rpc('thread/resume', { threadId: request.sessionId, cwd: request.cwd, model: request.model, approvalPolicy: 'never', sandbox: 'read-only', excludeTurns: true, config: { mcp_servers: {}, hooks: {} } });
@@ -96,7 +113,7 @@ export class CodexNativeCompaction {
       if (child.exitCode !== 0) throw new Error(`Codex recovery probe exited ${child.exitCode ?? -1}.`);
       return !!healthy;
     } catch (error) {
-      try { child.kill(); } catch {}
+      try { stopAppServer(child); } catch {}
       try { await close(); } catch (closeError: any) { throw new Error(`${String((error as any)?.message || error)}; ${closeError?.message || closeError}`); }
       throw error;
     } finally { guard.stop(); }
@@ -117,12 +134,7 @@ export class CodexNativeCompaction {
       const now = monotonicNowMs();
       return timeoutMs - (now - startedAt - guard.suspendedWithin(startedAt, now));
     };
-    const child = childProcess.spawn(request.executable, ['app-server', '--listen', 'stdio://', '-c', 'mcp_servers={}', '-c', 'hooks={}'], {
-      cwd: request.cwd,
-      windowsHide: true,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env },
-    });
+    const child = spawnAppServer(request, 'pipe');
     if (!child.pid) {
       await request.onSpawnNotStarted?.();
       throw new Error('Codex app-server did not start; no native child PID was created.');
@@ -130,7 +142,7 @@ export class CodexNativeCompaction {
     if (!child.stdin || !child.stdout) throw new Error('Codex app-server stdio is unavailable.');
     let activeChildPid: number | undefined = child.pid;
     let compactSettled = false;
-    const reportPid = async (pid: number | undefined, birthId?: string) => { activeChildPid = pid; await request.onChildPid?.(pid, birthId); };
+    const reportPid = async (pid: number | undefined, birthId?: string) => { activeChildPid = pid; await request.onChildPid?.(pid, birthId, pid ? child : undefined); };
     const reportMainExit = () => { if (compactSettled && activeChildPid === child.pid) void reportPid(undefined); };
     child.once('exit', reportMainExit);
     let nextId = 0;
@@ -141,12 +153,12 @@ export class CodexNativeCompaction {
     const rejectServerRequests = (message: RpcMessage): void => {
       if (message.id === undefined || !message.method) return;
       child.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', id: message.id, error: { code: -32000, message: 'Native compaction does not accept approvals or tool requests.' } })}\n`);
-      child.kill();
+      stopAppServer(child);
     };
     lineReader.on('line', (line) => {
       if (Buffer.byteLength(line, 'utf8') > 1 << 20) {
         protocolError = new Error('Codex app-server emitted a line larger than 1 MiB.');
-        try { child.kill(); } catch {}
+        try { stopAppServer(child); } catch {}
         return;
       }
       let message: RpcMessage;
@@ -208,7 +220,7 @@ export class CodexNativeCompaction {
         guard.sync();
         const now = monotonicNowMs();
         if (request.cancelled?.() || remainingMs() <= 0 || monotonicNowMs() >= closeDeadline) {
-          if (killedAt === undefined) { killedAt = now - guard.suspendedWithin(startedAt, now); try { child.kill(); } catch {} }
+          if (killedAt === undefined) { killedAt = now - guard.suspendedWithin(startedAt, now); try { stopAppServer(child); } catch {} }
         }
         if (killedAt !== undefined && now - guard.suspendedWithin(startedAt, now) - killedAt >= 5_000) throw new Error('Could not confirm Codex app-server process exit after termination.');
         await new Promise((resolve) => setTimeout(resolve, 50));
@@ -219,6 +231,7 @@ export class CodexNativeCompaction {
     try {
       const birthId = child.pid ? await getProcessBirthIdAsync(child.pid) : undefined;
       await reportPid(child.pid, birthId);
+      startWindowsJob(child);
       await rpc('initialize', { clientInfo: { name: 'agent-mesh-bridge', title: 'Agent Mesh Bridge', version: '1.0.0' }, capabilities: null });
       child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} })}\n`);
       const resumed = await rpc('thread/resume', {
@@ -254,7 +267,7 @@ export class CodexNativeCompaction {
       if (activeChildPid === child.pid) await reportPid(undefined);
       return { threadId, nativeTurnId: turn.id, model: thread.model, provider: thread.modelProvider, processExitCode: exitCode, usage };
     } catch (error) {
-      try { child.kill(); } catch {}
+      try { stopAppServer(child); } catch {}
       try {
         await close();
         await request.onChildPid?.(undefined);
@@ -282,22 +295,26 @@ export class CodexNativeCompaction {
       const now = monotonicNowMs();
       return now - guard.suspendedWithin(verifierStartedAt, now);
     };
-    const child = childProcess.spawn(request.executable, ['app-server', '--listen', 'stdio://', '-c', 'mcp_servers={}', '-c', 'hooks={}'], {
-      cwd: request.cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env },
-    });
+    const child = spawnAppServer(request, 'ignore');
     if (!child.stdin || !child.stdout) throw new Error('Codex persistence verifier stdio is unavailable.');
     let verifierSettled = false;
     const reportVerifierExit = () => { if (verifierSettled) void request.onChildPid?.(undefined); };
     child.once('exit', reportVerifierExit);
     const birthId = child.pid ? await getProcessBirthIdAsync(child.pid) : undefined;
-    await request.onChildPid?.(child.pid, birthId);
+    try {
+      await request.onChildPid?.(child.pid, birthId, child);
+      startWindowsJob(child);
+    } catch (error) {
+      stopAppServer(child);
+      throw error;
+    }
     const reader = readline.createInterface({ input: child.stdout });
     const waiters = new Map<string, { resolve: (value: RpcMessage) => void; reject: (error: Error) => void }>();
     let id = 0;
     let processError: Error | undefined;
     let exited = false;
     reader.on('line', (line) => {
-      if (Buffer.byteLength(line, 'utf8') > 1 << 20) { processError = new Error('Codex persistence verifier line exceeded 1 MiB.'); try { child.kill(); } catch {}; return; }
+      if (Buffer.byteLength(line, 'utf8') > 1 << 20) { processError = new Error('Codex persistence verifier line exceeded 1 MiB.'); try { stopAppServer(child); } catch {}; return; }
       let message: RpcMessage;
       try { message = JSON.parse(line); } catch { return; }
       if (message.id !== undefined) {
@@ -335,7 +352,7 @@ export class CodexNativeCompaction {
       while (child.exitCode === null) {
         const activeNow = verifierActiveNow();
         if (request.cancelled?.() || remainingMs() <= 0 || activeNow >= closeDeadline) {
-          if (killedAt === undefined) { killedAt = activeNow; try { child.kill(); } catch {} }
+          if (killedAt === undefined) { killedAt = activeNow; try { stopAppServer(child); } catch {} }
         }
         if (killedAt !== undefined && activeNow - killedAt >= 5_000) throw new Error('Could not confirm Codex persistence verifier process exit.');
         await new Promise((resolve) => setTimeout(resolve, 50));
@@ -361,7 +378,7 @@ export class CodexNativeCompaction {
       await close();
       if (child.exitCode !== 0) throw new Error(`Codex persistence verifier exited ${child.exitCode ?? -1}.`);
     } catch (error) {
-      try { child.kill(); } catch {}
+      try { stopAppServer(child); } catch {}
       if (!exited) await close();
       throw error;
     } finally {

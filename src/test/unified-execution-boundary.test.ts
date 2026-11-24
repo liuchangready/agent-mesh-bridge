@@ -333,8 +333,8 @@ describe('Unified Execution Boundary Tests', () => {
       };
 
       const [first, competing] = await Promise.all([
-        fixture.controller.startExecutionV2(thread.threadId, 'develop'),
-        secondController.startExecutionV2(thread.threadId, 'develop'),
+        fixture.controller.startExecution(thread.threadId, 'develop'),
+        secondController.startExecution(thread.threadId, 'develop'),
       ]);
       assert.ok(first.started || competing.started, 'one controller claims the orphaned handoff');
       await fixture.controller.waitForActiveExecutions(15_000);
@@ -356,7 +356,7 @@ describe('Unified Execution Boundary Tests', () => {
         next: { phase: 'develop', round: 1, sourceRunId: 'unknown-owner-run' },
       };
       fixture.store.upsertTask(uncertain);
-      const refused = await secondController.startExecutionV2(uncertain.threadId, 'develop');
+      const refused = await secondController.startExecution(uncertain.threadId, 'develop');
       assert.equal(refused.started, false);
       assert.equal(refused.reason, 'run_busy');
       assert.equal(fixture.store.reloadTask(uncertain.threadId)?.execution?.run?.id, 'unknown-owner-run',

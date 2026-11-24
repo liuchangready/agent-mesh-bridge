@@ -2,6 +2,8 @@ import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
+import type { ExecutionSubtreeEvidence } from '../../bridge/types';
 import { MockMcpClient, MockScenario, event, fixtureRoot } from './mock-agent-protocol';
 
 const root = fixtureRoot();
@@ -17,14 +19,17 @@ const threadId = process.env.MESH_TASK_THREAD_ID || process.env.MESH_REVIEW_THRE
 const model = args.find(arg => arg.startsWith('model='));
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const emit = (value: unknown) => process.stdout.write(JSON.stringify(value) + '\n');
-async function waitForDurableBinding(): Promise<string> {
+async function waitForDurableBinding(): Promise<{ runId: string; jobId?: string }> {
   const file = path.join(root, 'home', '.agent-mesh-bridge', 'threads', `${threadId}.json`);
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     try {
       const task = JSON.parse(fs.readFileSync(file, 'utf8'));
       const child = task.execution?.run?.child;
-      if (task.execution?.run?.state === 'active' && child?.pid === process.pid && typeof child.birthId === 'string') return task.execution.run.id;
+      const job = task.execution?.run?.subtrees?.find((tree: ExecutionSubtreeEvidence) =>
+        tree.root.pid === process.ppid)?.windowsJob;
+      if (task.execution?.run?.state === 'active' && (child?.pid === process.pid || (job && child?.pid === process.ppid)) &&
+          typeof child.birthId === 'string') return { runId: task.execution.run.id, jobId: job?.id };
     } catch { /* the ledger is atomically replaced during launch binding */ }
     await delay(20);
   }
@@ -43,10 +48,20 @@ async function main(): Promise<void> {
   assert.ok(args.indexOf('--ask-for-approval') < exec);
   assert.ok(threadId);
   emit({ type: 'thread.started', thread_id: sessionId });
-  const runId = await waitForDurableBinding();
+  const { runId, jobId } = await waitForDurableBinding();
   const role = bootstrap ? 'bootstrap' : worker ? 'worker' : 'reviewer';
   const round = Number(process.env.MESH_TASK_ROUND || 0);
-  event(root, 'agent.start', { launchId: process.env.MESH_MOCK_LAUNCH_ID, role, round, threadId, sessionId, resume, runId, model, cwd: process.cwd() });
+  event(root, 'agent.start', { launchId: process.env.MESH_MOCK_LAUNCH_ID, role, round, threadId, sessionId, resume, runId, jobId, model, cwd: process.cwd() });
+  if (bootstrap && scenario.bootstrapProcessChurn) {
+    // A short-lived child can disappear between process enumeration and identity reads.
+    for (let index = 0; index < 10; index++) {
+      spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore', windowsHide: true }).unref();
+    }
+    const background = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+      { detached: true, stdio: 'ignore', windowsHide: true });
+    background.unref();
+    event(root, 'bootstrap.process-churn', { backgroundPid: background.pid, launchId: process.env.MESH_MOCK_LAUNCH_ID });
+  }
   const pauseStage = bootstrap ? 'bootstrap' : worker ? 'develop' : 'review';
   const credential = bootstrap ? /^(\{"reviewBootstrap":\s*\{[^\n]+\}\})$/m.exec(prompt) : undefined;
   const bootstrapToken = credential ? JSON.parse(credential[1]).reviewBootstrap.token : undefined;

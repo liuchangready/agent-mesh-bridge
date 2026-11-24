@@ -1,6 +1,8 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { getProcessBirthId, probeProcessIdentityAsync } from './platform';
+import type { ProcessIdentity } from './types';
 
 export interface BridgeWorkspace {
   id: string;
@@ -31,6 +33,7 @@ export interface WindowWorkspaceContext {
   defaultWorkspaceId?: string;
   defaultSource?: 'manual' | 'first-dispatch';
   expiresAt: number;
+  executionOwner?: ProcessIdentity;
 }
 
 interface WorkspaceSelectionState {
@@ -70,6 +73,12 @@ export class WindowWorkspace {
     fs.writeFileSync(temp, JSON.stringify(this.context));
     fs.renameSync(temp, this.file);
   }
+  advertiseExecutionOwner(): void {
+    const birthId = getProcessBirthId(process.pid);
+    if (!birthId) return;
+    this.context.executionOwner = { pid: process.pid, birthId };
+    this.publish();
+  }
   async setDefault(id?: string, source: 'manual' | 'first-dispatch' = 'manual'): Promise<void> {
     this.context.defaultWorkspaceId = id;
     this.context.defaultSource = id ? source : undefined;
@@ -87,7 +96,7 @@ export class WindowWorkspace {
   dispose(): void { try { fs.unlinkSync(this.file); } catch {} }
 }
 
-export function matchingWindows(storageDir: string, root: string): WindowWorkspaceContext[] {
+function liveWindows(storageDir: string): WindowWorkspaceContext[] {
   const dir = path.join(storageDir, 'window-contexts');
   let files: string[];
   try { files = fs.readdirSync(dir); } catch { return []; }
@@ -95,10 +104,22 @@ export function matchingWindows(storageDir: string, root: string): WindowWorkspa
   for (const file of files.filter((name) => /^[a-f0-9-]+\.json$/.test(name))) {
     try {
       const context: WindowWorkspaceContext = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'));
-      if (context.expiresAt > Date.now() && context.folderRoots.includes(root)) matches.push(context);
+      if (context.expiresAt > Date.now() && Array.isArray(context.folderRoots)) matches.push(context);
     } catch {}
   }
   return matches;
+}
+
+export function matchingWindows(storageDir: string, root: string): WindowWorkspaceContext[] {
+  return liveWindows(storageDir).filter(context => context.folderRoots.includes(root));
+}
+
+export async function hasResidentExecutionHost(storageDir: string): Promise<boolean> {
+  for (const { executionOwner } of liveWindows(storageDir)) {
+    if (executionOwner?.birthId && Number.isSafeInteger(executionOwner.pid) && executionOwner.pid > 0 &&
+        await probeProcessIdentityAsync(executionOwner.pid, executionOwner.birthId) === 'alive') return true;
+  }
+  return false;
 }
 
 export function findUniqueWindow(storageDir: string, root: string): WindowWorkspaceContext | undefined {

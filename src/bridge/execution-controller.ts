@@ -1,3 +1,4 @@
+import { windowsJobFinished, windowsJobOf } from './windows-job';
 import { assertDedicatedTask } from './types';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
@@ -103,6 +104,7 @@ export interface ExecutionControllerOptions {
   /** Production hosts set this after v2 dispatch is wired; fixture/legacy controllers may inspect v1 behavior. */
   requireV2Execution?: boolean;
   admissionEnabled?: boolean;
+  ownsRuns?: boolean;
   defaultBudgetLimitMs?: number;
   streamSyncIntervalMs?: number;
   retryBackoffsMs?: number[];
@@ -125,6 +127,7 @@ export class ExecutionController {
   private readonly defaultBudgetLimitMs: number;
   private readonly requireV2Execution: boolean;
   private readonly admissionEnabled: boolean;
+  public readonly ownsRuns: boolean;
   private readonly checkpointIntervalMs: number;
   private readonly retryBackoffsMs: number[];
   private readonly monotonicNow: () => number;
@@ -166,6 +169,7 @@ export class ExecutionController {
     this.defaultBudgetLimitMs = options?.defaultBudgetLimitMs ?? DEFAULT_EXECUTION_BUDGET_MS;
     this.requireV2Execution = options?.requireV2Execution === true;
     this.admissionEnabled = options?.admissionEnabled !== false;
+    this.ownsRuns = options?.ownsRuns !== false;
     this.checkpointIntervalMs = options?.streamSyncIntervalMs ?? 5_000;
     this.retryBackoffsMs = options?.retryBackoffsMs ?? AUTO_RETRY_BACKOFFS_MS;
     this.monotonicNow = options?.monotonicNow ?? monotonicNowMs;
@@ -187,7 +191,7 @@ export class ExecutionController {
     const scanInterval = options?.standingScanIntervalMs !== undefined
       ? options.standingScanIntervalMs
       : 5_000;
-    if (this.admissionEnabled && scanInterval > 0) {
+    if (this.admissionEnabled && this.ownsRuns && scanInterval > 0) {
       this.standingScanTimer = setInterval(() => {
         if (!this.isDisposed) {
           void this.scanAndDrain().catch(() => {});
@@ -232,6 +236,7 @@ export class ExecutionController {
       let sawUnknown = false;
       let sawAlive = false;
       for (const subtree of run.subtrees) {
+        if (subtree.windowsJob && !windowsJobFinished(subtree.windowsJob)) sawUnknown = true;
         for (const identity of [subtree.root, ...subtree.descendants]) {
           if (!identity?.pid || !identity.birthId) {
             sawUnknown = true;
@@ -307,6 +312,7 @@ export class ExecutionController {
     options?: StartExecutionOptions,
   ): Promise<{ started: boolean; reason?: string; run?: ExecutionRun }> {
     if (!this.admissionEnabled) return { started: false, reason: 'V2_STARTUP_BLOCKED' };
+    if (!this.ownsRuns) return { started: false, reason: 'RESIDENT_EXECUTION_REQUIRED' };
     const pending = this.startingExecutions.get(threadId);
     if (pending) return pending;
     // V1 acquires resources before CAS. Concurrent local callers must not share
@@ -369,6 +375,9 @@ export class ExecutionController {
   }
 
   private v2StartBlocker(task: DelegationThread, phase: ExecutionPhase): string | undefined {
+    if (phase === 'review' && task.execution?.purpose === 'bootstrap' && task.workspace?.dispatchAccepted === false) {
+      return 'dispatch_not_accepted';
+    }
     const queue = task.execution?.queue;
     if (queue?.notBefore !== undefined) {
       const notBefore = Date.parse(queue.notBefore);
@@ -650,7 +659,7 @@ export class ExecutionController {
    * After acquiring starting run, acquires necessary resources, checks pre-spawn invalidation, records spawn intent,
    * and launches background worker with confirmed child binding handshake.
    */
-  public async startExecutionV2(
+  private async startExecutionV2(
     threadId: string,
     targetPhase?: ExecutionPhase,
     options?: StartExecutionOptions,
@@ -1512,7 +1521,7 @@ export class ExecutionController {
     let accumulatedSpentMs = 0;
     const processIdentityKey = (identity: ProcessIdentity) => `${identity.pid}:${identity.birthId ?? 'unknown'}`;
     const refreshDescendants = async (tracked: TrackedChild) => {
-      if (!tracked.belongsToSubtree || !tracked.birthId) return;
+      if (!tracked.belongsToSubtree || !tracked.birthId || windowsJobOf(tracked.process)) return;
       const captured = await captureChildDescendants(tracked.pid, tracked.birthId);
       const known = new Map(tracked.descendants.map((identity) => [processIdentityKey(identity), identity]));
       for (const identity of captured) {
@@ -1642,7 +1651,7 @@ export class ExecutionController {
       };
       trackedChildren.set(trackedKey, tracked);
       const belongsToSubtree = await verifyCapturedSubtreeOwnership(pid, childProcess, candidateBirthId);
-      if (belongsToSubtree && candidateBirthId) {
+      if (belongsToSubtree && candidateBirthId && !windowsJobOf(childProcess)) {
         tracked.descendants = await captureChildDescendants(pid, candidateBirthId);
       }
       tracked.belongsToSubtree = belongsToSubtree;
@@ -1864,21 +1873,38 @@ export class ExecutionController {
         this.executionRegistry.end(registration);
       } catch {}
 
-      // A decision is durable before cancellation. Once the matching run's
-      // child tree and all acquired resources have acknowledged release, retire
-      // that run and expose an answered handoff to the common scanner.
+      // The run owner can attest exit even when pause or delete came from another process.
       try {
-        await this.transitionTask(threadId, (task) => {
-          const control = task.execution;
-          if (control?.version !== 2 || control.run?.id !== runId || control.generation !== generation ||
-              control.operationId !== operationId || control.run.state !== 'stopping' || task.status !== 'wait_decision') return;
-          control.run = undefined;
-          if (task.decision?.answer && control.next?.sourceRunId === runId) {
-            control.phase = control.next.phase;
-            control.purpose = control.next.purpose;
-            task.status = 'queued';
-          }
-        });
+        const cleanup = this.taskStore.reloadTask(threadId)?.cleanup;
+        if (!cleanup || (cleanup.action === 'delete' && cleanup.runId === runId &&
+            cleanup.operationId === operationId && cleanup.generation === generation)) {
+          const settled = await this.transitionTask(threadId, (task) => {
+            const control = task.execution;
+            const run = control?.run;
+            if (control?.version !== 2 || run?.id !== runId || control.generation !== generation ||
+                control.operationId !== operationId || run.state !== 'stopping' || run.unconfirmed ||
+                run.owner.pid !== params.ownerIdentity.pid || run.owner.birthId !== params.ownerIdentity.birthId ||
+                task.cleanup?.token !== cleanup?.token) return;
+            if (task.status === 'wait_decision' && !cleanup) {
+              control.run = undefined;
+              if (task.decision?.answer && control.next?.sourceRunId === runId) {
+                control.phase = control.next.phase;
+                control.purpose = control.next.purpose;
+                task.status = 'queued';
+              }
+            } else if (task.interruption?.kind === 'paused' && task.status !== 'completed') {
+              control.run = undefined;
+              control.queue = undefined;
+              task.status = 'paused';
+              const pausedRound = findInFlightRound(task);
+              if (pausedRound) {
+                pausedRound.status = 'paused';
+                pausedRound.interruption = task.interruption;
+              }
+            }
+          }, cleanup?.token, cleanup ? { runId, operationId, generation } : undefined);
+          if (settled.execution?.run?.id !== runId) phaseResult = undefined;
+        }
       } catch {}
       settleRun();
     }
@@ -2300,6 +2326,7 @@ export class ExecutionController {
       receiverSessionId: thread.receiverSessionId || '',
       isRework,
       cwd: thread.workspace?.executionPath,
+      artifactDir: thread.artifactDir,
       model: thread.targetModel,
       taskRound: round.round,
       executionIdentity: thread.execution?.version === 2 ? {
@@ -3009,7 +3036,8 @@ export class ExecutionController {
         const descendants = (run.subtrees || []).flatMap((subtree) => subtree.descendants || []);
         let stopped = false;
         try {
-          stopped = await stopVerifiedChildTree(childPid, true, undefined, childBirthId, PROCESS_STOP_TIMEOUT_MS, descendants, true);
+          const job = run.subtrees?.find(tree => tree.root.pid === childPid && tree.root.birthId === childBirthId)?.windowsJob;
+          stopped = await stopVerifiedChildTree(childPid, true, undefined, childBirthId, PROCESS_STOP_TIMEOUT_MS, descendants, true, job);
         } catch {}
         if (!stopped) {
           await this.markDecisionStopUnconfirmed(threadId, capturedV2, 'Decision could not confirm exit of the full captured child tree.');
@@ -3321,6 +3349,7 @@ export class ExecutionController {
         e.budget.spentActiveMs = 0;
         e.run = undefined;
         e.queue = undefined;
+        if (!this.ownsRuns) t.status = 'queued';
       });
       const nextGen = updated.execution?.generation ?? captured.generation + 1;
       await this.startExecution(threadId, captured.phase, { allowStates: ['failed', 'queued'], generation: nextGen });
@@ -3401,6 +3430,14 @@ export class ExecutionController {
       const cancellations = new CancellationRegistry(this.storageDir);
       cancellations.clear(threadId);
       if (cancellations.peek(threadId)) throw new Error(`Cannot resume task ${threadId}: cancellation request could not be cleared.`);
+      if (!this.ownsRuns && updated.status === 'paused') {
+        return this.taskStore.transitionExecution(threadId, updated.execution!.revision, (task) => {
+          if (task.status !== 'paused' || task.cleanup || task.execution?.run || cancellations.peek(threadId)) {
+            throw new Error('Task changed while preparing it to resume.');
+          }
+          task.status = 'queued';
+        });
+      }
       await this.startExecution(threadId, captured.phase, { allowStates: ['paused', 'queued'] });
       return this.taskStore.getTask(threadId) || updated;
     }
@@ -3540,8 +3577,10 @@ export class ExecutionController {
         if (currentRun?.id === capturedRun.id && currentRun.child?.pid && currentRun.child.birthId) {
           const descendants = (currentRun.subtrees || []).flatMap((tree) => tree.descendants || []);
           try {
+            const job = currentRun.subtrees?.find(tree =>
+              tree.root.pid === currentRun.child?.pid && tree.root.birthId === currentRun.child?.birthId)?.windowsJob;
             await stopVerifiedChildTree(currentRun.child.pid, true, undefined, currentRun.child.birthId,
-              PROCESS_STOP_TIMEOUT_MS, descendants, true);
+              PROCESS_STOP_TIMEOUT_MS, descendants, true, job);
           } catch {}
         }
         const latest = this.taskStore.reloadTask(threadId);
@@ -3736,7 +3775,7 @@ export class ExecutionController {
   };
 
   public async scanAndDrain(): Promise<void> {
-    if (!this.admissionEnabled || this.isDisposed) return;
+    if (!this.admissionEnabled || !this.ownsRuns || this.isDisposed) return;
     if (this.drainInFlight) return this.drainInFlight;
     const drain = this.drainLedger();
     this.drainInFlight = drain;

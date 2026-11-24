@@ -22,11 +22,10 @@ import { AgentNodesProvider, AgentNodeItem } from './ui/agent-nodes-provider';
 import { TaskDetailPanel } from './ui/detail-panel';
 import { ModelApprovalService } from './ui/model-approval-service';
 import { TaskRetargetService } from './bridge/task-retarget';
-import { AgentId, isValidSessionId, isMergePending } from './bridge/types';
-import { TaskSupervisor } from './bridge/task-supervisor';
+import { AgentId, isValidSessionId, isMergePending, isMergeReview } from './bridge/types';
+import { readRecentTaskLogs } from './bridge/round-log';
 import { TaskControlService } from './bridge/task-control';
 import { TaskArchiveService } from './bridge/task-archive';
-import { ReviewerBootstrapService, confirmReviewerBootstrapTask } from './bridge/reviewer-bootstrap';
 import { TaskExecutionRegistry } from './bridge/task-execution-registry';
 import { saveBridgePolicy } from './bridge/bridge-policy';
 import { probeCodexResumeSupport } from './bridge/codex-session';
@@ -485,7 +484,7 @@ export function activate(context: vscode.ExtensionContext) {
     callbackManager,
     detector,
     executionRegistry,
-    true,
+    false,
     true,
     runtimeAdmission.ready,
   );
@@ -504,52 +503,14 @@ export function activate(context: vscode.ExtensionContext) {
   const taskControl = new TaskControlService(taskStore, runner);
   const configSync = new ConfigSyncService(undefined, dshProvider);
   configSync.setAgentMcpEnv(agentMcpEnvFor(dshProvider));
-  const supervisor = new TaskSupervisor(
-    taskStore,
-    runner,
-    callbackManager,
-    detector,
-    executionRegistry,
-    true,
-    runtimeAdmission.ready,
-  );
-  context.subscriptions.push({ dispose: () => supervisor.dispose() });
-
-  // Dedicated review: launch each pending reviewer conversation independently;
-  // the developer round starts after its reviewer session is captured.
-  const reviewerBootstrap = new ReviewerBootstrapService({
-    taskStore,
-    runner,
-    detector,
-    executionRegistry,
-    requireV2Execution: true,
-    onSettled: () => {
-      // The supervisor observes ledger changes, but a direct nudge removes the
-      // up-to-one-poll delay after the bootstrap records its session handoff.
-      supervisor.checkPendingTasks();
-    },
-  });
   if (runtimeAdmission.ready) {
+    windowWorkspace.advertiseExecutionOwner();
     reviewWakeScheduler.start();
     void reviewWakeScheduler.runWatchdog();
-    reviewerBootstrap.start();
+    void executionController.scanAndDrain().catch(error => {
+      console.error('[Agent Bridge] Initial execution scan failed:', error);
+    });
   }
-  context.subscriptions.push({ dispose: () => reviewerBootstrap.stop() });
-
-  supervisor.on('taskStarted', ({ thread, round }) => {
-    statusBar.update();
-    activeTreeProvider.refresh();
-    recentTreeProvider.refresh();
-    vscode.window.showInformationMessage(
-      `[Agent Bridge] 开始执行【${thread.title}】第 ${round.round} 轮 (${thread.targetAgent})...`,
-    );
-  });
-
-  supervisor.on('taskCompleted', () => {
-    statusBar.update();
-    activeTreeProvider.refresh();
-    recentTreeProvider.refresh();
-  });
 
   const applyAgentDefaults = () => {
     const agentConfig = vscode.workspace.getConfiguration('agentMeshBridge');
@@ -925,7 +886,7 @@ export function activate(context: vscode.ExtensionContext) {
           }
 
           const picks = tasks.map((t) => {
-            const isRunning = t.execution?.version === 2 ? Boolean(t.execution.run) : supervisor.isExecuting(t.threadId);
+            const isRunning = t.execution?.version === 2 && Boolean(t.execution.run);
             const prefix = isRunning ? '⚡ [运行中] ' : t.status === 'queued' ? '⏳ [排队中] ' : '';
             return {
               label: `${prefix}${t.title}`,
@@ -946,7 +907,7 @@ export function activate(context: vscode.ExtensionContext) {
         const thread = taskStore.getTask(threadId);
         const title = thread ? thread.title : threadId;
 
-        const logInfo = TaskSupervisor.getRecentLogs(threadId, 1000, taskStore);
+        const logInfo = readRecentTaskLogs(taskStore, threadId);
 
         const channel = vscode.window.createOutputChannel(
           `Agent Bridge: ${title.slice(0, 20)} Logs`,
@@ -1294,9 +1255,14 @@ export function activate(context: vscode.ExtensionContext) {
           (thread.rounds || []).some((r) => r.status === 'paused')
         ) {
           try {
-            const round = await reworkController.resumePausedTask(threadId);
+            const needsMergeReview = thread.execution?.version === 2 &&
+              isMergeReview({ ...thread, status: 'reviewing' }) &&
+              [...thread.rounds].reverse().find(round => round.type !== 'approval')?.status !== 'paused';
+            const round = needsMergeReview
+              ? (await reworkController.resumePausedTask(threadId)).round
+              : (await executionController.resumeOperation(threadId)).execution?.round ?? thread.currentRound;
             vscode.window.showInformationMessage(
-              `已恢复暂停任务 ${threadId} 第 ${round.round} 轮，正在同一原生会话中继续执行。`,
+              `已请求恢复任务 ${threadId} 第 ${round} 轮。`,
             );
             TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
           } catch (e: any) {
@@ -1345,7 +1311,12 @@ export function activate(context: vscode.ExtensionContext) {
           if (!choice) return;
 
           if (choice.action === 'retry') {
-            await reworkController.retryFailedRound(threadId);
+            try {
+              await executionController.retryOperation(threadId);
+            } catch (e: any) {
+              vscode.window.showErrorMessage(`重试失败轮次失败: ${e.message}`);
+              return;
+            }
             vscode.window.showInformationMessage(
               `正在重新执行任务 ${threadId} 第 ${lastRound.round} 轮..`,
             );
@@ -1393,9 +1364,9 @@ export function activate(context: vscode.ExtensionContext) {
         }
 
         try {
-          const retried = await reworkController.retryFailedRound(threadId);
+          const retried = await executionController.retryOperation(threadId);
           vscode.window.showInformationMessage(
-            `正在重新执行任务 ${threadId} 第 ${retried.round} 轮..`,
+            `已请求重新执行任务 ${threadId} 第 ${retried.execution?.round ?? retried.currentRound} 轮。`,
           );
           TaskDetailPanel.render(context.extensionUri, taskStore, reworkController, threadId);
         } catch (e: any) {

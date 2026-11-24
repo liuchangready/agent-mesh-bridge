@@ -21,23 +21,14 @@ import { getTaskExecutionPath } from './types';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import { AutonomousRunner } from './autonomous-runner';
-import { AgentDetector } from './agent-detector';
-import { CancellationRegistry } from './cancellation-registry';
-import { concurrencyPolicy } from './bridge-policy';
-import { TaskExecutionRegistry } from './task-execution-registry';
-import { TaskRoleLock } from './task-role-lock';
 import { TaskStore } from './task-store';
-import { ExecutionController } from './execution-controller';
+import { requireV2ExecutionEligibility } from './execution-gate';
 import { bootstrapDir } from './task-summary';
-import { reviewerBootstrapLogPath } from './reviewer-log';
 import { taskBootstrapDir, bridgeHomeDir } from './round-log';
 import { resolveTaskDataRoot } from './task-data-dir';
-import { assertCanExecute } from './agent-capabilities';
 import {
   DelegationThread,
   ReviewFlow,
-  appendInterruption,
   isReviewerBootstrapPending,
 } from './types';
 
@@ -69,68 +60,6 @@ const BOOTSTRAP_HOST_TTL_MS = 30 * 60 * 1000;
 
 /** The one tool a bootstrap turn exists to call. */
 const REVIEWER_BOOTSTRAP_TOOL = 'dispatch_task';
-
-/** Bounded relaunch budget for a bootstrap that never confirmed. */
-const MAX_REVIEWER_BOOTSTRAP_ATTEMPTS = 3;
-
-/**
- * Cool-off before relaunching a bootstrap that ended without confirming.
- *
- * The failure being retried is a launch race with the host's MCP registration,
- * so an immediate relaunch tends to lose the same race. A short pause lets the
- * previous reviewer process exit and its server release the stdio pipe.
- */
-const REVIEWER_BOOTSTRAP_RETRY_DELAY_MS = 8 * 1000;
-
-/**
- * Did the reviewer log show it never even saw the bridge tools?
- *
- * A dedicated reviewer launch can lose a race with the host's MCP registration:
- * the host starts the model turn before the bridge server finished `initialize`,
- * so `dispatch_task` is absent from the tool list and the model correctly
- * reports "no such tool". A native MCP call always records the server/tool
- * pair, so its absence plus an explicit missing-tool symptom identifies that
- * race rather than a reviewer that simply ignored its instructions.
- */
-function reviewerBootstrapLogShowsMissingTools(logFile: string): boolean {
-  let text = '';
-  try {
-    const stat = fs.statSync(logFile);
-    const limit = 256 * 1024;
-    if (stat.size <= limit) {
-      text = fs.readFileSync(logFile, 'utf8');
-    } else {
-      const half = Math.floor(limit / 2);
-      const head = Buffer.alloc(half);
-      const tail = Buffer.alloc(half);
-      const fd = fs.openSync(logFile, 'r');
-      try {
-        fs.readSync(fd, head, 0, head.length, 0);
-        fs.readSync(fd, tail, 0, tail.length, stat.size - tail.length);
-      } finally {
-        fs.closeSync(fd);
-      }
-      text = head.toString('utf8') + tail.toString('utf8');
-    }
-  } catch {
-    return false;
-  }
-  // A recorded MCP call proves the tools were present; nothing to retry for.
-  // The marker is the host's own `mcp_tool_call` event, NOT a bare mention of
-  // the tool name: a failed exec probe also prints `dispatch_task` in its source.
-  if (
-    text.includes(`"type":"mcp_tool_call"`) &&
-    text.includes(`"tool":"${REVIEWER_BOOTSTRAP_TOOL}"`)
-  ) {
-    return false;
-  }
-  if (text.includes(`mcp__agent_mesh_bridge__${REVIEWER_BOOTSTRAP_TOOL}`)) {
-    return false;
-  }
-  return /Cannot read properties of undefined|tool not available|unknown tool|no such tool|没有\s*`?dispatch_task|工具中没有/i.test(
-    text,
-  );
-}
 
 export function reviewerBootstrapTokenPath(
   threadId: string,
@@ -279,20 +208,6 @@ export function resolveReviewFlow(override?: ReviewFlow, _policyFlow?: ReviewFlo
   return 'dedicated';
 }
 
-export interface ReviewerBootstrapDeps {
-  taskStore: TaskStore;
-  runner: AutonomousRunner;
-  detector: AgentDetector;
-  executionRegistry: TaskExecutionRegistry;
-  storageDir?: string;
-  /** Overall budget for one bootstrap turn. */
-  timeoutMs?: number;
-  /** Called after a bootstrap settles so the queue can advance. */
-  onSettled?: (threadId: string) => void;
-  /** Production hosts set this to keep all history execution v2-only. */
-  requireV2Execution?: boolean;
-}
-
 /**
  * Find the only pending bootstrap a reviewer process could be claiming.
  *
@@ -394,12 +309,16 @@ export async function confirmReviewerBootstrapTask(
   root?: string,
 ): Promise<DelegationThread> {
   taskStore.loadFromDisk();
-  let thread = taskStore.getTask(threadId);
-  if (!thread) throw new Error(`Reviewer bootstrap thread not found: ${threadId}`);
-  const v2BootstrapRun = thread.execution?.version === 2 && thread.execution.phase === 'review' &&
-    thread.execution.purpose === 'bootstrap' && thread.execution.run?.role === 'reviewer';
-  if ((thread.status !== 'queued' && !(v2BootstrapRun && thread.status === 'reviewing')) || thread.reviewFlow !== 'dedicated')
-    throw new Error(`Reviewer bootstrap for ${threadId} is no longer a queued dedicated task.`);
+  const thread = taskStore.getTask(threadId);
+  requireV2ExecutionEligibility(thread, 'confirm reviewer bootstrap');
+  const isConfirmableRun = (task: DelegationThread) => {
+    const execution = task.execution;
+    return task.reviewFlow === 'dedicated' && !task.cleanup && !task.archivedAt &&
+      (task.status === 'queued' || task.status === 'reviewing') && execution?.version === 2 &&
+      execution.phase === 'review' && execution.purpose === 'bootstrap' &&
+      execution.run?.role === 'reviewer' && execution.run.state !== 'stopping' && !execution.run.unconfirmed;
+  };
+  if (!isConfirmableRun(thread)) throw new Error(`Reviewer bootstrap for ${threadId} has no active v2 run.`);
   if (thread.reviewBootstrap?.phase === 'confirmed') throw new Error(`Thread ${threadId} was already dispatched by its reviewer.`);
   if (thread.reviewBootstrap?.phase === 'failed') throw new Error(`Thread ${threadId} failed its reviewer bootstrap; it cannot be dispatched anymore.`);
   const record = readReviewerBootstrapToken(threadId, root, thread.artifactDir);
@@ -411,411 +330,36 @@ export async function confirmReviewerBootstrapTask(
   if (!credential.token && !credential.hostPid)
     throw new Error(`Reviewer bootstrap credential is missing for ${threadId}.`);
   if (record.agent !== thread.initiatorAgent) throw new Error(`Reviewer bootstrap agent mismatch for ${threadId}.`);
-  taskStore.loadFromDisk();
-  let latest = taskStore.getTask(threadId);
-  const latestV2BootstrapRun = (candidate: DelegationThread | undefined) => candidate?.execution?.version === 2 &&
-    candidate.execution.phase === 'review' && candidate.execution.purpose === 'bootstrap' &&
-    candidate.execution.run?.role === 'reviewer';
-  if (!latest || (latest.status !== 'queued' && !(latestV2BootstrapRun(latest) && latest.status === 'reviewing')) || latest.reviewFlow !== 'dedicated')
-    throw new Error(`Reviewer bootstrap for ${threadId} was stopped before confirmation; its token was not consumed.`);
-  thread = latest;
-  if (thread.execution?.version === 2) {
-    const source = {
-      runId: thread.execution.run?.id,
-      operationId: thread.execution.operationId,
-      generation: thread.execution.generation,
-    };
-    let confirmed: DelegationThread | undefined;
-    for (let attempt = 0; attempt < 6; attempt++) {
-      taskStore.loadFromDisk();
-      latest = taskStore.getTask(threadId);
-      if (!latest || !latestV2BootstrapRun(latest) || latest.execution?.run?.id !== source.runId ||
-          latest.execution?.operationId !== source.operationId || latest.execution?.generation !== source.generation ||
-          latest.cleanup || (latest.status !== 'queued' && latest.status !== 'reviewing')) {
-        throw new Error(`Reviewer bootstrap run changed before confirmation for ${threadId}; its token was not consumed.`);
-      }
-      if (latest.reviewBootstrap?.phase === 'confirmed') {
-        confirmed = latest;
-        break;
-      }
-      try {
-        confirmed = await taskStore.transitionExecution(threadId, latest.execution.revision, (fresh) => {
-          if (!latestV2BootstrapRun(fresh) || fresh.execution?.run?.id !== source.runId ||
-              fresh.execution?.operationId !== source.operationId || fresh.execution?.generation !== source.generation ||
-              fresh.cleanup || (fresh.status !== 'queued' && fresh.status !== 'reviewing')) {
-            throw new Error(`Reviewer bootstrap run changed before confirmation for ${threadId}.`);
-          }
-          fresh.reviewBootstrap = { ...(fresh.reviewBootstrap || { phase: 'pending', attempts: 0 }), phase: 'confirmed' };
-          fresh.summary.lastOutputSnippet = 'Reviewer dispatched the task; waiting for the bootstrap process to persist its native session.';
-        });
-        break;
-      } catch (error: any) {
-        if (!String(error?.message || error).includes('revision mismatch') || attempt === 5) throw error;
-      }
+  const source = thread.execution!;
+  const matchesSource = (task: DelegationThread) => isConfirmableRun(task) &&
+    task.execution!.run?.id === source.run!.id && task.execution!.operationId === source.operationId &&
+    task.execution!.generation === source.generation;
+  let confirmed: DelegationThread | undefined;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const latest = taskStore.reloadTask(threadId);
+    if (!latest || !matchesSource(latest)) {
+      throw new Error(`Reviewer bootstrap run changed before confirmation for ${threadId}; its token was not consumed.`);
     }
-    if (!confirmed) throw new Error(`Reviewer bootstrap confirmation did not commit for ${threadId}.`);
-    // The CAS is the durable confirmation point. A crash before it leaves the
-    // credential reusable; a crash after it is harmless because confirmation
-    // is already persisted and cannot be replayed as a new dispatch.
-    clearReviewerBootstrapToken(threadId, root, confirmed.artifactDir);
-    return confirmed;
-  }
-  thread.reviewBootstrap = { ...(thread.reviewBootstrap || { phase: 'pending', attempts: 0 }), phase: 'confirmed' };
-  thread.status = 'queued';
-  thread.summary.lastOutputSnippet = 'Reviewer dispatched the task; waiting for the bootstrap process to persist its native session.';
-  taskStore.upsertTask(thread);
-  clearReviewerBootstrapToken(threadId, root, thread.artifactDir);
-  return thread;
-}
-
-/**
- * Launches and supervises the one bootstrap turn per dedicated task.
- *
- * It starts each queued dedicated task independently, subject only to optional
- * concurrency caps and that task's reviewer role lock.
- */
-export class ReviewerBootstrapService {
-  private deps: ReviewerBootstrapDeps;
-  private timer: NodeJS.Timeout | null = null;
-  private launching = new Set<string>();
-  private disposed = false;
-
-  constructor(deps: ReviewerBootstrapDeps) {
-    this.deps = deps;
-  }
-
-  public start(intervalMs: number = 1500): void {
-    if (this.timer) return;
-    this.timer = setInterval(() => void this.tick(), Math.max(250, intervalMs));
-    this.timer.unref?.();
-    void this.tick();
-  }
-
-  public stop(): void {
-    this.disposed = true;
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
+    if (latest.reviewBootstrap?.phase === 'failed') {
+      throw new Error(`Thread ${threadId} failed its reviewer bootstrap; it cannot be dispatched anymore.`);
     }
-  }
-
-  /**
-   * One pass: start every pending reviewer bootstrap allowed by the optional
-   * concurrency caps. Task role locks are the only per-task exclusion.
-   */
-  public async tick(): Promise<void> {
-    if (this.disposed) return;
-    const store = this.deps.taskStore;
-    const root = this.deps.storageDir || path.dirname(store.getStoragePath());
-    store.loadFromDisk();
-    const tasks = store.getAllTasks();
-    const policy = concurrencyPolicy(root);
-
-    const pending = tasks
-      .filter((thread) => (!this.deps.requireV2Execution || thread.execution?.version === 2) && thread.status === 'queued' && isReviewerBootstrapPending(thread))
-      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
-
-    for (const candidate of pending) {
-      if (candidate.reviewBootstrap?.phase === 'failed') continue;
-      if (candidate.execution && ExecutionController.getInstance()) {
-        void ExecutionController.getInstance()!.startExecution(candidate.threadId, 'review', { purpose: 'bootstrap' });
-        continue;
-      }
-      if (this.launching.has(candidate.threadId)) continue;
-      // An active same-task bootstrap must be left to its owning process. Check
-      // this before the retry budget so another extension host cannot mark a
-      // healthy third attempt failed merely because it observes `launching`.
-      if (
-        this.deps.executionRegistry.getOwner(candidate.threadId) ||
-        new TaskRoleLock(root).getOwner(candidate.threadId)
-      ) continue;
-      // A relaunch after a lost MCP-registration race waits out its cool-off.
-      const retryAfter = Date.parse(candidate.reviewBootstrap?.retryAfter || '');
-      if (Number.isFinite(retryAfter) && Date.now() < retryAfter) continue;
-      if ((candidate.reviewBootstrap?.attempts || 0) >= MAX_REVIEWER_BOOTSTRAP_ATTEMPTS) {
-        this.fail(
-          candidate,
-          candidate.reviewBootstrap?.lastError || 'reviewer bootstrap attempts exhausted',
-        );
-        continue;
-      }
-
-      if (policy.enabled) {
-        const owners = this.deps.executionRegistry.listAgentOwners();
-        if (owners.length >= policy.maxConcurrentTasks) continue;
-        const initiatorSlots = owners.filter(
-          (owner) => owner.agent === candidate.initiatorAgent,
-        ).length;
-        if (initiatorSlots >= policy.maxConcurrentPerAgent) continue;
-      }
-
-      this.launching.add(candidate.threadId);
-      // Bootstrap turns can take minutes. Do not let one workspace or one
-      // reviewer process delay starting other eligible tasks in this pass.
-      void this.launch(candidate)
-        .catch((e: any) => {
-        console.warn(`[ReviewerBootstrap] Failed for ${candidate.threadId}: ${e?.message || e}`);
-        })
-        .finally(() => this.launching.delete(candidate.threadId));
+    if (latest.reviewBootstrap?.phase === 'confirmed') {
+      confirmed = latest;
+      break;
     }
-  }
-
-  /** Launch the fresh reviewer conversation and wait for its bootstrap turn. */
-  private async launch(thread: DelegationThread): Promise<void> {
-    assertCanExecute(thread.initiatorAgent, 'bootstrap as a reviewer', 'initiator');
-    const store = this.deps.taskStore;
-    const root = this.deps.storageDir || path.dirname(store.getStoragePath());
-    store.loadFromDisk();
-    const current = store.getTask(thread.threadId);
-    if (
-      !current ||
-      current.status !== 'queued' ||
-      !isReviewerBootstrapPending(current)
-    ) {
-      return;
-    }
-    thread = current;
-    const tokenRecord = readReviewerBootstrapToken(thread.threadId, root, thread.artifactDir);
-    if (!tokenRecord) {
-      this.fail(thread, 'Reviewer bootstrap token is missing (the task was created before the bootstrap service raced it?).');
-      return;
-    }
-
-    const resumeReviewerSession =
-      thread.reviewerSessionCaptured === true && !!thread.reviewerSessionId;
-    const preassigned = resumeReviewerSession ? thread.reviewerSessionId! : crypto.randomUUID();
-    const roleLock = new TaskRoleLock(root);
-    const roleLease = roleLock.tryAcquire(thread.threadId, 'reviewer');
-    if (!roleLease) return;
-
-    let registration;
     try {
-      registration = this.deps.executionRegistry.begin(
-        thread.threadId,
-        0,
-        thread.initiatorAgent,
-        getTaskExecutionPath(thread),
-        'bootstrap',
-      );
-    } catch (error: any) {
-      roleLock.release(roleLease);
-      this.fail(thread, `could not record reviewer bootstrap execution: ${error?.message || error}`);
-      this.deps.onSettled?.(thread.threadId);
-      return;
-    }
-
-    const attempt = (thread.reviewBootstrap?.attempts || 0) + 1;
-    const logFile = reviewerBootstrapLogPath(thread.threadId, root, thread.initiatorAgent, thread.artifactDir);
-    let result;
-    let runError: any;
-    try {
-      store.loadFromDisk();
-      const beforeStart = store.getTask(thread.threadId);
-      const cancellationBeforeStart = new CancellationRegistry(root).peek(thread.threadId);
-      if (
-        !beforeStart ||
-        beforeStart.status !== 'queued' ||
-        cancellationBeforeStart?.action === 'pause' ||
-        cancellationBeforeStart?.action === 'delete'
-      ) {
-        return;
-      }
-      thread = beforeStart;
-      // The cool-off has done its job once the relaunch is admitted.
-      const { retryAfter: _retryAfter, ...previousBootstrap } =
-        thread.reviewBootstrap || { phase: 'pending' as const };
-      thread.reviewBootstrap = {
-        ...previousBootstrap,
-        phase: 'launching',
-        attempts: attempt,
-        launchedAt: new Date().toISOString(),
-      };
-      thread.summary.lastOutputSnippet = 'Starting the dedicated reviewer conversation...';
-      store.upsertTask(thread);
-      try {
-        fs.mkdirSync(path.dirname(logFile), { recursive: true });
-        fs.writeFileSync(logFile, '', 'utf8');
-      } catch {}
-
-      result = await this.deps.runner.execute({
-        agent: thread.initiatorAgent,
-        prompt: buildReviewerBootstrapPrompt(thread, tokenRecord.token),
-        isRework: resumeReviewerSession,
-        receiverSessionId: preassigned,
-        title: `Reviewer bootstrap: ${thread.title}`,
-        cwd: getTaskExecutionPath(thread),
-        taskThreadId: thread.threadId,
-        artifactDir: thread.artifactDir,
-        taskRound: 0,
-        nativeSessionRole: 'reviewer',
-        model: thread.reviewerModel,
-        role: 'bootstrap',
-        markAsReceiver: false,
-        timeoutMs: this.deps.timeoutMs ?? 3 * 60 * 1000,
-        silenceTimeoutMs: 2 * 60 * 1000,
-        extraEnv: {
-          MESH_REVIEW_BOOTSTRAP: '1',
-          MESH_REVIEW_BOOTSTRAP_TOKEN: tokenRecord.token,
-          MESH_REVIEW_THREAD_ID: thread.threadId,
-          MESH_CALLER_AGENT: thread.initiatorAgent,
-        },
-        onChildPid: (pid) => {
-          this.deps.executionRegistry.attachChildPid(pid, registration!);
-          roleLock.attachChild(roleLease, pid);
-          // Environment-independent half of the handshake: the bridge server
-          // that this reviewer CLI spawns can identify itself by this pid even
-          // when the host scrubs the inherited environment.
-          if (pid) recordReviewerBootstrapHostPid(thread.threadId, pid, root, thread.artifactDir);
-        },
-        onStdoutChunk: (chunk: string) => {
-          try {
-            fs.appendFileSync(logFile, chunk, 'utf8');
-          } catch {}
-        },
-        onStderrChunk: (chunk: string) => {
-          try {
-            fs.appendFileSync(logFile, chunk, 'utf8');
-          } catch {}
-        },
+      confirmed = await taskStore.transitionExecution(threadId, latest.execution!.revision, (fresh) => {
+        if (!matchesSource(fresh)) throw new Error(`Reviewer bootstrap run changed before confirmation for ${threadId}.`);
+        fresh.reviewBootstrap = { ...(fresh.reviewBootstrap || { attempts: 0 }), phase: 'confirmed' };
+        fresh.summary.lastOutputSnippet = 'Reviewer dispatched the task; waiting for the bootstrap process to persist its native session.';
       });
-    } catch (e: any) {
-      runError = e;
-    } finally {
-      try {
-        store.loadFromDisk();
-        const fresh = store.getTask(thread.threadId);
-        const cancellation = new CancellationRegistry(root).peek(thread.threadId);
-        const deleting = cancellation?.action === 'delete';
-        const paused = fresh?.status === 'paused' || cancellation?.action === 'pause';
-        // Pause/delete is authoritative even if an already-running bootstrap
-        // returned after cancellation. Capture a confirmed native session when
-        // available, but never revive the task to queued/failed.
-        if (fresh && !deleting && paused) {
-          fresh.status = 'paused';
-          const sessionId =
-            result?.actualSessionId ||
-            (result && thread.initiatorAgent === 'claude_code' ? preassigned : undefined) ||
-            (result && resumeReviewerSession ? preassigned : undefined);
-          if (sessionId) {
-            fresh.reviewerSessionId = sessionId;
-            fresh.reviewerSessionCaptured = true;
-            fresh.callerSessionId = sessionId;
-            if (fresh.reviewBootstrap?.phase === 'confirmed') {
-              fresh.reviewBootstrap = {
-                ...fresh.reviewBootstrap,
-                reviewerSessionId: sessionId,
-              };
-              clearReviewerBootstrapToken(fresh.threadId, root, fresh.artifactDir);
-            }
-          }
-          store.upsertTask(fresh);
-        } else if (fresh && !deleting && fresh.status === 'queued') {
-          if (!result) {
-            fresh.reviewBootstrap = {
-              ...(fresh.reviewBootstrap || { phase: 'pending', attempts: attempt }),
-              phase: attempt >= MAX_REVIEWER_BOOTSTRAP_ATTEMPTS ? 'failed' : 'pending',
-              lastError: `reviewer launch failed: ${runError?.message || runError}`,
-            };
-            if (attempt >= MAX_REVIEWER_BOOTSTRAP_ATTEMPTS) {
-              this.fail(fresh, `reviewer launch failed: ${runError?.message || runError}`);
-            } else {
-              store.upsertTask(fresh);
-            }
-          } else if (fresh.reviewBootstrap?.phase === 'confirmed') {
-            const sessionId =
-              result.actualSessionId ||
-              (thread.initiatorAgent === 'claude_code' ? preassigned : undefined) ||
-              (resumeReviewerSession ? preassigned : undefined);
-            if (!sessionId) {
-              this.fail(
-                fresh,
-                `reviewer dispatch was confirmed but no native session id was captured (reviewer log: ${logFile})`,
-              );
-            } else {
-              fresh.reviewerSessionId = sessionId;
-              fresh.reviewerSessionCaptured = true;
-              fresh.callerSessionId = sessionId;
-              fresh.reviewBootstrap = {
-                ...fresh.reviewBootstrap,
-                phase: 'confirmed',
-                reviewerSessionId: sessionId,
-              };
-              fresh.status = 'queued';
-              fresh.summary.lastOutputSnippet =
-                'Reviewer conversation dispatched the task; waiting for execution.';
-              clearReviewerBootstrapToken(fresh.threadId, root, fresh.artifactDir);
-              store.upsertTask(fresh);
-            }
-          } else {
-            const detail =
-              result.error ||
-              (result.exitCode === 0
-                ? `the reviewer turn ended without calling dispatch_task (reviewer log: ${logFile})`
-                : `reviewer process exited with code ${result.exitCode} (reviewer log: ${logFile})`);
-            // A reviewer that never saw `dispatch_task` lost a race with the
-            // host's MCP registration rather than ignoring its instructions.
-            // Relaunching after a cool-off recovers those launches; a reviewer
-            // that HAD the tool and still did nothing stays terminal.
-            if (attempt < MAX_REVIEWER_BOOTSTRAP_ATTEMPTS && reviewerBootstrapLogShowsMissingTools(logFile)) {
-              fresh.reviewBootstrap = {
-                ...(fresh.reviewBootstrap || { phase: 'pending', attempts: attempt }),
-                phase: 'pending',
-                lastError: detail,
-                retryAfter: new Date(Date.now() + REVIEWER_BOOTSTRAP_RETRY_DELAY_MS).toISOString(),
-              };
-              fresh.summary.lastOutputSnippet =
-                `Reviewer bootstrap lost the MCP launch race (${REVIEWER_BOOTSTRAP_TOOL} was not ` +
-                `registered); relaunching (attempt ${attempt + 1}/${MAX_REVIEWER_BOOTSTRAP_ATTEMPTS}).`;
-              store.upsertTask(fresh);
-            } else {
-              this.fail(fresh, detail);
-            }
-          }
-        }
-      } finally {
-        this.deps.executionRegistry.end(registration!);
-        roleLock.release(roleLease);
-        this.deps.onSettled?.(thread.threadId);
-      }
+      break;
+    } catch (error: any) {
+      if (!String(error?.message || error).includes('revision mismatch') || attempt === 5) throw error;
     }
   }
-
-  /** Mark a bootstrap as failed without touching the developer's work. */
-  private fail(thread: DelegationThread, detail: string): void {
-    this.deps.taskStore.loadFromDisk();
-    const fresh = this.deps.taskStore.getTask(thread.threadId);
-    const root = this.deps.storageDir || path.dirname(this.deps.taskStore.getStoragePath());
-    const cancellation = new CancellationRegistry(root).peek(thread.threadId);
-    if (!fresh || fresh.archivedAt || fresh.status !== 'queued' ||
-        (fresh.failureRevision || 0) !== (thread.failureRevision || 0) ||
-        cancellation?.action === 'pause' || cancellation?.action === 'delete') {
-      return;
-    }
-    const at = new Date().toISOString();
-    fresh.reviewBootstrap = {
-      ...(fresh.reviewBootstrap || { phase: 'pending', attempts: 0 }),
-      phase: 'failed',
-      lastError: detail,
-      retryAfter: undefined,
-    };
-    fresh.status = 'failed';
-    fresh.failureRevision = (fresh.failureRevision || 0) + 1;
-    fresh.failure = { stage: 'bootstrap', reason: detail.trim() || 'Reviewer bootstrap failed', at, round: fresh.currentRound };
-    fresh.summary.lastOutputSnippet = `[Reviewer bootstrap failed] ${detail.slice(0, 140)}`;
-    const round = fresh.rounds && fresh.rounds.length > 0
-      ? fresh.rounds[fresh.rounds.length - 1]
-      : undefined;
-    if (round && round.status === 'running') {
-      round.status = 'failed';
-      round.error = `Reviewer bootstrap failed: ${detail}`;
-    }
-    appendInterruption(fresh, {
-      kind: 'stopped',
-      reason: `Reviewer bootstrap failed: ${detail}`,
-      at,
-      by: 'bridge',
-    });
-    clearReviewerBootstrapToken(fresh.threadId, this.deps.storageDir, fresh.artifactDir);
-    this.deps.taskStore.upsertTask(fresh);
-  }
+  if (!confirmed) throw new Error(`Reviewer bootstrap confirmation did not commit for ${threadId}.`);
+  // The credential is consumed only after the confirmation is durable.
+  clearReviewerBootstrapToken(threadId, root, confirmed.artifactDir);
+  return confirmed;
 }

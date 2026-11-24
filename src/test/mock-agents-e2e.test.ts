@@ -3,7 +3,7 @@ import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import type { DelegationThread } from '../bridge/types';
 import { MockMcpClient, MockScenario } from './fixtures/mock-agent-protocol';
 import { getProcessBirthId, probeProcessIdentity } from '../bridge/platform';
@@ -66,7 +66,7 @@ async function waitForEvent(root: string, kind: string, predicate: (entry: any) 
   throw new Error(`Timed out waiting for ${kind}; evidence=${root}`);
 }
 
-async function fixture(t: TestContext, scenario: MockScenario) {
+async function fixture(t: TestContext, scenario: MockScenario, delayResident = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amb-e2e-'));
   const repo = path.join(root, 'repo');
   const home = path.join(root, 'home');
@@ -130,13 +130,16 @@ async function fixture(t: TestContext, scenario: MockScenario) {
     NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --require ${path.resolve(__dirname, '../../src/test/fixtures/mock-agent-spawn.cjs')}`.trim(),
   });
   const client = new MockMcpClient(env, repo);
+  let resident: MockMcpClient | undefined;
+  let clientClosed = false;
   const state: { threadId?: string; passed: boolean } = { passed: false };
   t.after(async () => {
     try {
       if (!state.passed && state.threadId) {
-        try { await client.tool('pause_task', { threadId: state.threadId, reason: 'Fixture teardown' }); } catch {}
+        try { await (clientClosed ? resident : client)?.tool('pause_task', { threadId: state.threadId, reason: 'Fixture teardown' }); } catch {}
       }
-      await client.close();
+      if (!clientClosed) await client.close();
+      await resident?.close();
       const events = trace(root);
       for (const start of events.filter(entry => entry.kind === 'process.start')) {
         assert.ok(events.some(entry => entry.kind === 'process.close' && entry.launchId === start.launchId),
@@ -153,18 +156,65 @@ async function fixture(t: TestContext, scenario: MockScenario) {
   await client.initialize();
   const templates = await client.tool('list_task_templates', { workspaceRoot: repo });
   assert.ok(templates.templates.some((entry: any) => entry.id === 'programming'));
-  const dispatch = await client.tool('dispatch_task', {
+  const brief = {
     workspaceRoot: repo, targetBranch: 'master', targetAgent: 'codex', initiatorAgent: 'codex',
     title: 'Scripted multi-round acceptance', prompt: 'Write result.txt for each requested revision', templateId: 'programming',
-  });
+  };
+  if (delayResident) {
+    await assert.rejects(client.tool('dispatch_task', brief), /RESIDENT_EXECUTION_REQUIRED/);
+    await assert.rejects(client.tool('invoke_agent', { targetAgent: 'codex', prompt: 'Must not start' }), /RESIDENT_EXECUTION_REQUIRED/);
+    assert.deepEqual(fs.readdirSync(path.join(storage, 'threads')), []);
+  }
+  const residentGate = path.join(root, 'resident-scan');
+  const residentScript = [
+    "const fs = require('node:fs');",
+    'const [pkg, storage, gate] = process.argv.slice(1);',
+    "const { createBridgeHost } = require(pkg + '/bin/agent-bridge-mcp.cjs');",
+    "const { WindowWorkspace } = require(pkg + '/out/bridge/workspace');",
+    "const { ExecutionController } = require(pkg + '/out/bridge/execution-controller');",
+    'const host = createBridgeHost();',
+    "if (!host.startupAdmission.ready) throw Error(JSON.stringify(host.startupAdmission));",
+    'host.executionController.dispose();',
+    'const controller = new ExecutionController(host.taskStore, host.runner, host.callbackManager, host.reworkController.getMergeCoordinator(), undefined, undefined, host.registry, { requireV2Execution: true, standingScanIntervalMs: gate ? 0 : 500 });',
+    'const window = new WindowWorkspace(storage, [process.cwd()]);',
+    'window.advertiseExecutionOwner();',
+    "process.on('exit', () => window.dispose());",
+    'setInterval(() => window.publish(), 10000).unref();',
+    'if (gate) setInterval(() => { if (fs.existsSync(gate)) void controller.scanAndDrain(); }, 100).unref();',
+    'host.server.startStdio();',
+  ].join('\n');
+  resident = new MockMcpClient(env, repo, ['-e', residentScript, packageRoot, storage, delayResident ? residentGate : '']);
+  await resident.initialize();
+  const dispatch = await client.tool('dispatch_task', brief);
   state.threadId = dispatch.threadId;
   assert.equal(dispatch.nextAction, 'END_TURN_AND_WAIT_FOR_CALLBACK');
-  assert.equal(dispatch.status, 'REVIEWER_STARTING');
-  return { root, repo, base, client, threadId: state.threadId!, finish: () => { state.passed = true; } };
+  assert.equal(dispatch.status, 'QUEUED');
+  return { root, repo, base, client, residentPid: resident.child.pid, residentGate, threadId: state.threadId!,
+    closeSubmitter: async () => { await client.close(); clientClosed = true; },
+    finish: () => { state.passed = true; } };
 }
 
+test('resident Bridge starts the accepted task after its stdio submitter exits', { timeout: 180_000 }, async t => {
+  const f = await fixture(t, { rounds: 1, pauseAt: 'bootstrap' }, true);
+  const queued = await waitForTask(f.root, f.threadId, task => task.workspace?.dispatchAccepted === true);
+  assert.equal(queued.status, 'queued');
+  assert.equal(queued.execution?.run, undefined);
+  assert.equal(trace(f.root).filter(entry => entry.kind === 'agent.start').length, 0);
+  await f.closeSubmitter();
+  fs.writeFileSync(f.residentGate, '');
+  const running = await waitForTask(f.root, f.threadId, task => task.execution?.run?.state === 'active');
+  assert.equal(running.execution?.run?.owner.pid, f.residentPid);
+  assert.equal(running.execution?.purpose, 'bootstrap');
+  // Let the controlled waiting agent proceed through bootstrap and delivery.
+  const gate = await waitForEvent(f.root, 'agent.pause-ready', entry => entry.role === 'bootstrap');
+  fs.writeFileSync(path.join(f.root, 'bootstrap-' + gate.round + '.release'), '');
+  await waitForTask(f.root, f.threadId, task => task.status === 'completed' && !task.execution?.run, 80000);
+  assert.equal(trace(f.root).filter(entry => entry.kind === 'bootstrap.confirmed').length, 1);
+  f.finish();
+});
+
 test('mock agents: real MCP bootstrap, three worker/reviewer rounds and validated Git delivery', { timeout: 420_000 }, async t => {
-  const f = await fixture(t, { rounds: 3, reviewerTailMs: 200 });
+  const f = await fixture(t, { rounds: 3, reviewerTailMs: 200, bootstrapProcessChurn: process.platform === 'win32' });
   const task = await waitForTask(
     f.root,
     f.threadId,
@@ -177,6 +227,13 @@ test('mock agents: real MCP bootstrap, three worker/reviewer rounds and validate
   const reviewers = agents.filter(entry => entry.role === 'reviewer');
   assert.equal(agents.filter(entry => entry.role === 'bootstrap').length, 1);
   assert.equal(events.filter(entry => entry.kind === 'bootstrap.confirmed').length, 1);
+  if (process.platform === 'win32') {
+    assert.ok(workers.every(entry => entry.jobId), 'every Windows developer run must register a Job');
+    assert.equal(new Set(workers.map(entry => entry.jobId)).size, workers.length);
+    const churn = events.find(entry => entry.kind === 'bootstrap.process-churn');
+    assert.ok(churn?.backgroundPid);
+    assert.equal(probeProcessIdentity(churn.backgroundPid), 'exited', 'background descendant outlived bootstrap Job');
+  }
   assert.deepEqual(workers.map(entry => entry.round), [1, 2, 3]);
   assert.deepEqual(workers.map(entry => entry.resume), [false, true, true]);
   assert.equal(new Set(workers.map(entry => entry.sessionId)).size, 1);
@@ -251,7 +308,7 @@ for (const phase of ['bootstrap', 'develop', 'review', 'merge'] as const) {
     if (phase === 'review') assert.ok(reviewerSession, 'review starts after bootstrap captured the reviewer session');
 
     const pausedByMcp = await f.client.tool('pause_task', { threadId: f.threadId, reason: `E2E pause at ${phase}` });
-    assert.equal(pausedByMcp.status, 'PAUSED', JSON.stringify(pausedByMcp));
+    assert.ok(['PAUSED', 'STOPPING'].includes(pausedByMcp.status), JSON.stringify(pausedByMcp));
     pausedTask = await waitForTask(f.root, f.threadId, task => task.status === 'paused' && !task.execution?.run);
     if (heldValidation) assert.equal(probeProcessIdentity(heldValidation.pid, heldValidation.birthId), 'exited', 'pause must stop the held validation child');
     if (gateEvent?.launchId) {
@@ -322,3 +379,43 @@ for (const fault of ['empty-worker', 'nonzero-worker', 'no-verdict', 'bad-bootst
     f.finish();
   });
 }
+
+
+test('Windows Job emits an exit receipt when the controller process exits', { skip: process.platform !== 'win32', timeout: 20_000 }, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amb-job-owner-exit-'));
+  const platform = path.resolve(__dirname, '../bridge/platform.js');
+  const jobs = path.resolve(__dirname, '../bridge/windows-job.js');
+  const work = [
+    "const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });",
+    "child.unref();",
+    "require('node:fs').writeFileSync(process.argv[1], JSON.stringify([process.pid, child.pid]));",
+    "setInterval(() => {}, 1000);",
+  ].join('\n');
+  const ownerScript = [
+    "const fs = require('node:fs'), path = require('node:path');",
+    "const [platform, jobs, root, work] = process.argv.slice(1);",
+    "const { getProcessBirthId } = require(platform);",
+    "const { spawnWindowsJob, startWindowsJob, windowsJobOf } = require(jobs);",
+    "const pids = path.join(root, 'pids.json');",
+    "const child = spawnWindowsJob(process.execPath, ['-e', work, pids], { stdio: 'ignore', windowsHide: true }, root, getProcessBirthId(process.pid));",
+    "fs.writeFileSync(path.join(root, 'job.json'), JSON.stringify(windowsJobOf(child)));",
+    "startWindowsJob(child);",
+    "setInterval(() => { if (fs.existsSync(pids)) process.exit(0); }, 20);",
+    "setTimeout(() => process.exit(1), 10000).unref();",
+  ].join('\n');
+  const owner = spawn(process.execPath, ['-e', ownerScript, platform, jobs, root, work], { stdio: 'ignore', windowsHide: true });
+  const code = await new Promise<number | null>((resolve, reject) => {
+    owner.once('error', reject);
+    owner.once('close', (exitCode) => resolve(exitCode));
+  });
+  assert.equal(code, 0, root);
+  const job = JSON.parse(fs.readFileSync(path.join(root, 'job.json'), 'utf8'));
+  await waitForFile(job.prefix + '.done', 8_000);
+  const pids: number[] = JSON.parse(fs.readFileSync(path.join(root, 'pids.json'), 'utf8'));
+  assert.equal(pids.length, 2);
+  assert.ok(pids.every(pid => probeProcessIdentity(pid) === 'exited'), root);
+  const realRoot = fs.realpathSync.native(root);
+  const temp = fs.realpathSync.native(os.tmpdir()) + path.sep;
+  assert.ok(realRoot.startsWith(temp) && path.basename(realRoot).startsWith('amb-job-owner-exit-'));
+  fs.rmSync(realRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+});

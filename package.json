@@ -429,7 +429,7 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
+    "compile": "node scripts/build-windows-job.cjs && tsc -p ./",
     "watch": "tsc -watch -p ./",
     "test": "node scripts/test.cjs",
     "test:policy": "node scripts/test.cjs --layer=policy",

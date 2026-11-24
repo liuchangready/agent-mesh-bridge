@@ -1,3 +1,4 @@
+import { spawnWindowsJob, startWindowsJob, windowsJobOf } from './windows-job';
 import { taskArtifactBase } from './round-log';
 import { requireDeliveryTarget } from './types';
 import { assertDedicatedTask } from './types';
@@ -126,9 +127,20 @@ export class MergeCoordinator {
   private readonly attemptLogs = new Map<string, { id: string; number: number; path: string; candidateTree?: string }>();
   private activeChildPidCallback?: (pid: number, childProcess?: ReturnType<typeof spawn>, childBirthId?: string) => void | Promise<void>;
 
-  private spawnMergeChild(command: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv, shell = false) {
+  private spawnJobIfV2(threadId: string, command: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv, shell = false) {
+    const task = this.store.getTask(threadId);
+    if (process.platform !== 'win32' || !this.activeChildPidCallback || task?.execution?.version !== 2 || !task.artifactDir) return;
+    return spawnWindowsJob(command, args, { cwd, env, shell, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] },
+      path.join(task.artifactDir, 'worker_log'), getProcessBirthId(process.pid) ?? '');
+  }
+
+  private spawnMergeChild(threadId: string, command: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv, shell = false) {
     if (!this.activeChildPidCallback) {
       return { child: spawn(command, args, { cwd, env, shell, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }) };
+    }
+    const jobChild = this.spawnJobIfV2(threadId, command, args, cwd, env, shell);
+    if (jobChild) {
+      return { child: jobChild, start: () => { startWindowsJob(jobChild); jobChild.stdin!.end(); } };
     }
     // Keep the real command behind the run binding and the OS lock helper ACK.
     // EOF without the start byte means the owner exited before admission.
@@ -172,7 +184,7 @@ export class MergeCoordinator {
     const registration = this.executions.begin(threadId, thread?.currentRound || 0, 'merge-git', cwd);
     let child: ReturnType<typeof spawn>;
     let start: (() => void) | undefined;
-    try { ({ child, start } = this.spawnMergeChild(gitExecutable(), args, cwd)); }
+    try { ({ child, start } = this.spawnMergeChild(threadId, gitExecutable(), args, cwd)); }
     catch (error) { this.executions.end(registration); throw error; }
     const windows = process.platform === 'win32';
     let childBirthId = !windows && child.pid ? getProcessBirthId(child.pid) : undefined;
@@ -940,7 +952,8 @@ export class MergeCoordinator {
     if (!/^[0-9a-f]{40,64}$/i.test(sha)) throw new Error('Invalid landing stash SHA.');
     const registration = this.executions.begin(threadId, this.store.getTask(threadId)?.currentRound || 0, 'merge-git', cwd);
     let child: ReturnType<typeof spawn>;
-    try { child = spawn(gitExecutable(), ['update-ref', '--stdin'], { cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }); }
+    try { child = this.spawnJobIfV2(threadId, gitExecutable(), ['update-ref', '--stdin'], cwd) ??
+      spawn(gitExecutable(), ['update-ref', '--stdin'], { cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }); }
     catch (failure) { this.executions.end(registration); throw failure; }
     const windows = process.platform === 'win32';
     let childBirthId = !windows && child.pid ? getProcessBirthId(child.pid) : undefined;
@@ -985,6 +998,7 @@ export class MergeCoordinator {
         childBirthId = birthId;
       }
       await this.activeChildPidCallback?.(child.pid, child, childBirthId);
+      startWindowsJob(child);
       child.stdin!.write(`start\noption no-deref\ndelete refs/stash ${sha}\nprepare\n`);
       const removed = await completion;
       if (!removed && error) {
@@ -1213,7 +1227,7 @@ export class MergeCoordinator {
       const env = { ...process.env, [pathKey]: searchPath };
       const logPath = this.attemptLogs.get(threadId)?.path;
       if (logPath) fs.appendFileSync(logPath, `\n$ ${step.command} ${step.args.join(' ')}\n`, 'utf8');
-      const { child, start } = this.spawnMergeChild(step.command, step.args, cwd, env, step.needsShell);
+      const { child, start } = this.spawnMergeChild(threadId, step.command, step.args, cwd, env, step.needsShell);
       const windows = process.platform === 'win32';
       let childBirthId = !windows && child.pid ? getProcessBirthId(child.pid) : undefined;
       let output = '';
@@ -1226,9 +1240,13 @@ export class MergeCoordinator {
         output = (output + chunk.toString()).slice(-8192);
         if (logPath) try { fs.appendFileSync(logPath, chunk); } catch (error) { trackingError = error as Error; killProcessTree(child, childBirthId, true); }
       };
-      child.stdout.on('data', record);
-      child.stderr.on('data', record);
+      child.stdout!.on('data', record);
+      child.stderr!.on('data', record);
       const timer = setTimeout(() => {
+        if (windowsJobOf(child)) {
+          killProcessTree(child, childBirthId, true);
+          return;
+        }
         child.kill('SIGTERM');
         setTimeout(() => child.kill('SIGKILL'), 5_000).unref();
       }, 20 * 60 * 1000);

@@ -16,9 +16,12 @@ function event(kind, details) {
     JSON.stringify({ kind, at, pid: process.pid, ...details }));
 }
 childProcess.spawn = function(command, args, options) {
-  if (command === process.execPath && args.includes('exec') && args.includes('--ask-for-approval')) {
+  const isJob = command.endsWith('agent-bridge-windows-job.exe') && args[4] === process.execPath;
+  if ((command === process.execPath || isJob) && args.includes('exec') && args.includes('--ask-for-approval')) {
     const launchId = crypto.randomUUID();
-    const child = originalSpawn(process.execPath, [path.resolve(__dirname, '../../../out/test/fixtures/mock-agent.js'), ...args], {
+    const agent = path.resolve(__dirname, '../../../out/test/fixtures/mock-agent.js');
+    const wrappedArgs = isJob ? [...args.slice(0, 5), agent, ...args.slice(5)] : [agent, ...args];
+    const child = originalSpawn(command, wrappedArgs, {
       ...options, env: { ...options.env, MESH_MOCK_LAUNCH_ID: launchId },
     });
     const details = { launchId, childPid: child.pid, threadId: options.env?.MESH_TASK_THREAD_ID || options.env?.MESH_REVIEW_THREAD_ID };

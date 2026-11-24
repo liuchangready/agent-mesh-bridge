@@ -1,3 +1,4 @@
+import { startWindowsJob, stopWindowsJob, windowsJobFinished, windowsJobOf, type WindowsJobBinding } from './windows-job';
 import * as crypto from 'crypto';
 import type { ChildProcess } from 'child_process';
 import {
@@ -434,11 +435,15 @@ export async function stopVerifiedChildTree(
   stopTimeoutMs: number = 10_000,
   knownDescendants: ProcessIdentity[] = [],
   allowFreshSubtreeEnumeration: boolean = true,
+  recordedJob?: WindowsJobBinding,
 ): Promise<boolean> {
   if (!belongsToSubtree || !childPid || childPid <= 0 || childPid === process.pid) {
     // Foreign PID, host PID, or unverified subtree: forbidden to kill!
     return false;
   }
+
+  const job = recordedJob ?? windowsJobOf(childProcess);
+  if (job) return stopWindowsJob(job, stopTimeoutMs);
 
   // Must have EITHER a verified ChildProcess handle OR a trusted birthId matching the live process
   const hasValidChildHandle = Boolean(
@@ -836,6 +841,10 @@ export async function registerRunChildV2(
               pid, birthId, state: probeProcessIdentity(pid, birthId),
             })) || [];
             const blockedDescendant = descendantStates.find(({ state }) => state !== 'exited');
+            if (previous?.windowsJob && !windowsJobFinished(previous.windowsJob)) {
+              bindingInProgressReason = 'The prior child Windows Job has no exit receipt';
+              throw CHILD_BINDING_IN_PROGRESS;
+            }
             if (!previous || blockedDescendant) {
               bindingInProgressReason = !previous
                 ? `prior child ${existingChild.pid}/${existingChild.birthId || 'missing birthId'} has no captured subtree`
@@ -877,6 +886,8 @@ export async function registerRunChildV2(
           subtree = { root: { pid: childPid, birthId: effectiveBirthId }, descendants: [] };
           subtrees.push(subtree);
         }
+        const windowsJob = windowsJobOf(options.childProcess);
+        if (windowsJob) subtree.windowsJob = windowsJob;
         const knownDescendants = new Map(
           subtree.descendants.map((item) => [`${item.pid}:${item.birthId || 'unknown'}`, item] as const),
         );
@@ -1073,11 +1084,7 @@ export async function registerRunChildV2(
     };
   }
 
-  return {
-    success: true,
-    child: { pid: childPid, birthId: effectiveBirthId },
-  };
-
+  startWindowsJob(options.childProcess);
   return {
     success: true,
     child: { pid: childPid, birthId: effectiveBirthId },

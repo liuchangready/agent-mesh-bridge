@@ -24,7 +24,7 @@ test('historical target refs never become implicit delivery targets', () => {
   assert.equal(requireDeliveryTarget({ path: 'task', mainPath: 'repo', deliveryTarget }), deliveryTarget);
 });
 
-test('both controller entry points refuse historical review before claiming a run', async () => {
+test('the controller refuses historical review before claiming a run', async () => {
   const fixture = await setupFixture();
   try {
     for (const version of [1, 2] as const) {
@@ -36,7 +36,6 @@ test('both controller entry points refuse historical review before claiming a ru
         const execution = structuredClone(fixture.store.getTask(thread.threadId)!.execution);
         const expected = { started: false, reason: 'LEGACY_REVIEW_FLOW_DISABLED' };
         assert.deepEqual(await fixture.controller.startExecution(thread.threadId), expected);
-        assert.deepEqual(await fixture.controller.startExecutionV2(thread.threadId), expected);
         assert.deepEqual(fixture.store.getTask(thread.threadId)!.execution, execution);
       }
     }

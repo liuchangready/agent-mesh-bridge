@@ -19,7 +19,7 @@ import { ReworkController } from '../bridge/rework-controller';
 import { MCPServer } from '../bridge/mcp-server';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { getBridgeHome } from '../bridge/model-catalog';
-import { getProcessBirthId } from '../bridge/platform';
+import { makeBootstrapExecution } from './unified-execution-fixture';
 import {
   clearReviewerBootstrapToken,
   confirmReviewerBootstrapTask,
@@ -61,14 +61,14 @@ describe('dedicated reviewer bootstrap identity', () => {
     const gate = new TaskExecutionRegistry(tempDir);
     const dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector, gate);
     const reworkController = new ReworkController(taskStore, runner, callbackManager, detector, gate);
-    mcpServer = new MCPServer(dispatcher, reworkController, taskStore, detector, resolver, runner);
+    mcpServer = new MCPServer(dispatcher, reworkController, taskStore, detector, resolver, runner, true);
 
     // No inherited bootstrap environment: exactly what a closed-env host does.
     for (const name of saved) delete process.env[name];
     process.env.MESH_CALLER_AGENT = 'codex';
   });
 
-  function prepareTask(threadId: string, token: string): void {
+  function prepareTask(threadId: string, token: string, historical = false): void {
     taskStore.upsertTask({
       threadId,
       title: 'Prepared task behind a closed-env host',
@@ -84,6 +84,7 @@ describe('dedicated reviewer bootstrap identity', () => {
       reviewerModel: 'gpt-6-pro',
       targetModel: 'flash',
       reviewBootstrap: { phase: 'pending', attempts: 0 },
+      execution: historical ? undefined : makeBootstrapExecution(threadId),
       summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
       rounds: [],
     });
@@ -154,12 +155,25 @@ describe('dedicated reviewer bootstrap identity', () => {
     }
   });
 
+  test('the v2 MCP entry refuses a historical bootstrap even with its original credential', async () => {
+    const threadId = 'thread_historical_bootstrap';
+    const token = 'retired-bootstrap-token';
+    prepareTask(threadId, token, true);
+    try {
+      const response = await callDispatch({ reviewBootstrap: { threadId, token } });
+      assert.match(response.error?.message || '', /HISTORICAL_TASK_READ_ONLY/);
+      assert.equal(taskStore.getTask(threadId)?.reviewBootstrap?.phase, 'pending');
+      assert.equal(readReviewerBootstrapToken(threadId, getBridgeHome())?.token, token);
+    } finally {
+      clearReviewerBootstrapToken(threadId, getBridgeHome());
+      taskStore.dispose();
+    }
+  });
+
   test('a paused task cannot be confirmed by a delayed bootstrap and keeps its token', async () => {
     const threadId = 'thread_paused_bootstrap';
     prepareTask(threadId, 'token-before-pause');
-    const paused = taskStore.getTask(threadId)!;
-    paused.status = 'paused';
-    taskStore.upsertTask(paused);
+    await taskStore.transitionExecution(threadId, 1, task => { task.status = 'paused'; });
     try {
       const res = await callDispatch({
         reviewBootstrap: { threadId, token: 'token-before-pause' },
@@ -177,18 +191,6 @@ describe('dedicated reviewer bootstrap identity', () => {
   test('a v2 bootstrap CAS failure keeps its credential reusable until confirmation commits', async () => {
     const threadId = 'thread_bootstrap_cas_retry';
     prepareTask(threadId, 'cas-retry-token');
-    const thread = taskStore.getTask(threadId)!;
-    thread.execution = {
-      version: 2, revision: 3, operationId: 'review_bootstrap_1', phase: 'review', round: 1,
-      purpose: 'bootstrap', generation: 1, attempt: 1, autoRetriesUsed: 0,
-      budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 },
-      run: {
-        id: 'review_bootstrap_run_1', role: 'reviewer',
-        owner: { pid: process.pid, birthId: getProcessBirthId(process.pid) },
-        state: 'active', step: 'executing', startedAt: new Date().toISOString(),
-      },
-    };
-    taskStore.upsertTask(thread);
     const transition = taskStore.transitionExecution.bind(taskStore);
     (taskStore as any).transitionExecution = async () => { throw new Error('Execution revision mismatch'); };
     try {

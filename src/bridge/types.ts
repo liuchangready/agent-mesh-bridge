@@ -46,6 +46,7 @@ export interface ProcessIdentity {
 export interface ExecutionSubtreeEvidence {
   root: ProcessIdentity;
   descendants: ProcessIdentity[];
+  windowsJob?: import('./windows-job').WindowsJobBinding;
   /** Wall-clock time of the latest cumulative observation, for audit and recovery ordering. */
   sampledAt?: string;
 }

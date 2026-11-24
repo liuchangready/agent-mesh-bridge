@@ -17,6 +17,7 @@ import { MeshFileLock } from '../bridge/mesh-file-lock';
 import { AgentDetector } from '../bridge/agent-detector';
 import { AutonomousRunner, RunResult } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
+import { getProcessBirthId } from '../bridge/platform';
 import {
   DelegationRound,
   DelegationThread,
@@ -24,6 +25,19 @@ import {
   ExecutionPhase,
 } from '../bridge/types';
 import { testWorkspace } from './workspace-fixture';
+
+export function makeBootstrapExecution(threadId: string): ExecutionControl {
+  return {
+    version: 2, revision: 1, operationId: `bootstrap-${threadId}`, phase: 'review', round: 1,
+    purpose: 'bootstrap', generation: 1, attempt: 1, autoRetriesUsed: 0,
+    budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 },
+    run: {
+      id: `run-${threadId}`, role: 'reviewer', state: 'active', step: 'executing',
+      owner: { pid: process.pid, birthId: getProcessBirthId(process.pid) },
+      startedAt: new Date().toISOString(),
+    },
+  };
+}
 
 export class FastInMemoryLock {
   private static locks = new Map<string, Promise<void>>();

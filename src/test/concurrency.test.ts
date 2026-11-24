@@ -40,6 +40,9 @@ import { TaskSupervisor } from '../bridge/task-supervisor';
 import { ReworkController } from '../bridge/rework-controller';
 import { QueueDrainer } from '../bridge/queue-drainer';
 import { DelegationThread, pendingMerges } from '../bridge/types';
+import { readRecentTaskLogs, roundExecutionLogPath } from '../bridge/round-log';
+import { createThread } from './unified-execution-fixture';
+import { getProcessBirthId } from '../bridge/platform';
 
 function makeTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -213,37 +216,34 @@ describe('AsyncDispatcher - independent task admission', () => {
     assert.strictEqual(taskStore.getTask(task.threadId)?.rounds[0].status, 'completed');
   });
 
-  test('recent execution logs return the requested tail while running and after completion', async () => {
-    const detector = new AgentDetector();
-    const supervisor = new TaskSupervisor(taskStore, runner, callbackManager, detector, registry);
-    supervisor.setStreamSyncIntervalMs(30);
-    let releaseTask: () => void = () => {};
-    const held = new Promise<void>((resolve) => { releaseTask = resolve; });
-    let logChunkSeen = false;
+  test('recent execution logs return the requested tail from the v2 task across run settlement', async () => {
+    const task = createThread('thread_v2_log_tail');
+    task.status = 'running';
+    task.execution!.version = 2;
+    task.execution!.run = {
+      id: 'log-tail-run', state: 'active', step: 'executing', startedAt: task.createdAt,
+      owner: { pid: process.pid, birthId: getProcessBirthId(process.pid) },
+    };
+    taskStore.upsertTask(task);
+
     const totalLineCount = 1_500;
     const rawLogText = Array.from({ length: totalLineCount }, (_, index) => `[LOG LINE ${index + 1}] processing data chunk ${index + 1}`).join('\n');
-    runner.execute = async (options: RunOptions): Promise<RunResult> => {
-      options.onStdoutChunk?.(`${rawLogText}\n`);
-      logChunkSeen = true;
-      await held;
-      return { exitCode: 0, stdout: rawLogText, stderr: '', extractedOutput: rawLogText, durationMs: 50 };
-    };
-    const task = await dispatchReady({ targetAgent: 'antigravity', title: 'High volume log', prompt: 'emit 1500 lines', workspaceRoot: workspace });
-    supervisor.checkPendingTasks();
-    try {
-      await waitFor(() => logChunkSeen);
-      const running = supervisor.getRecentLogs(task.threadId, 1_000);
-      assert.strictEqual(running.isRunning, true);
-      assert.ok(running.totalLines >= totalLineCount);
-      assert.strictEqual(running.returnedLines, 1_000);
-      assert.ok(running.logs.includes('[LOG LINE 1500]'));
-      assert.ok(!running.logs.includes('[LOG LINE 1] processing data chunk 1'));
-    } finally {
-      releaseTask();
-      await waitFor(() => taskStore.getTask(task.threadId)?.status === 'reviewing');
-      supervisor.dispose();
-    }
-    const completed = TaskSupervisor.getRecentLogs(task.threadId, 500, taskStore);
+    const logPath = roundExecutionLogPath(task.threadId, 1, tempDir);
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.writeFileSync(logPath, rawLogText);
+    const running = readRecentTaskLogs(taskStore, task.threadId, 1_000);
+    assert.strictEqual(running.isRunning, true);
+    assert.strictEqual(running.logFilePath, logPath);
+    assert.strictEqual(running.totalLines, totalLineCount);
+    assert.strictEqual(running.returnedLines, 1_000);
+    assert.ok(running.logs.includes('[LOG LINE 1500]'));
+    assert.ok(!running.logs.includes('[LOG LINE 1] processing data chunk 1'));
+
+    await taskStore.transitionExecution(task.threadId, task.execution!.revision, fresh => {
+      fresh.execution!.run = undefined;
+      fresh.status = 'reviewing';
+    });
+    const completed = readRecentTaskLogs(taskStore, task.threadId, 500);
     assert.strictEqual(completed.isRunning, false);
     assert.strictEqual(completed.returnedLines, 500);
     assert.ok(completed.logs.includes('[LOG LINE 1500]'));

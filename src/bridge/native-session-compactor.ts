@@ -1,3 +1,4 @@
+import { windowsJobFinished, windowsJobOf, type WindowsJobBinding } from './windows-job';
 import { assertDedicatedTask } from './types';
 import { getTaskExecutionPath, isReviewerWakeEligible, isMergeReview } from './types';
 import * as crypto from 'crypto';
@@ -399,12 +400,13 @@ export class NativeSessionCompactor {
             executable, sessionId: sessionId!, cwd: getTaskExecutionPath(thread),
             model: latestOperation.model || model || '', operationId: latestOperation.id,
             role, cancelled: () => !!new CancellationRegistry(root).peek(threadId),
-            onChildPid: async (pid, birthId) => {
-              if (isV2Run) await runContext!.onChildPid?.(pid, undefined, birthId);
+            jobDirectory: (isV2Run || nativeRun) && thread.artifactDir ? path.join(thread.artifactDir, 'worker_log') : undefined,
+            onChildPid: async (pid, birthId, child) => {
+              if (isV2Run) await runContext!.onChildPid?.(pid, child, birthId);
               else if (lease) new NativeSessionLock(root).attachChild(lease, pid, pid ? () => !!new CancellationRegistry(root).peek(threadId) : undefined);
               if (activeExecution) activeExecution.registry.attachChildPid(pid, activeExecution.registration);
               if (!isV2Run && roleLease) roleLock!.attachChild(roleLease, pid);
-              if (nativeRun && !isV2Run) await bindNativeRunChild(this.store, threadId, nativeRun, pid, birthId);
+              if (nativeRun && !isV2Run) await bindNativeRunChild(this.store, threadId, nativeRun, pid, birthId, windowsJobOf(child));
             },
           });
         } catch (error: any) {
@@ -600,12 +602,12 @@ export class NativeSessionCompactor {
     const registry = runContext ? undefined : new TaskExecutionRegistry(root);
     const executionOwner = registry?.getOwner(thread.threadId);
     const registration = executionOwner ? { token: executionOwner.token, threadId: executionOwner.threadId, round: executionOwner.round, recordPath: executionOwner.recordPath } : undefined;
-    const bindChild = async (pid: number | undefined, birthId?: string) => {
-      if (runContext) await runContext.onChildPid?.(pid, undefined, birthId);
+    const bindChild = async (pid: number | undefined, birthId?: string, child?: import('child_process').ChildProcess) => {
+      if (runContext) await runContext.onChildPid?.(pid, child, birthId);
       else if (lease) new NativeSessionLock(root).attachChild(lease, pid, pid ? () => !!cancellation.peek(thread.threadId) : undefined);
       if (!runContext && registration && registry) registry.attachChildPid(pid, registration);
       if (!runContext && roleOwner) roleLock!.attachChild({ token: roleOwner.token, threadId: thread.threadId, role: role as 'developer' | 'reviewer' }, pid);
-      if (v2Run && !runContext) await bindNativeRunChild(this.store, thread.threadId, v2Run, pid, birthId);
+      if (v2Run && !runContext) await bindNativeRunChild(this.store, thread.threadId, v2Run, pid, birthId, windowsJobOf(child));
     };
     const originalStatus = thread.status;
     operation.phase = 'running'; operation.revision++;
@@ -617,6 +619,7 @@ export class NativeSessionCompactor {
         expectedProviderId: identity.providerId,
         cancelled: () => !!cancellation.peek(thread.threadId),
         onUsage: (usage) => this.recordMaintenanceUsage(thread.threadId, latest.round, id, role, agent, model, usage),
+        jobDirectory: (runContext || v2Run) && thread.artifactDir ? path.join(thread.artifactDir, 'worker_log') : undefined,
         onChildPid: bindChild,
       });
       this.store.loadFromDisk();
@@ -673,7 +676,7 @@ export class NativeSessionCompactor {
         const probeBudget = v2Run ? remainingMaintenanceBudget(probeThread) : undefined;
         if (v2Run && (!probeBudget || probeBudget.remainingMs <= 0)) throw new Error('NATIVE_MAINTENANCE_BUDGET_EXHAUSTED: No active budget remains for recovery probe.');
         const probeTimeoutMs = Math.min(MAX_NATIVE_RECOVERY_PROBE_ACTIVE_MS, probeBudget?.remainingMs ?? MAX_NATIVE_RECOVERY_PROBE_ACTIVE_MS);
-        const healthy = await this.codex.probeResume({ executable, sessionId, cwd: getTaskExecutionPath(thread), model, operationId: id, role: role as 'developer' | 'reviewer', timeoutMs: probeTimeoutMs, cancelled: () => !!cancellation.peek(thread.threadId), onChildPid: bindChild });
+        const healthy = await this.codex.probeResume({ executable, sessionId, cwd: getTaskExecutionPath(thread), model, operationId: id, role: role as 'developer' | 'reviewer', timeoutMs: probeTimeoutMs, cancelled: () => !!cancellation.peek(thread.threadId), jobDirectory: (runContext || v2Run) && thread.artifactDir ? path.join(thread.artifactDir, 'worker_log') : undefined, onChildPid: bindChild });
         if (healthy) return { warning: 'Automatic compaction outcome is unknown; same-ID read-only recovery succeeded and the recovery document remains pending.' };
       } catch {}
       const reason = `Native session ${sessionId} could not be proven healthy after automatic operation ${id}; compression was not replayed.`;
@@ -1003,7 +1006,8 @@ export class NativeSessionCompactor {
             activeRun.state = 'active';
           }, latest.cleanup?.token);
         },
-        onChildPid: async (pid, birthId) => {
+        jobDirectory: thread.artifactDir ? path.join(thread.artifactDir, 'worker_log') : undefined,
+        onChildPid: async (pid, birthId, child) => {
           executions.attachChildPid(pid, registration);
           if (!pid && nativeSubtreeTimer) { clearInterval(nativeSubtreeTimer); nativeSubtreeTimer = undefined; }
           if (!pid) await nativeSubtreeTail;
@@ -1020,7 +1024,8 @@ export class NativeSessionCompactor {
             nativeChildBirthId ? [{ root: { pid: nativeChildPid, birthId: nativeChildBirthId }, descendants: [] }] : [])) === 'exited'
             ? { runId: id, operationId: admittedOperationId, generation: admittedGeneration }
             : undefined;
-          const sampledDescendants = pid && birthId ? await captureChildDescendants(pid, birthId) : [];
+          const windowsJob = windowsJobOf(child);
+          const sampledDescendants = pid && birthId && !windowsJob ? await captureChildDescendants(pid, birthId) : [];
           await this.store.transitionExecution(threadId, current.execution.revision, (fresh) => {
             const activeRun = fresh.execution?.run;
             if (!fresh.execution || !activeRun || activeRun.id !== id || activeRun.purpose !== 'native_maintenance' ||
@@ -1041,7 +1046,7 @@ export class NativeSessionCompactor {
               const priorExit = subtreeEvidenceExit(priorSubtrees);
               const priorSettled = !activeRun.child && (!priorSubtrees.length || priorExit === 'exited');
               const additions = birthId
-                ? [{ root: { pid, birthId }, descendants, sampledAt: new Date().toISOString() }]
+                ? [{ root: { pid, birthId }, descendants, sampledAt: new Date().toISOString(), windowsJob }]
                 : [{ root: { pid }, descendants, sampledAt: new Date().toISOString() }];
               activeRun.subtrees = mergeSubtreeEvidence(priorSettled ? undefined : priorSubtrees, additions);
               if (!priorSettled) {
@@ -1090,7 +1095,7 @@ export class NativeSessionCompactor {
               }
             }
           }, cleanupToken, runExitProof);
-          if (pid && nativeChildPid === pid && !nativeRunUnconfirmed && !nativeSubtreeTimer) {
+          if (pid && nativeChildPid === pid && !nativeRunUnconfirmed && !nativeSubtreeTimer && !windowsJob) {
             nativeSubtreeTimer = setInterval(() => {
               nativeSubtreeTail = nativeSubtreeTail.then(async () => {
                 if (nativeChildPid !== pid || !nativeChildBirthId) return;
@@ -1227,6 +1232,7 @@ function mergeSubtreeEvidence(
     const descendants = new Map(current.descendants.map((identity) => [processEvidenceKey(identity), { ...identity }] as const));
     for (const identity of evidence.descendants) descendants.set(processEvidenceKey(identity), { ...identity });
     current.descendants = [...descendants.values()];
+    if (evidence.windowsJob) current.windowsJob = evidence.windowsJob;
     if (evidence.sampledAt && (!current.sampledAt || evidence.sampledAt > current.sampledAt)) current.sampledAt = evidence.sampledAt;
     merged.set(key, current);
   }
@@ -1246,6 +1252,7 @@ function processEvidenceExit(identities: ProcessIdentity[]): ProcessEvidenceExit
 
 function subtreeEvidenceExit(subtrees: ExecutionSubtreeEvidence[] | undefined): ProcessEvidenceExit {
   if (!subtrees?.length) return 'exited';
+  if (subtrees.some(tree => tree.windowsJob && !windowsJobFinished(tree.windowsJob))) return 'unknown';
   const identities = subtrees.flatMap((tree) => [tree.root, ...tree.descendants]);
   return processEvidenceExit(identities);
 }
@@ -1278,6 +1285,7 @@ async function bindNativeRunChild(
   expected: NativeRunSnapshot,
   pid: number | undefined,
   birthId?: string,
+  windowsJob?: WindowsJobBinding,
 ): Promise<void> {
   store.loadFromDisk();
   const fresh = store.getTask(threadId);
@@ -1285,7 +1293,7 @@ async function bindNativeRunChild(
   let descendants: Awaited<ReturnType<typeof captureChildDescendants>> = [];
   if (pid) {
     if (!birthId || probeProcessIdentity(pid, birthId) !== 'alive') throw new Error('Native maintenance child identity is unverified.');
-    descendants = await captureChildDescendants(pid, birthId);
+    if (!windowsJob) descendants = await captureChildDescendants(pid, birthId);
   }
   let bindingUnconfirmed = false;
   await store.transitionExecution(threadId, fresh.execution.revision, (current) => {
@@ -1300,7 +1308,7 @@ async function bindNativeRunChild(
       const priorExit = subtreeEvidenceExit(priorSubtrees);
       const priorSettled = !run.child && (!priorSubtrees.length || priorExit === 'exited');
       run.subtrees = mergeSubtreeEvidence(priorSettled ? undefined : priorSubtrees, [
-        { root: { pid, birthId }, descendants, sampledAt: new Date().toISOString() },
+        { root: { pid, birthId }, descendants, sampledAt: new Date().toISOString(), windowsJob },
       ]);
       run.child = { pid, birthId };
       run.registeredAt = new Date().toISOString();

@@ -40,7 +40,7 @@ import { readStoredRoundUsage } from './token-usage-collector';
 import { concurrencyPolicy } from './bridge-policy';
 import { ModelApprovalHandler, resolveDispatchModel } from './model-approval';
 import { assertCanExecute } from './agent-capabilities';
-import { WorkspaceRegistry, WorkspaceResolver, physicalDirectory, findUniqueWindow, readWindow } from './workspace';
+import { WorkspaceRegistry, WorkspaceResolver, physicalDirectory, findUniqueWindow, readWindow, hasResidentExecutionHost } from './workspace';
 
 export class AsyncDispatcher {
   private taskStore: TaskStore;
@@ -62,7 +62,7 @@ export class AsyncDispatcher {
     callbackManager: CallbackManager,
     detector?: AgentDetector,
     executionRegistry?: TaskExecutionRegistry,
-    private readonly v2?: { controller: ExecutionController; admitted: boolean },
+    private readonly v2?: { admitted: boolean },
   ) {
     this.taskStore = taskStore;
     this.resolver = resolver;
@@ -102,6 +102,10 @@ export class AsyncDispatcher {
    */
   public async dispatchTask(params: DispatchTaskParams): Promise<DispatchResult> {
     if (this.v2 && !this.v2.admitted) throw new Error('V2_STARTUP_BLOCKED: runtime component preflight has not passed.');
+    const submitOnly = Boolean(this.v2);
+    if (submitOnly && !await hasResidentExecutionHost(this.storageDir)) {
+      throw new Error('RESIDENT_EXECUTION_REQUIRED: Open the Agent Bridge extension host and wait for its runtime preflight before dispatching.');
+    }
     if (Object.prototype.hasOwnProperty.call(params, 'workspacePath')) throw new Error('workspacePath is not supported; use workspaceRoot or workspaceId');
     if (!params.title?.trim() || !params.prompt?.trim()) {
       throw new Error('A task title and prompt are required for a normal dispatch.');
@@ -238,6 +242,7 @@ export class AsyncDispatcher {
       workspace: { id: selected.id, environmentId: selected.environmentId, rootPath: selected.rootPath,
         canonicalRootKey: selected.canonicalRootKey, nameAtDispatch: selected.name,
         source: params.workspaceSource || 'explicit', executionPath: worktree.path,
+        ...(this.v2 ? { dispatchAccepted: false } : {}),
         ...(windowContext ? { origin: { hostInstanceId: windowContext.hostInstanceId, generation: windowContext.generation } } : {}) },
       artifactDir: taskDirs.artifactDir,
       taskDataDir: taskDirs.artifactDir,
@@ -249,7 +254,7 @@ export class AsyncDispatcher {
       modelApproval: modelResolution.approval,
       summary: {
         lastPromptSnippet: (params.prompt || '').slice(0, 100),
-        lastOutputSnippet: 'Starting the dedicated reviewer conversation...',
+        lastOutputSnippet: submitOnly ? 'Waiting for the resident Bridge to start the dedicated reviewer.' : 'Starting the dedicated reviewer conversation...',
         totalDurationMs: 0,
       },
       rounds: [round1],
@@ -315,22 +320,22 @@ export class AsyncDispatcher {
     await this.taskStore.transitionExecution(threadId, this.taskStore.getTask(threadId)?.execution?.revision ?? thread.execution!.revision, (fresh) => {
       if (fresh.workspace) fresh.workspace.dispatchAccepted = true;
     });
-    if (this.v2) void this.v2.controller.startExecutionV2(threadId, 'review', { purpose: 'bootstrap' });
-    else void ExecutionController.getInstance()?.startExecution(threadId, 'review', { purpose: 'bootstrap' });
+    if (!submitOnly) void ExecutionController.getInstance()?.startExecution(threadId, 'review', { purpose: 'bootstrap' });
     const routing = getModelRouting(thread);
     const reviewerLine =
       `Dedicated reviewer ${initiatorAgent}` +
       `${reviewerModel ? `(${reviewerModel})` : ''} will dispatch this task to ${targetAgent}` +
       `${targetModel ? `(${targetModel})` : ''}.`;
-    const stopInstruction =
-      'STOP NOW — a dedicated reviewer conversation is starting and will dispatch this task. ' +
+    const stopInstruction = submitOnly
+      ? 'End your turn now. The resident Bridge will start the dedicated reviewer and publish the result in the task summary.'
+      : 'STOP NOW — a dedicated reviewer conversation is starting and will dispatch this task. ' +
       'End your turn immediately: you are NOT the reviewer and the bridge will not wake you for review. ' +
       'The reviewer reports the result into the task summary; use get_task_summary or the task tree.';
     return {
       threadId,
       receiverSessionId,
       targetAgent,
-      status: 'REVIEWER_STARTING',
+      status: submitOnly ? 'QUEUED' : 'REVIEWER_STARTING',
       message:
         `nextAction=END_TURN_AND_WAIT_FOR_CALLBACK. ${stopInstruction} ` +
         `Task ${threadId} created. ${reviewerLine} Model routing: ${routing.text}.${modelNotice ? ` ${modelNotice}` : ''}`,

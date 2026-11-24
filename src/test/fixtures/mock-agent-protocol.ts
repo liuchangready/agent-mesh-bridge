@@ -8,6 +8,7 @@ export interface MockScenario {
   rounds: number;
   fault?: 'empty-worker' | 'nonzero-worker' | 'no-verdict' | 'bad-bootstrap-token';
   reviewerTailMs?: number;
+  bootstrapProcessChurn?: boolean;
   pauseAt?: 'bootstrap' | 'develop' | 'review' | 'merge';
   pauseRound?: number;
 }
@@ -34,8 +35,8 @@ export class MockMcpClient {
   private pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
   private closed: Promise<void>;
 
-  constructor(env: NodeJS.ProcessEnv, cwd: string) {
-    this.child = spawn(process.execPath, [path.resolve(__dirname, '../../../bin/agent-bridge-mcp.cjs')], {
+  constructor(env: NodeJS.ProcessEnv, cwd: string, entry = [path.resolve(__dirname, '../../../bin/agent-bridge-mcp.cjs')]) {
+    this.child = spawn(process.execPath, entry, {
       cwd, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child.stderr.on('data', chunk => {

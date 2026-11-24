@@ -1,3 +1,4 @@
+import { requestWindowsJobStop, windowsJobOf } from './windows-job';
 import * as child_process from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -193,6 +194,12 @@ export function killProcessTree(
   expectedBirthId?: string,
   identityWasCaptured: boolean = false,
 ): void {
+  const job = windowsJobOf(child);
+  if (job) {
+    requestWindowsJobStop(job);
+    return;
+  }
+
   const rootPid = child.pid;
   if (!rootPid || child.exitCode !== null || child.signalCode !== null) return;
 

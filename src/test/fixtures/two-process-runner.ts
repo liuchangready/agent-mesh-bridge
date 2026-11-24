@@ -213,9 +213,7 @@ async function main() {
   }
 
   // Attempt to start execution
-  const res = recoveryPhase
-    ? await controller.startExecutionV2(threadId, recoveryPhase as any)
-    : await controller.startExecution(threadId);
+  const res = await controller.startExecution(threadId, recoveryPhase as any);
   trace(`controller-start-return:${res.started ? 'started' : res.reason || 'not-started'}`);
 
   // startExecution is intentionally non-blocking; keep this control process

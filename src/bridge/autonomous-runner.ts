@@ -19,7 +19,8 @@ import {
 import { AgentDetector } from './agent-detector';
 import { buildDshHeadlessCommand } from './deepseek-harness';
 import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
-import { bindSpawnedChildIdentity, defaultBinary, getProcessBirthId, killPidTree, killProcessTree, needsShellWrapper } from './platform';
+import { spawnWindowsJob } from './windows-job';
+import { bindSpawnedChildIdentity, defaultBinary, getProcessBirthId, killProcessTree, needsShellWrapper } from './platform';
 import { normalizeModelId, resolveConfiguredModel, writeDshModelOverlay } from './model-catalog';
 import { accumulateTokenUsage, collectTokenUsage } from './token-usage-collector';
 import {
@@ -900,6 +901,7 @@ export class AutonomousRunner {
         const sessionLock = options.executionIdentity ? undefined : new NativeSessionLock(path.dirname(this.taskStore.getStoragePath()));
         const originalOnChildPid = options.onChildPid;
         const originalOnNativeSessionId = options.onNativeSessionId;
+        let businessChild: child_process.ChildProcess | undefined;
         const captureSession = (sessionId: string, childPid?: number) => {
           if (!isValidSessionId(sessionId)) throw new Error('Agent emitted an invalid native session id.');
           if (nativeSessionId && nativeSessionId !== sessionId) throw new Error('Native session id changed during one task execution.');
@@ -939,7 +941,9 @@ export class AutonomousRunner {
               nativeSessionId = sessionId;
             }).catch((error: any) => {
               sessionCaptureError = String(error?.message || error);
-              if (childPid) { try { killPidTree(childPid); } catch {} }
+              if (businessChild && businessChild.pid === childPid) {
+                try { this.killProcess(businessChild); } catch {}
+              }
             });
             originalOnNativeSessionId?.(sessionId, childPid);
             return;
@@ -990,6 +994,7 @@ export class AutonomousRunner {
             ? `<bridge_recovery_document version="${prepared.recoveryVersion}">\n${prepared.recoveryPrefix}\n</bridge_recovery_document>\n\n<CURRENT_INSTRUCTION>\n${options.prompt}\n</CURRENT_INSTRUCTION>`
             : options.prompt,
           onChildPid: async (pid, childProc, childBirthId) => {
+            businessChild = childProc;
             if (!options.executionIdentity && nativeLease && pid) sessionLock!.attachChild(nativeLease, pid);
             if (preparationExecution && pid) preparationExecution.registry.attachChildPid(pid, preparationExecution.registration);
             if (originalOnChildPid) await originalOnChildPid(pid, childProc, childBirthId);
@@ -1662,13 +1667,12 @@ export class AutonomousRunner {
 
       let child: child_process.ChildProcess;
       try {
-        child = child_process.spawn(command, args, {
-          cwd,
-          env,
-          shell: useShell,
-          stdio: ['pipe', 'pipe', 'pipe'],
-          windowsHide: true,
-        });
+        const spawnOptions: child_process.SpawnOptions = {
+          cwd, env, shell: useShell, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+        };
+        child = process.platform === 'win32' && options.executionIdentity && options.artifactDir
+          ? spawnWindowsJob(command, args, spawnOptions, path.join(options.artifactDir, 'worker_log'), getProcessBirthId(process.pid) ?? '')
+          : child_process.spawn(command, args, spawnOptions);
       } catch (err: any) {
         const durationMs = Date.now() - startTime;
         return settle({

@@ -1,9 +1,8 @@
 /**
  * One place that knows where a round's bytes live on disk.
  *
- * Three processes (the extension-host supervisor, the dispatcher/rework MCP
- * server, and the supervisor itself) used to build `~/.agent-mesh-bridge/logs`
- * paths by hand. Copies drift, and the "most recent log" lookup compared file
+ * Several execution paths used to build `~/.agent-mesh-bridge/logs` paths
+ * by hand. Copies drift, and the "most recent log" lookup compared file
  * names as strings, so `..._round_10.log` sorted before `..._round_9.log` and
  * `get_recent_logs` returned the wrong round for any task with 10+ rounds.
  *
@@ -16,6 +15,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import type { TaskStore } from './task-store';
 
 export const BRIDGE_HOME_DIRNAME = '.agent-mesh-bridge';
 export const ROUND_OUTPUT_ARCHIVE_SUFFIX = '.output.md';
@@ -274,6 +274,39 @@ export function readTextFileCapped(
   maxBytes: number = DEFAULT_RAW_LOG_BYTES,
 ): PagedText {
   return readTextFilePaged(filePath, { offsetBytes: 0, maxBytes });
+}
+
+function readLogExcerpt(filePath: string): string {
+  const maxBytes = 512 * 1024;
+  try {
+    const offsetBytes = Math.max(0, fs.statSync(filePath).size - maxBytes);
+    return readTextFilePaged(filePath, { offsetBytes, maxBytes }).content;
+  } catch {
+    return '';
+  }
+}
+
+export function readRecentTaskLogs(store: TaskStore, threadId: string, maxLines = 1000) {
+  store.ensureUpToDate();
+  const task = store.getTask(threadId);
+  const artifactDir = task?.artifactDir;
+  const storeRoot = path.dirname(store.getStoragePath());
+  const localLog = findLatestExecutionLog(threadId, storeRoot, undefined, artifactDir);
+  const defaultLog = artifactDir ? undefined : findLatestExecutionLog(threadId);
+  const latest = defaultLog && (!localLog || defaultLog.round > localLog.round) ? defaultLog : localLog;
+  const lastRound = task?.rounds.at(-1);
+  const lines = ((latest && readLogExcerpt(latest.path)) || lastRound?.output || lastRound?.error || '').split(/\r?\n/);
+  const tail = lines.length > maxLines ? lines.slice(-maxLines) : lines;
+  const logs = tail.join('\n');
+  return {
+    threadId,
+    isRunning: task?.execution?.version === 2 && Boolean(task.execution.run),
+    totalLines: lines.length,
+    returnedLines: tail.length,
+    logs,
+    recentLogs: logs,
+    logFilePath: latest?.path,
+  };
 }
 
 export function formatBytes(bytes: number): string {

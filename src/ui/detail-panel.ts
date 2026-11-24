@@ -6,11 +6,11 @@ import * as path from 'path';
 import { TaskStore } from '../bridge/task-store';
 import { ReworkController } from '../bridge/rework-controller';
 import { DelegationThread, findInFlightRound } from '../bridge/types';
-import { TaskSupervisor } from '../bridge/task-supervisor';
 import {
   findExistingExecutionLog,
   findExistingOutputArchive,
   formatBytes,
+  readRecentTaskLogs,
   resolveExistingArtifactPath,
   roundExecutionLogPath,
   roundOutputArchivePath,
@@ -490,7 +490,7 @@ export class TaskDetailPanel {
     };
 
     const badgeColor = statusBadgeColors[thread.status] || '#6b7280';
-    const recentLogs = TaskSupervisor.getRecentLogs(thread.threadId, 1000, this.taskStore);
+    const recentLogs = readRecentTaskLogs(this.taskStore, thread.threadId);
     // Derived on every render: a stored aggregate could be stale after a
     // cross-process write.
     const tokenSummary = aggregateThreadTokenUsage(thread.rounds || []);

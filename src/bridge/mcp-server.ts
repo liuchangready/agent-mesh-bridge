@@ -10,7 +10,6 @@ import { TaskStore } from './task-store';
 import { AgentDetector } from './agent-detector';
 import { ActiveAgentResolver } from './active-agent-resolver';
 import { AutonomousRunner } from './autonomous-runner';
-import { TaskSupervisor } from './task-supervisor';
 import { TaskControlService } from './task-control';
 import { ExecutionController } from './execution-controller';
 import { requireV2ExecutionEligibility } from './execution-gate';
@@ -40,6 +39,7 @@ import {
   findExistingExecutionLog,
   findExistingOutputArchive,
   taskArtifactBase,
+  readRecentTaskLogs,
   readTextFilePaged,
   resolveExistingArtifactPath,
   roundExecutionLogPath,
@@ -129,6 +129,7 @@ export class MCPServer {
     runner: AutonomousRunner,
     requireV2Execution = false,
     v2StartupBlockReason?: string,
+    private readonly submitOnly = false,
   ) {
     this.dispatcher = dispatcher;
     this.reworkController = reworkController;
@@ -1042,7 +1043,7 @@ export class MCPServer {
     if (this.resolveReceiverTask()) {
       return tools.filter((tool) => !FORWARDING_TOOLS.has(tool.name));
     }
-    return tools;
+    return this.submitOnly ? tools.filter(tool => tool.name !== 'invoke_agent') : tools;
   }
 
   /**
@@ -1050,7 +1051,7 @@ export class MCPServer {
    *
    * Primary channel: the `MESH_REVIEW_*` markers in the process environment.
    * Fallback: the pid of the CLI process that launched this server, matched
-   * against the launch records written by ReviewerBootstrapService.
+   * against the launch records written by the bootstrap run.
    *
    * The fallback is not cosmetic. A host may spawn its MCP servers with a closed
    * environment — Codex passes ONLY the `env` table from `config.toml`, and
@@ -1426,7 +1427,7 @@ export class MCPServer {
         // Reviewer decision submitted: hand the task role over to the
         // developer. The reviewer CLI process may still be printing its final
         // message; that is not an active review decision anymore.
-        new TaskRoleLock().releaseIfRole(args.threadId, 'reviewer');
+        if (controlledTask?.execution?.version !== 2) new TaskRoleLock().releaseIfRole(args.threadId, 'reviewer');
         return result;
       }
 
@@ -1435,7 +1436,15 @@ export class MCPServer {
         return await this.reworkController.requestMergeDecision(args.threadId, args.question, args.background, args.suggestion, args.conflictFiles, args.logPath);
       }
 
-      case 'submit_merge_decision': return this.reworkController.submitMergeDecision(args.threadId, args.answer);
+      case 'submit_merge_decision': {
+        const controller = ExecutionController.getInstance();
+        if (controlledTask?.execution?.version === 2 && controller && controlledTask.decision?.id) {
+          const decisionId = controlledTask.decision.id;
+          const task = await controller.submitTaskDecision(args.threadId, decisionId, args.answer, 'agent');
+          return { threadId: args.threadId, status: task.status, decisionId };
+        }
+        return this.reworkController.submitMergeDecision(args.threadId, args.answer);
+      }
 
       case 'request_task_decision': {
         const callerAgent = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
@@ -1486,7 +1495,17 @@ export class MCPServer {
         return await this.reworkController.submitMergeDecision(args.threadId, args.answer);
       }
 
-      case 'retry_merge': return await this.reworkController.retryMerge(args.threadId);
+      case 'retry_merge': {
+        const controller = ExecutionController.getInstance();
+        if (controlledTask?.execution?.version === 2 && controller) {
+          if (controlledTask.status !== 'failed' || controlledTask.failure?.stage !== 'merge') {
+            throw new Error('Only a merge failure can restart its merge budget.');
+          }
+          const task = await controller.retryOperation(args.threadId);
+          return { threadId: args.threadId, status: 'queued', retryGeneration: task.execution!.generation };
+        }
+        return this.reworkController.retryMerge(args.threadId);
+      }
 
       case 'get_merge_log': {
         const thread = this.taskStore.getTask(args.threadId);
@@ -1735,7 +1754,7 @@ export class MCPServer {
 
         const includeRawLogs = args.includeRawLogs === true || args.includeFullHistory === true;
         if (includeRawLogs) {
-          const recentLogsInfo = TaskSupervisor.getRecentLogs(args.threadId, 1000, this.taskStore);
+          const recentLogsInfo = readRecentTaskLogs(this.taskStore, args.threadId);
           return {
             ...task,
             modelRouting: getModelRouting(task),
@@ -1839,7 +1858,7 @@ export class MCPServer {
             return CallerPollGuard.repeatPayload(task, verdict.reads);
           }
         }
-        return TaskSupervisor.getRecentLogs(args.threadId, maxLines, this.taskStore);
+        return readRecentTaskLogs(this.taskStore, args.threadId, maxLines);
       }
 
       case 'list_agent_models': {
@@ -1886,6 +1905,9 @@ export class MCPServer {
       }
 
       case 'invoke_agent': {
+        if (this.submitOnly) {
+          throw new Error('RESIDENT_EXECUTION_REQUIRED: Use dispatch_task to submit work to the resident Bridge.');
+        }
         let agent: AgentId;
         if (!args.targetAgent || args.targetAgent === 'default') {
           const resolved = await this.resolver.resolveActiveAgent();

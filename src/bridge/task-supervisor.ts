@@ -27,37 +27,15 @@ import { TaskRoleLock } from './task-role-lock';
 import { appendCompactionProtocol, compactRoundBestEffort } from './context-compactor';
 import { readStoredRoundUsage } from './token-usage-collector';
 import { ExecutionController } from './execution-controller';
-import {
-  findLatestExecutionLog,
-  readTextFilePaged,
-  roundExecutionLogPath,
-} from './round-log';
+import { roundExecutionLogPath } from './round-log';
 import { changedFiles, currentHead } from './git-worktree';
 
-/** `get_recent_logs` reads a bounded tail, not a whole multi-megabyte log. */
-const RECENT_LOG_EXCERPT_BYTES = 512 * 1024;
-
-function readLogExcerpt(filePath: string): string {
-  try {
-    const stat = fs.statSync(filePath);
-    const startOffset = Math.max(0, stat.size - RECENT_LOG_EXCERPT_BYTES);
-    return readTextFilePaged(filePath, {
-      offsetBytes: startOffset,
-      maxBytes: RECENT_LOG_EXCERPT_BYTES,
-    }).content;
-  } catch {
-    return '';
-  }
-}
-
 export class TaskSupervisor extends EventEmitter {
-  private static instance: TaskSupervisor | undefined;
   private taskStore: TaskStore;
   private runner: AutonomousRunner;
   private callbackManager: CallbackManager;
   private detector?: AgentDetector;
   private activeTasks: Map<string, Promise<void>> = new Map();
-  private liveLogs: Map<string, string> = new Map();
   private lockFilePath: string;
   private heartbeatInterval: NodeJS.Timeout | null = null;
   private pollInterval: NodeJS.Timeout | null = null;
@@ -84,7 +62,6 @@ export class TaskSupervisor extends EventEmitter {
     admissionEnabled = true,
   ) {
     super();
-    TaskSupervisor.instance = this;
     this.taskStore = taskStore;
     this.runner = runner;
     this.callbackManager = callbackManager;
@@ -105,10 +82,6 @@ export class TaskSupervisor extends EventEmitter {
       this.startHeartbeat();
       this.startWatching();
     }
-  }
-
-  public static getInstance(): TaskSupervisor | undefined {
-    return TaskSupervisor.instance;
   }
 
   public setStreamSyncIntervalMs(ms: number): void {
@@ -538,7 +511,6 @@ export class TaskSupervisor extends EventEmitter {
         fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
         fs.writeFileSync(logFilePath, '', 'utf8');
       } catch {}
-      this.liveLogs.set(thread.threadId, '');
 
       let result: RunResult;
       // Baseline before the agent starts: the diff afterwards attributes exactly
@@ -564,16 +536,12 @@ export class TaskSupervisor extends EventEmitter {
           },
           onStdoutChunk: (chunk: string) => {
             streamedOutput += chunk;
-            const cur = this.liveLogs.get(thread.threadId) || '';
-            this.liveLogs.set(thread.threadId, cur + chunk);
             try {
               fs.appendFileSync(logFilePath, chunk, 'utf8');
             } catch {}
           },
           onStderrChunk: (chunk: string) => {
             streamedOutput += chunk;
-            const cur = this.liveLogs.get(thread.threadId) || '';
-            this.liveLogs.set(thread.threadId, cur + chunk);
             try {
               fs.appendFileSync(logFilePath, chunk, 'utf8');
             } catch {}
@@ -741,133 +709,7 @@ export class TaskSupervisor extends EventEmitter {
     return promise;
   }
 
-  public isExecuting(threadId: string): boolean {
-    return this.activeTasks.has(threadId);
-  }
-
-  /**
-   * Retrieves recent log lines (default 1,000 lines) for a running or past task.
-   */
-  public getRecentLogs(
-    threadId: string,
-    maxLines: number = 1000,
-  ): {
-    threadId: string;
-    isRunning: boolean;
-    totalLines: number;
-    returnedLines: number;
-    logs: string;
-    recentLogs: string;
-    logFilePath?: string;
-  } {
-    const isRunning = this.activeTasks.has(threadId);
-    let rawOutput = this.liveLogs.get(threadId);
-    let resolvedFilePath: string | undefined = undefined;
-
-    // Compare round numbers numerically: a plain name sort puts round_9 after
-    // round_10, which used to return the wrong round for long-lived tasks.
-    const artifactDir = this.taskStore.getTask(threadId)?.artifactDir;
-    const latest = artifactDir
-      ? findLatestExecutionLog(threadId, undefined, undefined, artifactDir)
-      : findLatestExecutionLog(threadId, path.dirname(this.taskStore.getStoragePath()))
-        || findLatestExecutionLog(threadId);
-    if (latest) resolvedFilePath = latest.path;
-
-    if ((!rawOutput || !rawOutput.trim()) && resolvedFilePath) {
-      rawOutput = readLogExcerpt(resolvedFilePath);
-    }
-
-    if (!rawOutput || !rawOutput.trim()) {
-      this.taskStore.loadFromDisk();
-      const task = this.taskStore.getTask(threadId);
-      if (task && task.rounds && task.rounds.length > 0) {
-        const lastRound = task.rounds[task.rounds.length - 1];
-        rawOutput = lastRound.output || lastRound.error || '';
-      }
-    }
-
-    const allText = rawOutput || '';
-    const allLines = allText.split(/\r?\n/);
-    const tailLines = allLines.length > maxLines ? allLines.slice(-maxLines) : allLines;
-
-    return {
-      threadId,
-      isRunning,
-      totalLines: allLines.length,
-      returnedLines: tailLines.length,
-      logs: tailLines.join('\n'),
-      recentLogs: tailLines.join('\n'),
-      logFilePath: resolvedFilePath,
-    };
-  }
-
-  /**
-   * Static helper to retrieve recent logs, falling back to disk and task store if supervisor is not active.
-   */
-  public static getRecentLogs(
-    threadId: string,
-    maxLines: number = 1000,
-    taskStore?: TaskStore,
-  ): {
-    threadId: string;
-    isRunning: boolean;
-    totalLines: number;
-    returnedLines: number;
-    logs: string;
-    recentLogs: string;
-    logFilePath?: string;
-  } {
-    const supervisor = TaskSupervisor.instance;
-    if (supervisor) {
-      return supervisor.getRecentLogs(threadId, maxLines);
-    }
-
-    let rawOutput = '';
-    let resolvedFilePath: string | undefined = undefined;
-
-    // The dispatcher/rework controller write under the store root, the
-    // supervisor under the default home; a unified task directory is
-    // self-contained and takes precedence so no agent-wide scan is needed.
-    const store = taskStore || TaskStore.getInstance();
-    store.loadFromDisk();
-    const storeRoot = path.dirname(store.getStoragePath());
-    const artifactDir = store.getTask(threadId)?.artifactDir;
-    const candidates = (artifactDir
-      ? [findLatestExecutionLog(threadId, undefined, undefined, artifactDir)]
-      : [storeRoot, undefined].map((root) => findLatestExecutionLog(threadId, root))
-    ).filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
-    if (candidates.length > 0) {
-      const latest = candidates.reduce((a, b) => (b.round > a.round ? b : a));
-      resolvedFilePath = latest.path;
-      rawOutput = readLogExcerpt(latest.path);
-    }
-
-    if (!rawOutput) {
-      const task = store.getTask(threadId);
-      if (task && task.rounds && task.rounds.length > 0) {
-        const lastRound = task.rounds[task.rounds.length - 1];
-        rawOutput = lastRound.output || lastRound.error || '';
-      }
-    }
-
-    const allLines = (rawOutput || '').split(/\r?\n/);
-    const tailLines = allLines.length > maxLines ? allLines.slice(-maxLines) : allLines;
-
-    return {
-      threadId,
-      isRunning: false,
-      totalLines: allLines.length,
-      returnedLines: tailLines.length,
-      logs: tailLines.join('\n'),
-      recentLogs: tailLines.join('\n'),
-      logFilePath: resolvedFilePath,
-    };
-  }
-
   public dispose(): void {
-    if (TaskSupervisor.instance === this) {
-      TaskSupervisor.instance = undefined;
-    }
     this.isDisposed = true;
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);

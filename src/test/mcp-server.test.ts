@@ -26,6 +26,7 @@ function initGitRepo(root: string): void {
 }
 
 import { TaskStore } from '../bridge/task-store';
+import { makeBootstrapExecution } from './unified-execution-fixture';
 import { AgentDetector } from '../bridge/agent-detector';
 import { ActiveAgentResolver } from '../bridge/active-agent-resolver';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
@@ -177,11 +178,16 @@ describe('MCPServer Protocol Tests', () => {
     callbackManager.setAutonomousRunner(runner);
     const host = createBridgeHost({ taskStore, detector, resolver, runner, callbackManager, registry,
       v2StartupAdmission: { ready: true, blockers: [] },
-      executionControllerOptions: { storageDir: tempDir, standingScanIntervalMs: 0, streamSyncIntervalMs: 60_000 } });
+      executionControllerOptions: { storageDir: tempDir, standingScanIntervalMs: 0 } });
     dispatcher = host.dispatcher;
     reworkController = host.reworkController;
     mcpServer = host.server;
-    const controller: ExecutionController = host.executionController;
+    assert.equal(host.executionController.ownsRuns, false);
+    host.executionController.dispose();
+    const controller = new ExecutionController(taskStore, runner, callbackManager, reworkController.getMergeCoordinator(),
+      undefined, undefined, registry, { requireV2Execution: true, storageDir: tempDir, standingScanIntervalMs: 0, streamSyncIntervalMs: 60_000 });
+    const residentWindow = new WindowWorkspace(tempDir, [process.cwd()]);
+    residentWindow.advertiseExecutionOwner();
     const mergeActiveMarker = path.join(tempDir, 'merge-helper-active');
     const mergeReleaseMarker = path.join(tempDir, 'merge-helper-release');
     const validationDir = path.join(process.cwd(), '.agent-mesh-bridge');
@@ -323,9 +329,12 @@ describe('MCPServer Protocol Tests', () => {
         title: 'Independent MCP v2 lifecycle', prompt: 'Implement the fixture change',
       });
       const threadId = dispatched.threadId;
+      assert.equal(dispatched.status, 'QUEUED');
+      assert.equal(taskStore.getTask(threadId)?.execution?.run, undefined);
       assert.equal(taskStore.getTask(threadId)?.execution?.version, 2, 'formal independent MCP dispatch creates v2');
       const targetAdvance = spawnSync(gitExe, ['commit', '--allow-empty', '-m', 'advance delivery target for merge fixture'], { cwd: process.cwd(), encoding: 'utf8', windowsHide: true });
       assert.equal(targetAdvance.status, 0, targetAdvance.stderr || 'could not advance temporary delivery target');
+      await controller.scanAndDrain();
       await waitFor(() => developerCalls >= 1, 'first developer launch after bootstrap exit ACK');
       await waitFor(() => reviewCalls >= 1, 'reviewer launch after first developer exit ACK');
       await waitFor(() => processEvents.some((event) => event.event === 'rework_decision_persisted'), 'durable rework decision');
@@ -382,6 +391,7 @@ describe('MCPServer Protocol Tests', () => {
       else process.env.MESH_REVIEW_SESSION_ID = previousReviewSession;
       await controller.waitForActiveExecutions(5000);
       controller.dispose();
+      residentWindow.dispose();
       registry.dispose();
     }
   });
@@ -2027,6 +2037,7 @@ describe('MCPServer Protocol Tests', () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       receiverSessionId: 'receiver-bootstrap-1',
+      execution: makeBootstrapExecution(threadId),
       workspace: testWorkspace(tempDir),
       reviewFlow: 'dedicated',
       reviewerModel: 'gpt-6-pro',
@@ -2106,6 +2117,7 @@ describe('MCPServer Protocol Tests', () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       receiverSessionId: 'receiver-bootstrap-pid',
+      execution: makeBootstrapExecution(threadId),
       workspace: testWorkspace(tempDir),
       reviewFlow: 'dedicated',
       reviewerModel: 'gpt-6-pro',

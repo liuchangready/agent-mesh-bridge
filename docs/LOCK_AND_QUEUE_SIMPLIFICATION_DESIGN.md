@@ -188,6 +188,8 @@ flowchart TD
 
 合入 run 可以先后启动多个 Git/验证子进程。`run.child` 不可简单覆盖掉仍未确认退出的前一个进程；串行时须先确认退出再更新，并保留全局锁 helper 的子进程 ACK 保护。确有并行子进程时以同 run 关联观测集合，不能因移除 registry 失去真实子树退出证据；不另建所有权账本。
 
+Windows 上已绑定 V2 run 的 Agent CLI、原生会话维护和受跟踪的合入命令，在业务进程首次运行前通过 Job Object 建立归属。控制器在任务账本登记启动助手与 Job 后才允许启动业务。每次受跟踪的启动保存该 Job 的退出回执，串行合入在前一个 Job 结束后才绑定后续启动。Windows Job 成员的归属由系统维护，账本写组绑定，无需采样成员的创建时间。启动助手会在控制器退出时停止组内进程并写出回执。回执缺失时保留原 run 的保护，已有 PID 子树记录仍按原证据判断。
+
 不另建调度 leader 锁：两个宿主同时扫描时，任务短写锁与唯一 run 防止同任务启动两次；静态归属禁止跨任务共享会话，全局合入锁保护 Git 收口。一个扫描函数允许多个进程调用，不等于多个持久队列。
 
 ## 六 无法进一步删除的边界
@@ -238,6 +240,8 @@ flowchart TD
 当前提供只读命令 `node bin/agent-bridge-preflight.cjs --component extension-host=<实际版本>`。命令读取 per-thread 账本、活动执行登记和合入 helper owner，不实例化会创建目录或写账本的服务；未提供扩展宿主版本、版本不一致、任务未交付、进程/子树身份未知或仍存活时以阻断项退出。扩展宿主版本必须来自实际加载进程的路径/版本核验，不能把包内期望版本当成运行版本。
 
 新版本入口另以 `node bin/agent-bridge-preflight.cjs --startup-admission` 检查本地实际组件路径和版本，并要求运维预先写入只读证据文件 `~/.agent-mesh-bridge/v2-runtime-components.json`。文件 schema 为 `{schemaVersion:1,cutoverApproved:true,components:[{component,version,packageRoot,path,completeProcessInventory:true,previousProcesses:[{pid,birthId,version,path}]}]}`；组件必须同时包含 `extension-host` 与 `standalone-mcp`。清单缺失、组件路径/版本不符、旧进程 PID+birthId 仍存活或状态未知时，两个入口都不启用派发与恢复扫描；历史读取和经过现有 run/cleanup 保护的安全清理仍可用。终态旧任务仍检查账本中的 run/owner/child/后代、next、cleanup 和 Git 恢复状态；已完成 Git 交付要求固定本地 branch ref 可达 approved commit，不能单凭 `integration.phase=merged` 放行。日常 v2 重启允许继续恢复，但活跃 merge helper 必须以 ledger run owner、helper PID+birthId、channel token/path 及被登记子树做精确关联，后续退出 ACK 仍由控制器处理。该清单是切换操作的外部证据，由运维在停机预检和实际进程盘点后提供，命令本身不创建或修改它。合法 v2 任务仍可按统一恢复分类重启，无须清空账本。当前仓库尚未提供清单生成器，也未完成所有旧角色/原生会话锁的退出；因此这只是 fail-closed 启动闸门，不代表 A→D 或切换验收已完成。
+
+独立 stdio MCP 仅提交和更新任务账本，无权认领 run、调度扫描或直接启动 Agent。普通下发须先确认通过预检的常驻扩展宿主存活，任务及 bootstrap 凭证入账后返回 QUEUED，由常驻扩展宿主认领唯一 run。审阅端的 bootstrap 确认和任务控制仍经 MCP 持久化。
 
 ### 7.4 开发与回退
 

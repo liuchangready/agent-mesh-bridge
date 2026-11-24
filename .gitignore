@@ -11,3 +11,5 @@ Thumbs.db
 .agent_bridge/
 
 
+
+/bin/agent-bridge-windows-job.exe

@@ -74,14 +74,14 @@ function createBridgeHost(options = {}) {
     undefined,
     undefined,
     registry,
-    { ...(options.executionControllerOptions || {}), requireV2Execution: true, admissionEnabled: startupAdmission.ready },
+    { ...(options.executionControllerOptions || {}), ownsRuns: false, requireV2Execution: true, admissionEnabled: startupAdmission.ready },
   );
   const dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector, registry,
-    { controller: executionController, admitted: startupAdmission.ready });
+    { admitted: startupAdmission.ready });
   const reason = startupAdmission.ready ? undefined :
     (startupAdmission.blockers || []).slice(0, 5).map((item) => `${item.code}: ${item.evidence}`).join(' | ') ||
     'runtime component preflight has not passed.';
-  const server = new MCPServer(dispatcher, reworkController, taskStore, detector, resolver, runner, true, reason);
+  const server = new MCPServer(dispatcher, reworkController, taskStore, detector, resolver, runner, true, reason, true);
   return { taskStore, detector, resolver, runner, callbackManager, registry, dispatcher, reworkController, executionController, server, startupAdmission };
 }
 
