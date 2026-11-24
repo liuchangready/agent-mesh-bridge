@@ -57,7 +57,7 @@ import { appendCompactionProtocol, compactRoundBestEffort } from './context-comp
 import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
 import {
   assessRunLaunchEvidence,
-  captureChildDescendants,
+  sampleChildDescendants,
   isUnconfirmedLaunchAfterOwnerExit,
   registerRunChildV2,
   recordLaunchRecoveryFailure,
@@ -236,7 +236,7 @@ export class ExecutionController {
       let sawUnknown = false;
       let sawAlive = false;
       for (const subtree of run.subtrees) {
-        if (subtree.windowsJob && !windowsJobFinished(subtree.windowsJob)) sawUnknown = true;
+        if (subtree.enumerationUnconfirmed || (subtree.windowsJob && !windowsJobFinished(subtree.windowsJob))) sawUnknown = true;
         for (const identity of [subtree.root, ...subtree.descendants]) {
           if (!identity?.pid || !identity.birthId) {
             sawUnknown = true;
@@ -250,6 +250,35 @@ export class ExecutionController {
       subtreeStatus = sawAlive ? 'alive' : sawUnknown ? 'unknown' : 'exited';
     }
     return { ownerStatus, childStatus, subtreeStatus };
+  }
+
+  private async stopRecordedChild(threadId: string, run: NonNullable<ExecutionControl['run']>, cleanupToken?: string): Promise<boolean> {
+    const child = run.child;
+    if (!child?.pid || !child.birthId) return false;
+    const sameRoot = (tree: NonNullable<typeof run.subtrees>[number]) =>
+      tree.root.pid === child.pid && tree.root.birthId === child.birthId;
+    const tree = run.subtrees?.find(sameRoot);
+    const descendants = (run.subtrees || []).flatMap(item => item.descendants);
+    return stopVerifiedChildTree(child.pid, true, undefined, child.birthId, PROCESS_STOP_TIMEOUT_MS,
+      descendants, true, tree?.windowsJob, tree?.enumerationUnconfirmed, async sample => {
+        if (sample.enumerationUnconfirmed === false && !tree?.enumerationUnconfirmed && !sample.descendants.length) return;
+        await this.transitionTask(threadId, task => {
+          const current = task.execution?.run;
+          if (current?.id !== run.id || current.child?.pid !== child.pid || current.child?.birthId !== child.birthId) {
+            throw new Error('Run child changed before process tree evidence could be recorded.');
+          }
+          const subtrees = current.subtrees ??= [];
+          let target = subtrees.find(sameRoot);
+          if (!target) {
+            target = { root: { ...child }, descendants: [] };
+            subtrees.push(target);
+          }
+          const known = new Map(target.descendants.map(item => [`${item.pid}:${item.birthId ?? 'unknown'}`, item]));
+          for (const item of sample.descendants) known.set(`${item.pid}:${item.birthId ?? 'unknown'}`, item);
+          target.descendants = [...known.values()];
+          target.enumerationUnconfirmed = sample.enumerationUnconfirmed || undefined;
+        }, cleanupToken);
+      });
   }
 
   /**
@@ -1496,6 +1525,7 @@ export class ExecutionController {
     type TrackedChild = ProcessIdentity & {
       process?: ChildProcess;
       descendants: ProcessIdentity[];
+      enumerationUnconfirmed?: boolean;
       belongsToSubtree: boolean;
       stopConfirmed: boolean;
     };
@@ -1522,9 +1552,10 @@ export class ExecutionController {
     const processIdentityKey = (identity: ProcessIdentity) => `${identity.pid}:${identity.birthId ?? 'unknown'}`;
     const refreshDescendants = async (tracked: TrackedChild) => {
       if (!tracked.belongsToSubtree || !tracked.birthId || windowsJobOf(tracked.process)) return;
-      const captured = await captureChildDescendants(tracked.pid, tracked.birthId);
+      const sample = await sampleChildDescendants(tracked.pid, tracked.birthId);
+      tracked.enumerationUnconfirmed = sample.enumerationUnconfirmed ?? tracked.enumerationUnconfirmed;
       const known = new Map(tracked.descendants.map((identity) => [processIdentityKey(identity), identity]));
-      for (const identity of captured) {
+      for (const identity of sample.descendants) {
         known.set(processIdentityKey(identity), identity);
       }
       tracked.descendants.splice(0, tracked.descendants.length, ...known.values());
@@ -1540,6 +1571,10 @@ export class ExecutionController {
             continue;
           }
           await refreshDescendants(tracked);
+          if (tracked.enumerationUnconfirmed) {
+            allStopped = false;
+            continue;
+          }
           let stopped = false;
           try {
             stopped = await stopVerifiedChildTree(
@@ -1608,6 +1643,7 @@ export class ExecutionController {
                   descendants.set(`${identity.pid}:${identity.birthId || 'unknown'}`, structuredClone(identity));
                 }
                 subtree.descendants = [...descendants.values()];
+                subtree.enumerationUnconfirmed = tracked.enumerationUnconfirmed || undefined;
               }
             }
           });
@@ -1651,10 +1687,10 @@ export class ExecutionController {
       };
       trackedChildren.set(trackedKey, tracked);
       const belongsToSubtree = await verifyCapturedSubtreeOwnership(pid, childProcess, candidateBirthId);
-      if (belongsToSubtree && candidateBirthId && !windowsJobOf(childProcess)) {
-        tracked.descendants = await captureChildDescendants(pid, candidateBirthId);
-      }
       tracked.belongsToSubtree = belongsToSubtree;
+      if (belongsToSubtree && candidateBirthId && !windowsJobOf(childProcess)) {
+        await refreshDescendants(tracked);
+      }
 
       const reg = await registerRunChildV2({
         taskStore: this.taskStore,
@@ -1670,6 +1706,7 @@ export class ExecutionController {
         childPid: pid,
         childBirthId: candidateBirthId,
         childDescendants: tracked.descendants,
+        childEnumerationUnconfirmed: tracked.enumerationUnconfirmed,
         childProcess,
         attachLeases: async (p) => {
           if (sessionLease) await this.sessionLock.attachChild(sessionLease, p);
@@ -1848,6 +1885,11 @@ export class ExecutionController {
             if (t.execution?.run?.id === runId) {
               t.execution.run.state = 'stopping';
               t.execution.run.unconfirmed = true;
+              for (const subtree of t.execution.run.subtrees || []) {
+                if (trackedChildren.get(processIdentityKey(subtree.root))?.enumerationUnconfirmed) {
+                  subtree.enumerationUnconfirmed = true;
+                }
+              }
               if (unconfirmedMergeHelper) {
                 t.execution.run.mergeLockHelper = {
                   ...unconfirmedMergeHelper,
@@ -3033,11 +3075,9 @@ export class ExecutionController {
           await this.markDecisionStopUnconfirmed(threadId, capturedV2, 'Decision cannot stop a registered child without its birthId.');
           return decision;
         }
-        const descendants = (run.subtrees || []).flatMap((subtree) => subtree.descendants || []);
         let stopped = false;
         try {
-          const job = run.subtrees?.find(tree => tree.root.pid === childPid && tree.root.birthId === childBirthId)?.windowsJob;
-          stopped = await stopVerifiedChildTree(childPid, true, undefined, childBirthId, PROCESS_STOP_TIMEOUT_MS, descendants, true, job);
+          stopped = await this.stopRecordedChild(threadId, run);
         } catch {}
         if (!stopped) {
           await this.markDecisionStopUnconfirmed(threadId, capturedV2, 'Decision could not confirm exit of the full captured child tree.');
@@ -3060,7 +3100,9 @@ export class ExecutionController {
           return decision;
         }
       } else {
-        const { ownerStatus, childStatus, subtreeStatus } = this.inspectRunProcesses(run);
+        const current = this.taskStore.reloadTask(threadId)?.execution?.run;
+        if (current?.id !== run.id) return decision;
+        const { ownerStatus, childStatus, subtreeStatus } = this.inspectRunProcesses(current);
         if (ownerStatus !== 'exited' || (childPid && childStatus !== 'exited') || (childPid && subtreeStatus !== 'exited')) {
           await this.markDecisionStopUnconfirmed(threadId, capturedV2, 'Decision is durable, but the previous controller or child tree has not acknowledged exit.');
           return decision;
@@ -3575,13 +3617,13 @@ export class ExecutionController {
         const current = this.taskStore.reloadTask(threadId);
         const currentRun = current?.execution?.run;
         if (currentRun?.id === capturedRun.id && currentRun.child?.pid && currentRun.child.birthId) {
-          const descendants = (currentRun.subtrees || []).flatMap((tree) => tree.descendants || []);
           try {
-            const job = currentRun.subtrees?.find(tree =>
-              tree.root.pid === currentRun.child?.pid && tree.root.birthId === currentRun.child?.birthId)?.windowsJob;
-            await stopVerifiedChildTree(currentRun.child.pid, true, undefined, currentRun.child.birthId,
-              PROCESS_STOP_TIMEOUT_MS, descendants, true, job);
-          } catch {}
+            if (!await this.stopRecordedChild(threadId, currentRun, cleanupToken)) {
+              return this.taskStore.reloadTask(threadId) || marked;
+            }
+          } catch {
+            return this.taskStore.reloadTask(threadId) || marked;
+          }
         }
         const latest = this.taskStore.reloadTask(threadId);
         const run = latest?.execution?.run;

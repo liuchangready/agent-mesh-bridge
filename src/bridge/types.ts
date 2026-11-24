@@ -47,6 +47,8 @@ export interface ExecutionSubtreeEvidence {
   root: ProcessIdentity;
   descendants: ProcessIdentity[];
   windowsJob?: import('./windows-job').WindowsJobBinding;
+  /** Failed to enumerate this root while its descendants could still be running. */
+  enumerationUnconfirmed?: boolean;
   /** Wall-clock time of the latest cumulative observation, for audit and recovery ordering. */
   sampledAt?: string;
 }

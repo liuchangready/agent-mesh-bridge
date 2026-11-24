@@ -1,9 +1,15 @@
 import { spawn } from 'child_process';
 import { createHash, randomUUID } from 'crypto';
 import { Socket } from 'net';
-import { parse, resolve } from 'path';
+import { join, parse, resolve } from 'path';
 import { createInterface } from 'readline';
 import { setTimeout as delay } from 'timers/promises';
+
+export const windowsPowerShell = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+export const windowsProcessTable = `Get-CimInstance -ClassName Win32_Process -Property ParentProcessId,ProcessId,CreationDate -ErrorAction Stop |
+  Select-Object ParentProcessId,ProcessId,@{Name='Created';Expression={
+    if ($_.CreationDate) { $_.CreationDate.ToFileTimeUtc().ToString('D19', [Globalization.CultureInfo]::InvariantCulture) }
+  }}`;
 
 const script = `
 $ErrorActionPreference = 'Stop'
@@ -14,6 +20,9 @@ try {
     $reply = @{ id = $request.id }
     try {
       switch ($request.operation) {
+        'processTable' {
+          $reply.value = @(${windowsProcessTable})
+        }
         'birthIds' {
           $identities = @{}
           foreach ($processId in $request.pids) {
@@ -63,6 +72,7 @@ try {
 `;
 
 type Request =
+  | { operation: 'processTable' }
   | { operation: 'birthIds'; pids: number[] }
   | { operation: 'acquire'; name: string; token: string; deadline: number }
   | { operation: 'release'; name: string; token: string };
@@ -75,7 +85,7 @@ interface Pending {
 function startHelper() {
   // stdin closes with the owner, so the PowerShell thread releases all its mutexes on owner exit.
   // A process-lifetime helper must not keep a disposable task worktree open on Windows.
-  const child = spawn('powershell.exe', [
+  const child = spawn(windowsPowerShell, [
     '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64'),
   ], { cwd: parse(process.execPath).root, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
   const pending = new Map<number, Pending>();

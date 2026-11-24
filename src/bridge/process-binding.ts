@@ -12,7 +12,7 @@ import {
 } from './types';
 import { TaskStore } from './task-store';
 import {
-  collectDescendants,
+  collectDescendantsAsync,
   confirmProcessTreeExit,
   getProcessBirthId,
   getProcessBirthIds,
@@ -69,7 +69,7 @@ export function assessRunLaunchEvidence(
     };
   }
 
-  if (run.unconfirmed) {
+  if (run.unconfirmed || run.subtrees?.some(tree => tree.enumerationUnconfirmed)) {
     return {
       status: 'STOPPING_UNCONFIRMED',
       safeToClean: false,
@@ -396,6 +396,7 @@ export interface RegisterChildOptions {
   childBirthId?: string;
   /** Descendant identities captured while that exact child birthId was alive. */
   childDescendants?: ProcessIdentity[];
+  childEnumerationUnconfirmed?: boolean;
   childProcess?: ChildProcess;
   attachLeases?: (childPid: number) => Promise<void> | void;
   stopTimeoutMs?: number;
@@ -413,14 +414,29 @@ export interface RegisterChildResult {
 const CHILD_BINDING_IN_PROGRESS = Symbol('CHILD_BINDING_IN_PROGRESS');
 const CHILD_BINDING_ALREADY_REGISTERED = Symbol('CHILD_BINDING_ALREADY_REGISTERED');
 
-export async function captureChildDescendants(rootPid: number, expectedRootBirthId?: string): Promise<ProcessIdentity[]> {
+export async function sampleChildDescendants(rootPid: number, expectedRootBirthId?: string): Promise<{
+  descendants: ProcessIdentity[];
+  enumerationUnconfirmed?: boolean;
+}> {
   const rootBirthId = expectedRootBirthId || getProcessBirthId(rootPid);
-  if (!rootBirthId || await probeProcessIdentityAsync(rootPid, rootBirthId) !== 'alive') return [];
-  const pids = collectDescendants(rootPid);
-  if (!pids.length) return [];
-  const birthIds = await getProcessBirthIds([rootPid, ...pids]);
-  const verifiedRoot = birthIds.get(rootPid) === rootBirthId;
-  return pids.map(pid => ({ pid, birthId: verifiedRoot ? birthIds.get(pid) : undefined }));
+  const rootStatus = rootBirthId ? await probeProcessIdentityAsync(rootPid, rootBirthId) : 'unknown';
+  if (rootStatus === 'exited') return { descendants: [] };
+  if (rootStatus === 'alive') {
+    try {
+      const pids = await collectDescendantsAsync(rootPid);
+      const birthIds = await getProcessBirthIds([rootPid, ...pids]);
+      if (birthIds.get(rootPid) === rootBirthId) {
+        return { descendants: pids.map(pid => ({ pid, birthId: birthIds.get(pid) })), enumerationUnconfirmed: false };
+      }
+    } catch {}
+  }
+  return { descendants: [], enumerationUnconfirmed: true };
+}
+
+export async function captureChildDescendants(rootPid: number, expectedRootBirthId?: string): Promise<ProcessIdentity[]> {
+  const sample = await sampleChildDescendants(rootPid, expectedRootBirthId);
+  if (sample.enumerationUnconfirmed) throw new Error('Child process tree enumeration could not be confirmed.');
+  return sample.descendants;
 }
 
 /**
@@ -436,6 +452,8 @@ export async function stopVerifiedChildTree(
   knownDescendants: ProcessIdentity[] = [],
   allowFreshSubtreeEnumeration: boolean = true,
   recordedJob?: WindowsJobBinding,
+  enumerationUnconfirmed = false,
+  onSample?: (sample: Awaited<ReturnType<typeof sampleChildDescendants>>) => Promise<void>,
 ): Promise<boolean> {
   if (!belongsToSubtree || !childPid || childPid <= 0 || childPid === process.pid) {
     // Foreign PID, host PID, or unverified subtree: forbidden to kill!
@@ -485,16 +503,17 @@ export async function stopVerifiedChildTree(
   };
   for (const item of knownDescendants) addDescendant(item.pid, item.birthId);
   if (rootWasVerifiedAlive) {
-    try {
-      for (const descendant of await captureChildDescendants(childPid, trustedBirthId)) {
-        if (descendant.birthId || probeProcessIdentity(descendant.pid) !== 'exited') {
-          addDescendant(descendant.pid, descendant.birthId);
-        }
+    const sample = await sampleChildDescendants(childPid, trustedBirthId);
+    if (sample.enumerationUnconfirmed !== undefined) await onSample?.(sample);
+    enumerationUnconfirmed = sample.enumerationUnconfirmed ?? enumerationUnconfirmed;
+    for (const descendant of sample.descendants) {
+      if (descendant.birthId || probeProcessIdentity(descendant.pid) !== 'exited') {
+        addDescendant(descendant.pid, descendant.birthId);
       }
-    } catch {
-      allIdentitiesKnown = false;
     }
   }
+  // Preserve parent links while enumeration can still be retried on the live root.
+  if (enumerationUnconfirmed) return false;
   const descendantsToKill = [...descendantsByIdentity.values()];
 
   // 3. Stop only captured descendants whose complete identity still matches.
@@ -888,6 +907,9 @@ export async function registerRunChildV2(
         }
         const windowsJob = windowsJobOf(options.childProcess);
         if (windowsJob) subtree.windowsJob = windowsJob;
+        if (options.childEnumerationUnconfirmed !== undefined) {
+          subtree.enumerationUnconfirmed = options.childEnumerationUnconfirmed || undefined;
+        }
         const knownDescendants = new Map(
           subtree.descendants.map((item) => [`${item.pid}:${item.birthId || 'unknown'}`, item] as const),
         );

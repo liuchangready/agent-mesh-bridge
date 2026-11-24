@@ -21,7 +21,7 @@ import { appendTokenUsageComponent } from './token-usage-collector';
 import { readBridgePolicy } from './bridge-policy';
 import { SessionOwnershipStore, nativeSessionNamespace } from './session-ownership';
 import { getProcessBirthId } from './platform';
-import { captureChildDescendants } from './process-binding';
+import { sampleChildDescendants } from './process-binding';
 import { probeProcessIdentity } from './platform';
 import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
 
@@ -1025,7 +1025,7 @@ export class NativeSessionCompactor {
             ? { runId: id, operationId: admittedOperationId, generation: admittedGeneration }
             : undefined;
           const windowsJob = windowsJobOf(child);
-          const sampledDescendants = pid && birthId && !windowsJob ? await captureChildDescendants(pid, birthId) : [];
+          const sample = pid && birthId && !windowsJob ? await sampleChildDescendants(pid, birthId) : undefined;
           await this.store.transitionExecution(threadId, current.execution.revision, (fresh) => {
             const activeRun = fresh.execution?.run;
             if (!fresh.execution || !activeRun || activeRun.id !== id || activeRun.purpose !== 'native_maintenance' ||
@@ -1038,7 +1038,7 @@ export class NativeSessionCompactor {
                 activeRun.unconfirmed = true; activeRun.state = 'stopping'; nativeRunUnconfirmed = true;
               }
               nativeChildPid = pid; nativeChildBirthId = birthId;
-              const descendants = sampledDescendants;
+              const descendants = sample?.descendants || [];
               if (descendants.some((item) => !item.birthId)) {
                 activeRun.unconfirmed = true; activeRun.state = 'stopping'; nativeRunUnconfirmed = true;
               }
@@ -1046,7 +1046,8 @@ export class NativeSessionCompactor {
               const priorExit = subtreeEvidenceExit(priorSubtrees);
               const priorSettled = !activeRun.child && (!priorSubtrees.length || priorExit === 'exited');
               const additions = birthId
-                ? [{ root: { pid, birthId }, descendants, sampledAt: new Date().toISOString(), windowsJob }]
+                ? [{ root: { pid, birthId }, descendants, sampledAt: new Date().toISOString(), windowsJob,
+                  enumerationUnconfirmed: sample && (sample.enumerationUnconfirmed ?? true) }]
                 : [{ root: { pid }, descendants, sampledAt: new Date().toISOString() }];
               activeRun.subtrees = mergeSubtreeEvidence(priorSettled ? undefined : priorSubtrees, additions);
               if (!priorSettled) {
@@ -1099,8 +1100,8 @@ export class NativeSessionCompactor {
             nativeSubtreeTimer = setInterval(() => {
               nativeSubtreeTail = nativeSubtreeTail.then(async () => {
                 if (nativeChildPid !== pid || !nativeChildBirthId) return;
-                const descendants = await captureChildDescendants(pid, nativeChildBirthId);
-                if (descendants.some((item) => !item.birthId)) nativeRunUnconfirmed = true;
+                const sample = await sampleChildDescendants(pid, nativeChildBirthId);
+                if (sample.descendants.some((item) => !item.birthId)) nativeRunUnconfirmed = true;
                 this.store.loadFromDisk();
                 const latest = this.store.getTask(threadId);
                 if (!latest?.execution || latest.execution.run?.id !== id) { nativeRunUnconfirmed = true; return; }
@@ -1110,7 +1111,7 @@ export class NativeSessionCompactor {
                     nativeRunUnconfirmed = true; return;
                   }
                   activeRun.subtrees = mergeSubtreeEvidence(activeRun.subtrees, [
-                    { root: { pid, birthId: nativeChildBirthId! }, descendants, sampledAt: new Date().toISOString() },
+                    { root: { pid, birthId: nativeChildBirthId! }, ...sample, sampledAt: new Date().toISOString() },
                   ]);
                   if (nativeRunUnconfirmed) { activeRun.unconfirmed = true; activeRun.state = 'stopping'; }
                 });
@@ -1233,6 +1234,9 @@ function mergeSubtreeEvidence(
     for (const identity of evidence.descendants) descendants.set(processEvidenceKey(identity), { ...identity });
     current.descendants = [...descendants.values()];
     if (evidence.windowsJob) current.windowsJob = evidence.windowsJob;
+    if (evidence.enumerationUnconfirmed !== undefined) {
+      current.enumerationUnconfirmed = evidence.enumerationUnconfirmed;
+    }
     if (evidence.sampledAt && (!current.sampledAt || evidence.sampledAt > current.sampledAt)) current.sampledAt = evidence.sampledAt;
     merged.set(key, current);
   }
@@ -1252,7 +1256,7 @@ function processEvidenceExit(identities: ProcessIdentity[]): ProcessEvidenceExit
 
 function subtreeEvidenceExit(subtrees: ExecutionSubtreeEvidence[] | undefined): ProcessEvidenceExit {
   if (!subtrees?.length) return 'exited';
-  if (subtrees.some(tree => tree.windowsJob && !windowsJobFinished(tree.windowsJob))) return 'unknown';
+  if (subtrees.some(tree => tree.enumerationUnconfirmed || (tree.windowsJob && !windowsJobFinished(tree.windowsJob)))) return 'unknown';
   const identities = subtrees.flatMap((tree) => [tree.root, ...tree.descendants]);
   return processEvidenceExit(identities);
 }
@@ -1290,10 +1294,10 @@ async function bindNativeRunChild(
   store.loadFromDisk();
   const fresh = store.getTask(threadId);
   if (!fresh?.execution || fresh.execution.run?.id !== expected.id) throw new Error('Native maintenance child has no matching v2 run.');
-  let descendants: Awaited<ReturnType<typeof captureChildDescendants>> = [];
+  let sample: Awaited<ReturnType<typeof sampleChildDescendants>> | undefined;
   if (pid) {
     if (!birthId || probeProcessIdentity(pid, birthId) !== 'alive') throw new Error('Native maintenance child identity is unverified.');
-    if (!windowsJob) descendants = await captureChildDescendants(pid, birthId);
+    if (!windowsJob) sample = await sampleChildDescendants(pid, birthId);
   }
   let bindingUnconfirmed = false;
   await store.transitionExecution(threadId, fresh.execution.revision, (current) => {
@@ -1307,8 +1311,10 @@ async function bindNativeRunChild(
       const priorSubtrees = run.subtrees || [];
       const priorExit = subtreeEvidenceExit(priorSubtrees);
       const priorSettled = !run.child && (!priorSubtrees.length || priorExit === 'exited');
+      const descendants = sample?.descendants || [];
       run.subtrees = mergeSubtreeEvidence(priorSettled ? undefined : priorSubtrees, [
-        { root: { pid, birthId }, descendants, sampledAt: new Date().toISOString(), windowsJob },
+        { root: { pid, birthId }, descendants, sampledAt: new Date().toISOString(), windowsJob,
+          enumerationUnconfirmed: sample && (sample.enumerationUnconfirmed ?? true) },
       ]);
       run.child = { pid, birthId };
       run.registeredAt = new Date().toISOString();

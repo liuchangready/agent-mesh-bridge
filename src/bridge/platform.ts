@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { ProcessIdentity } from './types';
-import { requestWindowsProcessHelper } from './windows-process-helper';
+import { requestWindowsProcessHelper, windowsPowerShell, windowsProcessTable } from './windows-process-helper';
 
 /**
  * Platform facts the bridge needs at runtime.
@@ -220,7 +220,9 @@ export function killProcessTree(
   let descendants: ProcessIdentity[] = [];
   try {
     descendants = collectDescendants(rootPid).map((pid) => ({ pid, birthId: getProcessBirthId(pid) }));
-  } catch {}
+  } catch {
+    return;
+  }
   for (const identity of descendants) {
     if (!identity.birthId || probeProcessIdentity(identity.pid, identity.birthId) !== 'alive') continue;
     if (probeProcessIdentity(identity.pid, identity.birthId) !== 'alive') continue;
@@ -279,32 +281,20 @@ export function killPidTree(pid: number): void {
 /**
  * Every descendant PID of `rootPid`, parents before children.
  *
- * Windows uses wmic/CIM process table; Linux reads `/proc/<pid>/stat`.
+ * Windows uses a CIM process snapshot; Linux reads `/proc/<pid>/stat`.
  */
 export function collectDescendants(rootPid: number): number[] {
   if (!rootPid || rootPid <= 0) return [];
   const childrenByParent = new Map<number, number[]>();
 
   if (IS_WINDOWS) {
-    try {
-      const output = child_process.execFileSync(
-        'wmic',
-        ['process', 'get', 'ParentProcessId,ProcessId'],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000, windowsHide: true },
-      );
-      for (const line of output.split(/\r?\n/)) {
-        const parts = line.trim().split(/\s+/);
-        if (parts.length >= 2) {
-          const ppid = parseInt(parts[0], 10);
-          const pid = parseInt(parts[1], 10);
-          if (ppid > 0 && pid > 0) {
-            const siblings = childrenByParent.get(ppid);
-            if (siblings) siblings.push(pid);
-            else childrenByParent.set(ppid, [pid]);
-          }
-        }
-      }
-    } catch {}
+    const output = child_process.execFileSync(
+      windowsPowerShell,
+      ['-NoProfile', '-NonInteractive', '-Command',
+        `$ErrorActionPreference = 'Stop'; ConvertTo-Json -InputObject @(${windowsProcessTable}) -Compress`],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 8000, windowsHide: true },
+    );
+    return windowsDescendants(rootPid, JSON.parse(output));
   } else {
     try {
       const entries = fs.readdirSync('/proc');
@@ -325,13 +315,49 @@ export function collectDescendants(rootPid: number): number[] {
     } catch {}
   }
 
+  return descendantsFromTable(rootPid, childrenByParent);
+}
+
+function windowsDescendants(rootPid: number, rows: unknown): number[] {
+  if (!Array.isArray(rows) || !rows.length) throw new Error('Windows process table is unavailable.');
+  const childrenByParent = new Map<number, number[]>();
+  const createdAt = new Map<number, string>();
+  for (const row of rows) {
+    const pid = row?.ProcessId;
+    const parent = row?.ParentProcessId;
+    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(parent)) throw new Error('Invalid Windows process table row.');
+    if (typeof row.Created === 'string' && /^\d{19}$/.test(row.Created)) createdAt.set(pid, row.Created);
+    if (pid <= 0 || parent <= 0) continue;
+    const children = childrenByParent.get(parent);
+    if (children) children.push(pid);
+    else childrenByParent.set(parent, [pid]);
+  }
+  return descendantsFromTable(rootPid, childrenByParent, (pid, parent) => {
+    const childStart = createdAt.get(pid);
+    const parentStart = createdAt.get(parent);
+    if (!childStart || !parentStart) throw new Error('Windows process tree creation times are unavailable.');
+    // ParentProcessId can outlive its original owner and refer to a recycled PID.
+    return childStart >= parentStart;
+  });
+}
+
+export async function collectDescendantsAsync(rootPid: number): Promise<number[]> {
+  if (!IS_WINDOWS) return collectDescendants(rootPid);
+  return windowsDescendants(rootPid, await requestWindowsProcessHelper({ operation: 'processTable' }));
+}
+
+function descendantsFromTable(
+  rootPid: number,
+  childrenByParent: Map<number, number[]>,
+  belongsToParent: (pid: number, parent: number) => boolean = () => true,
+): number[] {
   const descendants: number[] = [];
   const queue: number[] = [rootPid];
   const seen = new Set<number>([rootPid]);
   while (queue.length > 0) {
     const current = queue.shift()!;
     for (const pid of childrenByParent.get(current) ?? []) {
-      if (!seen.has(pid)) {
+      if (!seen.has(pid) && belongsToParent(pid, current)) {
         seen.add(pid);
         descendants.push(pid);
         queue.push(pid);
@@ -356,7 +382,11 @@ export function isProcessDescendant(candidatePid: number, rootPid: number): bool
 export function isProcessStrictDescendant(candidatePid: number, rootPid: number): boolean {
   if (!candidatePid || !rootPid || candidatePid <= 0 || rootPid <= 0) return false;
   if (candidatePid === rootPid) return false;
-  return collectDescendants(rootPid).includes(candidatePid);
+  try {
+    return collectDescendants(rootPid).includes(candidatePid);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -386,7 +416,7 @@ export function getProcessBirthId(pid: number): string | undefined {
   try {
     if (IS_WINDOWS) {
       const output = child_process.execFileSync(
-        'powershell.exe',
+        windowsPowerShell,
         [
           '-NoProfile',
           '-NonInteractive',
@@ -543,14 +573,23 @@ export async function confirmProcessTreeExit(
   for (const item of knownDescendants) {
     knownProcessBirthIds.set(`${item.pid}:${item.birthId ?? 'unknown'}`, item);
   }
+  let enumerationUnconfirmed = false;
 
   const scanDescendants = async () => {
     // A numeric PID can be reused as soon as the original root exits. Only
     // enumerate a fresh tree while the exact root birth ID is still alive.
-    if (!allowFreshRootScan || !expectedBirthId || probeProcessIdentity(pid, expectedBirthId) !== 'alive') return;
+    if (!allowFreshRootScan || !expectedBirthId) return;
+    const rootStatus = await probeProcessIdentityAsync(pid, expectedBirthId);
+    if (rootStatus === 'unknown') enumerationUnconfirmed = true;
+    if (rootStatus !== 'alive') return;
     try {
-      const descendantPids = collectDescendants(pid);
-      const birthIds = await getProcessBirthIds(descendantPids);
+      const descendantPids = await collectDescendantsAsync(pid);
+      const birthIds = await getProcessBirthIds([pid, ...descendantPids]);
+      if (birthIds.get(pid) !== expectedBirthId) {
+        enumerationUnconfirmed = true;
+        return;
+      }
+      enumerationUnconfirmed = false;
       for (const descendantPid of descendantPids) {
         const birthId = birthIds.get(descendantPid);
         const key = `${descendantPid}:${birthId ?? 'unknown'}`;
@@ -558,13 +597,16 @@ export async function confirmProcessTreeExit(
           knownProcessBirthIds.set(key, { pid: descendantPid, birthId });
         }
       }
-    } catch {}
+    } catch {
+      enumerationUnconfirmed = true;
+    }
   };
 
   // Windows process start-time lookup crosses into PowerShell/WMI. Query the
   // complete retained tree in one bounded batch per poll instead of launching
   // one shell for every PID; missing/ambiguous birth IDs remain unknown.
   const allConfirmedExited = async (): Promise<boolean> => {
+    if (enumerationUnconfirmed) return false;
     const identities = [...knownProcessBirthIds.values()];
     if (customProbeProvider || identities.some((identity) => !identity.birthId)) {
       return identities.every((identity) =>
@@ -590,7 +632,6 @@ export async function confirmProcessTreeExit(
     });
   };
 
-  await scanDescendants();
   while (Date.now() < deadline) {
     await scanDescendants();
     if (await allConfirmedExited()) return true;

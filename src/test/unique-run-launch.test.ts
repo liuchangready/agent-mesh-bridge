@@ -3,6 +3,7 @@ import * as child_process from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { once } from 'node:events';
 import { test, describe } from 'node:test';
 
 import { TaskStore } from '../bridge/task-store';
@@ -38,6 +39,7 @@ import {
   captureChildDescendants,
   recordLaunchRecoveryFailure,
   registerRunChildV2,
+  sampleChildDescendants,
   stopVerifiedChildTree,
   verifySubtreeOwnership,
   RunIdentity,
@@ -160,6 +162,50 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
     assert.deepEqual([...(await getProcessBirthIds([11, 22, 11, 0]))], [[11, '1001'], [22, '2002']]);
     assert.equal(batch.mock.callCount(), 1);
     assert.deepEqual(batch.mock.calls[0].arguments, [{ operation: 'birthIds', pids: [11, 22] }]);
+  });
+
+  test('Windows process enumeration failure blocks stop until the live root can be sampled', { skip: !IS_WINDOWS }, async (t) => {
+    const helper = require('../bridge/windows-process-helper') as typeof import('../bridge/windows-process-helper');
+    const request = helper.requestWindowsProcessHelper;
+    let enumerationFails = true;
+    let rootPid: number;
+    t.mock.method(helper, 'requestWindowsProcessHelper', async (operation: Parameters<typeof request>[0]) => {
+      if (operation.operation === 'processTable') {
+        if (enumerationFails) throw new Error('CIM unavailable');
+        return [
+          { ProcessId: rootPid, ParentProcessId: process.pid, Created: '0000000000000000100' },
+          { ProcessId: 2147483000, ParentProcessId: rootPid, Created: '0000000000000000099' },
+        ];
+      }
+      return request(operation);
+    });
+    const child = child_process.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
+    const exited = once(child, 'exit');
+    try {
+      await once(child, 'spawn');
+      const pid = child.pid!;
+      rootPid = pid;
+      const birthId = (await getProcessBirthIds([pid])).get(pid);
+      assert.ok(birthId);
+      const failed = await sampleChildDescendants(pid, birthId);
+      assert.deepStrictEqual(failed, { descendants: [], enumerationUnconfirmed: true });
+      assert.strictEqual(await stopVerifiedChildTree(pid, true, child, birthId), false);
+      assert.strictEqual(probeProcessIdentity(pid, birthId), 'alive');
+
+      enumerationFails = false;
+      assert.deepStrictEqual(await sampleChildDescendants(pid, birthId), { descendants: [], enumerationUnconfirmed: false });
+      assert.strictEqual(await stopVerifiedChildTree(pid, true, child, birthId, 10000, [], true, undefined, true), true);
+      await exited;
+      assert.strictEqual(await stopVerifiedChildTree(pid, true, child, birthId, 10000, [], true, undefined, true), false);
+      assert.strictEqual(assessRunLaunchEvidence({
+        id: 'cim-failure', owner: { pid: 0 }, child: { pid, birthId },
+        subtrees: [{ root: { pid, birthId }, descendants: [], enumerationUnconfirmed: true }],
+        step: 'executing', state: 'stopping', startedAt: new Date().toISOString(),
+      }, () => 'exited').safeToClean, false);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      await exited;
+    }
   });
 
 
