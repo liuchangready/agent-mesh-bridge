@@ -6,8 +6,9 @@ import type { DelegationThread } from '../bridge/types';
 
 const reason = 'The task role lease is not held during native-session preparation.';
 
-function failedThread(): DelegationThread {
+function failedThread(version: 1 | 2 = 1): DelegationThread {
   const thread = createThread('thread_failed_preparation');
+  thread.execution!.version = version;
   thread.status = 'failed';
   thread.currentRound = thread.execution!.round = 2;
   thread.receiverSessionId = '01a1f86c-f294-7df3-858b-5f286aaa0ffd';
@@ -22,7 +23,7 @@ test('a preparation exception finalizes the current failed work round', async ()
   const f = await setupFixture({ useFastLock: true });
   try {
     const thread = createThread('thread_preparation_throw');
-    f.store.upsertTask(thread);
+    f.addRunnableThread(thread);
     f.runner.setOnExecute(async () => { throw new Error(reason); });
     await f.controller.startExecution(thread.threadId);
     await f.controller.waitForActiveExecutions();
@@ -70,9 +71,9 @@ for (const roundStatus of ['running', 'failed'] as const) test(`the unified retr
   let release!: () => void;
   const barrier = new Promise<void>(resolve => { release = resolve; });
   try {
-    const thread = failedThread();
+    const thread = failedThread(2);
     thread.rounds[1].status = roundStatus;
-    f.store.upsertTask(thread);
+    f.addRunnableThread(thread);
     f.runner.setOnExecute(async () => { await barrier; throw new Error('Controlled end after retry admission'); });
     await f.controller.retryOperation(thread.threadId);
     const retried = f.store.getTask(thread.threadId)!;
@@ -82,7 +83,7 @@ for (const roundStatus of ['running', 'failed'] as const) test(`the unified retr
     assert.equal(retried.rounds.length, 2);
     assert.equal(retried.rounds[1].prompt, thread.rounds[1].prompt);
     assert.equal(retried.receiverSessionId, thread.receiverSessionId);
-    assert.equal(retried.execution?.version, 1);
+    assert.equal(retried.execution?.version, 2);
     assert.equal(retried.execution?.generation, 2);
     assert.equal(f.runner.executions.length, 1);
   } finally { release(); await f.controller.waitForActiveExecutions(); await f.cleanup(); }

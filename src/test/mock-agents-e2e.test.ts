@@ -175,7 +175,7 @@ async function fixture(t: TestContext, scenario: MockScenario, delayResident = f
     'const host = createBridgeHost();',
     "if (!host.startupAdmission.ready) throw Error(JSON.stringify(host.startupAdmission));",
     'host.executionController.dispose();',
-    'const controller = new ExecutionController(host.taskStore, host.runner, host.callbackManager, host.reworkController.getMergeCoordinator(), undefined, undefined, host.registry, { requireV2Execution: true, standingScanIntervalMs: gate ? 0 : 500 });',
+    'const controller = new ExecutionController(host.taskStore, host.runner, host.callbackManager, host.reworkController.getMergeCoordinator(), host.registry, { standingScanIntervalMs: gate ? 0 : 500 });',
     'const window = new WindowWorkspace(storage, [process.cwd()]);',
     'window.advertiseExecutionOwner();',
     "process.on('exit', () => window.dispose());",

@@ -323,7 +323,7 @@ describe('Unified Execution Integration Tests', () => {
     const fixture = await setupFixture();
     try {
       const thread = createThread('thread_s1', 'develop');
-      fixture.store.upsertTask(thread);
+      fixture.addRunnableThread(thread);
 
       let finishDevelop: () => void;
       const barrier = new Promise<void>((r) => { finishDevelop = r; });
@@ -347,7 +347,7 @@ describe('Unified Execution Integration Tests', () => {
       assert.strictEqual(updated?.status, 'running');
       assert.strictEqual(updated?.execution?.phase, 'develop');
       assert.strictEqual(updated?.execution?.attempt, 1);
-      assert.strictEqual(updated?.execution?.version, 1);
+      assert.strictEqual(updated?.execution?.version, 2);
       assert.ok(updated?.execution?.run?.id);
       assert.strictEqual(updated?.execution?.run?.owner.pid, process.pid);
 
@@ -356,6 +356,7 @@ describe('Unified Execution Integration Tests', () => {
       const deadline1 = Date.now() + 60_000;
       let postDevelop = fixture.store.getTask('thread_s1');
       while (postDevelop?.status !== 'reviewing' && Date.now() < deadline1) {
+        await fixture.controller.scanAndDrain();
         await new Promise((r) => setTimeout(r, 50));
         postDevelop = fixture.store.getTask('thread_s1');
       }
@@ -375,8 +376,8 @@ describe('Unified Execution Integration Tests', () => {
     try {
       const taskA = createThread('thread_s5_a', 'merge');
       const taskB = createThread('thread_s5_b', 'merge');
-      fixture.store.upsertTask(taskA);
-      fixture.store.upsertTask(taskB);
+      fixture.addRunnableThread(taskA);
+      fixture.addRunnableThread(taskB);
 
       // Simulate merge lock held by Task A
       const releaseA = await fixture.mergeLock.acquire();
@@ -674,8 +675,8 @@ describe('Unified Execution Integration Tests', () => {
       task1.reviewBootstrap = { phase: 'confirmed', attempts: 1 };
       const task2 = createThread('thread_s15_2', 'review');
       task2.reviewBootstrap = { phase: 'confirmed', attempts: 1 };
-      fixture.store.upsertTask(task1);
-      fixture.store.upsertTask(task2);
+      fixture.addRunnableThread(task1);
+      fixture.addRunnableThread(task2);
 
       let finishReview: () => void;
       const reviewBarrier = new Promise<void>((r) => { finishReview = r; });
@@ -747,12 +748,12 @@ describe('Unified Execution Integration Tests', () => {
     }
   });
 
-  // Scenario 23: Crash recovery scanner (scanAndDrain sets failed(OWNER_LOST) without auto-retry, stops orphan child)
-  test('Scenario 23: Crash recovery sets failed(OWNER_LOST) without auto-retry and stops orphan child', async () => {
+  // Scenario 23: A passive scan leaves historical ownership and files untouched
+  test('Scenario 23: V1 orphan is left untouched by the V2 scheduler', async () => {
     const fixture = await setupFixture();
+    let child: ReturnType<typeof spawn> | undefined;
     try {
-      // Spawn an orphan child
-      const child = spawn(process.execPath, ['-e', 'setInterval(()=>{}, 1000)'], {
+      child = spawn(process.execPath, ['-e', 'setInterval(()=>{}, 1000)'], {
         stdio: 'ignore',
       });
       assert.ok(child.pid);
@@ -786,20 +787,13 @@ describe('Unified Execution Integration Tests', () => {
       assert.strictEqual(inspect.ownerStatus, 'exited');
       assert.strictEqual(inspect.childStatus, 'alive');
 
-      // Run scanAndDrain
+      const snapshot = fixture.store.reloadTask(thread.threadId);
       await fixture.controller.scanAndDrain();
-
-      // Verify task entered failed(OWNER_LOST) without auto-retrying
-      const recovered = fixture.store.getTask('thread_s23');
-      assert.strictEqual(recovered?.status, 'failed');
-      assert.strictEqual(recovered?.failure?.code, 'OWNER_LOST');
-      assert.strictEqual(recovered?.execution?.autoRetriesUsed, 0); // MUST NOT auto-retry!
-      assert.strictEqual(recovered?.execution?.run, undefined);
-
-      // Verify child process was stopped
-      const childProbe = probeProcessIdentity(child.pid, childBirthId);
-      assert.strictEqual(childProbe, 'exited');
+      assert.deepEqual(fixture.store.reloadTask(thread.threadId), snapshot);
+      assert.strictEqual(probeProcessIdentity(child.pid, childBirthId), 'alive');
+      assert.equal(fixture.runner.executions.length, 0);
     } finally {
+      child?.kill();
       await fixture.cleanup();
     }
   });
@@ -867,10 +861,10 @@ describe('Unified Execution Integration Tests', () => {
       // Run scanAndDrain
       await fixture.controller.scanAndDrain();
 
-      // Task MUST NOT become completed! It must be failed(OWNER_LOST)!
+      // Historical candidate evidence must not advance execution.
       const afterDrain = fixture.store.getTask('thread_s27');
-      assert.strictEqual(afterDrain?.status, 'failed');
-      assert.strictEqual(afterDrain?.failure?.code, 'OWNER_LOST');
+      assert.strictEqual(afterDrain?.status, 'running');
+      assert.strictEqual(afterDrain?.execution?.run?.id, 'crashed-run-develop');
       assert.strictEqual(afterDrain?.worktree?.integration?.phase, 'ready'); // Preserved workspace
 
       // Case B: develop phase, BUT round has completed with valid assessment
@@ -937,10 +931,11 @@ describe('Unified Execution Integration Tests', () => {
 
       await fixture.controller.scanAndDrain();
 
-      // Successful develop with response evidence hands off to REVIEW, NEVER completed!
+      // A successful historical response also remains a historical record.
       const afterDrainB = fixture.store.getTask('thread_s27_b');
-      assert.strictEqual(afterDrainB?.status, 'reviewing');
-      assert.strictEqual(afterDrainB?.execution?.phase, 'review');
+      assert.strictEqual(afterDrainB?.status, 'running');
+      assert.strictEqual(afterDrainB?.execution?.phase, 'develop');
+      assert.strictEqual(afterDrainB?.execution?.run?.id, 'crashed-run-develop-b');
 
       // Wait for any background execution to settle before cleanup
       await fixture.controller.waitForActiveExecutions(3000);
@@ -1012,15 +1007,15 @@ describe('Unified Execution Integration Tests', () => {
 
       const afterDrain = fixture.store.getTask('thread_s28');
       // Must NOT be cleared or failed without protection!
-      assert.strictEqual(afterDrain?.execution?.run?.state, 'stopping');
-      assert.strictEqual(afterDrain?.interruption?.reason, 'PROCESS_STOP_UNCONFIRMED');
+      assert.strictEqual(afterDrain?.execution?.run?.state, 'active');
+      assert.strictEqual(afterDrain?.interruption, undefined);
 
       // Attempt concurrent retryOperation: must throw and refuse to run!
       await assert.rejects(
         async () => {
           await fixture.controller.retryOperation('thread_s28', 'retry');
         },
-        /still stopping or unconfirmed/,
+        /HISTORICAL_TASK_READ_ONLY/,
       );
 
       // Attempt concurrent resumeOperation: must throw and refuse to run!
@@ -1028,7 +1023,7 @@ describe('Unified Execution Integration Tests', () => {
         async () => {
           await fixture.controller.resumeOperation('thread_s28');
         },
-        /still stopping or unconfirmed/,
+        /HISTORICAL_TASK_READ_ONLY/,
       );
 
       // 2. pauseExecution with alive probe but missing child birthId: must NOT kill and must NOT clear run
@@ -1062,7 +1057,7 @@ describe('Unified Execution Integration Tests', () => {
       assert.ok(paused.execution?.run); // run is NOT undefined!
       assert.strictEqual(paused.interruption?.reason, 'PROCESS_STOP_UNCONFIRMED');
 
-      // 3. Production collection regression via updateRunChild with undefined birthId:
+      // 3. A historical child without a captured birthId cannot acquire a later PID's identity.
       const mockChildPid = 99999996;
       killedPids.length = 0;
       const threadCollect = createThread('thread_s28_collect', 'develop');
@@ -1079,6 +1074,7 @@ describe('Unified Execution Integration Tests', () => {
         budget: { limitMs: 120 * 60 * 1000, spentActiveMs: 1000, maxAutoRetries: 2 },
         run: {
           id: 'run-s28-c',
+          child: { pid: mockChildPid },
           owner: { pid: process.pid, birthId: getProcessBirthId(process.pid) },
           state: 'active',
           step: 'executing',
@@ -1086,9 +1082,6 @@ describe('Unified Execution Integration Tests', () => {
         },
       };
       fixture.store.upsertTask(threadCollect);
-
-      // Call updateRunChild simulating onChildPid with undefined birthId
-      await fixture.controller.updateRunChild('thread_s28_collect', 'run-s28-c', mockChildPid, undefined);
 
       // Verify task on disk has birthId=undefined (NOT fake String(pid)!)
       fixture.store.loadFromDisk();
@@ -1110,14 +1103,14 @@ describe('Unified Execution Integration Tests', () => {
       // Attempting resume/retry must be blocked
       await assert.rejects(
         async () => { await fixture.controller.resumeOperation('thread_s28_collect'); },
-        /still stopping or unconfirmed/,
+        /HISTORICAL_TASK_READ_ONLY/,
       );
       await assert.rejects(
         async () => { await fixture.controller.retryOperation('thread_s28_collect'); },
-        /still stopping or unconfirmed/,
+        /HISTORICAL_TASK_READ_ONLY/,
       );
 
-      // 4. Scanner regression with updateRunChild having undefined birthId and child alive:
+      // 4. The scanner leaves a historical child without birthId alone.
       killedPids.length = 0;
       const threadScanCollect = createThread('thread_s28_scan_collect', 'develop');
       threadScanCollect.status = 'running';
@@ -1133,6 +1126,7 @@ describe('Unified Execution Integration Tests', () => {
         budget: { limitMs: 120 * 60 * 1000, spentActiveMs: 1000, maxAutoRetries: 2 },
         run: {
           id: 'run-s28-sc',
+          child: { pid: mockChildPid },
           owner: { pid: process.pid, birthId: getProcessBirthId(process.pid) },
           state: 'active',
           step: 'executing',
@@ -1141,7 +1135,6 @@ describe('Unified Execution Integration Tests', () => {
       };
       fixture.store.upsertTask(threadScanCollect);
 
-      await fixture.controller.updateRunChild('thread_s28_scan_collect', 'run-s28-sc', mockChildPid, undefined);
       fixture.store.loadFromDisk();
       const taskScanBefore = fixture.store.getTask('thread_s28_scan_collect');
       assert.ok(taskScanBefore?.execution?.run);
@@ -1164,8 +1157,8 @@ describe('Unified Execution Integration Tests', () => {
       fixture.store.loadFromDisk();
       const taskScanAfter = fixture.store.getTask('thread_s28_scan_collect');
       assert.ok(taskScanAfter?.execution?.run, 'scanAndDrain must NOT clear run without verified birthId');
-      assert.strictEqual(taskScanAfter?.execution?.run?.state, 'stopping');
-      assert.strictEqual(taskScanAfter?.interruption?.reason, 'PROCESS_STOP_UNCONFIRMED');
+      assert.strictEqual(taskScanAfter?.execution?.run?.state, 'active');
+      assert.strictEqual(taskScanAfter?.interruption, undefined);
 
       // 5. Owner collection failure: owner.birthId is undefined, owner is alive
       const threadOwnerFail = createThread('thread_s28_owner_fail', 'develop');
@@ -1248,7 +1241,7 @@ describe('Unified Execution Integration Tests', () => {
         headCommit: headSha,
       };
       thread.rounds[0].status = 'completed'; // developer round completed
-      fixture.store.upsertTask(thread);
+      fixture.addRunnableThread(thread);
 
       let releaseCliBarrier: (res: { success: boolean; exitCode: number }) => void;
       const cliBarrier = new Promise<{ success: boolean; exitCode: number }>((resolve) => {
@@ -1256,10 +1249,7 @@ describe('Unified Execution Integration Tests', () => {
       });
 
       // Mock launchCaller representing a live Reviewer CLI
-      fixture.callbackManager.launchCaller = (async (_t: any, _r: any, onChildPid?: (pid: number) => void) => {
-        if (onChildPid) onChildPid(process.pid);
-        return await cliBarrier;
-      }) as any;
+      fixture.callbackManager.launchCaller = (async () => await cliBarrier) as any;
 
       // Start review phase
       const startRes = await fixture.controller.startExecution('thread_s29', 'review');
@@ -1294,6 +1284,7 @@ describe('Unified Execution Integration Tests', () => {
       const deadline = Date.now() + 60_000;
       let finalTask = fixture.store.getTask('thread_s29');
       while (finalTask?.execution?.phase !== 'merge' && Date.now() < deadline) {
+        await fixture.controller.scanAndDrain();
         await new Promise((r) => setTimeout(r, 100));
         fixture.store.loadFromDisk();
         finalTask = fixture.store.getTask('thread_s29');

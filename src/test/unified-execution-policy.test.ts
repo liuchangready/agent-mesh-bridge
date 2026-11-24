@@ -200,30 +200,20 @@ describe('Unified Execution Policy Tests', () => {
     }
   });
 
-  test('v1 develop preserves the runner-captured child birth identity', async () => {
+  test('a V1 developer run cannot be created by the controller', async () => {
     const fixture = await setupFixture({ useFastLock: true });
-    let finishRun!: () => void;
-    const held = new Promise<void>((resolve) => { finishRun = resolve; });
     try {
-      const threadId = 'thread_v1_captured_identity';
-      fixture.store.upsertTask(createThread(threadId, 'develop'));
-      const execute = fixture.runner.execute.bind(fixture.runner);
-      fixture.runner.execute = (options) => execute({
-        ...options,
-        onChildPid: (pid: number) => options.onChildPid(pid, undefined, 'runner-captured-birth-id'),
+      const thread = createThread('thread_v1_unsupported');
+      thread.execution!.version = 1;
+      fixture.store.upsertTask(thread);
+      const initial = fixture.store.reloadTask(thread.threadId);
+      assert.deepEqual(await fixture.controller.startExecution(thread.threadId, 'develop'), {
+        started: false, reason: 'HISTORICAL_TASK_READ_ONLY:VERSION_1',
       });
-      fixture.runner.setOnExecute(async () => { await held; });
-
-      assert.equal((await fixture.controller.startExecution(threadId, 'develop')).started, true);
-      const deadline = Date.now() + 5_000;
-      let child = fixture.store.getTask(threadId)?.execution?.run?.child;
-      while (!child && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        child = fixture.store.getTask(threadId)?.execution?.run?.child;
-      }
-      assert.deepEqual(child, { pid: 777777, birthId: 'runner-captured-birth-id' });
+      await fixture.controller.scanAndDrain();
+      assert.deepEqual(fixture.store.reloadTask(thread.threadId), initial);
+      assert.equal(fixture.runner.executions.length, 0);
     } finally {
-      finishRun();
       await fixture.cleanup();
     }
   });
@@ -235,7 +225,7 @@ describe('Unified Execution Policy Tests', () => {
       const thread = createThread('thread_s2', 'develop');
       // Set small budget limit: 50ms
       thread.execution!.budget.limitMs = 50;
-      fixture.store.upsertTask(thread);
+      fixture.addRunnableThread(thread);
 
       // Runner hangs longer than budget
       fixture.runner.setOnExecute(async () => {
@@ -270,7 +260,7 @@ describe('Unified Execution Policy Tests', () => {
     });
     try {
       const thread = createThread('thread_s3', 'develop');
-      fixture.store.upsertTask(thread);
+      fixture.addRunnableThread(thread);
 
       // 1st attempt: transient failure
       fixture.runner.setNextResult({
@@ -377,7 +367,7 @@ describe('Unified Execution Policy Tests', () => {
         state: 'active',
         startedAt: new Date().toISOString(),
       };
-      fixture.store.upsertTask(thread);
+      fixture.addRunnableThread(thread);
 
       // Call handlePhaseOutcome directly with quotaResetsAt
       const runId = 'run_test_quota';
@@ -428,7 +418,7 @@ describe('Unified Execution Policy Tests', () => {
     const fixture = await setupFixture({ useFastLock: true });
     try {
       const thread = createThread('thread_s6', 'merge');
-      fixture.store.upsertTask(thread);
+      fixture.addRunnableThread(thread);
 
       const run: ExecutionControl['run'] = {
         id: 'run_6',
@@ -452,7 +442,7 @@ describe('Unified Execution Policy Tests', () => {
     try {
       const thread = createThread('thread_s8', 'review');
       thread.reviewBootstrap = { phase: 'confirmed', attempts: 1 };
-      fixture.store.upsertTask(thread);
+      fixture.addRunnableThread(thread);
 
       // Reviewer exits 0 with some output but NEVER called approve_task or request_rework
       fixture.callbackManager.launchCaller = (async () => ({
@@ -474,7 +464,7 @@ describe('Unified Execution Policy Tests', () => {
     try {
       const thread = createThread('thread_s10', 'merge');
       thread.execution!.budget.spentActiveMs = 1500;
-      fixture.store.upsertTask(thread);
+      fixture.addRunnableThread(thread);
 
       const decision = await fixture.controller.requestTaskDecision('thread_s10', {
         question: 'Resolve merge conflict in file A?',
@@ -513,7 +503,7 @@ describe('Unified Execution Policy Tests', () => {
     const fixture = await setupFixture({ useFastLock: true });
     try {
       const thread = createThread('thread_s11', 'develop');
-      fixture.store.upsertTask(thread);
+      fixture.addRunnableThread(thread);
 
       // Simulate transaction failure before spawn (e.g. disk or revision error)
       fixture.store.transitionExecution = async () => {
@@ -522,7 +512,7 @@ describe('Unified Execution Policy Tests', () => {
 
       const res = await fixture.controller.startExecution('thread_s11', 'develop');
       assert.strictEqual(res.started, false);
-      assert.ok(res.reason?.includes('transition_failed'));
+      assert.match(res.reason || '', /Revision conflict or lock acquisition error/);
 
       // No child was spawned!
       assert.strictEqual(fixture.runner.executions.length, 0);
@@ -534,18 +524,18 @@ describe('Unified Execution Policy Tests', () => {
   // Scenario 12: Manual retry starts new generation; resume preserves budget
   test('Scenario 12: Manual retry resets autoRetriesUsed and starts new generation; resume preserves budget', async () => {
     const fixture = await setupFixture({ useFastLock: true });
+    let finishRunner: (() => void) | undefined;
     try {
       const thread = createThread('thread_s12', 'develop');
       thread.execution!.generation = 1;
       thread.execution!.autoRetriesUsed = 2;
       thread.execution!.budget.spentActiveMs = 5000;
-      fixture.store.upsertTask(thread);
+      fixture.addRunnableThread(thread);
 
-      let finishRunner: () => void;
       const runnerBarrier = new Promise<void>((r) => { finishRunner = r; });
       fixture.runner.setOnExecute(async () => {
         await runnerBarrier;
-        return { exitCode: 0, stdout: 'ok', extractedOutput: 'ok' };
+        return { exitCode: 1, error: 'Invalid command arguments' };
       });
 
       // Resume preserves generation, retries, and spent budget
@@ -554,7 +544,18 @@ describe('Unified Execution Policy Tests', () => {
       assert.strictEqual(fresh?.execution?.generation, 1);
       assert.strictEqual(fresh?.execution?.budget.spentActiveMs, 5000);
 
-      // Manual retry increments generation and resets retries and spent budget
+      // A resume keeps its live run protected until the phase stops.
+      await assert.rejects(fixture.controller.retryOperation('thread_s12'), /not retryable/);
+      finishRunner!();
+      const deadline = Date.now() + 5_000;
+      while (fixture.store.getTask('thread_s12')?.status !== 'failed' && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      assert.strictEqual(fixture.store.getTask('thread_s12')?.status, 'failed');
+
+      // Manual retry increments generation and resets retries and spent budget.
+      const retryBarrier = new Promise<void>(resolve => { finishRunner = resolve; });
+      fixture.runner.setOnExecute(async () => { await retryBarrier; });
       await fixture.controller.retryOperation('thread_s12');
       fresh = fixture.store.getTask('thread_s12');
       assert.strictEqual(fresh?.execution?.generation, 2);
@@ -563,6 +564,7 @@ describe('Unified Execution Policy Tests', () => {
 
       finishRunner!();
     } finally {
+      finishRunner?.();
       await fixture.cleanup();
     }
   });
@@ -610,7 +612,7 @@ describe('Unified Execution Policy Tests', () => {
       task.status = 'failed';
       task.failure = { stage: 'execution', reason: 'syntax error', code: 'ERROR', at: new Date().toISOString(), round: 1 };
       task.execution = {
-        version: 1,
+        version: 2,
         revision: 1,
         operationId: 'op_s16',
         phase: 'develop',
@@ -620,7 +622,7 @@ describe('Unified Execution Policy Tests', () => {
         autoRetriesUsed: 2,
         budget: { limitMs: 120 * 60 * 1000, spentActiveMs: 5000, maxAutoRetries: 2 },
       };
-      fixture.store.upsertTask(task);
+      fixture.addRunnableThread(task);
 
       fixture.runner.setNextResult({
         exitCode: 0,
@@ -676,7 +678,7 @@ describe('Unified Execution Policy Tests', () => {
     const fixture = await setupFixture({ useFastLock: true });
     try {
       const task = createThread('thread_s17', 'develop');
-      fixture.store.upsertTask(task);
+      fixture.addRunnableThread(task);
 
       const decision = await fixture.controller.requestTaskDecision('thread_s17', {
         question: 'Should we use TypeScript or JavaScript?',
@@ -716,7 +718,7 @@ describe('Unified Execution Policy Tests', () => {
     const fixture = await setupFixture({ useFastLock: true });
     try {
       const task = createThread('thread_s18', 'develop');
-      fixture.store.upsertTask(task);
+      fixture.addRunnableThread(task);
 
       await fixture.controller.startExecution('thread_s18', 'develop');
       const running = fixture.store.getTask('thread_s18');
@@ -740,12 +742,12 @@ describe('Unified Execution Policy Tests', () => {
     }
   });
 
-  // Scenario 24: Direct execution without intermediate queued step when resources are free
-  test('Scenario 24: retryOperation, resumeOperation, and submitTaskDecision start directly without queued state', async () => {
+  // Scenario 24: Decisions persist a durable handoff before execution, while direct resume can start immediately.
+  test('Scenario 24: a decision queues its handoff before launch and local resume starts directly', async () => {
     const fixture = await setupFixture({ useFastLock: true });
     try {
       const thread = createThread('thread_s24', 'develop');
-      fixture.store.upsertTask(thread);
+      fixture.addRunnableThread(thread);
 
       // 1. Request decision -> wait_decision
       const dec = await fixture.controller.requestTaskDecision('thread_s24', {
@@ -762,12 +764,11 @@ describe('Unified Execution Policy Tests', () => {
         return origPersist(t);
       };
 
-      // 2. Submit decision: must transition directly to running when free
+      // 2. Submit the decision and consume the persisted handoff in the resident controller.
       await fixture.controller.submitTaskDecision('thread_s24', dec.id, 'yes proceed');
       const afterSubmit = fixture.store.getTask('thread_s24');
       assert.strictEqual(afterSubmit?.status, 'running');
-      // Verify 'queued' was never written during the direct submit transition
-      assert.ok(!recordedStatuses.includes('queued'), `Unexpected queued state in: ${recordedStatuses.join(', ')}`);
+      assert.strictEqual(recordedStatuses[0], 'queued', `Missing durable handoff in: ${recordedStatuses.join(', ')}`);
 
       // 3. Pause task
       await fixture.controller.pauseExecution('thread_s24', 'user pause');

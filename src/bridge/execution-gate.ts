@@ -2,7 +2,7 @@
 import * as os from 'os';
 import * as path from 'path';
 import { killPidTree } from './platform';
-import { DelegationThread } from './types';
+import { DelegationThread, ExecutionControl } from './types';
 
 /** Legacy record shape retained for reading execution.lock/leases only. */
 export interface ExecutionOwner {
@@ -135,7 +135,7 @@ export type ExecutionEligibilityResult =
 export function requireV2ExecutionEligibility(
   thread: DelegationThread | undefined | null,
   action: string,
-): asserts thread is DelegationThread {
+): asserts thread is DelegationThread & { execution: ExecutionControl & { version: 2 } } {
   const result = validateV2ExecutionEligibility(thread);
   if (!result.eligible) {
     throw new Error(`HISTORICAL_TASK_READ_ONLY: Cannot ${action}: ${result.code}: ${result.reason}`);

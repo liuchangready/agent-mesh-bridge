@@ -11,6 +11,7 @@ for (const persistent of [false, true]) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amb-atomic-'));
     const store = new TaskStore(root);
     const thread = createThread('thread_atomic_publish');
+    thread.execution!.version = 1;
     store.upsertTask(thread);
     const target = path.join(root, 'threads', `${thread.threadId}.json`);
     const before = fs.readFileSync(target, 'utf8');

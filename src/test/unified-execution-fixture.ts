@@ -18,6 +18,7 @@ import { AgentDetector } from '../bridge/agent-detector';
 import { AutonomousRunner, RunResult } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
 import { getProcessBirthId } from '../bridge/platform';
+import { SessionOwnershipStore, nativeSessionNamespace } from '../bridge/session-ownership';
 import {
   DelegationRound,
   DelegationThread,
@@ -85,7 +86,7 @@ export function createMockRunner() {
     isRateLimitOrQuotaError: (text: string) => /rate[-_\s]*limit|quota/i.test(text),
     execute: async (options: any): Promise<RunResult> => {
       executions.push(options);
-      if (options.onChildPid) {
+      if (!options.executionIdentity && options.onChildPid) {
         options.onChildPid(777777);
       }
       if (onExecute) {
@@ -166,7 +167,7 @@ export function createThread(id: string, phase: ExecutionPhase = 'develop'): Del
     reviewFlow: 'dedicated',
     reviewBootstrap: { phase: 'confirmed', attempts: 1 },
     execution: {
-      version: 1,
+      version: 2,
       revision: 1,
       operationId: `op_${id}`,
       phase,
@@ -234,8 +235,6 @@ export async function setupFixture(options?: SetupFixtureOptions) {
     runner as any,
     callbackManager,
     undefined,
-    roleLock,
-    sessionLock,
     registry,
     ctrlOptions,
   );
@@ -251,6 +250,20 @@ export async function setupFixture(options?: SetupFixtureOptions) {
     registry,
     mergeLock,
     controller,
+    addRunnableThread: (thread: DelegationThread) => {
+      const ownership = new SessionOwnershipStore(dir);
+      for (const role of ['developer', 'reviewer'] as const) {
+        const agent = role === 'developer' ? thread.targetAgent : thread.initiatorAgent;
+        const sessionId = role === 'developer' ? thread.receiverSessionId : thread.reviewerSessionId;
+        if (!sessionId) continue;
+        const namespace = nativeSessionNamespace(agent);
+        const assignment = { namespace, sessionEpoch: 1 };
+        const result = ownership.claim({ ...assignment, threadId: thread.threadId, agent, role, sessionId });
+        if (!result.ok) throw new Error(result.reason);
+        thread.nativeSessionAssignments = { ...thread.nativeSessionAssignments, [role]: assignment };
+      }
+      store.upsertTask(thread);
+    },
     cleanup: async () => {
       await controller.waitForActiveExecutions(3000);
       controller.dispose();

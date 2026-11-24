@@ -71,10 +71,8 @@ function createBridgeHost(options = {}) {
     runner,
     callbackManager,
     reworkController.getMergeCoordinator ? reworkController.getMergeCoordinator() : undefined,
-    undefined,
-    undefined,
     registry,
-    { ...(options.executionControllerOptions || {}), ownsRuns: false, requireV2Execution: true, admissionEnabled: startupAdmission.ready },
+    { ...(options.executionControllerOptions || {}), ownsRuns: false, admissionEnabled: startupAdmission.ready },
   );
   const dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector, registry,
     { admitted: startupAdmission.ready });

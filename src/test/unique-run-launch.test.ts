@@ -714,8 +714,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         mockRunner,
         {} as any,
         undefined,
-        roleLock,
-        sessionLock,
         registry,
         { storageDir, standingScanIntervalMs: 0 },
       );
@@ -762,8 +760,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         mockRunner,
         {} as any,
         undefined,
-        roleLock,
-        sessionLock,
         registry,
         { storageDir, standingScanIntervalMs: 0 },
       );
@@ -810,8 +806,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         mockRunner,
         {} as any,
         undefined,
-        roleLock,
-        sessionLock,
         registry,
         { storageDir, standingScanIntervalMs: 0 },
       );
@@ -860,8 +854,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         mockRunner,
         {} as any,
         undefined,
-        roleLock,
-        sessionLock,
         registry,
         { storageDir, standingScanIntervalMs: 0 },
       );
@@ -1102,8 +1094,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         runner,
         {} as any,
         undefined,
-        roleLock,
-        sessionLock,
         registry,
         { storageDir, standingScanIntervalMs: 0, streamSyncIntervalMs: 60_000 },
       );
@@ -1350,8 +1340,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         mockRunner,
         {} as any,
         undefined,
-        roleLock,
-        sessionLock,
         registry,
         { storageDir, standingScanIntervalMs: 0 },
       );
@@ -1419,8 +1407,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         mockRunner,
         {} as any,
         undefined,
-        roleLock,
-        sessionLock,
         registry,
         { storageDir, standingScanIntervalMs: 0 },
       );
@@ -1548,8 +1534,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         mockRunner,
         {} as any,
         undefined,
-        roleLock,
-        sessionLock,
         registry,
         { storageDir, standingScanIntervalMs: 0 },
       );
@@ -1651,8 +1635,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
           runner,
           {} as any,
           kind === 'merge' ? mergeCoordinator : undefined,
-          roleLock,
-          sessionLock,
           registry,
           { storageDir, standingScanIntervalMs: 0 },
         );
@@ -1924,7 +1906,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
   // -------------------------------------------------------------------------
   // Acceptance Criterion 3: Production default task (v1) isolation
   // -------------------------------------------------------------------------
-  test('Production tasks on execution.version=1 do not use v2 path', async () => {
+  test('V1 tasks cannot start or create a role or execution registration', async () => {
     const storageDir = createTempDir('v1-isolation');
     const threadId = 'thread_v1_isolation';
 
@@ -1972,10 +1954,9 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       assert.strictEqual(el.eligible, false);
       assert.strictEqual(el.code, 'LEGACY_VERSION_1');
 
-      // Verify ExecutionController startExecution uses v1 path (takes roleLock)
+      // The launch entry rejects V1 before writing or spawning anything.
       const registry = new TaskExecutionRegistry(path.join(storageDir, 'registry'));
       const roleLock = new TaskRoleLock(storageDir);
-      const sessionLock = new NativeSessionLock(storageDir);
       let executedV1 = false;
 
       const mockRunner: any = {
@@ -1991,14 +1972,18 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         mockRunner,
         {} as any,
         undefined,
-        roleLock,
-        sessionLock,
         registry,
         { storageDir, standingScanIntervalMs: 0 },
       );
 
+      const before = store.reloadTask(threadId);
       const result = await controller.startExecution(threadId);
-      assert.strictEqual(result.started, true);
+      assert.deepEqual(result, { started: false, reason: 'HISTORICAL_TASK_READ_ONLY:VERSION_1' });
+      await controller.scanAndDrain();
+      assert.equal(executedV1, false);
+      assert.deepEqual(store.reloadTask(threadId), before);
+      assert.equal(roleLock.getOwner(threadId), undefined);
+      assert.deepEqual(registry.listOwners(), []);
 
       store.ensureUpToDate();
       const fresh = store.getTask(threadId);
@@ -2294,8 +2279,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         mockRunner,
         {} as any,
         undefined,
-        roleLock,
-        sessionLock,
         registry,
         { storageDir, standingScanIntervalMs: 0 },
       );
@@ -2350,8 +2333,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         mockRunner,
         {} as any,
         undefined,
-        roleLock,
-        sessionLock,
         registry,
         { storageDir, standingScanIntervalMs: 0 },
       );
@@ -2375,7 +2356,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       const adapterRes = await (controller as any).executeDevelopAdapter(
         threadId,
         'run_pre_spawn_test',
-        undefined,
         () => {},
         { operationId: thread.execution!.operationId, generation: 1, round: 1 },
       );
@@ -2495,8 +2475,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         {} as any,
         {} as any,
         undefined,
-        roleLock,
-        sessionLock,
         registry,
         { storageDir, standingScanIntervalMs: 0 },
       );
@@ -2567,8 +2545,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         {} as any,
         {} as any,
         undefined,
-        roleLock,
-        sessionLock,
         registry,
         { storageDir, standingScanIntervalMs: 0 },
       );
@@ -2624,7 +2600,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       const runner: any = { execute: async () => { spawnAttempted = true; return { exitCode: 0 }; } };
       const controller = new ExecutionController(
         store, runner, {} as any, undefined,
-        new TaskRoleLock(storageDir), new NativeSessionLock(storageDir),
         new TaskExecutionRegistry(storageDir), { storageDir, standingScanIntervalMs: 0 },
       );
 
@@ -2689,8 +2664,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         {} as any,
         {} as any,
         undefined,
-        roleLock,
-        sessionLock,
         registry,
         { storageDir, standingScanIntervalMs: 0 },
       );
@@ -3325,8 +3298,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
         mockRunner,
         {} as any,
         undefined,
-        roleLock,
-        sessionLock,
         registry,
         { storageDir, standingScanIntervalMs: 0 },
       );

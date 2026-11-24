@@ -2,24 +2,19 @@ import { windowsJobFinished, windowsJobOf } from './windows-job';
 import { assertDedicatedTask } from './types';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import type { ChildProcess } from 'child_process';
 import {
   AgentId,
-  DelegationRound,
   DelegationThread,
   ExecutionControl,
   ExecutionNext,
   ExecutionPhase,
   ExecutionRun,
   FailureStage,
-  NextAction,
   ProcessIdentity,
-  ResponseAssessment,
   TaskDecisionRecord,
   TaskDecisionResumePoint,
-  TaskInterruption,
   ThreadStatus,
   appendInterruption,
   clearTaskFailure,
@@ -27,19 +22,14 @@ import {
   findInFlightRound,
   isMergeReview,
   isReviewerBootstrapPending,
-  isReviewerWakeEligible,
-  isTaskUnfinished,
   isUserInterruption,
-  nextRoundNumber,
   shouldResumeNativeSession,
 } from './types';
 import { TaskStore } from './task-store';
 import { applyReviewFailure, reopenFailedReview, reviewBlockDependencyId, reviewDependencyIssue } from './review-wake';
-import { AutonomousRunner, RunResult } from './autonomous-runner';
+import { AutonomousRunner } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
-import { MergeCoordinator, MergeResult } from './merge-coordinator';
-import { TaskRoleLock } from './task-role-lock';
-import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
+import { MergeCoordinator } from './merge-coordinator';
 import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 import { MeshFileLock, MeshLockAcquisitionError } from './mesh-file-lock';
 import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
@@ -51,10 +41,8 @@ import {
   probeProcessIdentity,
   probeProcessIdentityAsync,
 } from './platform';
-import { gitOutput } from './git-worktree';
 import { ConcurrencyPolicy, concurrencyPolicy } from './bridge-policy';
-import { appendCompactionProtocol, compactRoundBestEffort } from './context-compactor';
-import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
+import { appendCompactionProtocol } from './context-compactor';
 import {
   assessRunLaunchEvidence,
   sampleChildDescendants,
@@ -101,8 +89,6 @@ function mergeQueueTime(task: DelegationThread): number {
 
 export interface ExecutionControllerOptions {
   storageDir?: string;
-  /** Production hosts set this after v2 dispatch is wired; fixture/legacy controllers may inspect v1 behavior. */
-  requireV2Execution?: boolean;
   admissionEnabled?: boolean;
   ownsRuns?: boolean;
   defaultBudgetLimitMs?: number;
@@ -119,13 +105,10 @@ export class ExecutionController {
   private readonly runner: AutonomousRunner;
   private readonly callbackManager: CallbackManager;
   private readonly mergeCoordinator: MergeCoordinator;
-  private roleLockInstance?: TaskRoleLock;
-  private sessionLockInstance?: NativeSessionLock;
   private readonly sessionOwnership: SessionOwnershipStore;
   private readonly executionRegistry: TaskExecutionRegistry;
   private readonly storageDir: string;
   private readonly defaultBudgetLimitMs: number;
-  private readonly requireV2Execution: boolean;
   private readonly admissionEnabled: boolean;
   public readonly ownsRuns: boolean;
   private readonly checkpointIntervalMs: number;
@@ -142,22 +125,11 @@ export class ExecutionController {
   private releaseWake?: NodeJS.Immediate;
   private isDisposed = false;
 
-  /** Legacy v1 locks are constructed only if a v1 path actually needs them. */
-  private get roleLock(): TaskRoleLock {
-    return this.roleLockInstance || (this.roleLockInstance = new TaskRoleLock(this.storageDir));
-  }
-
-  private get sessionLock(): NativeSessionLock {
-    return this.sessionLockInstance || (this.sessionLockInstance = new NativeSessionLock(this.storageDir));
-  }
-
   constructor(
     taskStore: TaskStore,
     runner: AutonomousRunner,
     callbackManager: CallbackManager,
     mergeCoordinator?: MergeCoordinator,
-    roleLock?: TaskRoleLock,
-    sessionLock?: NativeSessionLock,
     executionRegistry?: TaskExecutionRegistry,
     options?: ExecutionControllerOptions,
   ) {
@@ -167,15 +139,12 @@ export class ExecutionController {
     this.callbackManager = callbackManager;
     this.storageDir = options?.storageDir || path.dirname(taskStore.getStoragePath());
     this.defaultBudgetLimitMs = options?.defaultBudgetLimitMs ?? DEFAULT_EXECUTION_BUDGET_MS;
-    this.requireV2Execution = options?.requireV2Execution === true;
     this.admissionEnabled = options?.admissionEnabled !== false;
     this.ownsRuns = options?.ownsRuns !== false;
     this.checkpointIntervalMs = options?.streamSyncIntervalMs ?? 5_000;
     this.retryBackoffsMs = options?.retryBackoffsMs ?? AUTO_RETRY_BACKOFFS_MS;
     this.monotonicNow = options?.monotonicNow ?? monotonicNowMs;
     this.wallClockNow = options?.wallClockNow ?? (() => Date.now());
-    this.roleLockInstance = roleLock;
-    this.sessionLockInstance = sessionLock;
     this.sessionOwnership = new SessionOwnershipStore(this.storageDir);
     this.executionRegistry = executionRegistry || new TaskExecutionRegistry(this.storageDir);
     this.mergeLock =
@@ -344,9 +313,7 @@ export class ExecutionController {
     if (!this.ownsRuns) return { started: false, reason: 'RESIDENT_EXECUTION_REQUIRED' };
     const pending = this.startingExecutions.get(threadId);
     if (pending) return pending;
-    // V1 acquires resources before CAS. Concurrent local callers must not share
-    // a reentrant role lease and let the losing caller release the winner's.
-    const starting = this.startExecutionAttempt(threadId, targetPhase, options);
+    const starting = this.startExecutionV2(threadId, targetPhase, options);
     this.startingExecutions.set(threadId, starting);
     try { return await starting; }
     finally { if (this.startingExecutions.get(threadId) === starting) this.startingExecutions.delete(threadId); }
@@ -421,273 +388,6 @@ export class ExecutionController {
     return undefined;
   }
 
-  private async startExecutionAttempt(
-    threadId: string,
-    targetPhase?: ExecutionPhase,
-    options?: StartExecutionOptions,
-  ): Promise<{ started: boolean; reason?: string; run?: ExecutionRun }> {
-    if (this.isDisposed) return { started: false, reason: 'disposed' };
-    this.taskStore.ensureUpToDate();
-    let thread = this.taskStore.getTask(threadId);
-    if (!thread) return { started: false, reason: 'not_found' };
-    if (thread.reviewFlow !== 'dedicated') return { started: false, reason: 'LEGACY_REVIEW_FLOW_DISABLED' };
-
-    if (this.requireV2Execution && thread.execution?.version !== 2) {
-      return { started: false, reason: `HISTORICAL_TASK_READ_ONLY:${thread.execution ? `VERSION_${String((thread.execution as any).version)}` : 'NO_EXECUTION'}` };
-    }
-
-    if (thread.execution?.version === 2) {
-      return this.startExecutionV2(threadId, targetPhase, options);
-    }
-    const pendingBackoff = this.backoffTimers.get(threadId);
-    if (pendingBackoff) {
-      clearTimeout(pendingBackoff);
-      this.backoffTimers.delete(threadId);
-    }
-
-    const allowStates = options?.allowStates;
-    const isAllowed = (s: ThreadStatus) => allowStates?.includes(s);
-
-    if (thread.status === 'completed' || (thread.status === 'failed' && !isAllowed('failed'))) {
-      return { started: false, reason: 'terminal' };
-    }
-    if (thread.status === 'paused' && !isAllowed('paused')) {
-      return { started: false, reason: 'paused' };
-    }
-    if (thread.status === 'wait_decision' && !isAllowed('wait_decision')) {
-      return { started: false, reason: 'wait_decision' };
-    }
-
-    // Budget exhaustion pre-check
-    const limitMs = thread.execution?.budget?.limitMs ?? this.defaultBudgetLimitMs;
-    const spentActiveMs = thread.execution?.budget?.spentActiveMs ?? 0;
-    if (spentActiveMs >= limitMs) {
-      return { started: false, reason: 'budget_exhausted' };
-    }
-
-    // Determine target phase
-    const phase: ExecutionPhase =
-      targetPhase ||
-      thread.execution?.phase ||
-      (thread.status === 'merging' || (thread.status === 'queued' && thread.queuePhase === 'merge')
-        ? 'merge'
-        : thread.status === 'reviewing'
-          ? 'review'
-          : 'develop');
-
-    // Prevent re-entrance if already running this exact task in this owner process
-    if (this.activeExecutions.has(threadId)) {
-      return { started: true, reason: 'already_running' };
-    }
-
-    // Check if an existing recorded run is still alive or unknown
-    if (thread.execution?.run) {
-      const probe = this.probeRun(threadId, thread.execution.run);
-      if (probe === 'alive' || probe === 'unknown') {
-        return { started: false, reason: 'previous_child_alive' };
-      }
-    }
-
-    // Check dedicated reviewer bootstrap constraint before developer round
-    if (phase === 'develop' && isReviewerBootstrapPending(thread)) {
-      await this.setQueuedState(threadId, phase, 'role');
-      return { started: false, reason: 'reviewer_bootstrap_pending' };
-    }
-
-    // Try to acquire prerequisites based on phase
-    const policy = concurrencyPolicy();
-    let roleLease: ReturnType<TaskRoleLock['tryAcquire']> = null;
-    let sessionLease: NativeSessionLease | undefined;
-    let mergeRelease: (() => void) | undefined;
-
-    if (phase === 'develop') {
-      roleLease = this.roleLock.tryAcquire(threadId, 'developer');
-      if (!roleLease) {
-        await this.setQueuedState(threadId, phase, 'role');
-        return { started: false, reason: 'role_busy' };
-      }
-      if (thread.receiverSessionCaptured && thread.receiverSessionId) {
-        sessionLease = this.sessionLock.acquire(thread.targetAgent, thread.receiverSessionId);
-        if (!sessionLease) {
-          this.roleLock.release(roleLease);
-          await this.setQueuedState(threadId, phase, 'session');
-          return { started: false, reason: 'session_busy' };
-        }
-      }
-      if (policy.enabled) {
-        const owners = this.executionRegistry.listAgentOwners();
-        if (owners.length >= policy.maxConcurrentTasks) {
-          this.cleanupAcquired(roleLease, sessionLease, mergeRelease);
-          await this.setQueuedState(threadId, phase, 'capacity');
-          return { started: false, reason: 'capacity_limit' };
-        }
-        const perAgent = owners.filter((o) => o.agent === thread!.targetAgent).length;
-        if (perAgent >= policy.maxConcurrentPerAgent) {
-          this.cleanupAcquired(roleLease, sessionLease, mergeRelease);
-          await this.setQueuedState(threadId, phase, 'capacity');
-          return { started: false, reason: 'capacity_limit_agent' };
-        }
-      }
-    } else if (phase === 'review') {
-      const reviewerSession = thread.reviewerSessionId || thread.callerSessionId;
-      roleLease = this.roleLock.tryAcquire(threadId, 'reviewer', reviewerSession);
-      if (!roleLease) {
-        await this.setQueuedState(threadId, phase, 'role');
-        return { started: false, reason: 'role_busy' };
-      }
-      if (reviewerSession) {
-        sessionLease = this.sessionLock.acquire(thread.initiatorAgent, reviewerSession);
-        if (!sessionLease) {
-          this.roleLock.release(roleLease);
-          await this.setQueuedState(threadId, phase, 'session');
-          return { started: false, reason: 'session_busy' };
-        }
-      }
-      if (policy.enabled) {
-        const owners = this.executionRegistry.listAgentOwners();
-        if (owners.length >= policy.maxConcurrentTasks) {
-          this.cleanupAcquired(roleLease, sessionLease, mergeRelease);
-          await this.setQueuedState(threadId, phase, 'capacity');
-          return { started: false, reason: 'capacity_limit' };
-        }
-      }
-    } else if (phase === 'merge') {
-      // Check if merge lock is currently held by someone else before acquiring
-      const ownerFile = `${this.mergeLock.lockPath}.owner.json`;
-      if (fs.existsSync(ownerFile)) {
-        try {
-          const owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8'));
-          if (owner?.pid && (owner.birthId ? probeProcessIdentity(owner.pid, owner.birthId) === 'alive' : probeProcessIdentity(owner.pid) === 'alive')) {
-            await this.setQueuedState(threadId, phase, 'merge_lock');
-            return { started: false, reason: 'merge_lock_busy' };
-          }
-        } catch {}
-      }
-      try {
-        mergeRelease = await this.mergeLock.acquire();
-      } catch (err) {
-        await this.setQueuedState(threadId, phase, 'merge_lock');
-        return { started: false, reason: 'merge_lock_busy' };
-      }
-      if (!mergeRelease) {
-        await this.setQueuedState(threadId, phase, 'merge_lock');
-        return { started: false, reason: 'merge_lock_busy' };
-      }
-    }
-
-    // We have acquired the required exclusive resources.
-    // Atomically commit execution start in TaskStore with write-lock validation.
-    const runId = crypto.randomUUID();
-    const ownerIdentity: ProcessIdentity = {
-      pid: process.pid,
-      birthId: getProcessBirthId(process.pid),
-    };
-
-    let operationId: string = '';
-    let generation: number = 1;
-
-    try {
-      thread = await this.transitionTask(threadId, (t) => {
-        if (options?.allowStates ? !options.allowStates.includes(t.status) : (t.status === 'completed' || t.status === 'failed' || t.status === 'paused' || t.status === 'wait_decision')) {
-          throw new Error(`Cannot start execution in state ${t.status}`);
-        }
-        if (t.execution?.run && (t.execution.run.state === 'starting' || t.execution.run.state === 'active')) {
-          const p = this.probeRun(threadId, t.execution.run);
-          if (p === 'alive' || p === 'unknown') {
-            throw new Error('Concurrent start conflict: previous run alive');
-          }
-        }
-
-        const existing = t.execution;
-        generation = options?.generation ?? existing?.generation ?? 1;
-        operationId =
-          options?.operationId ||
-          existing?.operationId ||
-          `${phase}_${t.currentRound || 1}_${this.wallClockNow()}`;
-        const currentAttempt = (existing?.attempt || 0) + 1;
-        const autoRetriesUsed = existing?.autoRetriesUsed || 0;
-        const curLimitMs = existing?.budget?.limitMs ?? this.defaultBudgetLimitMs;
-        const curSpentActiveMs = existing?.budget?.spentActiveMs ?? 0;
-
-        t.execution = {
-          version: 1,
-          revision: (existing?.revision || 0) + 1,
-          operationId,
-          phase,
-          round: t.currentRound || 1,
-          purpose: options?.purpose ?? existing?.purpose,
-          generation,
-          attempt: currentAttempt,
-          autoRetriesUsed,
-          budget: {
-            limitMs: curLimitMs,
-            spentActiveMs: curSpentActiveMs,
-            maxAutoRetries: MAX_AUTO_RETRIES,
-          },
-          run: {
-            id: runId,
-            owner: ownerIdentity,
-            step: 'starting',
-            state: 'starting',
-            startedAt: new Date().toISOString(),
-          },
-          queue: undefined,
-        };
-        t.status =
-          phase === 'develop'
-            ? 'running'
-            : phase === 'review'
-              ? t.execution.purpose === 'bootstrap' ? 'queued' : 'reviewing'
-              : 'merging';
-        clearTaskFailure(t);
-      });
-    } catch (err) {
-      this.cleanupAcquired(roleLease, sessionLease, mergeRelease);
-      return { started: false, reason: `transition_failed: ${(err as Error)?.message || err}` };
-    }
-
-    // Register with execution registry for observation
-    const registration = this.executionRegistry.begin(
-      threadId,
-      thread.currentRound || 1,
-      phase === 'develop'
-        ? thread.targetAgent
-        : phase === 'review'
-          ? thread.initiatorAgent
-          : 'merge-git',
-      thread.workspace?.executionPath,
-      phase === 'develop' ? 'developer' : phase === 'review' ? 'reviewer' : undefined,
-    );
-
-    // Launch background worker for phase
-    void this.executePhaseWorker({
-      threadId,
-      phase,
-      runId,
-      operationId,
-      generation,
-      ownerIdentity,
-      roleLease,
-      sessionLease,
-      mergeRelease,
-      registration,
-      purpose: options?.purpose,
-    }).catch((err) => {
-      if (!this.isDisposed && this.taskStore.getTask(threadId)) {
-        console.error(`[ExecutionController] executePhaseWorker unhandled error for ${threadId}:`, err);
-      }
-    });
-
-    return { started: true };
-  }
-
-  /**
-   * Primary entry point for v2 tasks: acquires unique run under short task write lock (TaskStore.transitionExecution),
-   * verifies eligibility, cancellation, cleanup marker, valid round/phase, generation/operationId.
-   * If run is occupied by starting, active, or stopping, refuses replacement run without mutating attempt or budget.
-   * After acquiring starting run, acquires necessary resources, checks pre-spawn invalidation, records spawn intent,
-   * and launches background worker with confirmed child binding handshake.
-   */
   private async startExecutionV2(
     threadId: string,
     targetPhase?: ExecutionPhase,
@@ -700,6 +400,10 @@ export class ExecutionController {
     if (!thread) return { started: false, reason: 'not_found' };
 
     if (thread.reviewFlow !== 'dedicated') return { started: false, reason: 'LEGACY_REVIEW_FLOW_DISABLED' };
+    if (thread.execution?.version !== 2) {
+      const version = thread.execution ? 'VERSION_' + thread.execution.version : 'NO_EXECUTION';
+      return { started: false, reason: 'HISTORICAL_TASK_READ_ONLY:' + version };
+    }
     const eligibility = validateV2ExecutionEligibility(thread);
     if (!eligibility.eligible) {
       return { started: false, reason: eligibility.code };
@@ -1126,7 +830,6 @@ export class ExecutionController {
       };
     }
 
-    let sessionLease: NativeSessionLease | undefined;
     let mergeRelease: (() => void) | undefined;
 
     if (phase === 'develop') {
@@ -1255,7 +958,6 @@ export class ExecutionController {
         const helper = mergeRelease ? this.mergeLock.getActiveHelperEvidence?.() : undefined;
       let mergeReleased = true;
       if (mergeRelease) mergeReleased = await this.mergeLock.releaseAndConfirm(mergeRelease, PROCESS_STOP_TIMEOUT_MS);
-      this.cleanupAcquired(null, sessionLease, undefined);
       if (!mergeReleased && check?.execution?.run?.id === finalRunId) {
         await this.markMergeHelperUnconfirmed(threadId, finalRunId, finalOperationId, finalGeneration, pendingNext,
           helper || { channelPath: this.mergeLock.lockPath }, 'Pre-spawn invalidation could not confirm merge helper release.');
@@ -1292,7 +994,6 @@ export class ExecutionController {
       const helper = mergeRelease ? this.mergeLock.getActiveHelperEvidence() : undefined;
       let mergeReleased = true;
       if (mergeRelease) mergeReleased = await this.mergeLock.releaseAndConfirm(mergeRelease, PROCESS_STOP_TIMEOUT_MS);
-      this.cleanupAcquired(null, sessionLease, undefined);
       if (!mergeReleased) {
         await this.markMergeHelperUnconfirmed(threadId, finalRunId, finalOperationId, finalGeneration, pendingNext,
           helper || { channelPath: this.mergeLock.lockPath }, `Spawn intent persistence failed and merge helper release was not confirmed: ${spawnIntentErr?.message || spawnIntentErr}`);
@@ -1326,7 +1027,6 @@ export class ExecutionController {
       round: finalRound,
       ownerIdentity: { pid: ownerPid, birthId: ownerBirthId },
       role,
-      sessionLease,
       mergeRelease,
       registration,
       purpose: options?.purpose,
@@ -1512,13 +1212,12 @@ export class ExecutionController {
     round: number;
     ownerIdentity: ProcessIdentity;
     role: 'developer' | 'reviewer';
-    sessionLease: NativeSessionLease | undefined;
     mergeRelease: (() => void) | undefined;
     registration: TaskExecutionRegistration;
     purpose?: 'bootstrap' | 'merge_resolution';
   }): Promise<void> {
     const { threadId, phase, runId, operationId, generation, round, role, registration } = params;
-    let { sessionLease, mergeRelease } = params;
+    let { mergeRelease } = params;
     let aborted = false;
     let abortReason = '';
     let unconfirmedMergeHelper: { pid?: number; birthId?: string; channelPath: string } | undefined;
@@ -1709,7 +1408,6 @@ export class ExecutionController {
         childEnumerationUnconfirmed: tracked.enumerationUnconfirmed,
         childProcess,
         attachLeases: async (p) => {
-          if (sessionLease) await this.sessionLock.attachChild(sessionLease, p);
           if (mergeRelease) await this.mergeLock.attachChildPid(p, undefined, candidateBirthId);
           await this.executionRegistry.attachChildPid(p, registration, candidateBirthId);
         },
@@ -1778,7 +1476,6 @@ export class ExecutionController {
         phaseResult = await this.executeDevelopAdapter(
           threadId,
           runId,
-          sessionLease,
           confirmedOnChildPid,
           { runId, operationId, generation, round },
         );
@@ -1852,12 +1549,7 @@ export class ExecutionController {
       }
       if (!unconfirmedStop) {
         try {
-          // Unbind the session and clear registry PID only after every captured
-          // process identity has been confirmed stopped. MeshFileLock's PID-less
-          // attach is a no-op; its helper exit is the actual release ACK.
-          if (sessionLease && !this.sessionLock.attachChild(sessionLease, undefined)) {
-            throw new Error('Native-session child unbinding was not acknowledged.');
-          }
+          // Clear the registry PID after every captured process has stopped.
           this.executionRegistry.attachChildPid(undefined, registration);
         } catch {
           unconfirmedStop = true;
@@ -1972,344 +1664,21 @@ export class ExecutionController {
     this.wakeQueuedTasks();
   }
 
-  private cleanupAcquired(
-    roleLease: ReturnType<TaskRoleLock['tryAcquire']>,
-    sessionLease: NativeSessionLease | undefined,
-    mergeRelease: (() => void) | undefined,
-  ): void {
-    if (roleLease) this.roleLock.release(roleLease);
-    if (sessionLease) this.sessionLock.release(sessionLease);
-    if (mergeRelease) mergeRelease();
+  private async setQueuedState(threadId: string, phase: ExecutionPhase, reason: 'quota', notBefore?: string): Promise<void> {
+    await this.transitionTask(threadId, (task) => {
+      const control = task.execution;
+      if (control?.version !== 2) return;
+      control.next = { phase, round: control.round, purpose: control.purpose, sourceRunId: control.run?.id };
+      control.phase = phase;
+      control.run = undefined;
+      control.queue = { reason, notBefore, enteredAt: new Date().toISOString() };
+      task.status = 'queued';
+    });
   }
 
-  private async setQueuedState(
-    threadId: string,
-    phase: ExecutionPhase,
-    reason: 'role' | 'session' | 'merge_lock' | 'merge_lock_error' | 'capacity' | 'backoff' | 'quota',
-    notBefore?: string,
-  ): Promise<void> {
-    const current = this.taskStore.getTask(threadId);
-    if (current?.execution?.version === 2) {
-      await this.transitionTask(threadId, (task) => {
-        const control = task.execution;
-        if (!control || control.version !== 2) return;
-        const sourceRunId = control.run?.id;
-        control.next = { phase, round: control.round, purpose: control.purpose, sourceRunId };
-        control.phase = phase;
-        control.run = undefined;
-        control.queue = { reason: reason === 'role' || reason === 'session' ? 'capacity' : reason, notBefore, enteredAt: new Date().toISOString() };
-        task.status = 'queued';
-      });
-      return;
-    }
-    try {
-      await this.transitionTask(threadId, (t) => {
-        const existing = t.execution;
-        let retainedRun = existing?.run?.state === 'stopping' ? existing.run : undefined;
-        if (!retainedRun && existing?.run) {
-          const probe = this.probeRun(threadId, existing.run);
-          if (probe === 'alive' || probe === 'unknown') {
-            retainedRun = existing.run;
-          }
-        }
-        t.execution = {
-          version: 1,
-          revision: (existing?.revision || 0) + 1,
-          operationId: existing?.operationId || `${phase}_${t.currentRound || 1}_${this.wallClockNow()}`,
-          phase,
-          round: t.currentRound || 1,
-          generation: existing?.generation || 1,
-          attempt: existing?.attempt || 0,
-          autoRetriesUsed: existing?.autoRetriesUsed || 0,
-          budget: existing?.budget || {
-            limitMs: this.defaultBudgetLimitMs,
-            spentActiveMs: 0,
-            maxAutoRetries: MAX_AUTO_RETRIES,
-          },
-          run: retainedRun,
-          queue: { reason, notBefore },
-        };
-        t.status = 'queued';
-      });
-    } catch {}
-  }
-
-  /**
-   * Internal worker executing a phase attempt under unified budget and observation.
-   */
-  private async executePhaseWorker(params: {
-    threadId: string;
-    phase: ExecutionPhase;
-    runId: string;
-    operationId?: string;
-    generation?: number;
-    ownerIdentity: ProcessIdentity;
-    roleLease: ReturnType<TaskRoleLock['tryAcquire']>;
-    sessionLease: NativeSessionLease | undefined;
-    mergeRelease: (() => void) | undefined;
-    registration: TaskExecutionRegistration;
-    purpose?: 'bootstrap' | 'merge_resolution';
-  }): Promise<void> {
-    const { threadId, phase, runId, operationId, generation, registration } = params;
-    let { roleLease, sessionLease, mergeRelease } = params;
-    let aborted = false;
-    let abortReason = '';
-    const abortFn = () => {
-      aborted = true;
-    };
-    this.activeExecutions.set(threadId, { abort: abortFn, activeSinceMs: this.monotonicNow() });
-
-    const guard = new HostSuspensionGuard({ monotonicNow: this.monotonicNow });
-    guard.start();
-    let childPid: number | undefined;
-    let childBirthId: string | undefined;
-
-    // Checkpoint timer: updates active spent time every 5 seconds
-    let lastMonotonic = this.monotonicNow();
-    let accumulatedSpentMs = 0;
-    const checkpointTimer = setInterval(async () => {
-      if (aborted || this.isDisposed) return;
-      const now = this.monotonicNow();
-      guard.sync();
-      const suspended = guard.suspendedWithin(lastMonotonic, now);
-      const delta = Math.max(0, (now - lastMonotonic) - suspended);
-      lastMonotonic = now;
-      accumulatedSpentMs += delta;
-
-      // Update checkpoint on task
-      try {
-        const t = this.taskStore.getTask(threadId);
-        if (t?.execution && t.execution.run?.id === runId) {
-          const newSpent = (t.execution.budget.spentActiveMs || 0) + accumulatedSpentMs;
-          accumulatedSpentMs = 0;
-          await this.transitionTask(threadId, (item) => {
-            if (item.execution?.run?.id === runId) {
-              item.execution.budget.spentActiveMs = newSpent;
-            }
-          });
-          // Check timeout
-          if (newSpent >= t.execution.budget.limitMs) {
-            aborted = true;
-            abortReason = 'TIMEOUT: Active execution budget exceeded (120m)';
-            if (childPid && childBirthId && probeProcessIdentity(childPid, childBirthId) === 'alive') {
-              killPidTree(childPid);
-            }
-          }
-        }
-      } catch {}
-    }, this.checkpointIntervalMs);
-    checkpointTimer.unref?.();
-
-    let phaseResult:
-      | { ok: true; verdict?: string }
-      | { ok: false; code: string; reason: string; stage?: FailureStage; quotaResetsAt?: string; transient?: boolean }
-      | undefined;
-
-    try {
-      // Execute the adapter for this phase
-      if (phase === 'develop') {
-        phaseResult = await this.executeDevelopAdapter(
-          threadId,
-          runId,
-          sessionLease,
-          (pid, _child, reportedBirthId) => {
-            childPid = pid;
-            if (pid) {
-              childBirthId = reportedBirthId || getProcessBirthId(pid);
-              this.executionRegistry.attachChildPid(pid, registration);
-              // Native-session preparation checks the child binding on the role lease.
-              this.roleLock.attachChild(roleLease, pid);
-              void this.updateRunChild(threadId, runId, pid, childBirthId);
-            } else {
-              this.executionRegistry.attachChildPid(undefined, registration);
-              this.roleLock.attachChild(roleLease, undefined);
-            }
-          },
-          { operationId, generation },
-        );
-      } else if (phase === 'review') {
-        phaseResult = await this.executeReviewAdapter(threadId, runId, params.purpose, (pid, _child, reportedBirthId) => {
-          childPid = pid;
-          if (pid) {
-            childBirthId = reportedBirthId || getProcessBirthId(pid);
-            this.executionRegistry.attachChildPid(pid, registration);
-            this.roleLock.attachChild(roleLease, pid);
-            void this.updateRunChild(threadId, runId, pid, childBirthId);
-          } else {
-            this.executionRegistry.attachChildPid(undefined, registration);
-            this.roleLock.attachChild(roleLease, undefined);
-          }
-        });
-      } else if (phase === 'merge') {
-        phaseResult = await this.executeMergeAdapter(
-          threadId,
-          runId,
-          params.purpose,
-          (pid, _child, reportedBirthId) => {
-            childPid = pid;
-            if (pid) {
-              childBirthId = reportedBirthId || getProcessBirthId(pid);
-              this.executionRegistry.attachChildPid(pid, registration);
-              void this.updateRunChild(threadId, runId, pid, childBirthId);
-            } else {
-              this.executionRegistry.attachChildPid(undefined, registration);
-            }
-          },
-          mergeRelease,
-        );
-      }
-
-      // Check spent active time post-execution
-      guard.sync();
-      const postNow = this.monotonicNow();
-      const suspendedPost = guard.suspendedWithin(lastMonotonic, postNow);
-      const delta = Math.max(0, (postNow - lastMonotonic) - suspendedPost);
-      accumulatedSpentMs += delta;
-      try {
-        const t = this.taskStore.getTask(threadId);
-        if (t?.execution && t.execution.run?.id === runId) {
-          const finalSpent = (t.execution.budget.spentActiveMs || 0) + accumulatedSpentMs;
-          accumulatedSpentMs = 0;
-          await this.transitionTask(threadId, (item) => {
-            if (item.execution?.run?.id === runId) {
-              item.execution.budget.spentActiveMs = finalSpent;
-            }
-          });
-          if (finalSpent >= t.execution.budget.limitMs) {
-            aborted = true;
-            abortReason = 'TIMEOUT: Active execution budget exceeded (120m)';
-          }
-        }
-      } catch {}
-    } catch (err) {
-      phaseResult = {
-        ok: false,
-        code: 'EXECUTION_ERROR',
-        reason: (err as Error)?.message || String(err),
-      };
-    } finally {
-      clearInterval(checkpointTimer);
-      guard.stop();
-
-      let unconfirmedStop = false;
-      if (childPid && childPid !== process.pid) {
-        try {
-          const isAlive = probeProcessIdentity(childPid) !== 'exited';
-          if (isAlive) {
-            if (!childBirthId) {
-              unconfirmedStop = true;
-            } else {
-              const probe = probeProcessIdentity(childPid, childBirthId);
-              if (probe === 'alive') {
-                killPidTree(childPid);
-                const exited = await confirmProcessTreeExit(childPid, PROCESS_STOP_TIMEOUT_MS, childBirthId);
-                if (!exited) {
-                  unconfirmedStop = true;
-                }
-              } else if (probe === 'unknown') {
-                unconfirmedStop = true;
-              }
-            }
-          }
-        } catch {
-          unconfirmedStop = true;
-        }
-      }
-
-      if (unconfirmedStop) {
-        try {
-          await this.transitionTask(threadId, (t) => {
-            appendInterruption(t, {
-              kind: 'error',
-              reason: 'PROCESS_STOP_UNCONFIRMED',
-              at: new Date().toISOString(),
-              by: 'execution_controller',
-            });
-            if (t.execution?.run) {
-              t.execution.run.state = 'stopping';
-            }
-          });
-        } catch {}
-        // Do NOT release locks; retain stopping state and active execution
-        return;
-      }
-
-      this.activeExecutions.delete(threadId);
-
-      // End execution registry entry
-      try {
-        this.executionRegistry.end(registration);
-      } catch {}
-
-      // Release locks
-      if (roleLease) {
-        try {
-          this.roleLock.release(roleLease);
-        } catch {}
-        roleLease = null;
-      }
-      if (sessionLease) {
-        try {
-          this.sessionLock.release(sessionLease);
-        } catch {}
-        sessionLease = undefined;
-      }
-      if (mergeRelease) {
-        try {
-          mergeRelease();
-        } catch {}
-        mergeRelease = undefined;
-      }
-    }
-
-    if (aborted && abortReason.includes('TIMEOUT')) {
-      phaseResult = {
-        ok: false,
-        code: 'TIMEOUT',
-        reason: abortReason,
-        transient: false,
-      };
-    }
-
-    // Process outcome & classify NextAction
-    if (!this.isDisposed && phaseResult) {
-      try {
-        await this.handlePhaseOutcome(threadId, phase, runId, phaseResult, { operationId, generation });
-      } catch (err) {
-        if (!this.isDisposed && this.taskStore.getTask(threadId)) {
-          console.error(`[ExecutionController] handlePhaseOutcome error for ${threadId}:`, err);
-        }
-      }
-    }
-  }
-
-  public async updateRunChild(
-    threadId: string,
-    runId: string,
-    childPid: number,
-    childBirthId?: string,
-  ): Promise<void> {
-    try {
-      await this.transitionTask(threadId, (t) => {
-        if (t.execution?.run?.id === runId) {
-          t.execution.run.child = {
-            pid: childPid,
-            birthId: childBirthId,
-          };
-          t.execution.run.state = 'active';
-          t.execution.run.step = 'executing';
-        }
-      });
-    } catch {}
-  }
-
-  /**
-    * Adapter for phase: develop
-    */
   private async executeDevelopAdapter(
     threadId: string,
     runId: string,
-    sessionLease: NativeSessionLease | undefined,
     onChildPid: (pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>,
     identity?: { runId?: string; operationId?: string; generation?: number; round?: number },
   ): Promise<
@@ -2381,7 +1750,6 @@ export class ExecutionController {
       } : undefined,
       timeoutMs: remainingMs,
       previousTokenUsage: round.tokenUsage,
-      sessionLease,
       maxRetries: 0,
       onChildPid: (pid, childProc, childBirthId) => {
         return onChildPid(pid, childProc, childBirthId);
@@ -2735,7 +2103,7 @@ export class ExecutionController {
   ): Promise<void> {
     this.taskStore.ensureUpToDate();
     const thread = this.taskStore.getTask(threadId);
-    if (!thread || !thread.execution) return;
+    if (thread?.execution?.version !== 2) return;
 
     // Check anti-stale protection: must strictly match current runId, generation, and operationId
     if (!thread.execution.run || thread.execution.run.id !== runId) {
@@ -3011,6 +2379,8 @@ export class ExecutionController {
     if (thread) assertDedicatedTask(thread);
     if (!thread) throw new Error(`Task thread not found: ${threadId}`);
 
+    requireV2ExecutionEligibility(thread, 'request a decision for this task');
+
     const decisionId = crypto.randomUUID();
     const phase: ExecutionPhase = thread.execution?.phase || 'develop';
     const decision: TaskDecisionRecord = {
@@ -3120,71 +2490,6 @@ export class ExecutionController {
       });
       return decision;
     }
-
-    const childPid = thread.execution?.run?.child?.pid;
-    const childBirthId = thread.execution?.run?.child?.birthId;
-    const isInsideChildTree = childPid ? isProcessDescendant(process.pid, childPid) : false;
-
-    // If called from within child process tree (stdio MCP server invoked by agent CLI),
-    // do NOT kill self/parent tree; return decision JSON-RPC response so CLI turn ends cleanly.
-    if (!isInsideChildTree) {
-      const activeExecution = this.activeExecutions.get(threadId);
-      if (activeExecution) {
-        activeExecution.abort();
-      }
-
-      if (childPid) {
-        if (!childBirthId) {
-          // Missing birthId: CANNOT authorize kill or identity check!
-          await this.transitionTask(threadId, (t) => {
-            appendInterruption(t, {
-              kind: 'error',
-              reason: 'PROCESS_STOP_UNCONFIRMED',
-              at: new Date().toISOString(),
-              by: 'decision',
-            });
-            if (t.execution?.run) t.execution.run.state = 'stopping';
-          });
-          return decision;
-        }
-        const probe = probeProcessIdentity(childPid, childBirthId);
-        if (probe === 'alive') {
-          killPidTree(childPid);
-          const exited = await confirmProcessTreeExit(childPid, PROCESS_STOP_TIMEOUT_MS, childBirthId);
-          if (!exited) {
-            await this.transitionTask(threadId, (t) => {
-              appendInterruption(t, {
-                kind: 'error',
-                reason: 'PROCESS_STOP_UNCONFIRMED',
-                at: new Date().toISOString(),
-                by: 'decision',
-              });
-              if (t.execution?.run) t.execution.run.state = 'stopping';
-            });
-            return decision;
-          }
-        } else if (probe === 'unknown') {
-          // Unknown process identity must retain stopping and retain leases
-          await this.transitionTask(threadId, (t) => {
-            appendInterruption(t, {
-              kind: 'error',
-              reason: 'PROCESS_STOP_UNCONFIRMED',
-              at: new Date().toISOString(),
-              by: 'decision',
-            });
-            if (t.execution?.run) t.execution.run.state = 'stopping';
-          });
-          return decision;
-        }
-      }
-
-      await this.transitionTask(threadId, (t) => {
-        if (t.execution) {
-          t.execution.run = undefined;
-        }
-      });
-    }
-
     return decision;
   }
 
@@ -3224,18 +2529,12 @@ export class ExecutionController {
     const thread = this.taskStore.getTask(threadId);
     if (thread) assertDedicatedTask(thread);
     if (!thread) throw new Error(`Task thread not found: ${threadId}`);
+    requireV2ExecutionEligibility(thread, 'answer a decision for this task');
     if (thread.status !== 'wait_decision' || !thread.decision || thread.decision.id !== decisionId) {
       throw new Error(`Task ${threadId} has no pending decision matching ID ${decisionId}`);
     }
     if (thread.decision.answer) {
       throw new Error(`Decision ${decisionId} for task ${threadId} was already answered`);
-    }
-
-    if (thread.execution?.version !== 2 && thread.execution?.run?.state === 'stopping') {
-      const probe = this.probeRun(threadId, thread.execution.run);
-      if (probe === 'alive' || probe === 'unknown') {
-        throw new Error(`Cannot submit decision for task ${threadId}: previous process is still stopping`);
-      }
     }
 
     const resumePoint = thread.decision.resumePoint;
@@ -3246,109 +2545,59 @@ export class ExecutionController {
           ? 'review'
           : 'develop';
 
-    if (thread.execution?.version === 2) {
-      const captured = {
-        operationId: thread.execution.operationId,
-        generation: thread.execution.generation,
-        phase: thread.execution.phase,
-        runId: thread.execution.run?.id,
-      };
-      const updated = await this.transitionTask(threadId, (task) => {
-        const control = task.execution;
-        if (task.cleanup || task.status !== 'wait_decision' || !task.decision || task.decision.id !== decisionId || task.decision.answer ||
-            control?.version !== 2 || control.operationId !== captured.operationId || control.generation !== captured.generation ||
-            control.phase !== captured.phase || (control.run?.id && control.run.id !== captured.runId) ||
-            task.decision.sourceRunId !== captured.runId) {
-          throw new Error(`Decision ${decisionId} changed execution identity before its answer could be committed.`);
-        }
-        if (control.next) {
-          throw new Error(`Decision ${decisionId} cannot replace an existing durable handoff from run ${control.next.sourceRunId || 'unknown'}.`);
-        }
-        const answeredRecord: TaskDecisionRecord = {
-          ...task.decision, answer, answeredAt: new Date().toISOString(), answeredBy: by,
-        };
-        if (task.decisions) {
-          const index = task.decisions.findIndex((entry) => entry.id === decisionId);
-          if (index >= 0) task.decisions[index] = answeredRecord;
-          else task.decisions.push(answeredRecord);
-        } else task.decisions = [answeredRecord];
-        task.decision = answeredRecord;
-        if (targetPhase === 'develop') {
-          const inFlight = findInFlightRound(task) || task.rounds[task.rounds.length - 1];
-          if (inFlight) inFlight.prompt += `\n\n[User Decision Answer]:\n${answer}\n[Decision ID: ${decisionId}]`;
-        } else if (targetPhase === 'review') {
-          const inFlight = task.rounds[task.rounds.length - 1];
-          if (inFlight) inFlight.prompt += `\n\n[User Decision Answer]:\n${answer}\n[Decision ID: ${decisionId}]`;
-        } else if (targetPhase === 'merge' && task.worktree) {
-          task.summary.lastOutputSnippet = `[Decision Answer (${decisionId})]: ${answer.slice(0, 100)}`;
-        }
-        control.next = {
-          phase: targetPhase,
-          round: control.round,
-          purpose: control.purpose,
-          sourceRunId: control.run?.id,
-        };
-        if (control.run) {
-          control.run.state = 'stopping';
-          task.status = 'wait_decision';
-        } else {
-          control.phase = targetPhase;
-          control.queue = undefined;
-          task.status = 'queued';
-        }
-      });
-
-      if (updated.execution?.run) return updated;
-      await this.startExecution(threadId, targetPhase, { allowStates: ['queued'] });
-      return this.taskStore.getTask(threadId) || updated;
-    }
-
-    const updated = await this.transitionTask(threadId, (t) => {
-      if (!t.decision || t.decision.id !== decisionId || t.decision.answer) {
-        throw new Error(`Decision ${decisionId} cannot be consumed: already answered or mismatched`);
+    const captured = {
+      operationId: thread.execution.operationId,
+      generation: thread.execution.generation,
+      phase: thread.execution.phase,
+      runId: thread.execution.run?.id,
+    };
+    const updated = await this.transitionTask(threadId, (task) => {
+      const control = task.execution;
+      if (task.cleanup || task.status !== 'wait_decision' || !task.decision || task.decision.id !== decisionId || task.decision.answer ||
+          control?.version !== 2 || control.operationId !== captured.operationId || control.generation !== captured.generation ||
+          control.phase !== captured.phase || (control.run?.id && control.run.id !== captured.runId) ||
+          task.decision.sourceRunId !== captured.runId) {
+        throw new Error(`Decision ${decisionId} changed execution identity before its answer could be committed.`);
+      }
+      if (control.next) {
+        throw new Error(`Decision ${decisionId} cannot replace an existing durable handoff from run ${control.next.sourceRunId || 'unknown'}.`);
       }
       const answeredRecord: TaskDecisionRecord = {
-        ...t.decision,
-        answer,
-        answeredAt: new Date().toISOString(),
-        answeredBy: by,
+        ...task.decision, answer, answeredAt: new Date().toISOString(), answeredBy: by,
       };
-      if (t.decisions) {
-        const idx = t.decisions.findIndex((d) => d.id === decisionId);
-        if (idx >= 0) t.decisions[idx] = answeredRecord;
-        else t.decisions.push(answeredRecord);
-      } else {
-        t.decisions = [answeredRecord];
-      }
-      t.decision = answeredRecord; // Kept as answered record so t.decision.answer is present
-
+      if (task.decisions) {
+        const index = task.decisions.findIndex((entry) => entry.id === decisionId);
+        if (index >= 0) task.decisions[index] = answeredRecord;
+        else task.decisions.push(answeredRecord);
+      } else task.decisions = [answeredRecord];
+      task.decision = answeredRecord;
       if (targetPhase === 'develop') {
-        const inFlight = findInFlightRound(t) || t.rounds[t.rounds.length - 1];
-        if (inFlight) {
-          inFlight.prompt += `\n\n[User Decision Answer]:\n${answer}\n[Decision ID: ${decisionId}]`;
-        }
+        const inFlight = findInFlightRound(task) || task.rounds[task.rounds.length - 1];
+        if (inFlight) inFlight.prompt += `\n\n[User Decision Answer]:\n${answer}\n[Decision ID: ${decisionId}]`;
       } else if (targetPhase === 'review') {
-        const inFlight = t.rounds[t.rounds.length - 1];
-        if (inFlight) {
-          inFlight.prompt += `\n\n[User Decision Answer]:\n${answer}\n[Decision ID: ${decisionId}]`;
-        }
-      } else if (targetPhase === 'merge') {
-        if (t.worktree) {
-          t.summary.lastOutputSnippet = `[Decision Answer (${decisionId})]: ${answer.slice(0, 100)}`;
-        }
+        const inFlight = task.rounds[task.rounds.length - 1];
+        if (inFlight) inFlight.prompt += `\n\n[User Decision Answer]:\n${answer}\n[Decision ID: ${decisionId}]`;
+      } else if (targetPhase === 'merge' && task.worktree) {
+        task.summary.lastOutputSnippet = `[Decision Answer (${decisionId})]: ${answer.slice(0, 100)}`;
       }
-
-      if (t.execution) {
-        t.execution.phase = targetPhase;
-        t.execution.run = undefined;
-        t.execution.queue = undefined;
+      control.next = {
+        phase: targetPhase,
+        round: control.round,
+        purpose: control.purpose,
+        sourceRunId: control.run?.id,
+      };
+      if (control.run) {
+        control.run.state = 'stopping';
+        task.status = 'wait_decision';
+      } else {
+        control.phase = targetPhase;
+        control.queue = undefined;
+        task.status = 'queued';
       }
     });
 
-    // Immediately attempt to start the preserved phase directly without mandatory queued state
-    await this.startExecution(threadId, targetPhase, {
-      allowStates: ['wait_decision', 'queued'],
-    });
+    if (updated.execution?.run) return updated;
+    await this.startExecution(threadId, targetPhase, { allowStates: ['queued'] });
     return this.taskStore.getTask(threadId) || updated;
   }
 
@@ -3361,74 +2610,45 @@ export class ExecutionController {
     const thread = this.taskStore.getTask(threadId);
     if (thread) assertDedicatedTask(thread);
     if (!thread) throw new Error(`Task thread not found: ${threadId}`);
-    if (this.requireV2Execution) requireV2ExecutionEligibility(thread, 'retry this task');
+    requireV2ExecutionEligibility(thread, 'retry this task');
 
-    if (thread.execution?.version === 2) {
-      const captured = thread.execution;
-      const updated = await this.transitionTask(threadId, (t) => {
-        const e = t.execution;
-        if (!e || e.version !== 2 || e.generation !== captured.generation || e.operationId !== captured.operationId || e.phase !== captured.phase) {
-          throw new Error(`Cannot retry task ${threadId}: execution identity changed`);
-        }
-        if (t.cleanup || e.next) throw new Error(`Cannot retry task ${threadId}: cleanup or handoff is pending`);
-        if (t.status !== 'failed' && t.status !== 'queued') throw new Error(`Cannot retry task ${threadId}: state ${t.status} is not retryable`);
-        if (e.queue?.notBefore) {
-          const notBefore = Date.parse(e.queue.notBefore);
-          if (!Number.isFinite(notBefore) || this.wallClockNow() < notBefore) throw new Error(`Cannot retry task ${threadId}: queue delay has not elapsed`);
-        }
-        if (e.run) {
-          const { ownerStatus, childStatus, subtreeStatus } = this.inspectRunProcesses(e.run);
-          if (e.run.state === 'starting' || e.run.state === 'active' || e.run.state === 'stopping' || e.run.unconfirmed ||
-              ownerStatus !== 'exited' || (e.run.child?.pid ? childStatus !== 'exited' : childStatus !== 'none') ||
-              (e.run.child?.pid ? subtreeStatus !== 'exited' : subtreeStatus !== 'none') || !assessRunLaunchEvidence(e.run).safeToClean) {
-            throw new Error(`Cannot retry task ${threadId}: previous run exit is not confirmed`);
-          }
-        }
-        clearTaskFailure(t);
-        e.generation += 1;
-        e.attempt = 0;
-        e.autoRetriesUsed = 0;
-        e.budget.spentActiveMs = 0;
-        e.run = undefined;
-        e.queue = undefined;
-        if (!this.ownsRuns) t.status = 'queued';
-      });
-      const nextGen = updated.execution?.generation ?? captured.generation + 1;
-      await this.startExecution(threadId, captured.phase, { allowStates: ['failed', 'queued'], generation: nextGen });
-      return this.taskStore.getTask(threadId) || updated;
-    }
-
-    if (thread.execution?.run?.state === 'stopping' || thread.interruption?.reason === 'PROCESS_STOP_UNCONFIRMED') {
-      const probe = this.probeRun(threadId, thread.execution?.run);
-      if (probe === 'alive' || probe === 'unknown' || thread.interruption?.reason === 'PROCESS_STOP_UNCONFIRMED') {
-        throw new Error(`Cannot retry task ${threadId}: previous process is still stopping or unconfirmed`);
-      }
-    }
-
-    const phase: ExecutionPhase = thread.execution?.phase || 'develop';
-    const nextGen = (thread.execution?.generation || 1) + 1;
+    const captured = thread.execution;
     const updated = await this.transitionTask(threadId, (t) => {
-      if (phase === 'develop') {
-        const round = t.rounds.find(item => item.round === t.currentRound && item.type !== 'approval');
+      const e = t.execution;
+      if (!e || e.version !== 2 || e.generation !== captured.generation || e.operationId !== captured.operationId || e.phase !== captured.phase) {
+        throw new Error(`Cannot retry task ${threadId}: execution identity changed`);
+      }
+      if (t.cleanup || e.next) throw new Error(`Cannot retry task ${threadId}: cleanup or handoff is pending`);
+      if (t.status !== 'failed' && t.status !== 'queued') throw new Error(`Cannot retry task ${threadId}: state ${t.status} is not retryable`);
+      if (e.queue?.notBefore) {
+        const notBefore = Date.parse(e.queue.notBefore);
+        if (!Number.isFinite(notBefore) || this.wallClockNow() < notBefore) throw new Error(`Cannot retry task ${threadId}: queue delay has not elapsed`);
+      }
+      if (e.run) {
+        const { ownerStatus, childStatus, subtreeStatus } = this.inspectRunProcesses(e.run);
+        if (e.run.state === 'starting' || e.run.state === 'active' || e.run.state === 'stopping' || e.run.unconfirmed ||
+            ownerStatus !== 'exited' || (e.run.child?.pid ? childStatus !== 'exited' : childStatus !== 'none') ||
+            (e.run.child?.pid ? subtreeStatus !== 'exited' : subtreeStatus !== 'none') || !assessRunLaunchEvidence(e.run).safeToClean) {
+          throw new Error(`Cannot retry task ${threadId}: previous run exit is not confirmed`);
+        }
+      }
+      if (e.phase === 'develop') {
+        const round = t.rounds.find(entry => entry.round === e.round && entry.type !== 'approval');
         if (!round) throw new Error('Cannot retry execution: current work round is missing.');
         round.status = 'running';
         round.error = undefined;
       }
       clearTaskFailure(t);
-      if (t.execution) {
-        t.execution.generation = nextGen;
-        t.execution.attempt = 0;
-        t.execution.autoRetriesUsed = 0;
-        t.execution.budget.spentActiveMs = 0;
-        t.execution.run = undefined;
-        t.execution.queue = undefined;
-      }
+      e.generation += 1;
+      e.attempt = 0;
+      e.autoRetriesUsed = 0;
+      e.budget.spentActiveMs = 0;
+      e.run = undefined;
+      e.queue = undefined;
+      if (!this.ownsRuns) t.status = 'queued';
     });
-
-    await this.startExecution(threadId, phase, {
-      allowStates: ['failed', 'queued'],
-      generation: nextGen,
-    });
+    const nextGen = updated.execution?.generation ?? captured.generation + 1;
+    await this.startExecution(threadId, captured.phase, { allowStates: ['failed', 'queued'], generation: nextGen });
     return this.taskStore.getTask(threadId) || updated;
   }
 
@@ -3441,70 +2661,45 @@ export class ExecutionController {
     const thread = this.taskStore.getTask(threadId);
     if (thread) assertDedicatedTask(thread);
     if (!thread) throw new Error(`Task thread not found: ${threadId}`);
-    if (this.requireV2Execution) requireV2ExecutionEligibility(thread, 'resume this task');
+    requireV2ExecutionEligibility(thread, 'resume this task');
 
-    if (thread.execution?.version === 2) {
-      const captured = thread.execution;
-      const updated = await this.transitionTask(threadId, (t) => {
-        const e = t.execution;
-        if (!e || e.version !== 2 || e.generation !== captured.generation || e.operationId !== captured.operationId || e.phase !== captured.phase) {
-          throw new Error(`Cannot resume task ${threadId}: execution identity changed`);
-        }
-        if (t.cleanup || e.next) throw new Error(`Cannot resume task ${threadId}: cleanup or handoff is pending`);
-        if (t.status !== 'paused' && t.status !== 'queued') throw new Error(`Cannot resume task ${threadId}: state ${t.status} is not resumable`);
-        if (e.queue?.notBefore) {
-          const notBefore = Date.parse(e.queue.notBefore);
-          if (!Number.isFinite(notBefore) || this.wallClockNow() < notBefore) throw new Error(`Cannot resume task ${threadId}: queue delay has not elapsed`);
-        }
-        if (e.run) {
-          const { ownerStatus, childStatus, subtreeStatus } = this.inspectRunProcesses(e.run);
-          if (e.run.state === 'starting' || e.run.state === 'active' || e.run.state === 'stopping' || e.run.unconfirmed ||
-              ownerStatus !== 'exited' || (e.run.child?.pid ? childStatus !== 'exited' : childStatus !== 'none') ||
-              (e.run.child?.pid ? subtreeStatus !== 'exited' : subtreeStatus !== 'none') || !assessRunLaunchEvidence(e.run).safeToClean) {
-            throw new Error(`Cannot resume task ${threadId}: previous run exit is not confirmed`);
-          }
-        }
-        if (t.interruption?.kind === 'paused') t.interruption = undefined;
-        e.run = undefined;
-        e.queue = undefined;
-      });
-      this.runner.clearPendingCancellation(threadId);
-      const cancellations = new CancellationRegistry(this.storageDir);
-      cancellations.clear(threadId);
-      if (cancellations.peek(threadId)) throw new Error(`Cannot resume task ${threadId}: cancellation request could not be cleared.`);
-      if (!this.ownsRuns && updated.status === 'paused') {
-        return this.taskStore.transitionExecution(threadId, updated.execution!.revision, (task) => {
-          if (task.status !== 'paused' || task.cleanup || task.execution?.run || cancellations.peek(threadId)) {
-            throw new Error('Task changed while preparing it to resume.');
-          }
-          task.status = 'queued';
-        });
-      }
-      await this.startExecution(threadId, captured.phase, { allowStates: ['paused', 'queued'] });
-      return this.taskStore.getTask(threadId) || updated;
-    }
-
-    if (thread.execution?.run?.state === 'stopping' || thread.interruption?.reason === 'PROCESS_STOP_UNCONFIRMED') {
-      const probe = this.probeRun(threadId, thread.execution?.run);
-      if (probe === 'alive' || probe === 'unknown' || thread.interruption?.reason === 'PROCESS_STOP_UNCONFIRMED') {
-        throw new Error(`Cannot resume task ${threadId}: previous process is still stopping or unconfirmed`);
-      }
-    }
-
-    const phase: ExecutionPhase = thread.execution?.phase || 'develop';
+    const captured = thread.execution;
     const updated = await this.transitionTask(threadId, (t) => {
-      if (t.interruption?.kind === 'paused') {
-        t.interruption = undefined;
+      const e = t.execution;
+      if (!e || e.version !== 2 || e.generation !== captured.generation || e.operationId !== captured.operationId || e.phase !== captured.phase) {
+        throw new Error(`Cannot resume task ${threadId}: execution identity changed`);
       }
-      if (t.execution) {
-        t.execution.run = undefined;
-        t.execution.queue = undefined;
+      if (t.cleanup || e.next) throw new Error(`Cannot resume task ${threadId}: cleanup or handoff is pending`);
+      if (t.status !== 'paused' && t.status !== 'queued') throw new Error(`Cannot resume task ${threadId}: state ${t.status} is not resumable`);
+      if (e.queue?.notBefore) {
+        const notBefore = Date.parse(e.queue.notBefore);
+        if (!Number.isFinite(notBefore) || this.wallClockNow() < notBefore) throw new Error(`Cannot resume task ${threadId}: queue delay has not elapsed`);
       }
+      if (e.run) {
+        const { ownerStatus, childStatus, subtreeStatus } = this.inspectRunProcesses(e.run);
+        if (e.run.state === 'starting' || e.run.state === 'active' || e.run.state === 'stopping' || e.run.unconfirmed ||
+            ownerStatus !== 'exited' || (e.run.child?.pid ? childStatus !== 'exited' : childStatus !== 'none') ||
+            (e.run.child?.pid ? subtreeStatus !== 'exited' : subtreeStatus !== 'none') || !assessRunLaunchEvidence(e.run).safeToClean) {
+          throw new Error(`Cannot resume task ${threadId}: previous run exit is not confirmed`);
+        }
+      }
+      if (t.interruption?.kind === 'paused') t.interruption = undefined;
+      e.run = undefined;
+      e.queue = undefined;
     });
-
-    await this.startExecution(threadId, phase, {
-      allowStates: ['paused', 'queued'],
-    });
+    this.runner.clearPendingCancellation(threadId);
+    const cancellations = new CancellationRegistry(this.storageDir);
+    cancellations.clear(threadId);
+    if (cancellations.peek(threadId)) throw new Error(`Cannot resume task ${threadId}: cancellation request could not be cleared.`);
+    if (!this.ownsRuns && updated.status === 'paused') {
+      return this.taskStore.transitionExecution(threadId, updated.execution!.revision, (task) => {
+        if (task.status !== 'paused' || task.cleanup || task.execution?.run || cancellations.peek(threadId)) {
+          throw new Error('Task changed while preparing it to resume.');
+        }
+        task.status = 'queued';
+      });
+    }
+    await this.startExecution(threadId, captured.phase, { allowStates: ['paused', 'queued'] });
     return this.taskStore.getTask(threadId) || updated;
   }
 
@@ -3733,17 +2928,6 @@ export class ExecutionController {
     return updated;
   }
 
-  private hasGitCandidate(thread: DelegationThread): boolean {
-    if (!thread.worktree?.path) return false;
-    try {
-      const main = thread.worktree.mainPath || thread.worktree.path;
-      const ref = gitOutput(main, ['rev-parse', '--verify', `refs/mesh/candidates/${thread.threadId}`]);
-      return Boolean(ref && ref.trim());
-    } catch {
-      return false;
-    }
-  }
-
   /**
    * Scans all tasks with execution records, drains queued phases, and recovers crashed or orphaned tasks.
    */
@@ -3843,259 +3027,58 @@ export class ExecutionController {
     for (const thread of tasks) {
       if (this.isDisposed) return;
       if (thread.reviewFlow !== 'dedicated') continue;
-      // Production controllers are v2-only. Keep the legacy scanner branch
-      // below for compatibility tests and explicitly constructed v1
-      // controllers; production wiring sets requireV2Execution and therefore
-      // never executes historical records.
-      if (thread.execution?.version !== 2 && this.requireV2Execution) continue;
-      if (thread.execution?.version === 2) {
-        const phase = thread.execution.next?.phase ?? thread.execution.phase;
-        if (thread.execution.run?.purpose === 'native_maintenance' && thread.execution.run.settlementPending) {
-          await this.settleReturnedNativeMaintenance(thread);
+      if (thread.execution?.version !== 2) continue;
+      const phase = thread.execution.next?.phase ?? thread.execution.phase;
+      if (thread.execution.run?.purpose === 'native_maintenance' && thread.execution.run.settlementPending) {
+        await this.settleReturnedNativeMaintenance(thread);
+        continue;
+      }
+      // A crashed owner's run is fed through the same v2 admission/recovery
+      // classifier as an explicit start. Unknown identity remains untouched.
+      if (thread.execution.run) {
+        if (thread.execution.run.mergeLockHelper && thread.execution.run.state === 'stopping' && thread.execution.run.unconfirmed) {
+          await this.startExecution(thread.threadId, phase);
           continue;
         }
-        // A crashed owner's run is fed through the same v2 admission/recovery
-        // classifier as an explicit start. Unknown identity remains untouched.
-        if (thread.execution.run) {
-          if (thread.execution.run.mergeLockHelper && thread.execution.run.state === 'stopping' && thread.execution.run.unconfirmed) {
-            await this.startExecution(thread.threadId, phase);
-            continue;
-          }
-          const ownerStatus = await this.probeRunOwner(thread.execution.run.owner);
-          if (thread.execution.phase === 'merge' && thread.execution.run.state === 'starting' &&
-              !thread.execution.run.unconfirmed && thread.execution.run.purpose !== 'native_maintenance' && ownerStatus === 'alive') {
-            mergeAdmissionPending = true;
-          }
-          if (ownerStatus === 'exited') {
-            if (phase === 'merge') scheduleQueuedV2(thread, phase);
-            else await this.startExecution(thread.threadId, phase);
-          }
-          continue;
+        const ownerStatus = await this.probeRunOwner(thread.execution.run.owner);
+        if (thread.execution.phase === 'merge' && thread.execution.run.state === 'starting' &&
+            !thread.execution.run.unconfirmed && thread.execution.run.purpose !== 'native_maintenance' && ownerStatus === 'alive') {
+          mergeAdmissionPending = true;
         }
-        const dependencyId = reviewBlockDependencyId(thread);
-        if (phase === 'review' && !thread.cleanup && !thread.execution.next &&
-            (thread.status === 'reviewing' || thread.status === 'queued') && dependencyId &&
-            reviewDependencyIssue(thread.threadId, dependencyId, id => tasksById.get(id))) {
-          void this.failInvalidV2Dependency(thread).catch(() => {});
-          continue;
-        }
-        // Recover a durable handoff whose queue status was not persisted by an
-        // older or interrupted controller. The CAS retains its source run.
-        if (thread.execution.next && thread.status !== 'queued' && !['paused', 'wait_decision', 'completed', 'failed'].includes(thread.status)) {
-          if (this.v2StartBlocker(thread, phase)) continue;
-          const revision = thread.execution.revision;
-          try {
-            const queued = await this.taskStore.transitionExecution(thread.threadId, revision, (fresh) => {
-              if (fresh.execution?.version !== 2 || fresh.execution.run || !fresh.execution.next || fresh.cleanup) {
-                throw new Error('The queued handoff changed.');
-              }
-              fresh.execution.phase = fresh.execution.next.phase;
-              fresh.execution.round = fresh.execution.next.round;
-              fresh.execution.purpose = fresh.execution.next.purpose;
-              fresh.status = 'queued';
-            });
-            scheduleQueuedV2(queued, phase);
-          } catch { continue; }
-          continue;
-        }
-        if (thread.status === 'queued' || (thread.status === 'reviewing' && phase === 'review' && thread.reviewBlocked)) {
-          scheduleQueuedV2(thread, phase);
+        if (ownerStatus === 'exited') {
+          if (phase === 'merge') scheduleQueuedV2(thread, phase);
+          else await this.startExecution(thread.threadId, phase);
         }
         continue;
       }
-      if (!thread.execution) continue;
-      const status = thread.status;
-      const threadId = thread.threadId;
-
-      if (status === 'queued') {
-        if (thread.execution.queue?.notBefore) {
-          const notBeforeTime = Date.parse(thread.execution.queue.notBefore);
-          if (!Number.isFinite(notBeforeTime) || this.wallClockNow() < notBeforeTime) {
-            continue;
-          }
-        }
-        void this.startExecution(threadId, thread.execution.phase);
-      } else if (status === 'running' || status === 'reviewing' || status === 'merging') {
-        const run = thread.execution.run;
-        const generation = thread.execution.generation;
-        const operationId = thread.execution.operationId;
-        const phase = thread.execution.phase;
-        const transitionRun = (change: (task: DelegationThread) => void) =>
-          this.transitionTask(threadId, (fresh) => {
-            if (fresh.status !== status || fresh.execution?.generation !== generation ||
-                fresh.execution.operationId !== operationId || fresh.execution.phase !== phase ||
-                fresh.execution.run?.id !== run?.id) return;
-            change(fresh);
-          });
-        const inspection = this.inspectRunProcesses(run);
-
-        if (inspection.ownerStatus === 'alive') {
-          // Owner process is alive and active; nothing for scanner to recover
-          continue;
-        }
-        if (inspection.ownerStatus === 'unknown') {
-          // Indeterminate process identity; do not guess-kill
-          continue;
-        }
-
-        // Owner process died (ownerStatus === 'exited' or 'none')
-        // Check child status and confirm termination
-        const childPid = run?.child?.pid;
-        const childBirthId = run?.child?.birthId;
-
-        if (childPid && childPid > 0) {
-          const isAlive = probeProcessIdentity(childPid) !== 'exited';
-          if (isAlive) {
-            if (!childBirthId) {
-              // Missing birthId: CANNOT authorize kill or identity check!
-              await transitionRun( (t) => {
-                appendInterruption(t, {
-                  kind: 'error',
-                  reason: 'PROCESS_STOP_UNCONFIRMED',
-                  at: new Date().toISOString(),
-                  by: 'system',
-                });
-                if (t.execution?.run) {
-                  t.execution.run.state = 'stopping';
-                }
-              });
-              continue;
+      const dependencyId = reviewBlockDependencyId(thread);
+      if (phase === 'review' && !thread.cleanup && !thread.execution.next &&
+          (thread.status === 'reviewing' || thread.status === 'queued') && dependencyId &&
+          reviewDependencyIssue(thread.threadId, dependencyId, id => tasksById.get(id))) {
+        void this.failInvalidV2Dependency(thread).catch(() => {});
+        continue;
+      }
+      // Recover a durable handoff whose queue status was not persisted by an
+      // older or interrupted controller. The CAS retains its source run.
+      if (thread.execution.next && thread.status !== 'queued' && !['paused', 'wait_decision', 'completed', 'failed'].includes(thread.status)) {
+        if (this.v2StartBlocker(thread, phase)) continue;
+        const revision = thread.execution.revision;
+        try {
+          const queued = await this.taskStore.transitionExecution(thread.threadId, revision, (fresh) => {
+            if (fresh.execution?.version !== 2 || fresh.execution.run || !fresh.execution.next || fresh.cleanup) {
+              throw new Error('The queued handoff changed.');
             }
-
-            const childProbe = probeProcessIdentity(childPid, childBirthId);
-            if (childProbe === 'alive') {
-              killPidTree(childPid);
-              const exited = await confirmProcessTreeExit(childPid, PROCESS_STOP_TIMEOUT_MS, childBirthId);
-              if (!exited) {
-                // Termination could not be confirmed: keep run.state = 'stopping' and record interruption.
-                // Do NOT clear run, do NOT advance or fail, to prevent concurrent replacement execution.
-                await transitionRun( (t) => {
-                  appendInterruption(t, {
-                    kind: 'error',
-                    reason: 'PROCESS_STOP_UNCONFIRMED',
-                    at: new Date().toISOString(),
-                    by: 'system',
-                  });
-                  if (t.execution?.run) {
-                    t.execution.run.state = 'stopping';
-                  }
-                });
-                continue;
-              }
-            } else if (childProbe === 'unknown') {
-              // Indeterminate process state: unconfirmed stop.
-              await transitionRun( (t) => {
-                appendInterruption(t, {
-                  kind: 'error',
-                  reason: 'PROCESS_STOP_UNCONFIRMED',
-                  at: new Date().toISOString(),
-                  by: 'system',
-                });
-                if (t.execution?.run) {
-                  t.execution.run.state = 'stopping';
-                }
-              });
-              continue;
-            }
-          }
-        }
-
-        // Child process is confirmed dead. Now evaluate evidence for current phase.
-        if (thread.execution.phase === 'merge') {
-          // Merge phase: completed ONLY if candidate actually landed on real target branch,
-          // or explicit no_changes
-          const landed = await this.mergeCoordinator.hasLandedCandidate(threadId);
-          if (landed && thread.worktree?.approvedCommit) {
-            await transitionRun( (t) => {
-              t.status = 'completed';
-              if (t.worktree?.integration) {
-                t.worktree.integration.phase = 'merged';
-                t.worktree.integration.updatedAt = new Date().toISOString();
-              }
-              if (t.execution) t.execution.run = undefined;
-            });
-            continue;
-          }
-          if (thread.worktree?.integration?.phase === 'no_changes') {
-            await transitionRun( (t) => {
-              t.status = 'completed';
-              if (t.execution) t.execution.run = undefined;
-            });
-            continue;
-          }
-        } else if (thread.execution.phase === 'review') {
-          // Review phase: advance ONLY if durable verdict was persisted before owner died
-          if (thread.worktree?.approvedCommit) {
-            await transitionRun( (t) => {
-              if (t.execution) {
-                t.execution.phase = 'merge';
-                t.execution.run = undefined;
-              }
-              t.status = 'queued';
-              t.queuePhase = 'merge';
-            });
-            void this.startExecution(threadId, 'merge');
-            continue;
-          }
-          const hasReworkRound = thread.rounds.some(
-            (r) => r.type === 'rework' && r.round === (thread.currentRound || 1),
-          );
-          if (hasReworkRound || thread.status === 'running') {
-            await transitionRun( (t) => {
-              if (t.execution) {
-                t.execution.phase = 'develop';
-                t.execution.run = undefined;
-              }
-              t.status = 'running';
-            });
-            void this.startExecution(threadId, 'develop');
-            continue;
-          }
-        } else if (thread.execution.phase === 'develop') {
-          // Develop phase: NEVER transition directly to completed!
-          // Can ONLY hand off to review, and ONLY if current round has valid persistent completed response evidence!
-          const activeRoundNum = thread.execution.round || thread.currentRound || 1;
-          const currentRound = thread.rounds.find((r) => r.round === activeRoundNum);
-          const hasCandidate = this.hasGitCandidate(thread);
-
-          const hasValidCompletedResponse =
-            Boolean(currentRound) &&
-            currentRound!.status === 'completed' &&
-            currentRound!.assessment?.success === true &&
-            currentRound!.assessment?.exitCode === 0 &&
-            currentRound!.assessment?.stream?.hasActualOutput !== false &&
-            hasCandidate;
-
-          if (hasValidCompletedResponse) {
-            await transitionRun( (t) => {
-              if (t.execution) {
-                t.execution.phase = 'review';
-                t.execution.run = undefined;
-              }
-              t.status = 'reviewing';
-            });
-            void this.startExecution(threadId, 'review');
-            continue;
-          }
-        }
-
-        // When owner died without completion evidence, mark failed(OWNER_LOST) and DO NOT auto-retry!
-        await transitionRun( (t) => {
-          enterTaskFailure(t, {
-            stage: t.execution?.phase === 'merge' ? 'merge' : t.execution?.phase === 'review' ? 'review' : 'execution',
-            reason: 'Owner process died without completion evidence',
-            at: new Date().toISOString(),
-            code: 'OWNER_LOST',
+            fresh.execution.phase = fresh.execution.next.phase;
+            fresh.execution.round = fresh.execution.next.round;
+            fresh.execution.purpose = fresh.execution.next.purpose;
+            fresh.status = 'queued';
           });
-          if (t.execution) {
-            t.execution.run = undefined;
-            t.execution.lastOutcome = {
-              code: 'OWNER_LOST',
-              reason: 'Owner process died without completion evidence',
-              at: new Date().toISOString(),
-            };
-          }
-        });
+          scheduleQueuedV2(queued, phase);
+        } catch { continue; }
+        continue;
+      }
+      if (thread.status === 'queued' || (thread.status === 'reviewing' && phase === 'review' && thread.reviewBlocked)) {
+        scheduleQueuedV2(thread, phase);
       }
     }
 

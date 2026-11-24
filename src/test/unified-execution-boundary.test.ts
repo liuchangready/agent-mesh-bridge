@@ -292,8 +292,7 @@ describe('Unified Execution Boundary Tests', () => {
     const secondStore = new TaskStore(fixture.dir);
     const secondRegistry = new TaskExecutionRegistry(fixture.dir);
     const secondController = new ExecutionController(
-      secondStore, fixture.runner as any, fixture.callbackManager, undefined, undefined, undefined,
-      secondRegistry, { storageDir: fixture.dir, standingScanIntervalMs: 0 } as any,
+      secondStore, fixture.runner as any, fixture.callbackManager, undefined, secondRegistry, { storageDir: fixture.dir, standingScanIntervalMs: 0 } as any,
     );
     let developerChildren = 0;
     let child: ReturnType<typeof spawn> | undefined;
@@ -407,8 +406,7 @@ describe('Unified Execution Boundary Tests', () => {
     const secondStore = new TaskStore(fixture.dir);
     const secondRegistry = new TaskExecutionRegistry(fixture.dir);
     const secondController = new ExecutionController(
-      secondStore, fixture.runner as any, fixture.callbackManager, undefined, undefined, undefined,
-      secondRegistry, { storageDir: fixture.dir, standingScanIntervalMs: 0 } as any,
+      secondStore, fixture.runner as any, fixture.callbackManager, undefined, secondRegistry, { storageDir: fixture.dir, standingScanIntervalMs: 0 } as any,
     );
     const pidFile = path.join(fixture.dir, 'maintenance-grandchild.pid');
     const stopFile = path.join(fixture.dir, 'maintenance-root.stop');
@@ -646,10 +644,11 @@ describe('Unified Execution Boundary Tests', () => {
       };
       fixture.store.upsertTask(thread);
 
-      // Calling startExecution when run is alive must return previous_child_alive
+      // Calling startExecution must preserve the active run.
       const startRes = await fixture.controller.startExecution('thread_s20', 'develop');
-      assert.strictEqual(startRes.started, false);
-      assert.strictEqual(startRes.reason, 'previous_child_alive');
+      assert.strictEqual(startRes.started, true);
+      assert.strictEqual(startRes.reason, 'already_running');
+      assert.strictEqual(fixture.runner.executions.length, 0);
 
       // Verify execution.run is STILL present and NOT wiped!
       const fresh = fixture.store.getTask('thread_s20');
@@ -868,7 +867,7 @@ describe('Unified Execution Boundary Tests', () => {
       const thread = createThread('thread_s25', 'develop');
       thread.status = 'running';
       thread.execution = {
-        version: 1,
+        version: 2,
         revision: 1,
         operationId: 'op_s25',
         phase: 'develop',
@@ -1197,36 +1196,17 @@ describe('Unified Execution Boundary Tests', () => {
   });
 
   // Scenario 31: recovery CAS cannot clear a concurrently started generation
-  test('Scenario 31: recovery CAS cannot clear a concurrently started generation', async () => {
+  test('Scenario 31: the scheduler never attempts to replace a historical generation', async () => {
     const fixture = await setupFixture();
     try {
       const thread = createThread('thread_s31', 'develop');
+      thread.execution!.version = 1;
       thread.status = 'running';
       fixture.store.upsertTask(thread);
-      const originalTransition = fixture.store.transitionExecution.bind(fixture.store);
-      let injected = false;
-      fixture.store.transitionExecution = (async (id: string, revision: number, change: (task: DelegationThread) => void) => {
-        if (id === thread.threadId && !injected) {
-          injected = true;
-          await originalTransition(id, revision, fresh => {
-            fresh.execution!.generation = 2;
-            fresh.execution!.run = {
-              id: 'new-recovery-run', state: 'active', step: 'executing',
-              owner: { pid: process.pid, birthId: getProcessBirthId(process.pid) },
-              startedAt: new Date().toISOString(),
-            };
-          });
-        }
-        return originalTransition(id, revision, change);
-      }) as any;
+      const before = fixture.store.reloadTask(thread.threadId);
       await fixture.controller.scanAndDrain();
-      fixture.store.loadFromDisk();
-      const fresh = fixture.store.getTask(thread.threadId)!;
-      assert.equal(injected, true);
-      assert.equal(fresh.execution!.generation, 2);
-      assert.equal(fresh.execution!.run?.id, 'new-recovery-run');
-      assert.equal(fresh.status, 'running');
-      assert.equal(fresh.failure, undefined);
+      assert.deepEqual(fixture.store.reloadTask(thread.threadId), before);
+      assert.equal(fixture.runner.executions.length, 0);
     } finally {
       await fixture.cleanup();
     }

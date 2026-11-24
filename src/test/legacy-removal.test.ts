@@ -44,3 +44,30 @@ test('the controller refuses historical review before claiming a run', async () 
     await fixture.cleanup();
   }
 });
+
+test('historical and unknown execution records cannot start, resume, retry, or open a decision', async () => {
+  const fixture = await setupFixture();
+  try {
+    for (const version of [undefined, 1, 99]) {
+      const thread = createThread('historical_run_' + version);
+      if (version === undefined) thread.execution = undefined;
+      else (thread.execution! as { version: number }).version = version;
+      fixture.store.upsertTask(thread);
+      const before = fixture.store.reloadTask(thread.threadId);
+      const result = await fixture.controller.startExecution(thread.threadId);
+      assert.equal(result.started, false);
+      assert.match(result.reason || '', /HISTORICAL_TASK_READ_ONLY/);
+      await assert.rejects(fixture.controller.resumeOperation(thread.threadId), /HISTORICAL_TASK_READ_ONLY/);
+      await assert.rejects(fixture.controller.retryOperation(thread.threadId), /HISTORICAL_TASK_READ_ONLY/);
+      await assert.rejects(fixture.controller.requestTaskDecision(thread.threadId, {
+        question: 'Should this run resume?', resumePoint: 'continue_develop',
+      }), /HISTORICAL_TASK_READ_ONLY/);
+      await assert.rejects(fixture.controller.submitTaskDecision(thread.threadId, 'past-decision', 'Yes'), /HISTORICAL_TASK_READ_ONLY/);
+      await fixture.controller.scanAndDrain();
+      assert.deepEqual(fixture.store.reloadTask(thread.threadId), before);
+    }
+    assert.equal(fixture.runner.executions.length, 0);
+  } finally {
+    await fixture.cleanup();
+  }
+});

@@ -494,10 +494,8 @@ export function activate(context: vscode.ExtensionContext) {
     runner,
     callbackManager,
     reworkController.getMergeCoordinator(),
-    undefined,
-    undefined,
     executionRegistry,
-    { requireV2Execution: true, admissionEnabled: runtimeAdmission.ready },
+    { admissionEnabled: runtimeAdmission.ready },
   );
   context.subscriptions.push({ dispose: () => executionController.dispose() });
   const taskControl = new TaskControlService(taskStore, runner);

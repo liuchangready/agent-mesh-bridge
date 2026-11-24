@@ -3,21 +3,23 @@ import * as assert from 'node:assert/strict';
 import { createThread, setupFixture } from './unified-execution-fixture';
 import { testWorkspace } from './workspace-fixture';
 
-test('concurrent local starts share admission without releasing the winning role lease', async () => {
+test('concurrent local starts share the winning V2 run', async () => {
   const fixture = await setupFixture();
   let release!: () => void;
   const barrier = new Promise<void>(resolve => { release = resolve; });
   fixture.runner.setOnExecute(async () => { await barrier; return { exitCode: 1, stderr: 'controlled end' }; });
   try {
     const thread = createThread('thread_start_admission');
-    fixture.store.upsertTask(thread);
+    fixture.addRunnableThread(thread);
     const [first, second] = await Promise.all([
       fixture.controller.startExecution(thread.threadId), fixture.controller.startExecution(thread.threadId),
     ]);
     assert.equal(first.started, true);
     assert.deepEqual(second, first);
     assert.equal(fixture.runner.executions.length, 1);
-    assert.equal(fixture.roleLock.getOwner(thread.threadId)?.role, 'developer');
+    assert.ok(first.run?.id);
+    assert.equal(fixture.store.getTask(thread.threadId)?.execution?.run?.id, first.run.id);
+    assert.equal(fixture.roleLock.getOwner(thread.threadId), undefined);
   } finally {
     release();
     await fixture.controller.waitForActiveExecutions();

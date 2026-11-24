@@ -185,7 +185,7 @@ describe('MCPServer Protocol Tests', () => {
     assert.equal(host.executionController.ownsRuns, false);
     host.executionController.dispose();
     const controller = new ExecutionController(taskStore, runner, callbackManager, reworkController.getMergeCoordinator(),
-      undefined, undefined, registry, { requireV2Execution: true, storageDir: tempDir, standingScanIntervalMs: 0, streamSyncIntervalMs: 60_000 });
+      registry, { storageDir: tempDir, standingScanIntervalMs: 0, streamSyncIntervalMs: 60_000 });
     const residentWindow = new WindowWorkspace(tempDir, [process.cwd()]);
     residentWindow.advertiseExecutionOwner();
     const mergeActiveMarker = path.join(tempDir, 'merge-helper-active');
@@ -1272,7 +1272,7 @@ describe('MCPServer Protocol Tests', () => {
 
   test('disposing the current execution controller clears its process singleton', () => {
     const controller = new ExecutionController(taskStore, runner, callbackManager,
-      reworkController.getMergeCoordinator(), undefined, undefined, undefined,
+      reworkController.getMergeCoordinator(), undefined,
       { storageDir: tempDir, standingScanIntervalMs: 0 } as any);
     assert.strictEqual(ExecutionController.getInstance(), controller);
     controller.dispose();
@@ -1736,7 +1736,7 @@ describe('MCPServer Protocol Tests', () => {
 
   test('MCP v2 retry_task and resume_task reject a live child without clearing its run or generation', async () => {
     const controller = new ExecutionController(taskStore, runner, callbackManager,
-      reworkController.getMergeCoordinator(), undefined, undefined, undefined,
+      reworkController.getMergeCoordinator(), undefined,
       { storageDir: tempDir, standingScanIntervalMs: 0 } as any);
     let child: ReturnType<typeof spawn> | undefined;
     const oldExecute = runner.execute;
@@ -1797,7 +1797,7 @@ describe('MCPServer Protocol Tests', () => {
 
   test('MCP decision keeps a v2 spawn-intent run until owner/child exit acknowledgement; answer is durable next', async () => {
     const controller = new ExecutionController(taskStore, runner, callbackManager,
-      reworkController.getMergeCoordinator(), undefined, undefined, undefined,
+      reworkController.getMergeCoordinator(), undefined,
       { storageDir: tempDir, standingScanIntervalMs: 0 } as any);
     const oldReceiver = process.env.MESH_TASK_RECEIVER;
     const oldThread = process.env.MESH_TASK_THREAD_ID;
@@ -1843,7 +1843,7 @@ describe('MCPServer Protocol Tests', () => {
       const answerScript = `const {TaskStore}=require(${JSON.stringify(require.resolve('../bridge/task-store'))});
         const {ExecutionController}=require(${JSON.stringify(require.resolve('../bridge/execution-controller'))});
         const store=new TaskStore(${JSON.stringify(tempDir)});
-        const controller=new ExecutionController(store,{execute:async()=>{throw new Error('unexpected spawn')}},{},{},undefined,undefined,undefined,{storageDir:${JSON.stringify(tempDir)},standingScanIntervalMs:0});
+        const controller=new ExecutionController(store,{execute:async()=>{throw new Error('unexpected spawn')}},{},{},undefined,{storageDir:${JSON.stringify(tempDir)},standingScanIntervalMs:0});
         controller.submitTaskDecision(${JSON.stringify(noBindingId)},${JSON.stringify(noBindingDecisionId)},'Proceed carefully').then(()=>{process.stdout.write('answered');controller.dispose();store.dispose()}).catch(e=>{process.stderr.write(String(e.stack||e));controller.dispose();store.dispose();process.exitCode=1});`;
       const answerProcess = spawnSync(process.execPath, ['-e', answerScript], { encoding: 'utf8', windowsHide: true });
       assert.equal(answerProcess.status, 0, answerProcess.stderr);
@@ -1893,7 +1893,7 @@ describe('MCPServer Protocol Tests', () => {
 
   test('v2 decision cannot replace a first review-run rework handoff', async () => {
     const controller = new ExecutionController(taskStore, runner, callbackManager,
-      reworkController.getMergeCoordinator(), undefined, undefined, undefined,
+      reworkController.getMergeCoordinator(), undefined,
       { storageDir: tempDir, standingScanIntervalMs: 0 } as any);
     const ownerBirthId = getProcessBirthId(process.pid)!;
     const createReview = (threadId: string, pendingDecision = false) => {

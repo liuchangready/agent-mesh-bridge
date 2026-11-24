@@ -178,8 +178,6 @@ async function main() {
     mockRunner,
     mockCallbackManager,
     undefined,
-    roleLock,
-    sessionLock,
     registry,
     { storageDir, defaultBudgetLimitMs: 60_000, ...(registrationGateFile ? { streamSyncIntervalMs: 60_000 } : {}) },
   );
