@@ -258,7 +258,8 @@ test('a failed reflog publication preserves all stash entries and reports the cl
   assert.equal(fs.readFileSync(path.join(repository, 'mine.txt'), 'utf8'), 'mine');
 });
 
-for (const failRollback of [false, true]) test(`ref publication failure preserves recoverable stash metadata, rollback failure=${failRollback}`, async (t) => {
+for (const [failRollback, deleteBeforeRecovery] of [[false, false], [true, false], [true, true]]) test(
+  `ref publication failure preserves recoverable stash metadata, rollback failure=${failRollback}, delete=${deleteBeforeRecovery}`, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-ref-fail-'));
   const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); const { old } = initMultiStashRepo(repository);
   const id = `thread_stash_ref_fail_${failRollback ? 'rollback' : 'ref'}`; const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, id, storage);
@@ -300,8 +301,17 @@ for (const failRollback of [false, true]) test(`ref publication failure preserve
     assert.ok(tx.stashCleanupLock);
     const racing = spawnSync(gitExe, ['stash', 'store', '-m', 'racing', later], { cwd: repository, encoding: 'utf8', windowsHide: true });
     assert.notEqual(racing.status, 0);
-    const control = new TaskControlService(store, undefined, undefined, storage, undefined, new MeshFileLock(path.join(root, 'merge.lock')));
-    await assert.rejects(() => control.deleteTask(id, 'delete', 'test', true), /stash metadata recovery/i);
+    if (deleteBeforeRecovery) {
+      const control = new TaskControlService(store, undefined, undefined, storage, undefined, new MeshFileLock(path.join(root, 'merge.lock')));
+      const deleted = await control.deleteTask(id, 'delete', 'test', true);
+      assert.equal(deleted.status, 'DELETED');
+      assert.match(deleted.message, /stash recovery metadata remains pending/i);
+      assert.equal(store.getTask(id), undefined);
+      assert.ok(fs.existsSync(worktree.path));
+      assert.ok(fs.existsSync(path.join(repository, '.git', 'refs', 'stash.lock')));
+      assert.deepEqual(JSON.parse(fs.readFileSync(txFile, 'utf8')), tx);
+      return;
+    }
   } else {
     assert.equal(tx.phase, 'stash_cleanup_rolled_back');
     assert.equal(fs.existsSync(path.join(repository, '.git', 'refs', 'stash.lock')), false);

@@ -4,7 +4,8 @@ import * as assert from 'node:assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
+const mutableFs = require('fs') as typeof fs;
 
 const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-control-home-'));
 process.env.USERPROFILE = isolatedHome;
@@ -20,6 +21,8 @@ import { TaskControlService } from '../bridge/task-control';
 import { ReworkController } from '../bridge/rework-controller';
 import { DelegationThread } from '../bridge/types';
 import { TaskRoleLock } from '../bridge/task-role-lock';
+import { MeshFileLock } from '../bridge/merge-coordinator';
+import { inspectShutdownPreflight, loadShutdownPreflightSnapshot } from '../bridge/shutdown-preflight';
 import { SessionOwnershipStore, nativeSessionNamespace } from '../bridge/session-ownership';
 import { getProcessBirthId } from '../bridge/platform';
 
@@ -112,6 +115,28 @@ describe('TaskControlService - pause/delete reasons', () => {
     assert.strictEqual(request?.reason, 'switch to a hotfix');
   });
 
+  test('pausing a V2 wait-decision handoff without a controller durably cancels next and queue', async () => {
+    const threadId = 'thread_control_v2_pause_handoff';
+    taskStore.upsertTask(makeThread({
+      threadId, status: 'wait_decision',
+      execution: {
+        version: 2, revision: 2, operationId: 'op_pause_handoff', phase: 'review', round: 1,
+        generation: 1, attempt: 1, autoRetriesUsed: 0,
+        next: { phase: 'develop', round: 2, sourceRunId: 'review-run' },
+        queue: { reason: 'backoff', notBefore: new Date(Date.now() + 60_000).toISOString() },
+        budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 },
+      },
+    }));
+    const result = await new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir)
+      .pauseTask(threadId, 'cancel pending decision handoff', 'user');
+    const paused = taskStore.getTask(threadId)!;
+    assert.equal(result.status, 'PAUSED');
+    assert.equal(paused.status, 'paused');
+    assert.equal(paused.execution?.next, undefined);
+    assert.equal(paused.execution?.queue, undefined);
+    assert.equal(paused.interruption?.reason, 'cancel pending decision handoff');
+  });
+
   test('deleting a task removes it, stops the child, and writes a tombstone reason', async () => {
     taskStore.upsertTask(makeThread());
     const control = new TaskControlService(
@@ -195,6 +220,400 @@ describe('TaskControlService - pause/delete reasons', () => {
     const record = records.find((entry: any) => entry.threadId === threadId && entry.cleanupToken);
     assert.ok(record, tombstones);
     assert.match(record.cleanupToken, /^clean_/);
+  });
+
+  test('v2 tombstones never copy round conversation at reservation, claim, completion, or repeat delete', async () => {
+    const threadId = 'thread_control_v2_tombstone_minimal';
+    const markers = ['PROMPT_SECRET_MARKER_A', 'OUTPUT_SECRET_MARKER_A', 'PROMPT_SECRET_MARKER_B', 'OUTPUT_SECRET_MARKER_B'];
+    taskStore.upsertTask(makeThread({ threadId, status: 'completed', execution: {
+      version: 2, revision: 1, operationId: 'op_minimal_tombstone', phase: 'merge', round: 2,
+      generation: 9, attempt: 1, autoRetriesUsed: 0,
+      budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 },
+    }, rounds: [
+      { round: 1, type: 'initial', prompt: markers[0], output: markers[1], status: 'completed', durationMs: 1, timestamp: new Date().toISOString() },
+      { round: 2, type: 'rework', prompt: markers[2], output: markers[3], status: 'completed', durationMs: 1, timestamp: new Date().toISOString() },
+    ] }));
+    const control = new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir);
+    assert.equal((await control.deleteTask(threadId, 'remove conversation', 'user')).status, 'DELETED');
+    const records = () => fs.readFileSync(path.join(tempDir, 'deleted_tasks.log'), 'utf8').trim().split(/\r?\n/)
+      .map((line) => JSON.parse(line)).filter((entry) => entry.threadId === threadId);
+    for (const record of records()) {
+      const encoded = JSON.stringify(record);
+      for (const marker of markers) assert.equal(encoded.includes(marker), false, `tombstone leaked ${marker}`);
+      assert.equal(record.cleanupManifest?.thread?.rounds, undefined);
+      assert.equal(record.cleanupManifest?.thread?.finalSummary, undefined);
+    }
+    assert.ok(records().some((record) => record.cleanupManifest?.stage === 'running'), 'claim state must also be minimal');
+    assert.ok(records().some((record) => record.cleanupManifest?.stage === 'complete'), 'complete state must also be minimal');
+    await control.deleteTask(threadId, 'repeat', 'user');
+    for (const record of records()) for (const marker of markers) assert.equal(JSON.stringify(record).includes(marker), false);
+  });
+
+  test('ledger_written transaction proves fixed-ref integration and permits exact worktree cleanup', async () => {
+    const threadId = 'thread_control_v2_ledger_written';
+    const repo = path.join(tempDir, 'ledger-repo');
+    const worktreePath = path.join(tempDir, 'worktrees', threadId);
+    fs.mkdirSync(repo, { recursive: true });
+    const git = (args: string[], cwd = repo) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    git(['init', '-b', 'master']); git(['config', 'user.email', 'test@example.invalid']); git(['config', 'user.name', 'Test']);
+    fs.writeFileSync(path.join(repo, 'base.txt'), 'base'); git(['add', 'base.txt']); git(['commit', '-m', 'base']);
+    const baseCommit = git(['rev-parse', 'HEAD']);
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    git(['worktree', 'add', '-b', `mesh/task/${threadId}`, worktreePath, baseCommit]);
+    fs.writeFileSync(path.join(worktreePath, 'change.txt'), 'approved'); git(['add', 'change.txt'], worktreePath); git(['commit', '-m', 'approved'], worktreePath);
+    const approved = git(['rev-parse', 'HEAD'], worktreePath);
+    git(['update-ref', 'refs/heads/master', approved]);
+    const artifactDir = path.join(tempDir, 'tasks', threadId); fs.mkdirSync(path.join(artifactDir, 'worker_log'), { recursive: true });
+    taskStore.upsertTask(makeThread({ threadId, status: 'completed', artifactDir, artifactRoot: path.dirname(artifactDir),
+      workspace: { ...testWorkspace(os.tmpdir()), executionPath: worktreePath },
+      worktree: { path: worktreePath, mainPath: repo, repositoryPath: repo, commonDir: path.join(repo, '.git'), targetRef: 'refs/heads/master',
+        deliveryTarget: { branch: 'master', ref: 'refs/heads/master', repositoryPath: repo }, taskBranch: `mesh/task/${threadId}`,
+        baseCommit, approvedCommit: approved, integration: { phase: 'merged', sourceCommit: approved, targetOldCommit: baseCommit,
+          candidateCommit: approved, mergedCommit: approved, updatedAt: new Date().toISOString() } },
+      execution: { version: 2, revision: 1, operationId: 'op_ledger', phase: 'merge', round: 1, generation: 1, attempt: 1, autoRetriesUsed: 0,
+        budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 } },
+    }));
+    const transactionDir = path.join(tempDir, 'merge-transactions'); fs.mkdirSync(transactionDir, { recursive: true });
+    fs.writeFileSync(path.join(transactionDir, `${threadId}.json`), JSON.stringify({ threadId, sourceCommit: approved,
+      targetOldCommit: baseCommit, candidateCommit: approved, phase: 'ledger_written', at: new Date().toISOString() }));
+    const lockPath = path.join(tempDir, 'merge.lock');
+    const mergeLock = new MeshFileLock(lockPath);
+    const control = new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir, undefined, mergeLock);
+    const originalSafeWorktree = (control as any).isSafeDeletionWorktree.bind(control);
+    (control as any).isSafeDeletionWorktree = () => { throw new Error('injected failure after merge lock acquisition'); };
+    const interrupted = await control.deleteTask(threadId, 'retry after cleaner fault', 'user');
+    assert.equal(interrupted.status, 'DELETED'); assert.match(interrupted.message, /injected failure after merge lock acquisition/);
+    const afterFaultRelease = await new MeshFileLock(lockPath).acquire(undefined, undefined, 500, true);
+    assert.ok(afterFaultRelease, 'cleaner finally releases the exact merge lock after an exception'); afterFaultRelease();
+    (control as any).isSafeDeletionWorktree = originalSafeWorktree;
+
+    const transactionPath = path.join(transactionDir, `${threadId}.json`);
+    const originalReadFileSync = mutableFs.readFileSync;
+    let transactionReads = 0;
+    (mutableFs as any).readFileSync = function (file: any, ...args: any[]) {
+      if (path.resolve(String(file)) === path.resolve(transactionPath)) {
+        transactionReads++;
+        if (transactionReads === 2) throw Object.assign(new Error('injected journal read EIO'), { code: 'EIO' });
+      }
+      return originalReadFileSync.call(this, file, ...args);
+    };
+    let result: Awaited<ReturnType<TaskControlService['deleteTask']>>;
+    try { result = await control.deleteTask(threadId, 'remove integrated task', 'user'); }
+    finally { (mutableFs as any).readFileSync = originalReadFileSync; }
+    assert.equal(transactionReads, 1, 'all checks reuse the single verified transaction snapshot');
+    assert.equal(result.status, 'DELETED');
+    const afterCleanupRelease = await new MeshFileLock(lockPath).acquire(undefined, undefined, 500, true);
+    assert.ok(afterCleanupRelease, 'another lock instance can acquire after cleanup'); afterCleanupRelease();
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.throws(() => git(['show-ref', '--verify', `refs/heads/mesh/task/${threadId}`]));
+    const preflight = inspectShutdownPreflight({ ...loadShutdownPreflightSnapshot(tempDir), expectedVersion: 'test', requiredComponents: [] });
+    assert.equal(preflight.blockers.some((blocker) => blocker.threadId === threadId), false);
+  });
+
+  test('ledger_written never discards post-approval tracked, untracked, or task-branch commits on ordinary delete', async () => {
+    for (const mutation of ['tracked', 'untracked', 'local-commit'] as const) {
+      const threadId = `thread_control_v2_ledger_dirty_${mutation.replace('-', '_')}`;
+      const repo = path.join(tempDir, `ledger-dirty-${mutation}`);
+      const worktreePath = path.join(tempDir, 'worktrees', threadId);
+      fs.mkdirSync(repo, { recursive: true });
+      const git = (args: string[], cwd = repo) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+      git(['init', '-b', 'master']); git(['config', 'user.email', 'test@example.invalid']); git(['config', 'user.name', 'Test']);
+      fs.writeFileSync(path.join(repo, 'tracked.txt'), 'base'); git(['add', 'tracked.txt']); git(['commit', '-m', 'base']);
+      const baseCommit = git(['rev-parse', 'HEAD']); fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+      git(['worktree', 'add', '-b', `mesh/task/${threadId}`, worktreePath, baseCommit]);
+      fs.writeFileSync(path.join(worktreePath, 'approved.txt'), 'approved'); git(['add', 'approved.txt'], worktreePath); git(['commit', '-m', 'approved'], worktreePath);
+      const approved = git(['rev-parse', 'HEAD'], worktreePath); git(['update-ref', 'refs/heads/master', approved]);
+      if (mutation === 'tracked') fs.writeFileSync(path.join(worktreePath, 'tracked.txt'), 'changed after approval');
+      if (mutation === 'untracked') fs.writeFileSync(path.join(worktreePath, 'untracked.txt'), 'created after approval');
+      if (mutation === 'local-commit') {
+        fs.writeFileSync(path.join(worktreePath, 'local-only.txt'), 'not on master'); git(['add', 'local-only.txt'], worktreePath); git(['commit', '-m', 'local only'], worktreePath);
+      }
+      if (mutation !== 'local-commit') assert.match(git(['status', '--porcelain', '--untracked-files=all'], worktreePath), mutation === 'tracked' ? /M/ : /\?\?/);
+      const artifactDir = path.join(tempDir, 'tasks', threadId); fs.mkdirSync(path.join(artifactDir, 'worker_log'), { recursive: true });
+      taskStore.upsertTask(makeThread({ threadId, status: 'completed', artifactDir, artifactRoot: path.dirname(artifactDir),
+        workspace: { ...testWorkspace(os.tmpdir()), executionPath: worktreePath },
+        worktree: { path: worktreePath, mainPath: repo, repositoryPath: repo, commonDir: path.join(repo, '.git'), targetRef: 'refs/heads/master',
+          deliveryTarget: { branch: 'master', ref: 'refs/heads/master', repositoryPath: repo }, taskBranch: `mesh/task/${threadId}`,
+          baseCommit, approvedCommit: approved, integration: { phase: 'merged', sourceCommit: approved, targetOldCommit: baseCommit,
+            candidateCommit: approved, mergedCommit: approved, updatedAt: new Date().toISOString() } },
+        execution: { version: 2, revision: 1, operationId: `op_${mutation}`, phase: 'merge', round: 1, generation: 1, attempt: 1, autoRetriesUsed: 0,
+          budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 } },
+      }));
+      const transactionDir = path.join(tempDir, 'merge-transactions'); fs.mkdirSync(transactionDir, { recursive: true });
+      fs.writeFileSync(path.join(transactionDir, `${threadId}.json`), JSON.stringify({ threadId, sourceCommit: approved,
+        targetOldCommit: baseCommit, candidateCommit: approved, phase: 'ledger_written', at: new Date().toISOString() }));
+      const result = await new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir)
+        .deleteTask(threadId, `ordinary delete ${mutation}`, 'user', false);
+      assert.equal(result.status, 'DELETED'); assert.equal(fs.existsSync(worktreePath), true, `${mutation}: worktree retained`);
+      assert.match(result.message, /retained/i, `${mutation}: result warns about preserved output`);
+      assert.equal(git(['for-each-ref', '--format=%(refname)', `refs/heads/mesh/task/${threadId}`]), `refs/heads/mesh/task/${threadId}`);
+      if (mutation === 'untracked') assert.equal(fs.readFileSync(path.join(worktreePath, 'untracked.txt'), 'utf8'), 'created after approval');
+      if (mutation === 'local-commit') assert.equal(git(['rev-parse', 'HEAD'], worktreePath) !== approved, true);
+    }
+  });
+
+  test('retry completes task-data cleanup after exact Git worktree removal already succeeded', async () => {
+    const threadId = 'thread_control_v2_removed_worktree_retry';
+    const repo = path.join(tempDir, 'retry-repo'); const worktreePath = path.join(tempDir, 'worktrees', threadId);
+    fs.mkdirSync(repo, { recursive: true });
+    const git = (args: string[], cwd = repo) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    git(['init', '-b', 'master']); git(['config', 'user.email', 'test@example.invalid']); git(['config', 'user.name', 'Test']);
+    fs.writeFileSync(path.join(repo, 'base.txt'), 'base'); git(['add', 'base.txt']); git(['commit', '-m', 'base']);
+    const baseCommit = git(['rev-parse', 'HEAD']); fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    git(['worktree', 'add', '-b', `mesh/task/${threadId}`, worktreePath, baseCommit]);
+    const artifactDir = path.join(tempDir, 'tasks', threadId); const blocker = path.join(artifactDir, 'unknown-child');
+    fs.mkdirSync(artifactDir, { recursive: true }); fs.writeFileSync(blocker, 'retain until repaired');
+    taskStore.upsertTask(makeThread({ threadId, status: 'completed', artifactDir, artifactRoot: path.dirname(artifactDir),
+      workspace: { ...testWorkspace(os.tmpdir()), executionPath: worktreePath },
+      worktree: { path: worktreePath, mainPath: repo, repositoryPath: repo, commonDir: path.join(repo, '.git'), targetRef: 'refs/heads/master',
+        deliveryTarget: { branch: 'master', ref: 'refs/heads/master', repositoryPath: repo }, taskBranch: `mesh/task/${threadId}`,
+        baseCommit, integration: { phase: 'no_changes', updatedAt: new Date().toISOString() } },
+      execution: { version: 2, revision: 1, operationId: 'op_retry_removed', phase: 'merge', round: 1, generation: 1, attempt: 1, autoRetriesUsed: 0,
+        budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 } },
+    }));
+    const control = new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir);
+    const first = await control.deleteTask(threadId, 'first cleanup pass', 'user');
+    assert.equal(first.status, 'DELETED'); assert.equal(fs.existsSync(worktreePath), false, first.message); assert.equal(fs.existsSync(blocker), true);
+    fs.unlinkSync(blocker);
+    const retry = await control.deleteTask(threadId, 'retry cleanup', 'user');
+    assert.equal(retry.status, 'DELETED'); assert.equal(fs.existsSync(artifactDir), false, `${retry.message}; entries=${fs.existsSync(artifactDir) ? fs.readdirSync(artifactDir).join(',') : ''}`);
+  });
+
+  test('historical stop timeout deletes logically but retains logs, worktree evidence, and requester session', async () => {
+    const threadId = 'thread_control_legacy_stop_unknown';
+    const artifactDir = path.join(tempDir, 'tasks', threadId); const log = path.join(artifactDir, 'worker_log', `${threadId}_round_1.log`);
+    const preservedWorktreeAsset = path.join(artifactDir, 'worktree', 'uncommitted.txt');
+    fs.mkdirSync(path.dirname(log), { recursive: true }); fs.mkdirSync(path.dirname(preservedWorktreeAsset), { recursive: true });
+    fs.writeFileSync(log, 'preserve legacy output'); fs.writeFileSync(preservedWorktreeAsset, 'preserve worktree');
+    const thread = makeThread({ threadId, status: 'running', callerSessionId: 'requester-session-must-survive',
+      artifactDir, artifactRoot: path.dirname(artifactDir), execution: undefined });
+    taskStore.upsertTask(thread);
+    let cleanedSessions = false;
+    const control = new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir, () => { cleanedSessions = true; return { entries: [], removedCount: 0 }; });
+    (control as any).waitForThreadChildren = async () => { throw new Error('injected stop timeout'); };
+    const result = await control.deleteTask(threadId, 'legacy stop uncertain', 'user');
+    assert.equal(result.status, 'DELETED'); assert.match(result.message, /stop remains unconfirmed|retained/i);
+    assert.equal(taskStore.getTask(threadId), undefined); assert.equal(fs.existsSync(log), true);
+    assert.equal(fs.existsSync(preservedWorktreeAsset), true); assert.equal(cleanedSessions, false);
+    const latest = fs.readFileSync(path.join(tempDir, 'deleted_tasks.log'), 'utf8').trim().split(/\r?\n/).map((line) => JSON.parse(line))
+      .filter((entry) => entry.threadId === threadId).slice(-1)[0];
+    assert.equal(latest.cleanupManifest.legacyStopPending, true);
+    assert.equal(latest.cleanupManifest.legacyStopIdentityUnknown, true);
+    const report = inspectShutdownPreflight({ ...loadShutdownPreflightSnapshot(tempDir), expectedVersion: 'test', requiredComponents: [] });
+    assert.equal(report.ready, false); assert.ok(report.blockers.some((blocker) => blocker.threadId === threadId));
+    assert.equal(latest.cleanupManifest.thread.callerSessionId, undefined, 'requester session is never copied into cleanup manifest');
+  });
+
+  test('v2 delete commits logically with an unconfirmed run and keeps its exact identity in the tombstone', async () => {
+    const threadId = 'thread_control_v2_unknown_run_delete';
+    const run = {
+      id: 'unknown-run-identity', owner: { pid: 991122, birthId: 'old-owner-birth' },
+      child: { pid: 991123, birthId: 'old-child-birth' }, step: 'running', state: 'stopping' as const,
+      unconfirmed: true, startedAt: new Date().toISOString(), spawnIntentAt: new Date().toISOString(),
+    };
+    taskStore.upsertTask(makeThread({
+      threadId, status: 'failed', execution: {
+        version: 2, revision: 3, operationId: 'op_unknown_delete', phase: 'develop', round: 1,
+        generation: 7, attempt: 1, autoRetriesUsed: 0, run,
+        budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 },
+      },
+    }));
+    const control = new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir);
+    const result = await control.deleteTask(threadId, 'remove failed run', 'user');
+    assert.equal(result.status, 'DELETED');
+    assert.equal(taskStore.getTask(threadId), undefined);
+    assert.match(result.message, /no verified .*exit proof|resources.*isolated/i);
+    const record = fs.readFileSync(path.join(tempDir, 'deleted_tasks.log'), 'utf8').trim().split(/\r?\n/)
+      .map((line) => JSON.parse(line)).filter((entry) => entry.threadId === threadId).slice(-1)[0];
+    assert.equal(record.cleanupManifest.retainResources, true);
+    assert.deepEqual(record.cleanupManifest.execution.run, run);
+    const stale = makeThread({ threadId, status: 'running' });
+    taskStore.upsertTask(stale);
+    assert.equal(taskStore.getTask(threadId), undefined, 'a late worker write cannot revive the tombstone');
+  });
+
+  test('logical deletion with an unknown spawn remains a shutdown blocker and repeat delete does not clean it', async () => {
+    const threadId = 'thread_control_v2_deleted_spawn_preflight';
+    const run = { id: 'unknown-spawn', owner: { pid: 991222, birthId: 'owner-unknown' },
+      child: undefined, step: 'spawn', state: 'stopping' as const, unconfirmed: true,
+      spawnIntentAt: new Date().toISOString(), startedAt: new Date().toISOString() };
+    taskStore.upsertTask(makeThread({ threadId, status: 'failed', execution: {
+      version: 2, revision: 1, operationId: 'op_deleted_spawn', phase: 'develop', round: 1,
+      generation: 4, attempt: 1, autoRetriesUsed: 0, run,
+      budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 },
+    } }));
+    const control = new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir);
+    assert.equal((await control.deleteTask(threadId, 'remove unknown spawn', 'user')).status, 'DELETED');
+    const snapshot = loadShutdownPreflightSnapshot(tempDir);
+    const report = inspectShutdownPreflight({ ...snapshot, expectedVersion: 'test', requiredComponents: [] });
+    assert.equal(report.ready, false);
+    assert.ok(report.blockers.some((blocker) => blocker.code === 'DELETED_RUN_PROTECTED' && blocker.threadId === threadId));
+    assert.ok(report.blockers.some((blocker) => blocker.code === 'DELETED_CLEANUP_PENDING' && blocker.threadId === threadId));
+    const repeated = await control.deleteTask(threadId, 'repeat delete', 'user');
+    assert.equal(repeated.status, 'DELETED');
+    assert.match(repeated.message, /no verified .*exit proof|resources remain isolated/i);
+  });
+
+  test('ordinary delete preserves unproven worktree output and still removes the task from the ledger', async () => {
+    const threadId = 'thread_control_v2_unproven_output';
+    const worktreePath = path.join(tempDir, 'unproven-worktree');
+    fs.mkdirSync(worktreePath, { recursive: true });
+    const workspace = { ...testWorkspace(os.tmpdir()), executionPath: worktreePath };
+    taskStore.upsertTask(makeThread({
+      threadId, status: 'failed', workspace,
+      worktree: {
+        path: worktreePath, mainPath: path.join(tempDir, 'missing-repository'),
+        repositoryPath: path.join(tempDir, 'missing-repository'), commonDir: path.join(tempDir, 'missing-repository', '.git'),
+        targetRef: 'refs/heads/master', taskBranch: `mesh/task/${threadId}`, baseCommit: 'base-sha',
+        deliveryTarget: { branch: 'master', ref: 'refs/heads/master', repositoryPath: path.join(tempDir, 'missing-repository') },
+        integration: { phase: 'ready', updatedAt: new Date().toISOString() },
+      },
+      execution: {
+        version: 2, revision: 1, operationId: 'op_unproven_output', phase: 'merge', round: 1,
+        generation: 1, attempt: 1, autoRetriesUsed: 0,
+        budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 },
+      },
+    }));
+    const result = await new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir)
+      .deleteTask(threadId, 'forget task but retain output', 'user');
+    assert.equal(result.status, 'DELETED');
+    assert.equal(taskStore.getTask(threadId), undefined);
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.match(result.message, /retained/i);
+    const record = fs.readFileSync(path.join(tempDir, 'deleted_tasks.log'), 'utf8').trim().split(/\r?\n/)
+      .map((line) => JSON.parse(line)).filter((entry) => entry.threadId === threadId).slice(-1)[0];
+    assert.equal(record.cleanupManifest.retainResources, true);
+    assert.equal(record.cleanupManifest.thread.worktree.path, worktreePath);
+  });
+
+  test('force delete still retains assets when the persisted artifact path is outside its authorized root', async () => {
+    const threadId = 'thread_control_v2_path_guard';
+    const outside = path.join(tempDir, 'outside', threadId);
+    const sentinel = path.join(outside, 'worker_log', `${threadId}_round_1.log`);
+    fs.mkdirSync(path.dirname(sentinel), { recursive: true });
+    fs.writeFileSync(sentinel, 'must survive');
+    taskStore.upsertTask(makeThread({
+      threadId, status: 'completed', artifactDir: outside, artifactRoot: path.join(tempDir, 'authorized'),
+      rounds: [{ round: 1, type: 'initial', prompt: 'done', output: 'done', status: 'completed', durationMs: 1, timestamp: new Date().toISOString() }],
+      execution: { version: 2, revision: 1, operationId: 'op_path_guard', phase: 'merge', round: 1,
+        generation: 1, attempt: 1, autoRetriesUsed: 0, budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 } },
+    }));
+    const result = await new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir)
+      .deleteTask(threadId, 'force cannot bypass path ownership', 'user', true);
+    assert.equal(result.status, 'DELETED');
+    assert.equal(taskStore.getTask(threadId), undefined);
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'must survive');
+    assert.match(result.message, /paths could not be verified/i);
+  });
+
+  test('a post-tombstone aggregate failure reports deletion success with a residual warning', async () => {
+    const threadId = 'thread_control_v2_post_tombstone_warning';
+    taskStore.upsertTask(makeThread({
+      threadId, status: 'completed',
+      execution: { version: 2, revision: 1, operationId: 'op_post_tombstone', phase: 'merge', round: 1,
+        generation: 1, attempt: 1, autoRetriesUsed: 0, budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 } },
+    }));
+    const originalMark = taskStore.markTaskCleanup.bind(taskStore);
+    taskStore.markTaskCleanup = async (...args: any[]) => {
+      const reservation = await (originalMark as any)(...args);
+      (taskStore as any).writeAggregate = () => { throw new Error('aggregate disk error'); };
+      return reservation;
+    };
+    const result = await new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir)
+      .deleteTask(threadId, 'tombstone is the commit boundary', 'user');
+    assert.equal(result.status, 'DELETED');
+    assert.equal(taskStore.getTask(threadId), undefined);
+    assert.match(result.message, /aggregate update failed/i);
+  });
+
+  test('a failed tombstone write remains a storage error and leaves the task visible', async () => {
+    const threadId = 'thread_control_v2_tombstone_write_failure';
+    taskStore.upsertTask(makeThread({ threadId, status: 'completed', execution: {
+      version: 2, revision: 1, operationId: 'op_tombstone_failure', phase: 'merge', round: 1,
+      generation: 1, attempt: 1, autoRetriesUsed: 0,
+      budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 },
+    } }));
+    const originalAppend = taskStore.appendTombstone.bind(taskStore);
+    (taskStore as any).appendTombstone = () => { throw new Error('injected tombstone fsync failure'); };
+    try {
+      const control = new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir);
+      await assert.rejects(control.deleteTask(threadId, 'storage fault', 'test'), /injected tombstone fsync failure/);
+      assert.equal(taskStore.reloadTask(threadId)?.status, 'completed', 'no successful deletion is reported without a durable tombstone');
+      assert.equal(taskStore.isTaskTombstoned(threadId), false);
+    } finally { (taskStore as any).appendTombstone = originalAppend; }
+  });
+
+  test('post-tombstone cleanup exceptions remain DELETED and mark resources for retry', async () => {
+    const threadId = 'thread_control_v2_cleanup_exception';
+    taskStore.upsertTask(makeThread({ threadId, status: 'completed', execution: {
+      version: 2, revision: 1, operationId: 'op_cleanup_exception', phase: 'merge', round: 1,
+      generation: 1, attempt: 1, autoRetriesUsed: 0,
+      budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 },
+    } }));
+    const originalClaim = taskStore.claimTombstoneCleanup.bind(taskStore);
+    taskStore.claimTombstoneCleanup = async () => { throw new Error('injected cleaner claim failure'); };
+    try {
+      const result = await new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir)
+        .deleteTask(threadId, 'post-commit cleanup error', 'test');
+      assert.equal(result.status, 'DELETED');
+      assert.match(result.message, /Physical cleanup remains pending: injected cleaner claim failure/i);
+      const latest = fs.readFileSync(path.join(tempDir, 'deleted_tasks.log'), 'utf8').trim().split(/\r?\n/)
+        .map((line) => JSON.parse(line)).filter((entry) => entry.threadId === threadId).slice(-1)[0];
+      assert.equal(latest.cleanupManifest.retainResources, true);
+    } finally { taskStore.claimTombstoneCleanup = originalClaim; }
+  });
+
+  test('delete retains worktree behind a junction in its authorized parent chain', async (t) => {
+    const threadId = 'thread_control_v2_worktree_junction';
+    const externalRoot = path.join(tempDir, 'external-worktrees');
+    const worktreesRoot = path.join(tempDir, 'worktrees');
+    const worktreePath = path.join(worktreesRoot, threadId);
+    fs.mkdirSync(externalRoot, { recursive: true });
+    fs.mkdirSync(tempDir, { recursive: true });
+    try { fs.symlinkSync(externalRoot, worktreesRoot, 'junction'); }
+    catch (error) { t.skip(`directory junction unavailable: ${(error as Error).message}`); return; }
+    fs.mkdirSync(path.join(externalRoot, threadId), { recursive: true });
+    const repositoryPath = path.join(tempDir, 'missing-repository');
+    taskStore.upsertTask(makeThread({ threadId, status: 'completed',
+      workspace: { ...testWorkspace(os.tmpdir()), executionPath: worktreePath },
+      worktree: { path: worktreePath, mainPath: repositoryPath, repositoryPath,
+        commonDir: path.join(repositoryPath, '.git'), targetRef: 'refs/heads/master',
+        taskBranch: `mesh/task/${threadId}`, baseCommit: 'base-sha',
+        deliveryTarget: { branch: 'master', ref: 'refs/heads/master', repositoryPath },
+        integration: { phase: 'no_changes', updatedAt: new Date().toISOString() } },
+      execution: { version: 2, revision: 1, operationId: 'op_worktree_junction', phase: 'merge', round: 1,
+        generation: 1, attempt: 1, autoRetriesUsed: 0, budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 } },
+    }));
+    const result = await new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir)
+      .deleteTask(threadId, 'junction path must be retained', 'test', true);
+    assert.equal(result.status, 'DELETED');
+    assert.equal(fs.existsSync(path.join(externalRoot, threadId)), true);
+    assert.match(result.message, /Git worktree or branch ownership is unverified/i);
+  });
+
+  test('a tombstoned file that cannot be unlinked cannot accept a late execution transition', async () => {
+    const threadId = 'thread_control_v2_tombstone_unlink_failure';
+    taskStore.upsertTask(makeThread({ threadId, status: 'completed', execution: {
+      version: 2, revision: 1, operationId: 'op_unlink_failure', phase: 'merge', round: 1,
+      generation: 1, attempt: 1, autoRetriesUsed: 0,
+      budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 },
+    } }));
+    const taskFile = path.join(tempDir, 'threads', `${threadId}.json`);
+    const originalUnlink = mutableFs.unlinkSync;
+    mutableFs.unlinkSync = (file: fs.PathLike) => {
+      if (path.resolve(String(file)) === path.resolve(taskFile)) throw new Error('injected task unlink failure');
+      return originalUnlink.call(mutableFs, file);
+    };
+    try {
+      const control = new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir);
+      const result = await control.deleteTask(threadId, 'unlink fault', 'test');
+      assert.equal(result.status, 'DELETED');
+      assert.match(result.message, /task file unlink failed/i);
+      assert.equal(taskStore.reloadTask(threadId), undefined);
+      const before = fs.readFileSync(taskFile, 'utf8');
+      await assert.rejects(taskStore.transitionExecution(threadId, 1, (task) => { task.status = 'running'; }), /durable deletion tombstone/);
+      assert.equal(fs.readFileSync(taskFile, 'utf8'), before, 'late writers cannot revive the still-present ledger file');
+    } finally { mutableFs.unlinkSync = originalUnlink; }
   });
 
   test('v2 delete retains native transcript when static ownership evidence is missing', async () => {
@@ -315,7 +734,7 @@ describe('TaskControlService - pause/delete reasons', () => {
   test('v2 delete resumes a durable pending tombstone once under the original cleaner identity', async () => {
     const threadId = 'thread_control_v2_tombstone_retry';
     const artifactDir = path.join(tempDir, 'task-data', threadId);
-    const asset = path.join(artifactDir, 'worker_log', 'round.log');
+    const asset = path.join(artifactDir, 'worker_log', `${threadId}_round.log`);
     fs.mkdirSync(path.dirname(asset), { recursive: true });
     fs.writeFileSync(asset, 'durable cleanup fixture');
     const owner = { pid: process.pid, birthId: getProcessBirthId(process.pid)! };
@@ -332,7 +751,7 @@ describe('TaskControlService - pause/delete reasons', () => {
       token: reservation.token, owner, stage: 'pending', reason: 'crash window', by: 'user', forced: false,
       thread: { threadId, targetAgent: thread.targetAgent, initiatorAgent: thread.initiatorAgent,
         reviewFlow: thread.reviewFlow, receiverSessionId: '', receiverSessionCaptured: false,
-        reviewerSessionCaptured: false, artifactDir, worktree: undefined },
+        reviewerSessionCaptured: false, artifactDir, artifactRoot: path.dirname(artifactDir), worktree: undefined },
     };
     await taskStore.commitTaskCleanup(threadId, reservation.token, 'delete', {
       tombstone: { reason: 'crash window', by: 'user' }, cleanupManifest: manifest,

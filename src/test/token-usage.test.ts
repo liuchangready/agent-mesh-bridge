@@ -992,7 +992,7 @@ describe('token usage - durability', () => {
     assert.equal(fs.existsSync(path.join(dir, thread.threadId)), false, 'exhaustion is checked before maintenance artifacts');
   });
 
-  test('manual maintenance keeps detached descendants until exit and refuses success or forced cleanup', async () => {
+  test('manual maintenance keeps detached descendants protected after logical deletion', async () => {
     const { store, dir } = makeStore();
     const sessionId = '46fca4fd-b457-48f0-a876-3bb2d6920e1b';
     const thread = makeThread([{ round: 1, type: 'initial', prompt: 'maintain me', durationMs: 1, status: 'completed', timestamp: new Date().toISOString() }]);
@@ -1070,12 +1070,20 @@ describe('token usage - durability', () => {
       assert.equal(blocked.execution!.run!.unconfirmed, true);
       assert.ok(blocked.execution!.run!.subtrees?.some((tree) => tree.descendants.some((entry) => entry.pid === grandchildPid && entry.birthId === grandchildBirthId)));
       const cleanup = await store.markTaskCleanup(thread.threadId, 'delete', { pid: process.pid, birthId: await getProcessBirthIdAsync(process.pid) });
-      await assert.rejects(store.commitTaskCleanup(thread.threadId, cleanup.token, 'delete'), /execution run .* is still recorded/);
-      await assert.rejects(compactor.compactPausedTask(thread.threadId, 'developer'), /Another developer|run, handoff, cleanup|run|cleanup/i);
+      assert.equal(await store.commitTaskCleanup(thread.threadId, cleanup.token, 'delete'), true,
+        'logical deletion must commit while an unconfirmed subtree remains protected');
+      assert.equal(store.getTask(thread.threadId), undefined);
+      const tombstone = fs.readFileSync(path.join(dir, 'deleted_tasks.log'), 'utf8').trim().split(/\r?\n/).map((line) => JSON.parse(line)).at(-1);
+      assert.equal(tombstone.cleanupManifest.retainResources, true);
+      assert.ok(tombstone.cleanupManifest.execution.run.subtrees.some((tree: any) => tree.descendants.some((entry: any) => entry.pid === grandchildPid)));
+      await assert.rejects(compactor.compactPausedTask(thread.threadId, 'developer'), /unarchived paused task/i);
       assert.equal(adapterCalls, 1, 'an unconfirmed previous subtree cannot start the next maintenance step');
       assert.equal(probeProcessIdentity(grandchildPid!, grandchildBirthId), 'alive');
     } finally {
       if (root?.pid && root.exitCode === null) { try { root.kill(); } catch {} }
+      if (grandchildPid && grandchildBirthId && probeProcessIdentity(grandchildPid, grandchildBirthId) === 'alive') {
+        try { process.kill(grandchildPid); } catch {}
+      }
       const known = store.getTask(thread.threadId)?.execution?.run?.subtrees?.flatMap((tree) => [tree.root, ...tree.descendants]) || [];
       for (const identity of known) if (identity.birthId && probeProcessIdentity(identity.pid, identity.birthId) === 'alive') {
         try { process.kill(identity.pid); } catch {}
@@ -1192,30 +1200,21 @@ describe('token usage - durability', () => {
     const compacting = compactor.compactPausedTask(thread.threadId, 'developer');
     try {
       await childReady;
-      const script = `const {TaskStore}=require(${JSON.stringify(path.resolve('out/bridge/task-store.js'))});const {getProcessBirthId}=require(${JSON.stringify(path.resolve('out/bridge/platform.js'))});(async()=>{const s=new TaskStore(${JSON.stringify(dir)});const x=await s.markTaskCleanup(${JSON.stringify(thread.threadId)},'delete',{pid:process.pid,birthId:getProcessBirthId(process.pid)});let blocked=false;try{await s.commitTaskCleanup(${JSON.stringify(thread.threadId)},x.token,'delete')}catch(e){blocked=/execution run/.test(String(e&&e.message||e))}console.log(JSON.stringify({token:x.token,blocked,run:x.thread.execution.run&&x.thread.execution.run.id}));s.dispose()})().catch(e=>{console.error(e);process.exitCode=1})`;
+      const script = `const {TaskStore}=require(${JSON.stringify(path.resolve('out/bridge/task-store.js'))});const {getProcessBirthId}=require(${JSON.stringify(path.resolve('out/bridge/platform.js'))});(async()=>{const s=new TaskStore(${JSON.stringify(dir)});const x=await s.markTaskCleanup(${JSON.stringify(thread.threadId)},'delete',{pid:process.pid,birthId:getProcessBirthId(process.pid)});const committed=await s.commitTaskCleanup(${JSON.stringify(thread.threadId)},x.token,'delete');const tombstone=JSON.parse(require('fs').readFileSync(require('path').join(${JSON.stringify(dir)},'deleted_tasks.log'),'utf8').trim().split(/\\r?\\n/).at(-1));console.log(JSON.stringify({committed,deleted:!s.getTask(${JSON.stringify(thread.threadId)}),protectedRun:tombstone.cleanupManifest.execution.run&&tombstone.cleanupManifest.execution.run.id}));s.dispose()})().catch(e=>{console.error(e);process.exitCode=1})`;
       const result = spawnSync(process.execPath, ['-e', script], { cwd: process.cwd(), encoding: 'utf8', timeout: 10_000, windowsHide: true });
       assert.equal(result.status, 0, result.stderr || result.error?.message);
       const evidence = JSON.parse(result.stdout.trim());
-      assert.equal(evidence.blocked, true, 'a second control process must not physically delete while the maintenance run is recorded');
-      assert.equal(store.getTask(thread.threadId)!.execution!.run!.purpose, 'native_maintenance');
+      assert.equal(evidence.committed, true, 'a second process can logically delete without proving the native run exited');
+      assert.equal(evidence.deleted, true);
+      assert.match(evidence.protectedRun, /^[0-9a-f-]{36}$/i, 'maintenance run identity is the durable generated UUID');
       releaseChild();
       const operation = await compacting;
       assert.equal(operation.phase, 'unknown', 'cleanup reservation races the adapter result and prevents a success commit');
       const stored = store.getTask(thread.threadId);
-      if (stored?.execution?.run) {
-        assert.equal(stored.execution.run.state, 'stopping', 'an unverified captured descendant keeps the run protected after its root closes');
-        assert.equal(stored.execution.run.unconfirmed, true);
-        await assert.rejects(store.commitTaskCleanup(thread.threadId, evidence.token, 'delete'), /execution run .* is still recorded/);
-        assert.ok(store.getTask(thread.threadId), 'physical deletion is refused while subtree evidence is incomplete');
-      } else {
-        assert.deepEqual(stored?.cleanup?.runExitProof && {
-          runId: stored.cleanup.runExitProof.runId,
-          operationId: stored.cleanup.runExitProof.operationId,
-          generation: stored.cleanup.runExitProof.generation,
-        }, { runId: evidence.run, operationId: 'business-operation', generation: 3 });
-        assert.equal(await store.commitTaskCleanup(thread.threadId, evidence.token, 'delete'), true);
-        assert.equal(store.getTask(thread.threadId), undefined);
-      }
+      assert.equal(stored, undefined, 'tombstone prevents a late maintenance callback from reviving the task');
+      const tombstone = fs.readFileSync(path.join(dir, 'deleted_tasks.log'), 'utf8').trim().split(/\r?\n/).map((line) => JSON.parse(line)).at(-1);
+      assert.equal(tombstone.cleanupManifest.execution.run.id, evidence.protectedRun);
+      assert.equal(tombstone.cleanupManifest.retainResources, true);
     } finally {
       releaseChild();
       if (child?.pid && child.exitCode === null) { try { child.kill(); } catch {} }

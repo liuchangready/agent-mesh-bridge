@@ -217,6 +217,9 @@ test('local merge state, not MR metadata, controls preservation and deletion', a
       integration: { phase: 'ready', updatedAt: new Date().toISOString() }, mergePending: true,
     } });
     thread.workspace.executionPath = thread.worktree!.path;
+    fs.mkdirSync(thread.worktree!.path);
+    const output = path.join(thread.worktree!.path, 'unmerged.txt');
+    fs.writeFileSync(output, 'retained output');
     store.upsertTask(thread);
     assert.deepStrictEqual(pendingMerges(store.getAllTasks()).map((task) => task.threadId), ['thread_merge_gate']);
     store.recordMergeRequest('thread_merge_gate', {
@@ -224,8 +227,10 @@ test('local merge state, not MR metadata, controls preservation and deletion', a
       status: 'synced', summary: 'remote record only', updatedAt: new Date().toISOString(), by: 'codex',
     });
     assert.strictEqual(pendingMerges(store.getAllTasks()).length, 1, 'an MR URL cannot claim that local integration succeeded');
-  await assert.rejects(() => control.deleteTask('thread_merge_gate', 'cleanup', 'test', false), /not been integrated locally/i);
-  await control.deleteTask('thread_merge_gate', 'discard explicitly', 'test', true);
+    const deleted = await control.deleteTask('thread_merge_gate', 'cleanup', 'test', false);
+    assert.strictEqual(deleted.status, 'DELETED');
+    assert.match(deleted.message, /retained/i);
+    assert.strictEqual(fs.readFileSync(output, 'utf8'), 'retained output');
     assert.strictEqual(store.getTask('thread_merge_gate'), undefined);
   } finally {
     store.dispose();

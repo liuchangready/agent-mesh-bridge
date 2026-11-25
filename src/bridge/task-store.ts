@@ -33,7 +33,6 @@ import {
 } from './task-summary';
 import { cleanupThreadNativeSessions, collectThreadSessionRefs } from './native-session-cleanup';
 import { NativeSessionLock, NativeSessionLease } from './native-session-lock';
-import { removeTaskDataDir } from './task-data-dir';
 import { MeshFileLock } from './mesh-file-lock';
 import { WindowsTaskLock } from './windows-process-helper';
 import { probeProcessIdentity } from './platform';
@@ -50,6 +49,43 @@ export {
 };
 
 export const MAX_STORED_TASKS = 1000;
+
+function cleanupExecutionProjection(execution?: DelegationThread['execution']): DelegationThread['execution'] | undefined {
+  if (!execution) return undefined;
+  return {
+    version: execution.version, revision: execution.revision, operationId: execution.operationId,
+    phase: execution.phase, round: execution.round, purpose: execution.purpose,
+    generation: execution.generation, run: execution.run ? structuredClone(execution.run) : undefined,
+  } as DelegationThread['execution'];
+}
+
+function cleanupThreadProjection(thread: DelegationThread): Record<string, unknown> {
+  const worktree = thread.worktree;
+  return {
+    threadId: thread.threadId, targetAgent: thread.targetAgent, initiatorAgent: thread.initiatorAgent,
+    reviewFlow: thread.reviewFlow, receiverSessionId: thread.receiverSessionId,
+    receiverSessionCaptured: thread.receiverSessionCaptured, reviewerSessionId: thread.reviewerSessionId,
+    reviewerSessionCaptured: thread.reviewerSessionCaptured, nativeSessionAssignments: thread.nativeSessionAssignments,
+    retargets: (thread.retargets || []).map(({ fromAgent, toAgent, previousReceiverSessionId }) => ({ fromAgent, toAgent, previousReceiverSessionId })),
+    artifactDir: thread.artifactDir, artifactRoot: thread.artifactRoot,
+    worktree: worktree ? {
+      path: worktree.path, mainPath: worktree.mainPath, commonDir: worktree.commonDir,
+      repositoryPath: worktree.repositoryPath, targetRef: worktree.targetRef, deliveryTarget: worktree.deliveryTarget,
+      taskBranch: worktree.taskBranch, headCommit: worktree.headCommit, approvedCommit: worktree.approvedCommit,
+      approvedSnapshot: worktree.approvedSnapshot, mergeResolutionPath: worktree.mergeResolutionPath,
+      supersededMergeResolutionPaths: worktree.supersededMergeResolutionPaths, branch: worktree.branch,
+      baseCommit: worktree.baseCommit, mergePending: worktree.mergePending,
+      integration: worktree.integration ? {
+        phase: worktree.integration.phase, sourceCommit: worktree.integration.sourceCommit,
+        targetOldCommit: worktree.integration.targetOldCommit, targetCommit: worktree.integration.targetCommit,
+        targetPath: worktree.integration.targetPath, candidateCommit: worktree.integration.candidateCommit,
+        mergedCommit: worktree.integration.mergedCommit, stashRecoveryPending: worktree.integration.stashRecoveryPending,
+        stashRecoveryLockHeld: worktree.integration.stashRecoveryLockHeld,
+        stashRestore: worktree.integration.stashRestore ? { status: worktree.integration.stashRestore.status, sha: worktree.integration.stashRestore.sha } : undefined,
+      } : undefined,
+    } : undefined,
+  };
+}
 
 export type ExecutionLockFactory = (lockPath: string) => {
   acquire(onWait?: () => void, cancelled?: () => boolean, timeoutMs?: number): Promise<(() => void | Promise<void>) | undefined>;
@@ -462,6 +498,7 @@ export class TaskStore extends EventEmitter {
   /** Per-thread authoritative files: parallel writers touch different files. */
   private threadsDir: string;
   private tasks: Map<string, DelegationThread> = new Map();
+  private readonly cleanupCommitWarnings = new Map<string, string[]>();
   /** mtime per thread file, so a sync only re-parses what actually changed. */
   private knownMtimes: Map<string, number> = new Map();
   private isWatching: boolean = false;
@@ -605,6 +642,9 @@ export class TaskStore extends EventEmitter {
   /** Atomic single-thread write: `rename` is the only step readers can observe. */
   private persistThread(thread: DelegationThread): void {
     if (!thread || !thread.threadId) return;
+    if (this.isTaskTombstoned(thread.threadId)) {
+      throw new Error(`Cannot persist task ${thread.threadId}: a durable deletion tombstone already exists.`);
+    }
     this.ensureThreadsDir();
     const file = this.threadFilePath(thread.threadId);
     const temp = `${file}.tmp.${process.pid}.${Date.now()}`;
@@ -893,6 +933,10 @@ export class TaskStore extends EventEmitter {
     runExitProof?: { runId: string; operationId: string; generation: number },
   ): Promise<DelegationThread> {
     return this.withExecutionLock(threadId, async () => {
+      if (this.isTaskTombstoned(threadId)) {
+        this.tasks.delete(threadId);
+        throw new Error(`Cannot transition execution for ${threadId}: task has a durable deletion tombstone.`);
+      }
       this.ensureUpToDate();
       let thread = this.tasks.get(threadId);
       const file = this.threadFilePath(threadId);
@@ -960,6 +1004,7 @@ export class TaskStore extends EventEmitter {
     options?: {
       token?: string;
       force?: boolean;
+      allowExisting?: boolean;
     },
   ): Promise<{ token: string; thread: DelegationThread }> {
     return this.withExecutionLock(threadId, async () => {
@@ -980,6 +1025,9 @@ export class TaskStore extends EventEmitter {
         throw new Error(`Task ${threadId} has already been deleted and cannot be cleaned up`);
       }
       if (thread.cleanup) {
+        if (action === 'delete' && thread.cleanup.action === 'delete' && thread.cleanup.stage === 'in_progress') {
+          return { token: thread.cleanup.token, thread };
+        }
         const sameOwner = !!owner.birthId && !!thread.cleanup.owner.birthId &&
           thread.cleanup.action === action && thread.cleanup.owner.pid === owner.pid &&
           thread.cleanup.owner.birthId === owner.birthId;
@@ -987,10 +1035,15 @@ export class TaskStore extends EventEmitter {
             (!options?.token || options.token === thread.cleanup.token)) {
           return { token: thread.cleanup.token, thread };
         }
-        throw new Error(
-          `Task ${threadId} is already reserved for cleanup (${thread.cleanup.action}) by token ${thread.cleanup.token}`,
-        );
+        if (!(action === 'delete' && options?.allowExisting)) {
+          throw new Error(
+            `Task ${threadId} is already reserved for cleanup (${thread.cleanup.action}) by token ${thread.cleanup.token}`,
+          );
+        }
       }
+      const previousCleanup = thread.cleanup && thread.cleanup.action !== action
+        ? structuredClone(thread.cleanup) as unknown as Record<string, unknown>
+        : thread.cleanup?.previousCleanup;
       if (action === 'archive' && !canArchiveTask(thread)) {
         throw new Error(`Task ${threadId} cannot be archived in its current status: ${thread.status}`);
       }
@@ -1007,6 +1060,7 @@ export class TaskStore extends EventEmitter {
         operationId: thread.execution?.operationId,
         generation: thread.execution?.generation,
         runId: thread.execution?.run?.id,
+        ...(previousCleanup ? { previousCleanup } : {}),
       };
       if (thread.execution) {
         thread.execution.revision += 1;
@@ -1145,6 +1199,7 @@ export class TaskStore extends EventEmitter {
 
     if (action === 'delete') {
       return this.withExecutionLock(threadId, async () => {
+        const postTombstoneWarnings: string[] = [];
         this.ensureUpToDate();
         let current = this.tasks.get(threadId);
         if (fs.existsSync(file)) {
@@ -1154,21 +1209,18 @@ export class TaskStore extends EventEmitter {
             throw new Error(`Corrupted task file on disk for ${threadId}: ${(err as Error)?.message || err}`);
           }
         }
-        if (!current) return true;
+        if (!current) {
+          if (this.isTaskTombstoned(threadId)) return true;
+          throw new Error(`Cannot commit deletion for ${threadId}: task is missing and no durable tombstone exists.`);
+        }
         if (current.cleanup?.token !== token || current.cleanup?.action !== action) {
           throw new Error(
             `Cannot commit cleanup for ${threadId}: cleanup token mismatch (expected ${token}, found ${current.cleanup?.token ?? 'none'})`,
           );
         }
-        if (current.execution?.run) {
-          throw new Error(`Cannot commit deletion for ${threadId}: execution run ${current.execution.run.id} is still recorded.`);
-        }
-        if (current.cleanup.runId && (!current.cleanup.runExitProof ||
-            current.cleanup.runExitProof.runId !== current.cleanup.runId ||
-            current.cleanup.runExitProof.operationId !== current.cleanup.operationId ||
-            current.cleanup.runExitProof.generation !== current.cleanup.generation)) {
-          throw new Error(`Cannot commit deletion for ${threadId}: cleanup run exit proof is missing or mismatched.`);
-        }
+        // Logical deletion is the durable tombstone commit. A live or unknown
+        // run remains represented in the tombstone manifest and protects its
+        // resources; it must not keep the task visible in the active ledger.
         const record = {
           threadId: current.threadId,
           title: current.title,
@@ -1181,21 +1233,46 @@ export class TaskStore extends EventEmitter {
           at: new Date().toISOString(),
           cleanupToken: token,
           nativeSessions: options?.tombstone?.nativeSessions,
-          cleanupManifest: options?.cleanupManifest,
+          cleanupManifest: options?.cleanupManifest || {
+            token, stage: 'pending', reason: options?.tombstone?.reason || 'deleted',
+            by: options?.tombstone?.by || 'system', retainResources: !!current.execution?.run,
+            execution: cleanupExecutionProjection(current.execution),
+            thread: cleanupThreadProjection(current),
+          },
+        };
+        record.cleanupManifest = {
+          ...(record.cleanupManifest || {}),
+          token,
+          execution: cleanupExecutionProjection(current.execution) || record.cleanupManifest?.execution,
+          retainResources: !!current.execution?.run || record.cleanupManifest?.retainResources === true,
         };
         this.appendTombstone(record);
         this.tasks.delete(threadId);
         const taskFile = this.threadFilePath(threadId);
         if (fs.existsSync(taskFile)) {
-          fs.unlinkSync(taskFile);
+          try { fs.unlinkSync(taskFile); }
+          catch (error) { postTombstoneWarnings.push(`Task file unlink failed: ${(error as Error).message}`); }
         }
         this.knownMtimes.delete(path.basename(taskFile));
-        this.writeAggregate();
-        this.emit('changed', Array.from(this.tasks.values()), [threadId]);
+        try { this.writeAggregate(); }
+        catch (error) { postTombstoneWarnings.push(`Aggregate update failed: ${(error as Error).message}`); }
+        if (postTombstoneWarnings.length) {
+          this.cleanupCommitWarnings.set(token, postTombstoneWarnings);
+          for (const warning of postTombstoneWarnings) console.warn(`[TaskStore] ${threadId} deletion committed with residue: ${warning}`);
+        }
+        try { this.emit('changed', Array.from(this.tasks.values()), [threadId]); }
+        catch (error) {
+          postTombstoneWarnings.push(`Task notification failed: ${(error as Error).message}`);
+          this.cleanupCommitWarnings.set(token, postTombstoneWarnings);
+        }
         return true;
       });
     }
     return false;
+  }
+
+  public getCleanupCommitWarnings(token: string): string[] {
+    return [...(this.cleanupCommitWarnings.get(token) || [])];
   }
 
   /** Clear a run that never reached spawn when cleanup won admission immediately after start CAS. */
@@ -1335,6 +1412,16 @@ export class TaskStore extends EventEmitter {
       const manifest = latest?.cleanupManifest;
       const currentOwner = manifest?.owner as ProcessIdentity | undefined;
       if (!latest || manifest?.stage !== 'running' || currentOwner?.pid !== owner.pid || currentOwner.birthId !== owner.birthId) return false;
+      if (complete) {
+        const taskFile = this.threadFilePath(threadId);
+        if (fs.existsSync(taskFile)) {
+          try { fs.unlinkSync(taskFile); }
+          catch (error) {
+            console.warn(`[TaskStore] Tombstoned task file unlink remains pending for ${threadId}: ${(error as Error).message}`);
+            return false;
+          }
+        }
+      }
       const durableNativeSessions = nativeSessions && typeof nativeSessions === 'object' && 'entries' in nativeSessions
         ? {
             removedFiles: Number((nativeSessions as any).removedCount) || 0,
@@ -1349,7 +1436,40 @@ export class TaskStore extends EventEmitter {
         : nativeSessions;
       this.appendTombstone({ ...latest, at: new Date().toISOString(), cleanupComplete: complete,
         nativeSessions: durableNativeSessions ?? latest.nativeSessions,
-        cleanupManifest: { ...manifest, stage: complete ? 'complete' : 'pending' } });
+        cleanupManifest: { ...manifest, stage: complete ? 'complete' : 'pending', retainResources: complete ? false : true } });
+      return true;
+    });
+  }
+
+  public async recordTombstoneRunExitProof(
+    threadId: string,
+    token: string,
+    proof: { runId: string; operationId: string; generation: number; confirmedAt: string },
+  ): Promise<boolean> {
+    return this.withExecutionLock(threadId, async () => {
+      const latest = this.readCleanupTombstone(threadId, token);
+      const manifest = latest?.cleanupManifest;
+      const run = manifest?.execution?.run;
+      if (!latest || !manifest || run?.id !== proof.runId ||
+          manifest.execution?.operationId !== proof.operationId || manifest.execution?.generation !== proof.generation) return false;
+      this.appendTombstone({ ...latest, at: new Date().toISOString(), cleanupManifest: {
+        ...manifest, runExitProof: proof, retainResources: false,
+      } });
+      return true;
+    });
+  }
+
+  public async updateTombstoneCleanupManifest(
+    threadId: string,
+    token: string,
+    patch: Record<string, unknown>,
+  ): Promise<boolean> {
+    return this.withExecutionLock(threadId, async () => {
+      const latest = this.readCleanupTombstone(threadId, token);
+      if (!latest?.cleanupManifest || latest.cleanupManifest.stage === 'complete') return false;
+      this.appendTombstone({ ...latest, at: new Date().toISOString(), cleanupManifest: {
+        ...latest.cleanupManifest, ...patch,
+      } });
       return true;
     });
   }
@@ -1691,6 +1811,7 @@ export class TaskStore extends EventEmitter {
     expected?: any,
     identity?: any,
   ): any {
+    if (this.isTaskTombstoned(threadId)) return undefined;
     this.ensureUpToDate();
     let thread = this.tasks.get(threadId);
     const file = this.threadFilePath(threadId);
@@ -2138,6 +2259,10 @@ export class TaskStore extends EventEmitter {
     }
 
     return this.withExecutionLock(threadId, async () => {
+      if (this.isTaskTombstoned(threadId)) {
+        this.tasks.delete(threadId);
+        return undefined;
+      }
       this.ensureUpToDate();
       let thread = this.tasks.get(threadId);
       const file = this.threadFilePath(threadId);
@@ -2482,8 +2607,8 @@ export class TaskStore extends EventEmitter {
    *
    * @returns true when an entry existed and was removed.
    */
-  public deleteTask(threadId: string, cleanupToken?: string): boolean;
-  public deleteTask(threadId: string, cleanupToken?: string): any {
+  public deleteTask(threadId: string, cleanupToken?: string, options?: { preserveAssets?: boolean }): boolean;
+  public deleteTask(threadId: string, cleanupToken?: string, options?: { preserveAssets?: boolean }): any {
     const tombstonePath = path.join(this.storageDir, 'deleted_tasks.log');
     if (fs.existsSync(tombstonePath) && fs.statSync(tombstonePath).isDirectory()) {
       throw new Error(`EISDIR: illegal operation on a directory, open '${tombstonePath}'`);
@@ -2531,21 +2656,51 @@ export class TaskStore extends EventEmitter {
             by: 'system',
             at: new Date().toISOString(),
             cleanupToken: cleanupToken || current?.cleanup?.token,
+            cleanupManifest: current ? {
+              token: cleanupToken || current.cleanup?.token,
+              stage: 'pending', retainResources: true, execution: current.execution ? {
+                version: current.execution.version, revision: current.execution.revision,
+                operationId: current.execution.operationId, phase: current.execution.phase,
+                round: current.execution.round, purpose: current.execution.purpose,
+                generation: current.execution.generation,
+                run: current.execution.run,
+              } : undefined,
+              thread: {
+                threadId: current.threadId, targetAgent: current.targetAgent,
+                initiatorAgent: current.initiatorAgent, reviewFlow: current.reviewFlow,
+                receiverSessionId: current.receiverSessionId, receiverSessionCaptured: current.receiverSessionCaptured,
+                reviewerSessionId: current.reviewerSessionId, reviewerSessionCaptured: current.reviewerSessionCaptured,
+                nativeSessionAssignments: current.nativeSessionAssignments, artifactDir: current.artifactDir,
+                artifactRoot: current.artifactRoot,
+                retargets: (current.retargets || []).map(({ fromAgent, toAgent, previousReceiverSessionId }) => ({ fromAgent, toAgent, previousReceiverSessionId })),
+                worktree: current.worktree ? {
+                  path: current.worktree.path, mainPath: current.worktree.mainPath, commonDir: current.worktree.commonDir,
+                  repositoryPath: current.worktree.repositoryPath, targetRef: current.worktree.targetRef,
+                  deliveryTarget: current.worktree.deliveryTarget, taskBranch: current.worktree.taskBranch,
+                  headCommit: current.worktree.headCommit, approvedCommit: current.worktree.approvedCommit,
+                  approvedSnapshot: current.worktree.approvedSnapshot, mergeResolutionPath: current.worktree.mergeResolutionPath,
+                  supersededMergeResolutionPaths: current.worktree.supersededMergeResolutionPaths,
+                  branch: current.worktree.branch, baseCommit: current.worktree.baseCommit, mergePending: current.worktree.mergePending,
+                  integration: current.worktree.integration ? {
+                    phase: current.worktree.integration.phase, sourceCommit: current.worktree.integration.sourceCommit,
+                    targetOldCommit: current.worktree.integration.targetOldCommit, targetCommit: current.worktree.integration.targetCommit,
+                    targetPath: current.worktree.integration.targetPath, candidateCommit: current.worktree.integration.candidateCommit,
+                    mergedCommit: current.worktree.integration.mergedCommit, stashRecoveryPending: current.worktree.integration.stashRecoveryPending,
+                    stashRecoveryLockHeld: current.worktree.integration.stashRecoveryLockHeld,
+                    stashRestore: current.worktree.integration.stashRestore ? { status: current.worktree.integration.stashRestore.status, sha: current.worktree.integration.stashRestore.sha } : undefined,
+                  } : undefined,
+                } : undefined,
+              },
+            } : undefined,
           });
           this.tasks.delete(threadId);
           if (fs.existsSync(file)) {
-            fs.unlinkSync(file);
+            try { fs.unlinkSync(file); } catch (error) { console.warn(`[TaskStore] Tombstoned task file could not be unlinked for ${threadId}: ${(error as Error).message}`); }
           }
-          removeTaskArtifacts(threadId, this.storageDir, {
-            keepArchive: false,
-            targetAgent: current?.targetAgent,
-            initiatorAgent: current?.initiatorAgent,
-            artifactDir: current?.artifactDir,
-          });
-          if (current?.artifactDir) removeTaskDataDir(current.artifactDir, false);
           this.knownMtimes.delete(path.basename(file));
-          this.writeAggregate();
-          this.emit('changed', Array.from(this.tasks.values()), [threadId]);
+          try { this.writeAggregate(); } catch (error) { console.warn(`[TaskStore] Tombstoned task aggregate update failed for ${threadId}: ${(error as Error).message}`); }
+          try { this.emit('changed', Array.from(this.tasks.values()), [threadId]); }
+          catch (error) { console.warn(`[TaskStore] Tombstoned task notification failed for ${threadId}: ${(error as Error).message}`); }
         }
         return existed;
       });
@@ -2554,31 +2709,35 @@ export class TaskStore extends EventEmitter {
     const existed = Boolean(this.tasks.has(threadId) || fs.existsSync(file));
     if (existed) {
       // Must append durable tombstone before unlinking; throws on failure
-      this.appendTombstone({
-        threadId,
-        title: thread?.title,
-        initiatorAgent: thread?.initiatorAgent,
-        targetAgent: thread?.targetAgent,
-        statusAtDeletion: thread?.status,
-        reason: 'Direct task store deletion',
-        by: 'system',
-        at: new Date().toISOString(),
-        cleanupToken: cleanupToken || thread?.cleanup?.token,
-      });
+      if (!this.isTaskTombstoned(threadId)) {
+        this.appendTombstone({
+          threadId,
+          title: thread?.title,
+          initiatorAgent: thread?.initiatorAgent,
+          targetAgent: thread?.targetAgent,
+          statusAtDeletion: thread?.status,
+          reason: 'Direct task store deletion',
+          by: 'system',
+          at: new Date().toISOString(),
+          cleanupToken: cleanupToken || thread?.cleanup?.token,
+        });
+      }
       this.tasks.delete(threadId);
       if (fs.existsSync(file)) {
-        fs.unlinkSync(file);
+        try { fs.unlinkSync(file); } catch (error) { console.warn(`[TaskStore] Tombstoned task file could not be unlinked for ${threadId}: ${(error as Error).message}`); }
       }
-      removeTaskArtifacts(threadId, this.storageDir, {
-        keepArchive: false,
-        targetAgent: thread?.targetAgent,
-        initiatorAgent: thread?.initiatorAgent,
-        artifactDir: thread?.artifactDir,
-      });
-      if (thread?.artifactDir) removeTaskDataDir(thread.artifactDir, false);
       this.knownMtimes.delete(path.basename(file));
-      this.writeAggregate();
-      this.emit('changed', Array.from(this.tasks.values()), [threadId]);
+      if (!options?.preserveAssets) {
+        try {
+          removeTaskArtifacts(threadId, this.storageDir, {
+            keepArchive: false, targetAgent: thread?.targetAgent,
+            initiatorAgent: thread?.initiatorAgent, artifactDir: thread?.artifactDir,
+          });
+        } catch (error) { console.warn(`[TaskStore] Bridge artifact cleanup deferred for ${threadId}: ${(error as Error).message}`); }
+      }
+      try { this.writeAggregate(); } catch (error) { console.warn(`[TaskStore] Tombstoned task aggregate update failed for ${threadId}: ${(error as Error).message}`); }
+      try { this.emit('changed', Array.from(this.tasks.values()), [threadId]); }
+      catch (error) { console.warn(`[TaskStore] Tombstoned task notification failed for ${threadId}: ${(error as Error).message}`); }
     }
     return existed;
   }

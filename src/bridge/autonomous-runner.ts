@@ -473,13 +473,19 @@ export class AutonomousRunner {
     action: CancellationAction,
     reason: string,
     by: string = 'user',
+    runIdentity?: CancellationRequest['runIdentity'],
   ): boolean {
     this.localCancellations.set(threadId, {
       action,
       reason: reason || 'No reason provided',
       at: new Date().toISOString(),
       by,
+      runIdentity,
     });
+    if (runIdentity && !this.cancellationMatchesCurrentRun(threadId, this.localCancellations.get(threadId)!)) {
+      this.localCancellations.delete(threadId);
+      return false;
+    }
     const child = this.activeChildren.get(threadId);
     if (child) {
       try {
@@ -504,10 +510,16 @@ export class AutonomousRunner {
     if (!taskThreadId) return undefined;
 
     const local = this.localCancellations.get(taskThreadId);
-    if (local) return local;
+    if (local) {
+      if (this.cancellationMatchesCurrentRun(taskThreadId, local)) return local;
+      this.localCancellations.delete(taskThreadId);
+    }
 
     const external = this.cancellationRegistry.peek(taskThreadId);
-    if (external) return external;
+    if (external) {
+      if (this.cancellationMatchesCurrentRun(taskThreadId, external)) return external;
+      this.cancellationRegistry.clear(taskThreadId);
+    }
 
     if (this.taskStore) {
       const stored = this.taskStore.getTask(taskThreadId);
@@ -553,7 +565,18 @@ export class AutonomousRunner {
     const local = this.localCancellations.get(taskThreadId);
     const external = this.cancellationRegistry.consume(taskThreadId);
     this.clearPendingCancellation(taskThreadId);
-    return local || external;
+    return (local && this.cancellationMatchesCurrentRun(taskThreadId, local) ? local : undefined) ||
+      (external && this.cancellationMatchesCurrentRun(taskThreadId, external) ? external : undefined);
+  }
+
+  private cancellationMatchesCurrentRun(taskThreadId: string, request: CancellationRequest): boolean {
+    const identity = request.runIdentity;
+    if (!identity) return true;
+    const task = this.taskStore?.reloadTask(taskThreadId);
+    if (!task) return request.action === 'delete' && !!this.taskStore?.isTaskTombstoned(taskThreadId);
+    const execution = task.execution;
+    return execution?.operationId === identity.operationId && execution.generation === identity.generation &&
+      execution.run?.id === identity.runId;
   }
 
   /**
@@ -1717,7 +1740,8 @@ export class AutonomousRunner {
         // A pause may land in the tiny window between the child exiting and
         // this handler running; consume once more so it still wins.
         const lateExternal = this.cancellationRegistry.consume(taskThreadId);
-        const cancellation = local || externalCancellation || lateExternal;
+        const cancellation = (local && this.cancellationMatchesCurrentRun(taskThreadId, local) ? local : undefined) ||
+          externalCancellation || (lateExternal && this.cancellationMatchesCurrentRun(taskThreadId, lateExternal) ? lateExternal : undefined);
         this.localCancellations.delete(taskThreadId);
         this.activeChildren.delete(taskThreadId);
         this.cancellationRegistry.clear(taskThreadId);
@@ -1732,7 +1756,8 @@ export class AutonomousRunner {
         this.activeChildren.set(taskThreadId, child);
 
         // A pause/delete may have landed between dispatch and spawn.
-        const pending = this.cancellationRegistry.consume(taskThreadId);
+        const consumed = this.cancellationRegistry.consume(taskThreadId);
+        const pending = consumed && this.cancellationMatchesCurrentRun(taskThreadId, consumed) ? consumed : undefined;
         const local = this.localCancellations.get(taskThreadId);
         if (pending || local) {
           externalCancellation = pending || local;
@@ -1744,7 +1769,9 @@ export class AutonomousRunner {
         cancellationPoll = setInterval(() => {
           if (isSettled || !taskThreadId) return;
           const currentLocal = this.localCancellations.get(taskThreadId);
-          const request = currentLocal || this.cancellationRegistry.consume(taskThreadId);
+          const consumed = this.cancellationRegistry.consume(taskThreadId);
+          const request = (currentLocal && this.cancellationMatchesCurrentRun(taskThreadId, currentLocal) ? currentLocal : undefined) ||
+            (consumed && this.cancellationMatchesCurrentRun(taskThreadId, consumed) ? consumed : undefined);
           if (request) {
             externalCancellation = request;
             console.warn(

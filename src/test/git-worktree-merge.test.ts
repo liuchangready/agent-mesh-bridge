@@ -271,7 +271,8 @@ test('deleting an unmerged snapshot unregisters its retained resolution worktree
   assert.equal((await controller.mergeApproved(item.threadId)).status, 'conflict');
   const resolution = store.getTask(item.threadId)!.worktree!.mergeResolutionPath!;
   const control = new TaskControlService(store, undefined, undefined, storage, undefined, new MeshFileLock(path.join(root, 'merge.lock')));
-  await control.deleteTask(item.threadId, 'discard candidate', 'test', true);
+  const deleted = await control.deleteTask(item.threadId, 'discard candidate', 'test', true);
+  assert.equal(deleted.status, 'DELETED');
   assert.equal(fs.existsSync(resolution), false);
   assert.equal(git(repository, 'worktree', 'list', '--porcelain').replace(/\\/g, '/').includes(resolution.replace(/\\/g, '/')), false);
 });
@@ -611,10 +612,14 @@ test('delete protects running dirty output, force waits and cleans, and clean me
   const running = createTaskWorktree(target, 'thread_delete_running_dirty', storage);
   fs.writeFileSync(path.join(running.path, 'shared.txt'), 'dirty running output\n');
   store.upsertTask({ ...thread('thread_delete_running_dirty', running), status: 'running' });
-  await assert.rejects(() => control.deleteTask('thread_delete_running_dirty', 'delete', 'test', false), /not been integrated locally/i);
-  assert.ok(fs.existsSync(running.path));
-  await control.deleteTask('thread_delete_running_dirty', 'force discard', 'test', true);
-  assert.equal(fs.existsSync(running.path), false);
+  const retained = await control.deleteTask('thread_delete_running_dirty', 'delete', 'test', false);
+  assert.equal(retained.status, 'DELETED');
+  assert.match(retained.message, /retained/i);
+  assert.equal(store.getTask('thread_delete_running_dirty'), undefined);
+  assert.equal(fs.readFileSync(path.join(running.path, 'shared.txt'), 'utf8'), 'dirty running output\n');
+  const forced = await control.deleteTask('thread_delete_running_dirty', 'force discard', 'test', true);
+  assert.equal(forced.status, 'DELETED');
+  assert.equal(fs.existsSync(running.path), false, forced.message);
 
   const merged = createTaskWorktree(target, 'thread_delete_merged_clean', storage);
   fs.writeFileSync(path.join(merged.path, 'shared.txt'), 'integrated output\n');
@@ -625,7 +630,10 @@ test('delete protects running dirty output, force waits and cleans, and clean me
   store.upsertTask({ ...thread('thread_delete_merged_clean', merged), status: 'completed', worktree: { ...merged, integration: { phase: 'merged', mergedCommit: merged.headCommit, updatedAt: new Date().toISOString() }, mergePending: false } });
   const dirtyAfterMerge = path.join(merged.path, 'shared.txt');
   fs.writeFileSync(dirtyAfterMerge, 'new unmerged change\n');
-  await assert.rejects(() => control.deleteTask('thread_delete_merged_clean', 'delete', 'test', false), /not been integrated locally/i);
+  const dirty = await control.deleteTask('thread_delete_merged_clean', 'delete', 'test', false);
+  assert.equal(dirty.status, 'DELETED');
+  assert.match(dirty.message, /retained/i);
+  assert.equal(fs.readFileSync(dirtyAfterMerge, 'utf8'), 'new unmerged change\n');
   gitOutput(merged.path, ['checkout', '--', 'shared.txt']);
   const result = await control.deleteTask('thread_delete_merged_clean', 'delete merged', 'test', false);
   assert.equal(result.status, 'DELETED');

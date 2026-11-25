@@ -720,18 +720,13 @@ export function activate(context: vscode.ExtensionContext) {
     const title = thread ? thread.title : threadId;
     const worktree = thread?.worktree;
     const mergeGate = !!thread && isMergePending(thread);
-    const running = !!thread && (thread.status === 'running' || thread.status === 'merging');
+    const running = !!thread && (thread.status === 'running' || thread.status === 'merging' ||
+      !!thread.execution?.run || !!thread.execution?.next || !!thread.execution?.queue);
 
     const details = [
       force ? `确定要【强制删除】任务【${title}】吗？` : `确定要永久删除任务【${title}】吗？`,
-      ...(running ? ['该任务正在运行：会先终止 Agent 进程。'] : []),
-      ...(mergeGate
-        ? [
-            `⚠️ worktree ${worktree!.path} 尚未合并回 ${worktree!.mainPath}` +
-              `${worktree!.branch ? `（分支 ${worktree!.branch}）` : ''}：` +
-              '删除会把只存在于该 worktree 的改动永久丢弃。',
-          ]
-        : []),
+      ...(running ? ['该任务仍有运行记录：会尝试停止 Agent；若退出无法确认，资源会保留并显示告警。'] : []),
+      ...(mergeGate ? ["Unmerged or uncertain worktree output will be retained by normal deletion; use Force Delete only to authorize discarding it."] : []),
       '接收方原生对话（Claude Code / Codex / Antigravity / DeepSeek Harness）会一并尽力清理；删除后不可恢复。',
     ];
     const confirmLabel = force ? '强制删除' : '删除';
@@ -742,19 +737,6 @@ export function activate(context: vscode.ExtensionContext) {
       '取消',
     );
     if (confirm !== confirmLabel) return;
-
-    if (!force && mergeGate) {
-      // Local integration, not a remote MR URL, protects this output.
-      const escalate = await vscode.window.showWarningMessage(
-        `任务【${title}】有未合并的 worktree 输出。推荐先 record_merge_request 再删除；` +
-          '若确认放弃这些改动，可以强制删除。',
-        { modal: true },
-        '强制删除',
-        '取消',
-      );
-      if (escalate !== '强制删除') return;
-      return deleteTaskCommand(threadId, true);
-    }
 
     const reason = await vscode.window.showInputBox({
       prompt: `请输入删除【${title}】的原因（会写入删除墓碑日志）:`,

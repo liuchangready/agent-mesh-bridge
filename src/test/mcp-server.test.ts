@@ -1166,13 +1166,23 @@ describe('MCPServer Protocol Tests', () => {
       currentRound: 1, createdAt: now, updatedAt: now, receiverSessionId: 'session-abcdef12', callerSessionId: 'reviewer-session',
       workspace: testWorkspace(tempDir), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 }, rounds: [],
       mergeControl: { revision: 1, retryGeneration: 0, consecutiveRetries: 6, failureFingerprint: 'failure' } });
-    for (const name of ['approve_task', 'request_rework', 'retry_task', 'retarget_task', 'pause_task']) {
-      await assert.rejects(() => mcpServer.handleToolCall(name, { threadId }), /only permits retry_merge or delete_task/);
+      for (const name of ['approve_task', 'request_rework', 'retry_task', 'retarget_task']) {
+        await assert.rejects(() => mcpServer.handleToolCall(name, { threadId }), /only permits retry_merge, pause_task, or delete_task/);
     }
     const result = await mcpServer.handleToolCall('retry_merge', { threadId });
     assert.equal(result.status, 'reviewing');
     assert.equal(taskStore.getTask(threadId)!.receiverSessionId, 'session-abcdef12');
     assert.equal(taskStore.getTask(threadId)!.mergeControl!.retryGeneration, 1);
+      taskStore.upsertTask({ ...taskStore.getTask(threadId)!, status: 'failed', failure: { stage: 'merge', reason: 'conflict', at: now }, execution: {
+        version: 2, revision: 1, operationId: 'merge-failed-live-op', phase: 'merge', round: 1,
+        generation: 1, attempt: 1, autoRetriesUsed: 0,
+        run: { id: 'merge-failed-live-run', owner: { pid: process.pid }, state: 'active', step: 'executing', startedAt: now, spawnIntentAt: now },
+        budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 },
+      } });
+      const paused = await mcpServer.handleToolCall('pause_task', { threadId, reason: 'pause failed merge run' });
+      assert.equal(paused.status, 'STOPPING');
+      assert.equal(taskStore.reloadTask(threadId)?.status, 'paused');
+      assert.equal(taskStore.reloadTask(threadId)?.execution?.run?.state, 'stopping');
   });
 
   test('get_task_token_usage reports task rollup and single-round detail', async () => {

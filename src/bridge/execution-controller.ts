@@ -280,6 +280,28 @@ export class ExecutionController {
     return 'exited';
   }
 
+  /** Stop a run after logical deletion without writing back to its task ledger row. */
+  public async stopDeletedRun(threadId: string, run: ExecutionRun): Promise<boolean> {
+    const active = this.activeExecutions.get(threadId);
+    if (!active) return false;
+    active.abort();
+    if (!active.settled) return false;
+    let timer: NodeJS.Timeout | undefined;
+    const settled = await Promise.race([
+      active.settled.then(() => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), PROCESS_STOP_TIMEOUT_MS); timer.unref?.(); }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (!settled || run.unconfirmed) return false;
+    const evidence = this.inspectRunProcesses(run);
+    const helperReleased = !run.mergeLockHelper || this.mergeLock.confirmHelperExit({
+      pid: run.mergeLockHelper.pid, birthId: run.mergeLockHelper.birthId, channelPath: run.mergeLockHelper.channelPath,
+    });
+    const noSpawn = !run.child?.pid && !run.spawnIntentAt && run.step === 'starting';
+    return helperReleased && (noSpawn || (Boolean(run.child?.pid && run.child.birthId) &&
+      evidence.childStatus === 'exited' && evidence.subtreeStatus === 'exited'));
+  }
+
   private async transitionTask(
     threadId: string,
     change: (thread: DelegationThread) => void,
@@ -2743,12 +2765,16 @@ export class ExecutionController {
     reason = 'Paused by user',
     by = 'user',
     cleanupToken?: string,
+    expected?: { generation: number; operationId: string },
   ): Promise<DelegationThread> {
     this.taskStore.ensureUpToDate();
     const thread = this.taskStore.getTask(threadId);
     if (!thread) throw new Error(`Task thread not found: ${threadId}`);
 
     if (thread.execution?.version === 2) {
+      if (expected && (thread.execution.generation !== expected.generation || thread.execution.operationId !== expected.operationId)) {
+        throw new Error(`Cannot pause task ${threadId}: execution generation or operation changed.`);
+      }
       const helperExitConfirmed = (run?: ExecutionRun): boolean => !run?.mergeLockHelper || this.mergeLock.confirmHelperExit({
         pid: run.mergeLockHelper.pid,
         birthId: run.mergeLockHelper.birthId,
@@ -2756,25 +2782,28 @@ export class ExecutionController {
       });
       const captured = thread.execution;
       const capturedRun = captured.run ? structuredClone(captured.run) : undefined;
+      const cleanupMatches = (task: DelegationThread) => !task.cleanup || Boolean(
+        cleanupToken && task.cleanup.token === cleanupToken && task.cleanup.action === 'delete' &&
+        task.cleanup.operationId === captured.operationId && task.cleanup.generation === captured.generation &&
+        (!capturedRun || task.cleanup.runId === capturedRun.id),
+      );
       if (!capturedRun) {
         return this.transitionTask(threadId, (task) => {
           const execution = task.execution;
           if (execution?.version !== 2 || execution.generation !== captured.generation ||
-              execution.operationId !== captured.operationId || execution.run || task.cleanup) {
+              execution.operationId !== captured.operationId || execution.run || !cleanupMatches(task)) {
             throw new Error(`Cannot pause task ${threadId}: execution changed or cleanup is active.`);
           }
           appendInterruption(task, { kind: 'paused', reason, at: new Date().toISOString(), by });
           task.status = 'paused';
           execution.queue = undefined;
+          execution.next = undefined;
+          const round = findInFlightRound(task);
+          if (round) { round.status = 'paused'; round.interruption = task.interruption; }
         });
       }
 
       const capturedNext = captured.next ? structuredClone(captured.next) : undefined;
-      const cleanupMatches = (task: DelegationThread) => !task.cleanup || Boolean(
-        cleanupToken && task.cleanup.token === cleanupToken && task.cleanup.action === 'delete' &&
-        task.cleanup.runId === capturedRun.id && task.cleanup.operationId === captured.operationId &&
-        task.cleanup.generation === captured.generation,
-      );
       const marked = await this.transitionTask(threadId, (task) => {
         const execution = task.execution;
         if (execution?.version !== 2 || execution.generation !== captured.generation ||
@@ -2784,6 +2813,11 @@ export class ExecutionController {
         }
         execution.run.state = 'stopping';
         appendInterruption(task, { kind: 'paused', reason, at: new Date().toISOString(), by });
+        execution.next = undefined;
+        execution.queue = undefined;
+        task.status = 'paused';
+        const round = findInFlightRound(task);
+        if (round) { round.status = 'paused'; round.interruption = task.interruption; }
       }, cleanupToken);
 
       const active = this.activeExecutions.get(threadId);
@@ -2816,7 +2850,7 @@ export class ExecutionController {
             if (execution?.version !== 2 || execution.generation !== captured.generation ||
                 execution.operationId !== captured.operationId || current?.id !== capturedRun.id ||
                 current.state !== 'stopping' || current.unconfirmed || !cleanupMatches(task) ||
-                JSON.stringify(execution.next) !== JSON.stringify(capturedNext) ||
+                execution.next ||
                 !helperReleased || !helperExitConfirmed(current)) {
               throw new Error(`Cannot settle pause for ${threadId}: run or resource proof changed.`);
             }
@@ -2867,7 +2901,7 @@ export class ExecutionController {
             if (execution?.version !== 2 || execution.generation !== captured.generation ||
                 execution.operationId !== captured.operationId || current?.id !== capturedRun.id ||
                 current.state !== 'stopping' || current.unconfirmed || !cleanupMatches(task) ||
-                JSON.stringify(execution.next) !== JSON.stringify(capturedNext) || !helperExitConfirmed(current)) {
+                execution.next || !helperExitConfirmed(current)) {
               throw new Error(`Cannot settle pause for ${threadId}: run or resource proof changed.`);
             }
             const fresh = this.inspectRunProcesses(current);

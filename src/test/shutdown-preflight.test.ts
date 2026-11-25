@@ -105,6 +105,34 @@ test('shutdown preflight identifies wait decision, pending wake, live terminal s
   assert.ok(report.blockers.some((item) => item.code === 'RUN_RECORD_REMAINS' && item.threadId === 'live'));
 });
 
+test('shutdown preflight consumes tombstones and blocks unknown deleted spawn/run evidence', () => {
+  const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-shutdown-tombstone-'));
+  try {
+    const threadId = 'deleted_unknown_spawn';
+    const threadsDir = path.join(storage, 'threads');
+    fs.mkdirSync(threadsDir, { recursive: true });
+    const stale = { threadId, status: 'queued', execution: { version: 2, next: { phase: 'develop', round: 1 } } };
+    fs.writeFileSync(path.join(threadsDir, `${threadId}.json`), JSON.stringify(stale));
+    fs.writeFileSync(path.join(storage, 'delegation_threads.json'), JSON.stringify([stale]));
+    fs.writeFileSync(path.join(storage, 'deleted_tasks.log'), JSON.stringify({
+      threadId, cleanupToken: 'delete-token', cleanupManifest: {
+        token: 'delete-token', stage: 'pending', retainResources: true,
+        execution: { version: 2, operationId: 'unknown-op', generation: 4, run: {
+          id: 'unknown-spawn-run', owner: { pid: 99_999_991 }, state: 'stopping', step: 'spawning',
+          spawnIntentAt: new Date().toISOString(), unconfirmed: true,
+        } },
+      },
+    }) + '\n');
+    const snapshot = loadShutdownPreflightSnapshot(storage);
+    assert.deepEqual(snapshot.tasks, [], 'a tombstoned task cannot reenter active task inspection');
+    const report = inspectShutdownPreflight({ ...snapshot, expectedVersion: '1.2.36', components: matchingVersions });
+    assert.equal(report.ready, false);
+    assert.ok(report.blockers.some((item) => item.code === 'DELETED_RUN_PROTECTED' && item.threadId === threadId));
+    assert.ok(report.blockers.some((item) => item.code === 'DELETED_RESOURCES_RETAINED' && item.threadId === threadId));
+    assert.ok(!report.blockers.some((item) => item.code === 'PREFLIGHT_READ_ERROR'));
+  } finally { fs.rmSync(storage, { recursive: true, force: true }); }
+});
+
 test('shutdown preflight fails closed when component version evidence is missing', () => {
   const report = inspectShutdownPreflight({ tasks: [], expectedVersion: '1.2.36', components: [] });
   assert.equal(report.ready, false);

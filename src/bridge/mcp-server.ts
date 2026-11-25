@@ -745,10 +745,10 @@ export class MCPServer {
       {
         name: 'delete_task',
         description:
-          'Permanently delete a task. A running agent process is stopped first; the deletion reason is written to the tombstone log. ' +
+          'Logically delete a task by durably writing its tombstone; a stop is attempted and physical cleanup follows best effort. The deletion reason is recorded. ' +
           "The receiver's native conversation (Claude Code / Codex / Antigravity / DeepSeek Harness session files) is cleaned up as well — " +
           'best effort: a conversation that can no longer be found is not an error. The caller/initiator session is never deleted. ' +
-          'A task with unmerged worktree output is REFUSED unless force: true explicitly discards it. A remote merge request record never counts as local integration.',
+          'Deletion is logical and succeeds even when run exit or physical cleanup is unconfirmed. Unmerged or uncertain worktree output is retained with a bounded warning unless force: true explicitly authorizes discarding it; force still requires verified process and path safety. A remote merge request record never proves local integration.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -763,7 +763,7 @@ export class MCPServer {
             force: {
               type: 'boolean',
               description:
-                'Delete even though task work remains unmerged (the worktree output will be lost).',
+                'Explicitly authorize discarding unmerged worktree output. Process identity, child-tree exit, and resource ownership checks still apply.',
             },
           },
           required: ['threadId', 'reason'],
@@ -1325,9 +1325,9 @@ export class MCPServer {
     if (this.v2StartupBlockReason && (name === 'dispatch_task' || name.startsWith('invoke_') || V2_EXECUTION_TOOLS.has(name))) {
       throw new Error(`V2_STARTUP_BLOCKED: ${this.v2StartupBlockReason}`);
     }
-    if (controlledTask?.status === 'failed' && controlledTask.failure?.stage === 'merge' && name !== 'retry_merge' && name !== 'delete_task' &&
+    if (controlledTask?.status === 'failed' && controlledTask.failure?.stage === 'merge' && name !== 'retry_merge' && name !== 'delete_task' && name !== 'pause_task' &&
         (CONTROL_TOOLS.has(name) || name === 'request_rework' || name === 'approve_task')) {
-      throw new Error('A failed merge only permits retry_merge or delete_task.');
+      throw new Error('A failed merge only permits retry_merge, pause_task, or delete_task.');
     }
     if (controlledTask && (CONTROL_TOOLS.has(name) || name === 'request_rework' || name === 'approve_task' || name === 'retry_merge') && !['pause_task', 'delete_task', 'record_merge_request'].includes(name)) assertDedicatedTask(controlledTask);
     switch (name) {

@@ -197,7 +197,7 @@ test('archive and cleanup stay inside the task directory and never delete the ar
   assert.strictEqual(fs.existsSync(archived.jsonPaths[0]), false);
 });
 
-test('TaskStore.deleteTask removes a task directory and its bootstrap credential', (t) => {
+test('TaskStore.deleteTask tombstones first and removes only recognized Bridge artifacts', (t) => {
   const storage = isolatedDir('mesh-taskdata-delete-');
   t.after(() => removeTree(storage));
   const store = new TaskStore(storage);
@@ -231,7 +231,10 @@ test('TaskStore.deleteTask removes a task directory and its bootstrap credential
   });
 
   assert.strictEqual(store.deleteTask(threadId), true);
-  assert.strictEqual(fs.existsSync(dirs.artifactDir), false);
+  assert.strictEqual(store.getTask(threadId), undefined);
+  assert.strictEqual(fs.existsSync(path.join(dirs.workerLogDir, `${threadId}_round_1.log`)), false);
+  assert.strictEqual(fs.existsSync(path.join(dirs.bootstrapDir, `${threadId}.json`)), false);
+  assert.strictEqual(fs.existsSync(dirs.artifactDir), true, 'unknown assets and the task root are not recursively removed');
 });
 
 test('delete_task removes the unified directory including its worktree', async (t) => {
@@ -287,10 +290,11 @@ test('delete_task removes the unified directory including its worktree', async (
   );
   const result = await control.deleteTask(threadId, 'test cleanup', 'test', true);
   assert.strictEqual(result.status, 'DELETED');
-  assert.strictEqual(fs.existsSync(dirs.artifactDir), false);
-  assert.strictEqual(fs.existsSync(dirs.modelOverlayDir), false);
+  assert.strictEqual(fs.existsSync(dirs.artifactDir), true, 'unrecognized overlay content keeps the task directory from recursive removal');
+  assert.strictEqual(fs.existsSync(path.join(dirs.modelOverlayDir, 'deepseek-delete.yml')), true);
   assert.strictEqual(fs.existsSync(worktree.path), false);
   assert.strictEqual(store.getTask(threadId), undefined);
+  assert.match(result.message, /unrecognized or nonempty child assets were retained/i);
 });
 
 test('stale log settings cannot redirect task logs', (t) => {
