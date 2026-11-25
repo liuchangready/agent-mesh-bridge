@@ -54,9 +54,10 @@ test('historical and unknown execution records cannot start, resume, retry, or o
       else (thread.execution! as { version: number }).version = version;
       fixture.store.upsertTask(thread);
       const before = fixture.store.reloadTask(thread.threadId);
-      const result = await fixture.controller.startExecution(thread.threadId);
-      assert.equal(result.started, false);
-      assert.match(result.reason || '', /HISTORICAL_TASK_READ_ONLY/);
+      const reason = version === undefined ? 'NO_EXECUTION' : `VERSION_${version}`;
+      assert.deepEqual(await fixture.controller.startExecution(thread.threadId), {
+        started: false, reason: `HISTORICAL_TASK_READ_ONLY:${reason}`,
+      });
       await assert.rejects(fixture.controller.resumeOperation(thread.threadId), /HISTORICAL_TASK_READ_ONLY/);
       await assert.rejects(fixture.controller.retryOperation(thread.threadId), /HISTORICAL_TASK_READ_ONLY/);
       await assert.rejects(fixture.controller.requestTaskDecision(thread.threadId, {
@@ -65,8 +66,10 @@ test('historical and unknown execution records cannot start, resume, retry, or o
       await assert.rejects(fixture.controller.submitTaskDecision(thread.threadId, 'past-decision', 'Yes'), /HISTORICAL_TASK_READ_ONLY/);
       await fixture.controller.scanAndDrain();
       assert.deepEqual(fixture.store.reloadTask(thread.threadId), before);
+      assert.equal(fixture.roleLock.getOwner(thread.threadId), undefined);
     }
     assert.equal(fixture.runner.executions.length, 0);
+    assert.deepEqual(fixture.registry.listOwners(), []);
   } finally {
     await fixture.cleanup();
   }

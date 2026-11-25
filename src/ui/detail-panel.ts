@@ -63,14 +63,16 @@ export class TaskDetailPanel {
       },
     });
 
-    // The reviewer runs outside the ledger, so `changed` never fires while it
-    // works. Tick once every 30s during `reviewing` so the Reviewer Output
-    // block follows the live log instead of freezing on the first chunk.
-    const reviewerTick = setInterval(() => {
+    // Appending stdout/stderr does not emit a task-store change.
+    const logTick = setInterval(() => {
       const thread = this.taskStore.getTask(this.currentThreadId);
       if (thread?.status === 'reviewing') this.update();
+      if (thread?.status === 'running' && this.panel.visible) {
+        const { threadId, logs, returnedLines, totalLines, isRunning } = readRecentTaskLogs(this.taskStore, thread.threadId);
+        void this.panel.webview.postMessage({ command: 'updateRecentLogs', threadId, logs, returnedLines, totalLines, isRunning });
+      }
     }, 30_000);
-    this.disposables.push({ dispose: () => clearInterval(reviewerTick) });
+    this.disposables.push({ dispose: () => clearInterval(logTick) });
 
     // Handle messages from Webview
     this.panel.webview.onDidReceiveMessage(
@@ -1207,14 +1209,14 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
       <div style="font-weight:600; font-size:14px; display:flex; align-items:center; gap:8px;">
         ${thread.status === 'running' ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;"></span>` : ''}
         <span>最近 1,000 行实时日志 (Live Logs)</span>
-        <span style="font-size:12px;opacity:0.6;font-weight:normal;">(${recentLogs.returnedLines} / ${recentLogs.totalLines} 行${recentLogs.isRunning ? ' · 实时运行中' : ''})</span>
+        <span id="recentLogCount" style="font-size:12px;opacity:0.6;font-weight:normal;">(${recentLogs.returnedLines} / ${recentLogs.totalLines} 行${recentLogs.isRunning ? ' · 实时运行中' : ''})</span>
       </div>
       <div style="display:flex; gap:8px;">
         <button class="secondary" style="padding:4px 10px;font-size:12px;" onclick="printRecentLogs()">在 VS Code 输出面板打印</button>
         <button class="secondary" style="padding:4px 10px;font-size:12px;" onclick="copyLogs()">复制日志</button>
       </div>
     </div>
-    <pre id="recentLogViewer" class="code-block output-text" style="max-height: 380px; overflow-y: auto; background: #0b0f19; border: 1px solid #1e293b; padding: 12px; border-radius: 6px; font-family: Consolas, monospace; font-size: 12px; line-height: 1.5; color: #e2e8f0; white-space: pre-wrap; word-break: break-all;">${escapeHtml(recentLogs.logs || '(暂无输出日志)')}</pre>
+    <pre id="recentLogViewer" data-thread-id="${escapeHtml(thread.threadId)}" class="code-block output-text" style="max-height: 380px; overflow-y: auto; background: #0b0f19; border: 1px solid #1e293b; padding: 12px; border-radius: 6px; font-family: Consolas, monospace; font-size: 12px; line-height: 1.5; color: #e2e8f0; white-space: pre-wrap; word-break: break-all;">${escapeHtml(recentLogs.logs || '(暂无输出日志)')}</pre>
   </div>
 
   ${historical ? '<div class="action-bar"><button onclick="deleteTask()">Delete historical task</button><button class="secondary" onclick="printRecentLogs()">View logs</button></div>' : ''}
@@ -1324,6 +1326,17 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
     if (logViewer) {
       logViewer.scrollTop = logViewer.scrollHeight;
     }
+    window.addEventListener('message', ({ data }) => {
+      if (data?.command !== 'updateRecentLogs' || data.threadId !== logViewer?.dataset.threadId) return;
+      const text = data.logs || '(暂无输出日志)';
+      if (logViewer.textContent !== text) {
+        const followTail = logViewer.scrollHeight - logViewer.scrollTop - logViewer.clientHeight <= 1;
+        logViewer.textContent = text;
+        if (followTail) logViewer.scrollTop = logViewer.scrollHeight;
+      }
+      document.getElementById('recentLogCount').textContent =
+        '(' + data.returnedLines + ' / ' + data.totalLines + ' 行' + (data.isRunning ? ' · 实时运行中' : '') + ')';
+    });
 
     function submitRework() {
       const text = document.getElementById('reworkFeedback').value;

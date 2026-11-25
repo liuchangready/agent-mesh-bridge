@@ -934,8 +934,7 @@ describe('Unified Execution Boundary Tests', () => {
     }
   });
 
-  // Scenario 30: Controlled CAS concurrency on rework and approve rejects stale generation/run/status without wiping out new generation
-  test('Scenario 30: Controlled CAS concurrency on rework and approve rejects stale generation/run/status without wiping out new generation', async () => {
+  test('V2 rework and approval reject stale decisions and retry after a budget checkpoint', async () => {
     const fixture = await setupFixture();
     const reworkController = new ReworkController(
       fixture.store,
@@ -943,271 +942,96 @@ describe('Unified Execution Boundary Tests', () => {
       fixture.callbackManager,
       fixture.detector,
       fixture.registry,
+      false,
+      true,
     );
+    const transition = fixture.store.transitionExecution.bind(fixture.store);
+    const owner = { pid: process.pid, birthId: getProcessBirthId(process.pid) };
+    const reviewingTask = (id: string, status: DelegationThread['status'] = 'reviewing') => {
+      const task = createThread(id, 'review');
+      task.status = status;
+      task.rounds[0].status = 'completed';
+      return task;
+    };
+    const injectConcurrentWrite = (threadId: string, change: (task: DelegationThread) => void) => {
+      let pending = true;
+      fixture.store.transitionExecution = async (...args) => {
+        const [id, revision] = args;
+        if (id === threadId && pending) {
+          pending = false;
+          assert.equal(typeof revision, 'number');
+          await transition(id, revision, change);
+        }
+        return transition(...args);
+      };
+    };
+    const rework = (threadId: string) => reworkController.requestRework({ threadId, feedback: 'Fix the findings' });
+    const approve = async (threadId: string) => reworkController.approveTask({ threadId, remarks: 'Looks good' });
+
     try {
-      // 1. requestRework: Intercept first CAS attempt, inject generation 2 with active run
-      const thread1 = createThread('thread_s30_rework', 'develop');
-      thread1.status = 'reviewing';
-      thread1.rounds[0].status = 'completed';
-      thread1.execution = {
-        version: 1,
-        revision: 1,
-        operationId: 'op_s30_1',
+      for (const decide of [rework, approve]) {
+        const task = reviewingTask(`thread_s30_${decide.name}`);
+        fixture.store.upsertTask(task);
+        injectConcurrentWrite(task.threadId, fresh => {
+          fresh.execution!.generation = 2;
+          fresh.execution!.operationId = 'new-operation';
+          fresh.execution!.run = {
+            id: 'new-reviewer-run',
+            role: 'reviewer',
+            owner,
+            state: 'active',
+            step: 'executing',
+            startedAt: fresh.createdAt,
+          };
+        });
+
+        await assert.rejects(() => decide(task.threadId), /execution (operation|generation) changed concurrently/);
+        const fresh = fixture.store.reloadTask(task.threadId)!;
+        assert.equal(fresh.status, 'reviewing');
+        assert.equal(fresh.currentRound, 1);
+        assert.equal(fresh.execution?.generation, 2);
+        assert.equal(fresh.execution?.operationId, 'new-operation');
+        assert.equal(fresh.execution?.run?.id, 'new-reviewer-run');
+        assert.equal(fresh.execution?.next, undefined);
+      }
+
+      for (const status of ['paused', 'wait_decision'] as const) {
+        const task = reviewingTask(`thread_s30_${status}`, status);
+        fixture.store.upsertTask(task);
+        await assert.rejects(() => rework(task.threadId), new RegExp(status));
+        await assert.rejects(() => approve(task.threadId), new RegExp(status));
+      }
+
+      const task = reviewingTask('thread_s30_checkpoint');
+      task.execution!.run = {
+        id: 'checkpoint-reviewer-run',
+        role: 'reviewer',
+        owner,
+        state: 'active',
+        step: 'executing',
+        startedAt: task.createdAt,
+      };
+      fixture.store.upsertTask(task);
+      injectConcurrentWrite(task.threadId, fresh => { fresh.execution!.budget.spentActiveMs = 2_000; });
+
+      const result = await rework(task.threadId);
+      assert.equal(result.status, 'REWORK_DISPATCHED');
+      const fresh = fixture.store.reloadTask(task.threadId)!;
+      assert.equal(fresh.currentRound, 2);
+      assert.equal(fresh.execution?.budget.spentActiveMs, 2_000);
+      assert.equal(fresh.execution?.run?.id, 'checkpoint-reviewer-run');
+      assert.deepEqual(fresh.execution?.next, {
         phase: 'develop',
-        round: 1,
-        generation: 1,
-        attempt: 1,
-        autoRetriesUsed: 0,
-        budget: { limitMs: 120 * 60 * 1000, spentActiveMs: 1000, maxAutoRetries: 2 },
-        run: undefined,
-      };
-      fixture.store.upsertTask(thread1);
-
-      let injectedReworkRace = false;
-      const originalTransition = fixture.store.transitionExecution.bind(fixture.store);
-      fixture.store.transitionExecution = (async (threadId: string, expectedRev: number, change: (t: any) => void) => {
-        if (threadId === 'thread_s30_rework' && !injectedReworkRace) {
-          injectedReworkRace = true;
-          // Concurrent writer commits generation 2 with active run!
-          const revision = fixture.store.getTask(threadId)!.execution!.revision;
-          await originalTransition(threadId, revision, (t: DelegationThread) => {
-            if (t.execution) {
-              t.execution.generation = 2;
-              t.execution.operationId = 'op_s30_gen2';
-              t.execution.run = {
-                id: 'new-generation-run',
-                owner: { pid: process.pid, birthId: getProcessBirthId(process.pid) },
-                state: 'active',
-                step: 'executing',
-                startedAt: new Date().toISOString(),
-              };
-            }
-            t.status = 'reviewing';
-          });
-        }
-        return await originalTransition(threadId, expectedRev, change);
-      }) as any;
-
-      // requestRework should reject and NOT wipe out generation 2
-      await assert.rejects(
-        async () => {
-          await reworkController.requestRework({
-            threadId: 'thread_s30_rework',
-            feedback: 'Rework needed for scenario 30',
-          });
-        },
-        /Cannot request rework: execution operation changed concurrently|Cannot request rework: execution generation changed concurrently/,
-      );
-
-      // Verify generation 2 and its active run were PRESERVED!
-      fixture.store.loadFromDisk();
-      const afterReworkConflict = fixture.store.getTask('thread_s30_rework');
-      assert.strictEqual(afterReworkConflict?.execution?.generation, 2);
-      assert.strictEqual(afterReworkConflict?.execution?.run?.id, 'new-generation-run');
-      assert.strictEqual(afterReworkConflict?.status, 'reviewing');
-
-      // 2. approveTask: Intercept first CAS attempt, inject generation 2 with active run
-      const thread2 = createThread('thread_s30_approve', 'review');
-      thread2.status = 'reviewing';
-      thread2.rounds[0].status = 'completed';
-      thread2.execution = {
-        version: 1,
-        revision: 1,
-        operationId: 'op_s30_2',
-        phase: 'review',
-        round: 1,
-        generation: 1,
-        attempt: 1,
-        autoRetriesUsed: 0,
-        budget: { limitMs: 120 * 60 * 1000, spentActiveMs: 1000, maxAutoRetries: 2 },
-        run: undefined,
-      };
-      fixture.store.upsertTask(thread2);
-
-      let injectedApproveRace = false;
-      fixture.store.transitionExecution = (async (threadId: string, expectedRev: number, change: (t: any) => void) => {
-        if (threadId === 'thread_s30_approve' && !injectedApproveRace) {
-          injectedApproveRace = true;
-          // Concurrent writer commits generation 2 with active run!
-          const revision = fixture.store.getTask(threadId)!.execution!.revision;
-          await originalTransition(threadId, revision, (t: DelegationThread) => {
-            if (t.execution) {
-              t.execution.generation = 2;
-              t.execution.operationId = 'op_s30_approve_gen2';
-              t.execution.run = {
-                id: 'new-gen-run-approve',
-                owner: { pid: process.pid, birthId: getProcessBirthId(process.pid) },
-                state: 'active',
-                step: 'executing',
-                startedAt: new Date().toISOString(),
-              };
-            }
-            t.status = 'reviewing';
-          });
-        }
-        return await originalTransition(threadId, expectedRev, change);
-      }) as any;
-
-      // approveTask should reject and NOT wipe out generation 2
-      await assert.rejects(
-        async () => {
-          await reworkController.approveTask({
-            threadId: 'thread_s30_approve',
-            remarks: 'Approving scenario 30',
-          });
-        },
-        /Cannot approve task: execution operation changed concurrently|Cannot approve task: execution generation changed concurrently/,
-      );
-
-      fixture.store.loadFromDisk();
-      const afterApproveConflict = fixture.store.getTask('thread_s30_approve');
-      assert.strictEqual(afterApproveConflict?.execution?.generation, 2);
-      assert.strictEqual(afterApproveConflict?.execution?.run?.id, 'new-gen-run-approve');
-      assert.strictEqual(afterApproveConflict?.status, 'reviewing');
-
-      // 3. Cross with pause: task paused concurrently
-      const threadPause = createThread('thread_s30_pause', 'review');
-      threadPause.status = 'paused';
-      threadPause.rounds[0].status = 'completed';
-      threadPause.execution = {
-        version: 1,
-        revision: 1,
-        operationId: 'op_s30_pause',
-        phase: 'review',
-        round: 1,
-        generation: 1,
-        attempt: 1,
-        autoRetriesUsed: 0,
-        budget: { limitMs: 120 * 60 * 1000, spentActiveMs: 1000, maxAutoRetries: 2 },
-        run: undefined,
-      };
-      fixture.store.upsertTask(threadPause);
-
-      await assert.rejects(
-        async () => {
-          await reworkController.requestRework({ threadId: 'thread_s30_pause', feedback: 'test pause' });
-        },
-        /paused/,
-      );
-      await assert.rejects(
-        async () => {
-          await reworkController.approveTask({ threadId: 'thread_s30_pause', remarks: 'test pause' });
-        },
-        /paused/,
-      );
-
-      // 4. Cross with wait_decision: task in wait_decision
-      const threadDecision = createThread('thread_s30_decision', 'review');
-      threadDecision.status = 'wait_decision';
-      threadDecision.rounds[0].status = 'completed';
-      threadDecision.execution = {
-        version: 1,
-        revision: 1,
-        operationId: 'op_s30_dec',
-        phase: 'review',
-        round: 1,
-        generation: 1,
-        attempt: 1,
-        autoRetriesUsed: 0,
-        budget: { limitMs: 120 * 60 * 1000, spentActiveMs: 1000, maxAutoRetries: 2 },
-        run: undefined,
-      };
-      fixture.store.upsertTask(threadDecision);
-
-      await assert.rejects(
-        async () => {
-          await reworkController.requestRework({ threadId: 'thread_s30_decision', feedback: 'test dec' });
-        },
-        /wait_decision/,
-      );
-      await assert.rejects(
-        async () => {
-          await reworkController.approveTask({ threadId: 'thread_s30_decision', remarks: 'test dec' });
-        },
-        /wait_decision/,
-      );
-
-      // 5. An unrelated checkpoint may advance the revision while keeping the same decision identity
-      fixture.store.transitionExecution = originalTransition;
-
-      const threadCheckpoint = createThread('thread_s30_cp', 'review');
-      threadCheckpoint.status = 'reviewing';
-      threadCheckpoint.rounds[0].status = 'completed';
-      threadCheckpoint.execution = {
-        version: 1,
-        revision: 1,
-        operationId: 'op_s30_cp',
-        phase: 'review',
-        round: 1,
-        generation: 1,
-        attempt: 1,
-        autoRetriesUsed: 0,
-        budget: { limitMs: 120 * 60 * 1000, spentActiveMs: 1000, maxAutoRetries: 2 },
-        run: {
-          id: 'run-cp',
-          owner: { pid: process.pid, birthId: getProcessBirthId(process.pid) },
-          state: 'active',
-          step: 'executing',
-          startedAt: new Date().toISOString(),
-        },
-      };
-      fixture.store.upsertTask(threadCheckpoint);
-
-      let injectedCheckpoint = false;
-      let decisionAttempts = 0;
-      fixture.store.transitionExecution = (async (threadId: string, expectedRev: number, change: (t: any) => void) => {
-        if (threadId === 'thread_s30_cp') decisionAttempts++;
-        if (threadId === 'thread_s30_cp' && !injectedCheckpoint) {
-          injectedCheckpoint = true;
-          // Unrelated checkpoint: budget updated, revision bumped to 2
-          const revision = fixture.store.getTask(threadId)!.execution!.revision;
-          await originalTransition(threadId, revision, (t: DelegationThread) => {
-            if (t.execution) {
-              t.execution.budget.spentActiveMs = 2000;
-            }
-          });
-        }
-        return await originalTransition(threadId, expectedRev, change);
-      }) as any;
-
-      // The decision should use the latest record and preserve the checkpoint.
-      const reworkRes = await reworkController.requestRework({
-        threadId: 'thread_s30_cp',
-        feedback: 'Valid rework after a budget checkpoint',
+        round: 2,
+        sourceRunId: 'checkpoint-reviewer-run',
       });
-      assert.strictEqual(reworkRes.status, 'REWORK_DISPATCHED');
-      const taskAfterCp = fixture.store.getTask('thread_s30_cp');
-      // Has active run was preserved because reviewer is still running!
-      assert.strictEqual(taskAfterCp?.execution?.run?.id, 'run-cp');
-      assert.strictEqual(taskAfterCp?.currentRound, 2);
-      assert.strictEqual(taskAfterCp?.execution?.budget.spentActiveMs, 2000);
-      assert.strictEqual(decisionAttempts, 1);
-
-      const v2 = createThread('thread_s30_v2', 'review');
-      v2.execution!.version = 2;
-      fixture.store.upsertTask(v2);
       await assert.rejects(
-        fixture.store.transitionExecution(v2.threadId, 'current-legacy-review', () => assert.fail('must reject v2 before mutation')),
+        transition(task.threadId, 'current-legacy-review', () => assert.fail('must reject v2 before mutation')),
         /requires eligible legacy execution/,
       );
     } finally {
-      await fixture.cleanup();
-    }
-  });
-
-  // Scenario 31: recovery CAS cannot clear a concurrently started generation
-  test('Scenario 31: the scheduler never attempts to replace a historical generation', async () => {
-    const fixture = await setupFixture();
-    try {
-      const thread = createThread('thread_s31', 'develop');
-      thread.execution!.version = 1;
-      thread.status = 'running';
-      fixture.store.upsertTask(thread);
-      const before = fixture.store.reloadTask(thread.threadId);
-      await fixture.controller.scanAndDrain();
-      assert.deepEqual(fixture.store.reloadTask(thread.threadId), before);
-      assert.equal(fixture.runner.executions.length, 0);
-    } finally {
+      fixture.store.transitionExecution = transition;
+      reworkController.dispose();
       await fixture.cleanup();
     }
   });

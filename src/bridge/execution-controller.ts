@@ -56,6 +56,7 @@ import {
 import { requireV2ExecutionEligibility, validateV2ExecutionEligibility } from './execution-gate';
 import { CancellationRegistry } from './cancellation-registry';
 import { nativeSessionNamespace, SessionOwnershipStore } from './session-ownership';
+import { roundExecutionLogPath } from './round-log';
 
 export const DEFAULT_EXECUTION_BUDGET_MS = 120 * 60 * 1000; // 120 minutes
 export const AUTO_RETRY_BACKOFFS_MS = [5_000, 30_000];
@@ -1729,6 +1730,16 @@ export class ExecutionController {
     const spentActiveMs = thread.execution?.budget?.spentActiveMs ?? 0;
     const remainingMs = Math.max(1000, limitMs - spentActiveMs);
 
+    const logPath = roundExecutionLogPath(threadId, round.round, path.dirname(this.taskStore.getStoragePath()), undefined, thread.artifactDir);
+    try {
+      fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    } catch {}
+    const appendLog = (chunk: string) => {
+      try {
+        fs.appendFileSync(logPath, chunk, 'utf8');
+      } catch {}
+    };
+
     // Run execution with runner maxRetries = 0 (controller owns retries)
     const result = await this.runner.execute({
       taskThreadId: threadId,
@@ -1751,6 +1762,8 @@ export class ExecutionController {
       timeoutMs: remainingMs,
       previousTokenUsage: round.tokenUsage,
       maxRetries: 0,
+      onStdoutChunk: appendLog,
+      onStderrChunk: appendLog,
       onChildPid: (pid, childProc, childBirthId) => {
         return onChildPid(pid, childProc, childBirthId);
       },

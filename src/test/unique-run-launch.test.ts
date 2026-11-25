@@ -45,7 +45,6 @@ import {
   RunIdentity,
 } from '../bridge/process-binding';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
-import { validateV2ExecutionEligibility } from '../bridge/execution-gate';
 import { AgentDetector } from '../bridge/agent-detector';
 import { testWorkspace } from './workspace-fixture';
 
@@ -1904,98 +1903,7 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Acceptance Criterion 3: Production default task (v1) isolation
-  // -------------------------------------------------------------------------
-  test('V1 tasks cannot start or create a role or execution registration', async () => {
-    const storageDir = createTempDir('v1-isolation');
-    const threadId = 'thread_v1_isolation';
-
-    try {
-      const store = new TaskStore(storageDir);
-      const now = new Date().toISOString();
-      const thread: DelegationThread = {
-        threadId,
-        title: 'v1 Task',
-        initiatorAgent: 'claude_code',
-        targetAgent: 'codex',
-        status: 'queued',
-        currentRound: 1,
-        createdAt: now,
-        updatedAt: now,
-        receiverSessionId: `session-${threadId}`,
-        reviewerSessionId: `rev-session-${threadId}`,
-        callerSessionId: `rev-session-${threadId}`,
-        reviewerSessionCaptured: true,
-        reviewFlow: 'dedicated',
-        reviewBootstrap: { phase: 'confirmed', attempts: 1 },
-        summary: {
-          lastPromptSnippet: 'v1 work',
-          lastOutputSnippet: '',
-          totalDurationMs: 0,
-        },
-        rounds: [{ round: 1, type: 'initial', prompt: 'v1 work', status: 'running', durationMs: 0, timestamp: now }],
-        workspace: testWorkspace(storageDir),
-        execution: {
-          version: 1,
-          revision: 1,
-          operationId: 'op_v1_1',
-          phase: 'develop',
-          round: 1,
-          generation: 1,
-          attempt: 0,
-          autoRetriesUsed: 0,
-          budget: { limitMs: 60000, spentActiveMs: 0, maxAutoRetries: 2 },
-        },
-      };
-      store.upsertTask(thread);
-
-      // Verify eligibility check explicitly rejects v1 for v2 execution
-      const el = validateV2ExecutionEligibility(thread);
-      assert.strictEqual(el.eligible, false);
-      assert.strictEqual(el.code, 'LEGACY_VERSION_1');
-
-      // The launch entry rejects V1 before writing or spawning anything.
-      const registry = new TaskExecutionRegistry(path.join(storageDir, 'registry'));
-      const roleLock = new TaskRoleLock(storageDir);
-      let executedV1 = false;
-
-      const mockRunner: any = {
-        execute: async (opts: any) => {
-          executedV1 = true;
-          if (opts.onChildPid) opts.onChildPid(process.pid);
-          return { exitCode: 0, stdout: 'v1_done', stderr: '', extractedOutput: 'v1_done', durationMs: 10 };
-        },
-      };
-
-      const controller = new ExecutionController(
-        store,
-        mockRunner,
-        {} as any,
-        undefined,
-        registry,
-        { storageDir, standingScanIntervalMs: 0 },
-      );
-
-      const before = store.reloadTask(threadId);
-      const result = await controller.startExecution(threadId);
-      assert.deepEqual(result, { started: false, reason: 'HISTORICAL_TASK_READ_ONLY:VERSION_1' });
-      await controller.scanAndDrain();
-      assert.equal(executedV1, false);
-      assert.deepEqual(store.reloadTask(threadId), before);
-      assert.equal(roleLock.getOwner(threadId), undefined);
-      assert.deepEqual(registry.listOwners(), []);
-
-      store.ensureUpToDate();
-      const fresh = store.getTask(threadId);
-      assert.strictEqual(fresh?.execution?.version, 1, 'v1 task must NOT be upgraded to v2');
-      controller.dispose();
-    } finally {
-      cleanTempDir(storageDir);
-    }
-  });
-
-  // -------------------------------------------------------------------------
-  // Round 2 Regression Tests: Defect 1 to Defect 5
+  // Round 2 Regression Tests: Defect 1 to Defect 4
   // -------------------------------------------------------------------------
 
   // Defect 1: assessRunLaunchEvidence stopping run without child must return safeToClean=false
@@ -2426,73 +2334,6 @@ describe('Task 02: Unique Run Acquisition & Launch Registration', () => {
       assert.notStrictEqual(fresh?.execution?.run?.state, 'active');
 
       try { child.kill(); } catch {}
-    } finally {
-      cleanTempDir(storageDir);
-    }
-  });
-
-  // Defect 5: probeRun on v1 tasks retains legacy behavior where exited owner with no child returns exited
-  test('Defect 5: probeRun on v1 tasks retains legacy behavior where exited owner with no child returns exited', () => {
-    const storageDir = createTempDir('v1-proberun');
-    const threadId = 'thread_v1_probe';
-
-    try {
-      const store = new TaskStore(storageDir);
-      const now = new Date().toISOString();
-      const thread: DelegationThread = {
-        threadId,
-        title: 'v1 Probe Task',
-        initiatorAgent: 'claude_code',
-        targetAgent: 'codex',
-        receiverSessionId: 'sess_v1_probe',
-        status: 'queued',
-        currentRound: 1,
-        createdAt: now,
-        updatedAt: now,
-        summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
-        rounds: [],
-        workspace: testWorkspace(storageDir),
-        execution: {
-          version: 1, // Legacy v1
-          revision: 1,
-          operationId: 'op_v1_probe',
-          phase: 'develop',
-          round: 1,
-          generation: 1,
-          attempt: 0,
-          autoRetriesUsed: 0,
-          budget: { limitMs: 60000, spentActiveMs: 0, maxAutoRetries: 2 },
-        },
-      };
-      store.upsertTask(thread);
-
-      const registry = new TaskExecutionRegistry(path.join(storageDir, 'registry'));
-      const roleLock = new TaskRoleLock(storageDir);
-      const sessionLock = new NativeSessionLock(storageDir);
-
-      const controller = new ExecutionController(
-        store,
-        {} as any,
-        {} as any,
-        undefined,
-        registry,
-        { storageDir, standingScanIntervalMs: 0 },
-      );
-
-      // A legacy v1 run where owner PID 999999 has exited and child is undefined
-      const v1Run: ExecutionRun = {
-        id: 'run_v1_exited',
-        role: 'developer',
-        owner: { pid: 999999, birthId: 'dead' },
-        state: 'starting',
-        step: 'starting',
-        startedAt: now,
-      };
-
-      const probeResult = controller.probeRun(threadId, v1Run);
-      assert.strictEqual(probeResult, 'exited', 'v1 task must retain legacy exited verdict');
-
-      controller.dispose();
     } finally {
       cleanTempDir(storageDir);
     }

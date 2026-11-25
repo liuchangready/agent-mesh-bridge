@@ -279,8 +279,17 @@ export function readTextFileCapped(
 function readLogExcerpt(filePath: string): string {
   const maxBytes = 512 * 1024;
   try {
-    const offsetBytes = Math.max(0, fs.statSync(filePath).size - maxBytes);
-    return readTextFilePaged(filePath, { offsetBytes, maxBytes }).content;
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const size = fs.fstatSync(fd).size;
+      const buffer = Buffer.alloc(Math.min(size, maxBytes));
+      const offset = size - buffer.length;
+      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, offset);
+      const content = buffer.toString('utf8', 0, bytesRead);
+      return offset > 0 ? content.replace(/^\uFFFD+/, '') : content;
+    } finally {
+      fs.closeSync(fd);
+    }
   } catch {
     return '';
   }
@@ -295,7 +304,8 @@ export function readRecentTaskLogs(store: TaskStore, threadId: string, maxLines 
   const defaultLog = artifactDir ? undefined : findLatestExecutionLog(threadId);
   const latest = defaultLog && (!localLog || defaultLog.round > localLog.round) ? defaultLog : localLog;
   const lastRound = task?.rounds.at(-1);
-  const lines = ((latest && readLogExcerpt(latest.path)) || lastRound?.output || lastRound?.error || '').split(/\r?\n/);
+  const content = (latest && readLogExcerpt(latest.path)) || lastRound?.output || lastRound?.error || '';
+  const lines = content ? content.replace(/\r?\n$/, '').split(/\r?\n/) : [];
   const tail = lines.length > maxLines ? lines.slice(-maxLines) : lines;
   const logs = tail.join('\n');
   return {

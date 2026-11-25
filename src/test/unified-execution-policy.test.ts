@@ -200,24 +200,6 @@ describe('Unified Execution Policy Tests', () => {
     }
   });
 
-  test('a V1 developer run cannot be created by the controller', async () => {
-    const fixture = await setupFixture({ useFastLock: true });
-    try {
-      const thread = createThread('thread_v1_unsupported');
-      thread.execution!.version = 1;
-      fixture.store.upsertTask(thread);
-      const initial = fixture.store.reloadTask(thread.threadId);
-      assert.deepEqual(await fixture.controller.startExecution(thread.threadId, 'develop'), {
-        started: false, reason: 'HISTORICAL_TASK_READ_ONLY:VERSION_1',
-      });
-      await fixture.controller.scanAndDrain();
-      assert.deepEqual(fixture.store.reloadTask(thread.threadId), initial);
-      assert.equal(fixture.runner.executions.length, 0);
-    } finally {
-      await fixture.cleanup();
-    }
-  });
-
   // Scenario 2: Active budget with monotonic tracking; output does not extend budget
   test('Scenario 2: Active time budget is enforced and output does not extend deadline', async () => {
     const fixture = await setupFixture({ useFastLock: true });

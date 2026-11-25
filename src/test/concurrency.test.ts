@@ -248,6 +248,13 @@ describe('AsyncDispatcher - independent task admission', () => {
     assert.strictEqual(completed.returnedLines, 500);
     assert.ok(completed.logs.includes('[LOG LINE 1500]'));
     assert.ok(!completed.logs.includes('[LOG LINE 900]'));
+
+    const largeLog = Array.from({ length: totalLineCount }, (_, index) => `[LOG LINE ${index + 1}] ${'x'.repeat(400)}\r\n`).join('');
+    fs.writeFileSync(logPath, largeLog);
+    const recent = readRecentTaskLogs(taskStore, task.threadId);
+    assert.strictEqual(recent.returnedLines, 1000);
+    assert.ok(recent.logs.startsWith('[LOG LINE 501]'));
+    assert.ok(recent.logs.split('\n').at(-1)?.startsWith('[LOG LINE 1500]'));
   });
 
   test('an old execution.lock record does not block a new independent task', async () => {
