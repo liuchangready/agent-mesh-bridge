@@ -59,9 +59,9 @@ describe('Unified Execution Boundary Tests', () => {
       const paused = fixture.store.reloadTask(thread.threadId)!;
       assert.equal(paused.execution?.run?.id, 'pause-spawn-run');
       assert.equal(paused.execution?.run?.state, 'stopping');
-      assert.equal(paused.status, 'running', 'pause is not reported complete while spawn exit is unconfirmed');
+      assert.equal(paused.status, 'paused', 'pause blocks scheduling immediately while retaining unconfirmed spawn evidence');
       assert.equal(paused.execution?.generation, 3);
-      await assert.rejects(fixture.controller.resumeOperation(thread.threadId), /previous run exit is not confirmed|state running is not resumable/);
+      await assert.rejects(fixture.controller.resumeOperation(thread.threadId), /previous run exit is not confirmed|state paused is not resumable/);
       lateChild = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true });
       await new Promise<void>((resolve, reject) => { lateChild!.once('error', reject); lateChild!.once('spawn', resolve); });
       const lateBirthId = getProcessBirthId(lateChild.pid!);
@@ -74,11 +74,12 @@ describe('Unified Execution Boundary Tests', () => {
       });
       assert.equal(late.success, false, 'late spawn binding cannot revive a stopping run');
       assert.equal(fixture.store.reloadTask(thread.threadId)?.execution?.run?.id, 'pause-spawn-run');
-      await assert.rejects(service.deleteTask(thread.threadId, 'concurrent delete at spawn window', 'test', true), /has not confirmed complete process-tree and resource exit/);
-      const deleting = fixture.store.reloadTask(thread.threadId)!;
-      assert.equal(deleting.execution?.run?.id, 'pause-spawn-run');
-      assert.equal(deleting.cleanup?.action, 'delete');
-      assert.ok(deleting.cleanup?.token);
+      const deleted = await service.deleteTask(thread.threadId, 'concurrent delete at spawn window', 'test', true);
+      assert.equal(deleted.status, 'DELETED', 'logical deletion does not wait for a spawn-window run proof');
+      assert.equal(fixture.store.reloadTask(thread.threadId), undefined);
+      const tombstone = fs.readFileSync(path.join(fixture.dir, 'deleted_tasks.log'), 'utf8').trim().split(/\r?\n/).map((line) => JSON.parse(line)).at(-1);
+      assert.equal(tombstone.cleanupManifest.execution.run.id, 'pause-spawn-run');
+      assert.equal(tombstone.cleanupManifest.retainResources, true);
     } finally {
       if (lateChild && lateChild.exitCode === null && lateChild.signalCode === null) {
         const closed = new Promise<void>((resolve) => lateChild!.once('close', () => resolve()));
@@ -193,12 +194,13 @@ describe('Unified Execution Boundary Tests', () => {
       const cleanupDir = path.join(fixture.dir, 'must-remain');
       fs.mkdirSync(cleanupDir, { recursive: true });
       fs.writeFileSync(path.join(cleanupDir, 'evidence.txt'), 'keep until run settled');
-      await assert.rejects(service.deleteTask(thread.threadId, 'delete with unconfirmed owner', 'test', true), /has not confirmed complete process-tree and resource exit/);
-      const retained = fixture.store.reloadTask(thread.threadId)!;
-      assert.equal(retained.execution?.run?.id, 'pause-descendant-run');
-      assert.equal(retained.cleanup?.action, 'delete');
-      assert.ok(retained.cleanup?.token);
-      const cleanupToken = retained.cleanup!.token;
+      const firstDelete = await service.deleteTask(thread.threadId, 'delete with unconfirmed owner', 'test', true);
+      assert.equal(firstDelete.status, 'DELETED');
+      assert.equal(fixture.store.reloadTask(thread.threadId), undefined);
+      const firstTombstone = fs.readFileSync(path.join(fixture.dir, 'deleted_tasks.log'), 'utf8').trim().split(/\r?\n/).map((line) => JSON.parse(line)).at(-1);
+      assert.equal(firstTombstone.cleanupManifest.execution.run.id, 'pause-descendant-run');
+      assert.equal(firstTombstone.cleanupManifest.retainResources, true);
+      const cleanupToken = firstTombstone.cleanupToken;
       assert.equal(fs.existsSync(path.join(cleanupDir, 'evidence.txt')), true, 'cleanup assets remain while the run is protected');
 
       const ownerClosed = new Promise<void>((resolve) => owner!.once('close', () => resolve()));
@@ -211,6 +213,29 @@ describe('Unified Execution Boundary Tests', () => {
       assert.ok(tombstones.includes(cleanupToken), 'retry commits the original cleanup token after exit proof');
     } finally {
       await cleanupProcesses();
+      await fixture.cleanup();
+    }
+  });
+
+  test('pause reports a persistence failure instead of claiming a queued handoff was canceled', async () => {
+    const fixture = await setupFixture();
+    const thread = createThread('thread_v2_pause_persist_failure', 'develop');
+    thread.status = 'queued';
+    thread.execution = { ...thread.execution!, version: 2, revision: 3, operationId: 'pause-persist-op',
+      queue: { reason: 'backoff', notBefore: new Date(Date.now() + 60_000).toISOString() },
+      next: { phase: 'develop', round: 1 }, run: undefined };
+    fixture.store.upsertTask(thread);
+    const originalPersist = (fixture.store as any).persistThread;
+    (fixture.store as any).persistThread = () => { throw new Error('injected persistThread failure'); };
+    try {
+      const service = new TaskControlService(fixture.store, fixture.runner as any, new CancellationRegistry(fixture.dir), fixture.dir);
+      await assert.rejects(service.pauseTask(thread.threadId, 'fault injection', 'test'), /pause was not durably committed|injected persistThread failure/i);
+      const fresh = fixture.store.reloadTask(thread.threadId)!;
+      assert.equal(fresh.status, 'queued');
+      assert.ok(fresh.execution?.next);
+      assert.ok(fresh.execution?.queue);
+    } finally {
+      (fixture.store as any).persistThread = originalPersist;
       await fixture.cleanup();
     }
   });
@@ -454,7 +479,12 @@ describe('Unified Execution Boundary Tests', () => {
       await secondController.scanAndDrain();
       assert.equal(secondStore.reloadTask(thread.threadId)?.execution?.run?.id, 'returned-native-maintenance-run',
         'a live detached descendant retains the maintenance run after the adapter returned');
-      await assert.rejects(fixture.store.commitTaskCleanup(thread.threadId, cleanupToken, 'delete'), /execution run .* is still recorded/);
+      assert.equal(await fixture.store.commitTaskCleanup(thread.threadId, cleanupToken, 'delete'), true,
+        'logical deletion succeeds while the detached descendant remains protected');
+      assert.equal(fixture.store.getTask(thread.threadId), undefined);
+      const deletion = fs.readFileSync(path.join(fixture.dir, 'deleted_tasks.log'), 'utf8').trim().split(/\r?\n/).map((line) => JSON.parse(line)).at(-1);
+      assert.equal(deletion.cleanupManifest.retainResources, true);
+      assert.ok(deletion.cleanupManifest.execution.run.subtrees.some((tree: any) => tree.descendants.some((entry: any) => entry.pid === descendantPid)));
 
       for (const identity of known) if (identity.birthId && probeProcessIdentity(identity.pid, identity.birthId) === 'alive') {
         try { process.kill(identity.pid); } catch {}
@@ -465,9 +495,8 @@ describe('Unified Execution Boundary Tests', () => {
       }
       assert.ok(known.every((identity) => !!identity.birthId && probeProcessIdentity(identity.pid, identity.birthId) === 'exited'));
       await secondController.scanAndDrain();
-      assert.equal(secondStore.reloadTask(thread.threadId)?.execution?.run, undefined, 'a second controller settles the returned run after full tree exit');
-      assert.equal(await secondStore.commitTaskCleanup(thread.threadId, cleanupToken, 'delete'), true,
-        'cleanup can commit only after the scanner persisted full-tree exit settlement');
+      assert.equal(secondStore.reloadTask(thread.threadId), undefined,
+        'a later controller cannot revive a tombstoned task after the child tree exits');
     } finally {
       if (root?.pid && root.exitCode === null && root.signalCode === null) { try { root.kill(); } catch {} }
       for (const identity of known) if (identity.birthId && probeProcessIdentity(identity.pid, identity.birthId) === 'alive') {

@@ -71,16 +71,26 @@ function readText(file: string): string | undefined {
  * TaskExecutionRegistry (both are allowed to create directories/watchers). */
 export function loadShutdownPreflightSnapshot(storageDir: string): {
   tasks: DelegationThread[];
+  tombstones: any[];
   owners: PreflightOwnerRecord[];
   readErrors: string[];
   pendingCoordination: string[];
   pendingMergeTransactions: Array<{ threadId?: string; path: string; phase?: string }>;
 } {
   const tasks: DelegationThread[] = [];
+  const tombstones: any[] = [];
   const owners: PreflightOwnerRecord[] = [];
   const readErrors: string[] = [];
   const pendingCoordination: string[] = [];
   const pendingMergeTransactions: Array<{ threadId?: string; path: string; phase?: string }> = [];
+  try {
+    const content = readText(path.join(storageDir, 'deleted_tasks.log'));
+    if (content) for (const line of content.split(/\r?\n/).filter(Boolean)) {
+      try { tombstones.push(JSON.parse(line)); }
+      catch (error: any) { readErrors.push(`deleted_tasks.log: ${error?.message || error}`); }
+    }
+  } catch (error: any) { readErrors.push(`deleted_tasks.log: ${error?.message || error}`); }
+  const tombstonedIds = new Set(tombstones.map((entry) => entry?.threadId).filter((id): id is string => typeof id === 'string'));
   const threadsDir = path.join(storageDir, 'threads');
   let taskFiles: string[] = [];
   try { taskFiles = fs.readdirSync(threadsDir).filter((name) => name.endsWith('.json')); }
@@ -90,6 +100,7 @@ export function loadShutdownPreflightSnapshot(storageDir: string): {
     try {
       const item = JSON.parse(fs.readFileSync(file, 'utf8'));
       if (!item || typeof item.threadId !== 'string') throw new Error('missing threadId');
+      if (tombstonedIds.has(item.threadId)) continue;
       tasks.push(item as DelegationThread);
     } catch (error: any) { readErrors.push(`${path.relative(storageDir, file)}: ${error?.message || error}`); }
   }
@@ -99,6 +110,7 @@ export function loadShutdownPreflightSnapshot(storageDir: string): {
     const aggregate = JSON.parse(fs.readFileSync(aggregatePath, 'utf8'));
     if (!Array.isArray(aggregate)) throw new Error('aggregate is not an array');
     for (const item of aggregate) {
+      if (typeof item?.threadId === 'string' && tombstonedIds.has(item.threadId)) continue;
       if (typeof item?.threadId !== 'string' || !threadIds.has(item.threadId)) {
         readErrors.push(`delegation_threads.json: aggregate entry ${String(item?.threadId)} has no matching per-thread record.`);
       }
@@ -279,7 +291,7 @@ export function loadShutdownPreflightSnapshot(storageDir: string): {
       } catch (error: any) { readErrors.push(`${path.relative(storageDir, file)}: ${error?.message || error}`); }
     }
   }
-  return { tasks, owners, readErrors, pendingCoordination, pendingMergeTransactions };
+  return { tasks, tombstones, owners, readErrors, pendingCoordination, pendingMergeTransactions };
 }
 
 function historicalDeliveryProblem(task: DelegationThread): string | undefined {
@@ -318,6 +330,7 @@ function historicalDeliveryProblem(task: DelegationThread): string | undefined {
  * component version is a blocker, never an implicit green result. */
 export function inspectShutdownPreflight(input: {
   tasks: DelegationThread[];
+  tombstones?: any[];
   owners?: Array<PreflightOwnerRecord>;
   readErrors?: string[];
   pendingCoordination?: string[];
@@ -418,6 +431,31 @@ export function inspectShutdownPreflight(input: {
     if (thread.execution && thread.execution.version !== 2 && thread.status !== 'completed') blockers.push({ code: 'LEGACY_TASK_NOT_DRAINED', threadId: thread.threadId,
       evidence: `execution.version=${thread.execution.version} is historical but task is not terminal.` });
   }
+  const latestTombstones = new Map<string, any>();
+  for (const item of input.tombstones || []) if (typeof item?.threadId === 'string') latestTombstones.set(item.threadId, item);
+  for (const [threadId, tombstone] of latestTombstones) {
+    const manifest = tombstone.cleanupManifest;
+    if (!manifest || manifest.stage === 'complete' || tombstone.cleanupComplete) continue;
+    const run = manifest.execution?.run;
+    const proof = manifest.runExitProof;
+    if (run && (!proof || proof.runId !== run.id || proof.operationId !== manifest.execution?.operationId || proof.generation !== manifest.execution?.generation)) {
+      blockers.push({ code: 'DELETED_RUN_PROTECTED', threadId,
+        evidence: `Deleted task retains run ${run.id} without matching process-tree and resource exit acknowledgement.` });
+      inspectIdentity(run.owner?.pid, run.owner?.birthId, 'deleted run owner', threadId);
+      inspectIdentity(run.child?.pid, run.child?.birthId, 'deleted run child', threadId);
+      for (const tree of run.subtrees || []) {
+        inspectIdentity(tree.root?.pid, tree.root?.birthId, 'deleted captured subtree root', threadId);
+        for (const child of tree.descendants || []) inspectIdentity(child.pid, child.birthId, 'deleted captured descendant', threadId);
+        if (tree.windowsJob) blockers.push({ code: 'DELETED_JOB_RECEIPT_RETAINED', threadId,
+          evidence: `Deleted run ${run.id} retains Windows Job receipt ${tree.windowsJob.id}.` });
+      }
+      if (run.mergeLockHelper) inspectIdentity(run.mergeLockHelper.pid, run.mergeLockHelper.birthId, 'deleted merge helper', threadId);
+    }
+    if (manifest.retainResources) blockers.push({ code: 'DELETED_RESOURCES_RETAINED', threadId,
+      evidence: `Deleted task resources remain retained under cleanup token ${manifest.token || tombstone.cleanupToken || 'unknown'}.` });
+    blockers.push({ code: 'DELETED_CLEANUP_PENDING', threadId,
+      evidence: `Deleted task cleanup token ${manifest.token || tombstone.cleanupToken || 'unknown'} is ${manifest.stage || 'pending'}.` });
+  }
   const mergeTransactions = input.pendingMergeTransactions || [];
   for (const transaction of mergeTransactions) blockers.push({ code: 'GIT_RECOVERY_PENDING', threadId: transaction.threadId,
     evidence: `${transaction.path} is in phase ${transaction.phase || 'unknown'} and requires merge recovery.` });
@@ -435,6 +473,7 @@ export function inspectShutdownPreflight(input: {
 export function inspectV2RuntimeActivation(input: {
   storageDir: string;
   tasks: DelegationThread[];
+  tombstones?: any[];
   owners?: PreflightOwnerRecord[];
   readErrors?: string[];
   pendingCoordination?: string[];
@@ -609,6 +648,31 @@ export function inspectV2RuntimeActivation(input: {
     if (transaction.threadId && v2TaskIds.has(transaction.threadId)) continue;
     blockers.push({ code: 'GIT_RECOVERY_PENDING', threadId: transaction.threadId,
       evidence: `${transaction.path} is in phase ${transaction.phase || 'unknown'} and requires legacy recovery.` });
+  }
+  const latestDeleted = new Map<string, any>();
+  for (const tombstone of input.tombstones || []) if (typeof tombstone?.threadId === 'string') latestDeleted.set(tombstone.threadId, tombstone);
+  for (const [threadId, tombstone] of latestDeleted) {
+    const manifest = tombstone.cleanupManifest;
+    if (!manifest || manifest.stage === 'complete' || tombstone.cleanupComplete) continue;
+    const run = manifest.execution?.run;
+    const proof = manifest.runExitProof;
+    if (run && (!proof || proof.runId !== run.id || proof.operationId !== manifest.execution?.operationId || proof.generation !== manifest.execution?.generation)) {
+      blockers.push({ code: 'DELETED_RUN_PROTECTED', threadId,
+        evidence: `Deleted task run ${run.id} has no matching process-tree/Job exit acknowledgement.` });
+      inspectRuntimeIdentity(run.owner?.pid, run.owner?.birthId, 'Deleted run owner', threadId);
+      inspectRuntimeIdentity(run.child?.pid, run.child?.birthId, 'Deleted run child', threadId);
+      for (const tree of run.subtrees || []) {
+        inspectRuntimeIdentity(tree.root?.pid, tree.root?.birthId, 'Deleted subtree root', threadId);
+        for (const child of tree.descendants || []) inspectRuntimeIdentity(child.pid, child.birthId, 'Deleted subtree descendant', threadId);
+        if (tree.windowsJob) blockers.push({ code: 'DELETED_JOB_RECEIPT_RETAINED', threadId,
+          evidence: `Deleted task retains Windows Job receipt ${tree.windowsJob.id}.` });
+      }
+      if (run.mergeLockHelper) inspectRuntimeIdentity(run.mergeLockHelper.pid, run.mergeLockHelper.birthId, 'Deleted merge helper', threadId);
+    }
+    if (manifest.retainResources) blockers.push({ code: 'DELETED_RESOURCES_RETAINED', threadId,
+      evidence: `Deleted task resources remain protected by token ${manifest.token || tombstone.cleanupToken || 'unknown'}.` });
+    blockers.push({ code: 'DELETED_CLEANUP_PENDING', threadId,
+      evidence: `Deleted task cleanup is ${manifest.stage || 'pending'} under token ${manifest.token || tombstone.cleanupToken || 'unknown'}.` });
   }
   return { ready: blockers.length === 0, inventoryPath, blockers, components: input.components };
 }

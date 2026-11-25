@@ -1195,11 +1195,11 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
     ${thread.status === 'failed' && thread.failure?.stage === 'execution' ? `<button class="retry-btn" style="background: #dc2626; color: white;" onclick="retryFailedRound()">🔄 重试失败轮次 (Retry Failed)</button>` : ''}
     ${thread.status === 'reviewing' && thread.reviewWake && thread.reviewWake.round === (thread.currentRound || 1) ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（唤醒失败）</button>` : ''}
     ${(thread.status === 'failed' && thread.failure?.stage === 'review') ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（检视失败）</button>` : ''}
-    ${(thread.status === 'running' || thread.status === 'queued' || thread.status === 'merging' || (thread.status === 'reviewing' && thread.worktree?.mergePending && ['blocked', 'conflict', 'validation_failed'].includes(thread.worktree.integration?.phase || ''))) ? `<button style="background:#ea580c;color:white;" onclick="pauseTask()">⏸ 暂停任务 (Pause)</button>` : ''}
+    ${(['running', 'queued', 'merging', 'wait_decision'].includes(thread.status) || !!thread.execution?.run || !!thread.execution?.next || !!thread.execution?.queue || (thread.status === 'reviewing' && thread.worktree?.mergePending && ['blocked', 'conflict', 'validation_failed'].includes(thread.worktree.integration?.phase || ''))) ? `<button style="background:#ea580c;color:white;" onclick="pauseTask()">⏸ 暂停任务 (Pause)</button>` : ''}
     ${thread.status === 'paused' ? `<button class="resume-btn" onclick="resumeTask()">▶ 恢复执行 (Resume)</button>` : ''}
     ${(thread.status === 'reviewing' || (thread.status === 'failed' && ['execution', 'review'].includes(thread.failure?.stage || ''))) ? `<button class="resume-btn" onclick="resumeTask()">▶ 下发返修要求 / 重新执行</button>` : ''}
     ${(thread.status === 'reviewing' || (thread.status === 'failed' && ['execution', 'review'].includes(thread.failure?.stage || ''))) ? `<button onclick="approveTask()">✓ 手动验收通过 (Approve Task)</button>` : ''}
-    ${!thread.worktree?.integration?.stashRecoveryLockHeld ? `<button style="background:#7f1d1d;color:white;" onclick="deleteTask()">🗑 删除任务 (Delete)</button>` : ''}
+    <button style="background:#7f1d1d;color:white;" onclick="deleteTask()">🗑 删除任务 (Delete)</button>
     <button class="secondary" onclick="printRecentLogs()">📄 打印最近1000行日志 (Print 1,000 Lines)</button>
     <button class="secondary" onclick="refresh()">⟳ Refresh</button>
   </div>

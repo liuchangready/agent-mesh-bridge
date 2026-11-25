@@ -9,6 +9,7 @@ export interface CancellationRequest {
   reason: string;
   at: string;
   by?: string;
+  runIdentity?: { runId: string; operationId: string; generation: number };
 }
 
 const CANCELLATION_DIR = 'cancellations';
@@ -34,12 +35,14 @@ export class CancellationRegistry {
     action: CancellationAction,
     reason: string,
     by?: string,
+    runIdentity?: CancellationRequest['runIdentity'],
   ): CancellationRequest {
     const request: CancellationRequest = {
       action,
       reason: reason || 'No reason provided',
       at: new Date().toISOString(),
       by,
+      runIdentity,
     };
     try {
       fs.mkdirSync(this.dir, { recursive: true });

@@ -331,3 +331,7 @@ Windows 上已绑定 V2 run 的 Agent CLI、原生会话维护和受跟踪的合
 至少验证这些场景：排队中暂停、取消与 spawn 竞争、根进程退出但子进程仍存活、PID 复用或终止权限不足、其他任务持有合入锁、stash 待恢复、普通删除拒绝丢弃未合入成果、强制删除仍等待安全退出、删除过程中宿主重启、账本已删除但部分资产清理失败。退出确认与合入锁竞争场景使用真实受控进程和锁，并检查 UI/MCP 的反馈与持久记录一致。
 
 当前文档交付为唯一 run 替代角色锁/原生会话锁的设计与实施验收边界；生产仍为 1.2.36 的 dedicated/v1 接线，未执行下一版停机切换或删除生产租约。后续实施必须附实际提交、测试与未覆盖平台证据，不以本设计文本作为已实现证明。
+
+### Deletion and pause boundary update (2026-11-25)
+
+A valid delete request commits a durable tombstone under the task short-write lock before physical cleanup. Process exit proof, stash recovery, the global merge lock, Git availability, or cleanup errors must not keep the task in the active ledger. The tombstone retains the cleanup token, execution/run identity, generation, resource locations, and ownership evidence needed to prevent late callbacks from reviving work. Unknown or live runs and unmerged or uncertain worktree output remain protected in place and are reported as bounded cleanup warnings. force=true authorizes discarding unmerged output only; it never authorizes guessing process identity or bypassing path, child-tree, session-ownership, or global Git-lock safety. Repeated delete calls are idempotent and may retry only cleanup supported by the same durable tombstone evidence. Pause durably cancels queued handoffs and automatic continuation; an unconfirmed stop is reported as paused for scheduling while the run and resources remain protected. These semantics replace the older requirement that physical cleanup and run exit precede logical deletion.

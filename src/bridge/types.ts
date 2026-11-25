@@ -111,6 +111,7 @@ export interface TaskCleanupState {
   generation?: number;
   runId?: string;
   runExitProof?: { runId: string; operationId: string; generation: number; confirmedAt: string };
+  previousCleanup?: Record<string, unknown>;
 }
 
 export interface ExecutionControl {
@@ -912,6 +913,8 @@ export interface DelegationThread {
    * resolve logs from the retired global or per-agent directories.
    */
   artifactDir?: string;
+  /** Creation-time parent of artifactDir; never re-resolved from current policy. */
+  artifactRoot?: string;
   /** Alias retained for callers/UI that name the same directory `taskDataDir`. */
   taskDataDir?: string;
 

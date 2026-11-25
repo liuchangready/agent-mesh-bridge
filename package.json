@@ -223,7 +223,7 @@
         },
         {
           "command": "agent-mesh-bridge.pauseTask",
-          "when": "viewItem != workspace_group && ((view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks) && viewItem != failed_merge && viewItem != failed_review && viewItem != failed_execution && viewItem != failed_bootstrap && viewItem != wait_decision)",
+          "when": "viewItem != historical_task && viewItem != workspace_group && (view == agent-mesh-bridge.active-tasks || view == agent-mesh-bridge.recent-tasks)",
           "group": "1_actions"
         },
         {

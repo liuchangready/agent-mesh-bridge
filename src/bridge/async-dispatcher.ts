@@ -245,6 +245,7 @@ export class AsyncDispatcher {
         ...(this.v2 ? { dispatchAccepted: false } : {}),
         ...(windowContext ? { origin: { hostInstanceId: windowContext.hostInstanceId, generation: windowContext.generation } } : {}) },
       artifactDir: taskDirs.artifactDir,
+      artifactRoot: taskDirs.artifactRoot,
       taskDataDir: taskDirs.artifactDir,
       ...(worktree ? { worktree } : {}),
       initiatorModel: initiatorModel.model,

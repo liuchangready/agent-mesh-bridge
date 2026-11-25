@@ -40,6 +40,8 @@ export const TASK_DATA_ROOT_DIRNAME = 'tasks';
 export interface TaskDataDirectories {
   /** Absolute `<taskDataRoot>/<threadId>` (persisted as `thread.artifactDir`). */
   artifactDir: string;
+  /** Creation-time root used to validate later cleanup after policy changes. */
+  artifactRoot: string;
   worktreeDir: string;
   workerLogDir: string;
   reviewerLogDir: string;
@@ -91,6 +93,7 @@ export function ensureTaskDataDir(
   const artifactDir = taskArtifactDir(threadId, storageDir, root);
   const dirs: TaskDataDirectories = {
     artifactDir,
+    artifactRoot: path.dirname(artifactDir),
     worktreeDir: path.join(artifactDir, WORKTREE_DIRNAME),
     workerLogDir: path.join(artifactDir, WORKER_LOG_DIRNAME),
     reviewerLogDir: path.join(artifactDir, REVIEWER_LOG_DIRNAME),
@@ -127,12 +130,30 @@ export function ensureTaskSubdir(dir: string): void {
 export function removeTaskDataDir(
   artifactDir: string | undefined,
   includeWorktree: boolean,
+  expectedThreadId?: string,
 ): boolean {
   if (!artifactDir) return false;
   const resolved = path.resolve(artifactDir);
   if (!path.isAbsolute(resolved)) return false;
   try {
     if (includeWorktree) {
+      if (expectedThreadId) {
+        const expected = expectedThreadId.replace(/[^A-Za-z0-9_.-]/g, '_');
+        if (path.basename(resolved) !== expected) return false;
+        const allowed = new Set([WORKTREE_DIRNAME, WORKER_LOG_DIRNAME, REVIEWER_LOG_DIRNAME,
+          ARCHIVE_DIRNAME, BOOTSTRAP_DIRNAME, VALIDATION_DIRNAME, MODEL_OVERLAY_DIRNAME]);
+        const entries = fs.readdirSync(resolved, { withFileTypes: true });
+        if (entries.some((entry) => !allowed.has(entry.name) || entry.isSymbolicLink())) return false;
+        // A deleted task directory is removed only after its known children are
+        // empty. Unknown files, validation worktrees, and overlays stay put.
+        for (const entry of entries) {
+          const child = path.join(resolved, entry.name);
+          if (!entry.isDirectory() || fs.readdirSync(child).length > 0) return false;
+        }
+        for (const entry of entries) fs.rmdirSync(path.join(resolved, entry.name));
+        fs.rmdirSync(resolved);
+        return true;
+      }
       fs.rmSync(resolved, { recursive: true, force: true });
     } else {
       for (const name of [
