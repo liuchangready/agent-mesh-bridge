@@ -1365,7 +1365,7 @@ export class ReworkController {
     return { threadId, status: thread.status, retryGeneration: thread.mergeControl!.retryGeneration };
   }
 
-  public submitMergeResolution(threadId: string): { threadId: string; status: 'QUEUED'; message: string } {
+  public async submitMergeResolution(threadId: string): Promise<{ threadId: string; status: 'QUEUED'; message: string }> {
     this.assertExecutionAdmission('submit merge resolution');
     const thread = this.taskStore.getTask(threadId);
     if (thread) assertDedicatedTask(thread);
@@ -1392,12 +1392,30 @@ export class ReworkController {
     if (gitOutput(cwd, ['diff', '--name-only']) || gitOutput(cwd, ['ls-files', '--others', '--exclude-standard'])) {
       throw new Error('Stage all resolution changes before submitting.');
     }
-    worktree.mergeResolutionSubmitted = true;
-    thread.status = 'queued';
-    thread.queuePhase = 'merge';
-    worktree.integration = { ...worktree.integration, phase: 'waiting', updatedAt: new Date().toISOString() };
-    thread.updatedAt = new Date().toISOString();
-    this.taskStore.upsertTask(thread);
+    const queueResolution = (task: DelegationThread) => {
+      task.worktree!.mergeResolutionSubmitted = true;
+      task.status = 'queued';
+      task.queuePhase = 'merge';
+      const at = new Date().toISOString();
+      task.worktree!.integration = { ...task.worktree!.integration, phase: 'waiting', updatedAt: at };
+      task.updatedAt = at;
+    };
+    const execution = thread.execution;
+    if (execution?.version === 2) {
+      await this.taskStore.transitionExecution(threadId, execution.revision, fresh => {
+        const run = fresh.execution?.run;
+        if (fresh.execution?.version !== 2 || fresh.execution.phase !== 'review' || fresh.execution.next ||
+            !run || run.role !== 'reviewer' || !['starting', 'active'].includes(run.state) || run.unconfirmed ||
+            fresh.cleanup || fresh.worktree?.integration?.stashRecoveryPending || !isMergeReview(fresh)) {
+          throw new Error('The current reviewer run can no longer submit this merge resolution.');
+        }
+        queueResolution(fresh);
+        fresh.execution.next = { phase: 'merge', round: fresh.execution.round, sourceRunId: run.id };
+      });
+    } else {
+      queueResolution(thread);
+      this.taskStore.upsertTask(thread);
+    }
     return { threadId, status: 'QUEUED', message: 'Resolution submitted; end the reviewer turn so the bridge can validate and integrate it.' };
   }
 

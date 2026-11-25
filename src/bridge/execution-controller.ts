@@ -29,7 +29,7 @@ import { TaskStore } from './task-store';
 import { applyReviewFailure, reopenFailedReview, reviewBlockDependencyId, reviewDependencyIssue } from './review-wake';
 import { AutonomousRunner } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
-import { MergeCoordinator } from './merge-coordinator';
+import { MergeCoordinator, MergeFailureReview, recordMergeFailureReview } from './merge-coordinator';
 import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
 import { MeshFileLock, MeshLockAcquisitionError } from './mesh-file-lock';
 import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
@@ -70,6 +70,10 @@ interface StartExecutionOptions {
   allowStates?: ThreadStatus[];
   onMergeAdmission?: () => void;
 }
+
+type PhaseResult =
+  | { ok: true; verdict?: string }
+  | { ok: false; code: string; reason: string; stage?: FailureStage; quotaResetsAt?: string; transient?: boolean; mergeReview?: MergeFailureReview };
 
 function v2SlotAgent(task: DelegationThread): AgentId | undefined {
   const execution = task.execution;
@@ -1361,10 +1365,7 @@ export class ExecutionController {
     }, this.checkpointIntervalMs);
     checkpointTimer.unref?.();
 
-    let phaseResult:
-      | { ok: true; verdict?: string }
-      | { ok: false; code: string; reason: string; stage?: FailureStage; quotaResetsAt?: string; transient?: boolean }
-      | undefined;
+    let phaseResult: PhaseResult | undefined;
 
     const childBindingPromises = new Map<string, Promise<void>>();
     const bindChildPid = async (
@@ -2018,10 +2019,7 @@ export class ExecutionController {
     onChildPid?: (pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>,
     mergeRelease?: () => void,
     identity?: { operationId?: string; generation?: number; round?: number },
-  ): Promise<
-    | { ok: true }
-    | { ok: false; code: string; reason: string; stage?: FailureStage; quotaResetsAt?: string; transient?: boolean }
-  > {
+  ): Promise<PhaseResult> {
     this.taskStore.ensureUpToDate();
     const thread = this.taskStore.getTask(threadId);
     if (!thread) return { ok: false, code: 'NOT_FOUND', reason: 'Task not found' };
@@ -2059,6 +2057,9 @@ export class ExecutionController {
         return { ok: true };
       }
 
+      if (mergeResult.review) {
+        return { ok: false, code: mergeResult.status.toUpperCase(), reason: mergeResult.message, stage: 'merge', mergeReview: mergeResult.review };
+      }
       if (mergeResult.status === 'stale' || mergeResult.status === 'conflict') {
         return {
           ok: false,
@@ -2109,9 +2110,7 @@ export class ExecutionController {
     threadId: string,
     phase: ExecutionPhase,
     runId: string,
-    result:
-      | { ok: true; verdict?: string }
-      | { ok: false; code: string; reason: string; stage?: FailureStage; quotaResetsAt?: string; transient?: boolean },
+    result: PhaseResult,
     identity?: { operationId?: string; generation?: number; round?: number },
   ): Promise<void> {
     this.taskStore.ensureUpToDate();
@@ -2282,16 +2281,36 @@ export class ExecutionController {
     }
 
     // FAILURE in this phase:
-    const { code, reason, stage, quotaResetsAt, transient } = result;
-    if (phase === 'merge' && thread.execution.version === 2 && thread.status === 'reviewing' &&
+    const { code, reason, stage, quotaResetsAt, transient, mergeReview } = result;
+    if (phase === 'merge' && (mergeReview || thread.status === 'reviewing') &&
         !thread.worktree?.integration?.stashRecoveryPending) {
       await this.transitionTask(threadId, (t) => {
-        if (t.status !== 'reviewing' || t.worktree?.integration?.stashRecoveryPending) {
+        if (t.worktree?.integration?.stashRecoveryPending || t.execution?.next ||
+            t.status !== (mergeReview ? 'merging' : 'reviewing')) {
           throw new Error('Merge review is no longer available.');
         }
-        recordNext(t, 'review', t.execution!.round, isMergeReview(t) ? 'merge_resolution' : undefined);
+        if (mergeReview) {
+          const worktree = t.worktree;
+          if (!worktree || worktree.approvedCommit !== mergeReview.sourceCommit ||
+              worktree.deliveryTarget?.ref !== mergeReview.history.targetRef) {
+            throw new Error('The approved merge candidate or target changed before review.');
+          }
+          const previousPath = worktree.mergeResolutionPath;
+          if (previousPath && mergeReview.resolutionPath && previousPath !== mergeReview.resolutionPath) {
+            worktree.supersededMergeResolutionPaths = [...new Set([...(worktree.supersededMergeResolutionPaths || []), previousPath])];
+          }
+          recordMergeFailureReview(t, worktree, mergeReview, reason);
+          if (mergeReview.resolutionPath) {
+            worktree.validation = { path: mergeReview.resolutionPath, status: 'present',
+              result: mergeReview.phase === 'validation_failed' ? 'failed' : undefined, updatedAt: mergeReview.history.at };
+          }
+          t.execution!.lastOutcome = { code, reason, at: mergeReview.history.at };
+        }
+        t.queuePhase = undefined;
+        const purpose = mergeReview || isMergeReview(t) ? 'merge_resolution' : undefined;
+        recordNext(t, 'review', t.execution!.round, purpose);
       });
-      void this.startExecution(threadId, 'review');
+      await this.startExecution(threadId, 'review');
       return;
     }
     const autoRetriesUsed = thread.execution.autoRetriesUsed || 0;

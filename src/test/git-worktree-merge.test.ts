@@ -178,7 +178,7 @@ test('conflicting approved snapshot keeps the merge workspace and approval for r
   const resolution = saved.worktree!.mergeResolutionPath!;
   fs.writeFileSync(path.join(resolution, 'shared.txt'), 'A resolved\nmiddle\nbeta\n');
   git(resolution, 'add', 'shared.txt');
-  assert.equal(controller.submitMergeResolution(item.threadId).status, 'QUEUED');
+  assert.equal((await controller.submitMergeResolution(item.threadId)).status, 'QUEUED');
   const merged = await controller.mergeApproved(item.threadId);
   assert.equal(merged.status, 'merged', merged.message);
   assert.equal(git(repository, 'show', `${target.targetRef}:shared.txt`), 'A resolved\nmiddle\nbeta');
@@ -210,7 +210,7 @@ test('failed combined validation retains the approved snapshot and resolution wo
   assert.match(mergeLog, /failed \(exit 6\)/);
   assert.match(mergeLog, /\$ git merge --no-commit --no-ff/);
   assert.ok(mergeLog.includes('START-OUTPUT-') && mergeLog.includes('-END-OUTPUT'));
-  controller.submitMergeResolution(item.threadId);
+  await controller.submitMergeResolution(item.threadId);
   const merged = await controller.mergeApproved(item.threadId);
   assert.equal(merged.status, 'merged', merged.message);
 });
@@ -236,7 +236,7 @@ test('the last merge retry enters failed and retry_merge starts a new generation
   firstFailure.mergeControl!.consecutiveRetries = 5;
   firstFailure.mergeControl!.revision++;
   store.upsertTask(firstFailure);
-  controller.submitMergeResolution(item.threadId);
+  await controller.submitMergeResolution(item.threadId);
   assert.equal((await controller.mergeApproved(item.threadId)).status, 'validation_failed');
   const exhausted = store.getTask(item.threadId)!;
   assert.equal(exhausted.mergeControl!.consecutiveRetries, 6);
@@ -246,7 +246,7 @@ test('the last merge retry enters failed and retry_merge starts a new generation
   assert.ok((exhausted.failureRevision || 0) > 0);
   const before = store.getTask(item.threadId)!;
   const pathBefore = before.worktree!.mergeResolutionPath; const sessionBefore = before.receiverSessionId;
-  assert.throws(() => controller.submitMergeResolution(item.threadId), /awaiting submission/);
+  await assert.rejects(() => controller.submitMergeResolution(item.threadId), /awaiting submission/);
   assert.throws(() => controller.approveTask({ threadId: item.threadId }), /failed/);
   const retried = controller.retryMerge(item.threadId);
   const after = store.getTask(item.threadId)!;
@@ -292,7 +292,7 @@ test('a target that advances during conflict resolution is merged with the stage
   assert.equal((await controller.mergeApproved(item.threadId)).status, 'conflict');
   const resolution = store.getTask(item.threadId)!.worktree!.mergeResolutionPath!;
   fs.writeFileSync(path.join(resolution, 'shared.txt'), 'A resolved\nmiddle\nbeta\n'); git(resolution, 'add', 'shared.txt');
-  controller.submitMergeResolution(item.threadId);
+  await controller.submitMergeResolution(item.threadId);
   fs.writeFileSync(path.join(repository, 'next.txt'), 'next\n'); git(repository, 'add', 'next.txt'); git(repository, 'commit', '-m', 'advance again');
   const head = git(repository, 'rev-parse', target.targetRef);
   const merged = await controller.mergeApproved(item.threadId);
@@ -359,13 +359,13 @@ test('a second conflict after target advancement keeps the same resolution works
   assert.equal((await controller.mergeApproved(item.threadId)).status, 'conflict');
   const resolution = store.getTask(item.threadId)!.worktree!.mergeResolutionPath!;
   fs.writeFileSync(path.join(resolution, 'shared.txt'), 'A first fix\nmiddle\nbeta\n'); git(resolution, 'add', 'shared.txt');
-  controller.submitMergeResolution(item.threadId);
+  await controller.submitMergeResolution(item.threadId);
   fs.writeFileSync(path.join(repository, 'shared.txt'), 'target again\nmiddle\nbeta\n'); git(repository, 'add', 'shared.txt'); git(repository, 'commit', '-m', 'target again');
   assert.equal((await controller.mergeApproved(item.threadId)).status, 'conflict');
   assert.equal(store.getTask(item.threadId)!.worktree!.mergeResolutionPath, resolution);
   assert.match(fs.readFileSync(path.join(resolution, 'shared.txt'), 'utf8'), /<<<<<<< /);
   fs.writeFileSync(path.join(resolution, 'shared.txt'), 'A final fix\nmiddle\nbeta\n'); git(resolution, 'add', 'shared.txt');
-  controller.submitMergeResolution(item.threadId);
+  await controller.submitMergeResolution(item.threadId);
   const merged = await controller.mergeApproved(item.threadId);
   assert.equal(merged.status, 'merged', merged.message);
   assert.equal(git(repository, 'show', `${target.targetRef}:shared.txt`), 'A final fix\nmiddle\nbeta');

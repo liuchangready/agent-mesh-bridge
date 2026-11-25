@@ -22,6 +22,8 @@ import { testWorkspace } from './workspace-fixture';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { readRecentTaskLogs, roundExecutionLogPath } from '../bridge/round-log';
 import { SessionOwnershipStore, nativeSessionNamespace } from '../bridge/session-ownership';
+import { commitTaskChanges, createTaskWorktree, resolveGitRepository } from '../bridge/git-worktree';
+import { git, initRepo } from './git-worktree-fixture';
 import {
   createThread,
   setupFixture,
@@ -411,6 +413,101 @@ describe('Unified Execution Integration Tests', () => {
 
       await fixture.controller.waitForActiveExecutions(3000);
     } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  test('v2 merge retry validates the latest target and hands a failed validation back to the original reviewer', { timeout: 120_000 }, async () => {
+    const fixture = await setupFixture();
+    const rework = new ReworkController(fixture.store, fixture.runner as any, fixture.callbackManager, fixture.detector);
+    try {
+      const repo = path.join(fixture.dir, 'repository');
+      const evidence = path.join(fixture.dir, 'validation.jsonl');
+      initRepo(repo);
+      fs.writeFileSync(path.join(repo, 'validate.js'), [
+        'const fs = require("node:fs");',
+        'const latest = fs.readFileSync("latest.txt", "utf8");',
+        `fs.appendFileSync(${JSON.stringify(evidence)}, JSON.stringify([process.argv[2], latest]) + "\\n");`,
+        'if (process.argv[2] === "test" && fs.readFileSync("shared.txt", "utf8").includes("broken")) process.exitCode = 1;',
+      ].join('\n'));
+      git(repo, 'add', 'validate.js');
+      git(repo, 'commit', '-m', 'Record each validation step');
+      const target = resolveGitRepository(repo, fixture.dir);
+      const thread = createThread('thread_v2_merge_validation_review', 'merge');
+      const worktree = createTaskWorktree(target, thread.threadId, fixture.dir);
+      fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'broken\n');
+      const approved = commitTaskChanges(worktree, 'Approved candidate');
+      thread.worktree = { ...worktree, headCommit: approved, approvedCommit: approved, mergePending: true };
+      thread.artifactDir = path.dirname(worktree.path);
+      thread.workspace = testWorkspace(worktree.path);
+      thread.rounds[0].status = 'completed';
+      thread.status = 'failed';
+      thread.failure = { stage: 'merge', code: 'VALIDATION_FAILED', reason: 'Previous validation failed',
+        at: new Date().toISOString(), round: 1 };
+      fixture.addRunnableThread(thread);
+
+      fs.writeFileSync(path.join(repo, 'latest.txt'), 'first advance');
+      git(repo, 'add', 'latest.txt');
+      git(repo, 'commit', '-m', 'Advance the target before retry');
+      const retryBase = git(repo, 'rev-parse', 'HEAD');
+      let reviewerError: unknown;
+      let reviewerCalls = 0;
+      let secondBase = '';
+      fixture.callbackManager.launchCaller = (async (reviewed: typeof thread) => {
+        reviewerCalls++;
+        try {
+          const disk = fixture.store.reloadTask(thread.threadId)!;
+          assert.equal(reviewed.reviewerSessionId, thread.reviewerSessionId);
+          assert.equal(disk.execution?.purpose, 'merge_resolution');
+          assert.equal(disk.execution?.run?.role, 'reviewer');
+          assert.equal(disk.worktree?.integration?.phase, 'validation_failed');
+          assert.equal(disk.worktree?.integration?.targetOldCommit, retryBase);
+          assert.equal(disk.worktree?.approvedCommit, approved);
+          const failure = disk.mergeHistory?.at(-1);
+          assert.equal(failure?.result, 'failed');
+          assert.ok(failure?.logPath);
+          assert.match(fs.readFileSync(failure.logPath, 'utf8'), /npm run compile passed/);
+          const resolution = disk.worktree?.mergeResolutionPath;
+          assert.ok(resolution && fs.existsSync(resolution));
+          assert.equal(git(repo, 'rev-parse', 'HEAD'), retryBase);
+          const release = await fixture.mergeLock.acquire(undefined, undefined, 10_000, true);
+          assert.ok(release, 'review starts after the merge run releases the global lock');
+          assert.equal(await fixture.mergeLock.releaseAndConfirm(release, 10_000), true);
+          fs.writeFileSync(path.join(resolution, 'shared.txt'), 'fixed\n');
+          git(resolution, 'add', 'shared.txt');
+          fs.writeFileSync(path.join(repo, 'latest.txt'), 'second advance');
+          git(repo, 'add', 'latest.txt');
+          git(repo, 'commit', '-m', 'Advance the target during review');
+          secondBase = git(repo, 'rev-parse', 'HEAD');
+          assert.equal((await rework.submitMergeResolution(thread.threadId)).status, 'QUEUED');
+          const queued = fixture.store.reloadTask(thread.threadId)!;
+          assert.equal(queued.execution?.next?.phase, 'merge');
+          assert.equal(queued.execution?.next?.sourceRunId, disk.execution?.run?.id);
+          assert.equal(queued.execution?.run?.id, disk.execution?.run?.id, 'reviewer still owns its run at submission');
+        } catch (error) { reviewerError = error; }
+        return { success: true, exitCode: 0 };
+      }) as any;
+
+      await fixture.controller.retryOperation(thread.threadId);
+      const deadline = Date.now() + 100_000;
+      let final = fixture.store.reloadTask(thread.threadId)!;
+      while (!['completed', 'failed'].includes(final.status) && Date.now() < deadline && !reviewerError) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        final = fixture.store.reloadTask(thread.threadId)!;
+      }
+      if (reviewerError) throw reviewerError;
+      assert.equal(final.status, 'completed', JSON.stringify({
+        status: final.status, failure: final.failure, execution: final.execution,
+      }));
+      assert.equal(reviewerCalls, 1);
+      assert.equal(git(repo, 'rev-parse', 'HEAD^1'), secondBase);
+      assert.equal(fs.readFileSync(path.join(repo, 'shared.txt'), 'utf8').trim(), 'fixed');
+      assert.deepEqual(fs.readFileSync(evidence, 'utf8').trim().split('\n').map(line => JSON.parse(line)), [
+        ['compile', 'first advance'], ['test', 'first advance'],
+        ['compile', 'second advance'], ['test', 'second advance'],
+      ]);
+    } finally {
+      rework.dispose();
       await fixture.cleanup();
     }
   });
