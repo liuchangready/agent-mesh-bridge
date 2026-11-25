@@ -1,7 +1,7 @@
 import { assertDedicatedTask } from './types';
-import * as readline from 'readline';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as readline from 'readline';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { AsyncDispatcher } from './async-dispatcher';
@@ -2122,53 +2122,48 @@ export class MCPServer {
     return null;
   }
 
-  /**
-   * Connect and start Stdio JSON-RPC server.
-   */
-  public startStdio(): void {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      terminal: false,
-    });
+  public getClientState() {
+    return { workspaceContext: this.workspaceContext, dispatched: this.pollGuard.snapshot() };
+  }
 
+  public restoreClientState(state: ReturnType<MCPServer['getClientState']>): void {
+    this.workspaceContext = state.workspaceContext;
+    this.pollGuard = new CallerPollGuard(state.dispatched);
+  }
+
+  /** Stdio entry for a caller that supplies its own in-process host. */
+  public startStdio(): void {
+    const rl = readline.createInterface({ input: process.stdin, terminal: false });
+    const send = (message: unknown) => process.stdout.write(JSON.stringify(message) + '\n');
     rl.on('line', async (line) => {
-      const trimmed = line.trim();
-      if (!trimmed) return;
+      if (!line.trim()) return;
       try {
-        const req = JSON.parse(trimmed);
-        if (req?.method === 'notifications/initialized' && this.clientSupportsRoots) {
-          this.clientRoots = new Promise((resolve) => { this.resolveClientRoots = resolve; });
-          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: 'mesh-roots', method: 'roots/list', params: {} }) + '\n');
-        }
-        if (req?.id === 'mesh-roots' && !req.method) {
-          const roots: string[] = [];
-          let invalidRoot = false;
-          for (const entry of Array.isArray(req.result?.roots) ? req.result.roots : []) {
-            try {
-              if (typeof entry.uri !== 'string' || !entry.uri.startsWith('file:')) { invalidRoot = true; continue; }
-              roots.push(physicalDirectory(fileURLToPath(entry.uri)));
-            } catch { invalidRoot = true; }
-          }
-          this.resolveClientRoots?.(invalidRoot ? [] : [...new Set(roots)]);
-          this.resolveClientRoots = undefined;
-          return;
-        }
-        const resp = await this.handleRpcMessage(req);
-        if (resp) {
-          process.stdout.write(JSON.stringify(resp) + '\n');
-        }
+        await this.handleStdioMessage(JSON.parse(line), send);
       } catch {
-        process.stdout.write(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: null,
-            error: { code: -32700, message: 'Parse error' },
-          }) + '\n',
-        );
+        send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
       }
     });
+  }
 
-    process.stdin.resume();
+  public async handleStdioMessage(req: any, send: (message: unknown) => void): Promise<void> {
+    if (req?.method === 'notifications/initialized' && this.clientSupportsRoots) {
+      this.clientRoots = new Promise((resolve) => { this.resolveClientRoots = resolve; });
+      send({ jsonrpc: '2.0', id: 'mesh-roots', method: 'roots/list', params: {} });
+    }
+    if (req?.id === 'mesh-roots' && !req.method) {
+      const roots: string[] = [];
+      let invalidRoot = false;
+      for (const entry of Array.isArray(req.result?.roots) ? req.result.roots : []) {
+        try {
+          if (typeof entry.uri !== 'string' || !entry.uri.startsWith('file:')) { invalidRoot = true; continue; }
+          roots.push(physicalDirectory(fileURLToPath(entry.uri)));
+        } catch { invalidRoot = true; }
+      }
+      this.resolveClientRoots?.(invalidRoot ? [] : [...new Set(roots)]);
+      this.resolveClientRoots = undefined;
+      return;
+    }
+    const response = await this.handleRpcMessage(req);
+    if (response) send(response);
   }
 }

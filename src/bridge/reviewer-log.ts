@@ -183,8 +183,7 @@ export function readReviewerLogTail(
 export interface ReviewerLogHeader {
   agent: string;
   sessionId?: string;
-  /** `review` = report handed back, `failure` = failed round notification. */
-  kind?: 'review' | 'failure';
+  kind?: 'review' | 'failure' | 'bootstrap';
   /** Extra one-line context (round type, model, prompt preview...). */
   note?: string;
 }
@@ -211,7 +210,9 @@ export class ReviewerLogWriter {
     options: { root?: string; maxBytes?: number; agent?: string; artifactDir?: string } = {},
   ) {
     const agent = options.agent || header.agent;
-    this.path = reviewerLogPath(threadId, round, options.root, agent, options.artifactDir);
+    this.path = header.kind === 'bootstrap'
+      ? reviewerBootstrapLogPath(threadId, options.root, agent, options.artifactDir)
+      : reviewerLogPath(threadId, round, options.root, agent, options.artifactDir);
     this.maxBytes = Math.max(1024, options.maxBytes ?? REVIEWER_LOG_MAX_BYTES);
     try {
       fs.mkdirSync(path.dirname(this.path), { recursive: true });

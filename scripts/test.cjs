@@ -89,6 +89,7 @@ const LAYER_MAPPING = {
     'git-worktree-stash.test.js',
     'git-worktree-stash-part2.test.js',
     'mcp-server.test.js',
+    'standalone-mcp-restart.test.js',
     'merge-recovery.test.js',
     'merge-resident-host.test.js',
     'review-wake.test.js',

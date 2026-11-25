@@ -628,6 +628,12 @@ export class CallbackManager extends EventEmitter {
     const preassigned = resumeReviewerSession ? thread.reviewerSessionId! : thread.reviewerSessionId || crypto.randomUUID();
     const prompt = buildReviewerBootstrapPrompt(thread, tokenRecord.token);
     const runner = this.runner || new AutonomousRunner(this.detector);
+    const reviewerLog = createReviewerLogWriter(thread.threadId, 0, {
+      agent: thread.initiatorAgent,
+      sessionId: resumeReviewerSession ? preassigned : undefined,
+      kind: 'bootstrap',
+      note: `senderModel=${thread.reviewerModel || 'agent default'}`,
+    }, { root, artifactDir: thread.artifactDir });
 
     const result = await runner.execute({
       agent: thread.initiatorAgent,
@@ -664,7 +670,14 @@ export class CallbackManager extends EventEmitter {
         // it so v2 can clear the child binding and consume its durable handoff.
         await onChildPid?.(pid, childProc, childBirthId);
       },
-    });
+    }).then((result) => {
+      // Redact after stream assembly so a credential split across chunks is also removed.
+      const redact = (text: string) => text.replaceAll(tokenRecord.token, '[redacted]');
+      if (result.stdout) reviewerLog.write(redact(result.stdout));
+      if (result.stderr) reviewerLog.write(`\n[stderr]\n${redact(result.stderr)}`);
+      reviewerLog.writeOutcome({ exitCode: result.exitCode, error: result.error && redact(result.error) });
+      return result;
+    }).finally(() => reviewerLog.close());
 
     if (store) store.loadFromDisk();
     const fresh = store?.getTask(thread.threadId);
@@ -795,6 +808,12 @@ export class CallbackManager extends EventEmitter {
         return Promise.resolve({ success: false, error: 'V2 reviewer wake has no matching durable run identity.', exitCode: -1 });
       }
       const runner = this.runner || new AutonomousRunner(this.detector, undefined, undefined, this.taskStore);
+      const reviewerLog = createReviewerLogWriter(thread.threadId, round.round, {
+        agent: initiator,
+        sessionId: callerSessionId,
+        kind: 'review',
+        note: `${thread.title} | receiver=${thread.targetAgent} | roundType=${round.type} | senderModel=${senderModel || 'agent default'}`,
+      }, { root: this.storageDir, artifactDir: thread.artifactDir });
       return runner.execute({
         agent: initiator,
         prompt: wakeMessage,
@@ -828,12 +847,17 @@ export class CallbackManager extends EventEmitter {
           }
           return { ok: true };
         },
+        onStdoutChunk: (chunk) => reviewerLog.write(chunk),
+        onStderrChunk: (chunk) => reviewerLog.write(chunk),
         onChildPid,
-      }).then((result: any) => ({
-        success: result.exitCode === 0 && result.assessment?.success === true,
-        exitCode: result.exitCode,
-        error: result.error,
-      }));
+      }).then((result) => {
+        reviewerLog.writeOutcome(result);
+        return {
+          success: result.exitCode === 0 && result.assessment?.success === true,
+          exitCode: result.exitCode,
+          error: result.error,
+        };
+      }).finally(() => reviewerLog.close());
     }
 
     const callbackEnv: NodeJS.ProcessEnv = {

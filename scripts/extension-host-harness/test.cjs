@@ -42,6 +42,7 @@ exports.run = async () => {
     'agent-mesh-bridge.refreshAgentStatus',
     'agent-mesh-bridge.refreshTasks',
     'agent-mesh-bridge.syncMcpConfig',
+    'agent-mesh-bridge.showStandaloneMcpStatus',
   ]) {
     assert.ok(commands.has(command), `Expected command was not registered: ${command}`);
   }

@@ -252,6 +252,11 @@ test('mock agents: real MCP bootstrap, three worker/reviewer rounds and validate
   }
   assert.deepEqual(task.rounds.filter(round => round.type !== 'approval').map(round => round.round), [1, 2, 3]);
   assert.ok(task.rounds.filter(round => round.type !== 'approval').every(round => round.assessment?.success));
+  for (const round of [1, 2, 3]) {
+    const log = await f.client.tool('get_reviewer_log', { threadId: f.threadId, round });
+    assert.equal(log.available, true);
+    assert.match(log.content, /"type":"thread.started"/);
+  }
   assert.equal(task.worktree?.integration?.phase, 'merged');
   assert.equal(task.worktree?.validation?.result, 'passed');
   assert.ok(task.finalSummary);
