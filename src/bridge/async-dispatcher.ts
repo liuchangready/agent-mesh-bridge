@@ -1,7 +1,5 @@
-import { getTaskExecutionPath } from './types';
 import { resolveTaskTemplate, appendTemplateInstructions } from './task-templates';
 import * as crypto from 'crypto';
-import * as fs from 'fs';
 import * as path from 'path';
 import {
   AgentId,
@@ -11,33 +9,20 @@ import {
   DispatchTaskParams,
   DispatchResult,
   WorktreeInfo,
-  isIsolatedTaskWorktree,
   getModelRouting,
-  findInFlightRound,
-  isReviewerBootstrapPending,
-  isUserInterruption,
-  shouldResumeNativeSession,
   ExecutionPhase,
 } from './types';
 import { ExecutionController } from './execution-controller';
-import { roundExecutionLogPath } from './round-log';
 import { ensureTaskDataDir, removeTaskDataDir } from './task-data-dir';
 import { resolveReviewFlow, writeReviewerBootstrapToken } from './reviewer-bootstrap';
 import { TaskStore } from './task-store';
 import { AgentDetector } from './agent-detector';
 import { ActiveAgentResolver } from './active-agent-resolver';
-import { AutonomousRunner, RunResult } from './autonomous-runner';
+import { AutonomousRunner } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
-import { TaskSupervisor } from './task-supervisor';
-import { resolveGitRepository, resolveMainWorkspaceRoot, createTaskWorktree, removeTaskWorktree, changedFiles, currentHead } from './git-worktree';
-import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
-import { TaskExecutionOwner, TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
-import { QueueDrainer, QueuedExecution } from './queue-drainer';
-import { TaskRoleLock } from './task-role-lock';
+import { resolveGitRepository, resolveMainWorkspaceRoot, createTaskWorktree, removeTaskWorktree } from './git-worktree';
+import { TaskExecutionRegistry } from './task-execution-registry';
 import { resolveConfiguredModel, resolveInitiatorModel } from './model-catalog';
-import { appendCompactionProtocol, compactRoundBestEffort } from './context-compactor';
-import { readStoredRoundUsage } from './token-usage-collector';
-import { concurrencyPolicy } from './bridge-policy';
 import { ModelApprovalHandler, resolveDispatchModel } from './model-approval';
 import { assertCanExecute } from './agent-capabilities';
 import { WorkspaceRegistry, WorkspaceResolver, physicalDirectory, findUniqueWindow, readWindow, hasResidentExecutionHost } from './workspace';
@@ -49,9 +34,7 @@ export class AsyncDispatcher {
   private callbackManager: CallbackManager;
   private detector?: AgentDetector;
   private streamSyncIntervalMs: number = 30000;
-  private executionRegistry: TaskExecutionRegistry;
   private readonly storageDir: string;
-  private queueDrainer: QueueDrainer;
   /** Answers model-switch confirmations; the file channel unless overridden. */
   private modelApprovalHandler?: ModelApprovalHandler;
 
@@ -61,7 +44,7 @@ export class AsyncDispatcher {
     runner: AutonomousRunner,
     callbackManager: CallbackManager,
     detector?: AgentDetector,
-    executionRegistry?: TaskExecutionRegistry,
+    _executionRegistry?: TaskExecutionRegistry,
     private readonly v2?: { admitted: boolean },
   ) {
     this.taskStore = taskStore;
@@ -70,18 +53,6 @@ export class AsyncDispatcher {
     this.callbackManager = callbackManager;
     this.detector = detector;
     this.storageDir = path.dirname(taskStore.getStoragePath());
-    this.executionRegistry = executionRegistry || new TaskExecutionRegistry(this.storageDir);
-    this.queueDrainer = new QueueDrainer(
-      this.taskStore,
-      this.executionRegistry,
-      () => TaskSupervisor.isSupervisorActive(),
-      (target: QueuedExecution) => this.executeQueuedRound(target),
-    );
-
-    // Standalone MCP processes have no supervisor. React to ledger changes so a
-    // task approval/rework immediately releases the task-level queue instead of
-    // waiting for the next periodic poll.
-    if (!this.v2) this.taskStore.on('changed', () => this.queueDrainer.schedule(150));
   }
 
   public setStreamSyncIntervalMs(ms: number): void {
@@ -264,7 +235,7 @@ export class AsyncDispatcher {
     const initialPhase: ExecutionPhase = 'review';
     const initialPurpose = 'bootstrap' as const;
     tempCandidate.execution = {
-      version: this.v2 ? 2 : 1,
+      version: 2,
       revision: 1,
       operationId: `${initialPhase}_1_${Date.now()}`,
       phase: initialPhase,
@@ -347,389 +318,6 @@ export class AsyncDispatcher {
       nextAction: 'END_TURN_AND_WAIT_FOR_CALLBACK',
       stopInstruction,
     };
-  }
-
-  /**
-   * Internal background worker executing the round and updating state on completion.
-   */
-  private async executeBackgroundRound(
-    thread: DelegationThread,
-    roundNumber: number,
-    prompt: string,
-    isRework: boolean,
-  ): Promise<void> {
-    assertDedicatedTask(thread);
-    // The production v2 dispatcher has one execution owner: the durable run
-    // controller. Never let the legacy queue pump execute v1, missing-version,
-    // or unknown-version history after the host has enabled the cutover path.
-    if (this.v2 || thread.execution?.version === 2) return;
-    // A dedicated task may not execute before its reviewer conversation has
-    // dispatched it. The bootstrap service owns that first turn.
-    if (isReviewerBootstrapPending(thread)) {
-      this.markThreadQueued(
-        thread,
-        undefined,
-        'Queued: waiting for the dedicated reviewer conversation to dispatch this task.',
-      );
-      this.queueDrainer.schedule(1_500);
-      return;
-    }
-    if (this.executionRegistry.getOwner(thread.threadId)) {
-      this.queueDrainer.schedule(1_500);
-      return;
-    }
-    this.taskStore.loadFromDisk();
-
-    // Per-task role exclusivity: the developer may only run after the reviewer
-    // has handed off (request_rework/approve_task), and never while another
-    // reviewer/developer process owns the task.
-    const roleLock = new TaskRoleLock(this.storageDir);
-    const roleLease = roleLock.tryAcquire(thread.threadId, 'developer');
-    if (!roleLease) {
-      this.queueDrainer.schedule(1_500);
-      return;
-    }
-
-    const policy = concurrencyPolicy();
-    let registration: TaskExecutionRegistration | undefined;
-    try {
-      // Re-read and refresh the thread: it may have been queued for a while and
-      // another process may have updated its native session id.
-      this.taskStore.loadFromDisk();
-      const stored = this.taskStore.getTask(thread.threadId);
-      if (!stored) {
-        console.warn(
-          `[AsyncDispatcher] Task ${thread.threadId} was deleted before round ${roundNumber} started.`,
-        );
-        return;
-      }
-      const current = stored;
-      const currentRound = current.rounds.filter((round) => round.round === roundNumber).slice(-1)[0];
-      const terminal =
-        current.queuePhase === 'merge' ||
-        current.status === 'merging' || current.status === 'wait_decision' ||
-        current.status === 'completed' ||
-        current.status === 'failed' ||
-        current.status === 'paused' ||
-        current.status === 'reviewing';
-      if (
-        terminal ||
-        current.targetAgent !== thread.targetAgent ||
-        !currentRound ||
-        currentRound.status !== 'running' ||
-        currentRound.prompt !== prompt ||
-        findInFlightRound(current)?.round !== roundNumber ||
-        isReviewerBootstrapPending(current)
-      ) {
-        return;
-      }
-      if (policy.enabled) {
-        const owners = this.executionRegistry.listAgentOwners();
-        const agentSlots = owners.filter((owner) => owner.agent === current.targetAgent).length;
-        if (owners.length >= policy.maxConcurrentTasks || agentSlots >= policy.maxConcurrentPerAgent) {
-          roleLock.release(roleLease);
-          this.markThreadQueued(current, undefined, this.describeConcurrencyBlocked(current.targetAgent));
-          this.queueDrainer.schedule(1_500);
-          return;
-        }
-      }
-      try {
-        registration = this.executionRegistry.begin(
-          current.threadId,
-          roundNumber,
-          current.targetAgent,
-          getTaskExecutionPath(current),
-          'developer',
-        );
-      } catch (error: any) {
-        roleLock.release(roleLease);
-        currentRound.status = 'failed';
-        currentRound.error = `Could not register task execution: ${error?.message || error}`;
-        current.updatedAt = new Date().toISOString();
-        enterTaskFailure(current, { stage: 'execution', reason: currentRound.error, at: current.updatedAt, round: currentRound.round });
-        this.taskStore.upsertTask(current);
-        return;
-      }
-      current.status = 'running';
-      current.summary.lastOutputSnippet = 'Executing in background...';
-      this.taskStore.upsertTask(current);
-      thread = current;
-
-      console.log(
-        `[AsyncDispatcher] Starting background execution: ${thread.threadId} (Round ${roundNumber}) on ${thread.targetAgent}`,
-      );
-
-      const startedFailureRevision = thread.failureRevision || 0;
-      const startedRoundTimestamp = thread.rounds.filter(r => r.round === roundNumber).slice(-1)[0]?.timestamp;
-      let streamedOutput = '';
-      const startTime = Date.now();
-      let streamTimer: NodeJS.Timeout | null = null;
-
-      // Every 30 seconds, sync the live output stream and duration to taskStore
-      streamTimer = setInterval(() => {
-        if (!streamedOutput.trim()) return;
-        const elapsedMs = Date.now() - startTime;
-        const cleanSnippet = this.runner.extractCleanOutput(streamedOutput) || streamedOutput.trim();
-
-        this.taskStore.updateRound(thread.threadId, roundNumber, {
-          output: cleanSnippet,
-          durationMs: elapsedMs,
-          status: 'running',
-        }, undefined, undefined, undefined, undefined, { failureRevision: startedFailureRevision, roundTimestamp: startedRoundTimestamp });
-      }, this.streamSyncIntervalMs);
-
-      const logFilePath = roundExecutionLogPath(
-        thread.threadId,
-        roundNumber,
-        undefined,
-        thread.targetAgent,
-        thread.artifactDir,
-      );
-      try {
-        fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
-        fs.writeFileSync(logFilePath, '', 'utf8');
-      } catch {}
-
-      let result: RunResult;
-      // Baseline right before the agent starts: the diff afterwards tells us
-      // exactly which files this round changed, even if the caller declared
-      // nothing or the agent edited files unrelated to its task.
-      const workspaceBefore = captureWorkspaceSnapshot(getTaskExecutionPath(thread));
-      try {
-        result = await this.runner.execute({
-          agent: thread.targetAgent,
-          prompt: appendTemplateInstructions(isRework ? appendCompactionProtocol(prompt, roundNumber) : prompt, thread.taskTemplate, 'worker'),
-          isRework,
-          receiverSessionId: thread.receiverSessionId,
-          title: thread.title,
-          cwd: getTaskExecutionPath(thread),
-          taskThreadId: thread.threadId,
-          artifactDir: thread.artifactDir,
-          taskRound: roundNumber,
-          model: thread.targetModel,
-          role: 'developer',
-          previousTokenUsage: readStoredRoundUsage(this.taskStore, thread.threadId, roundNumber),
-          onChildPid: (pid) => {
-            if (registration) this.executionRegistry.attachChildPid(pid, registration);
-            roleLock.attachChild(roleLease, pid);
-          },
-          onStdoutChunk: (chunk: string) => {
-            streamedOutput += chunk;
-            try {
-              fs.appendFileSync(logFilePath, chunk, 'utf8');
-            } catch {}
-          },
-          onStderrChunk: (chunk: string) => {
-            streamedOutput += chunk;
-            try {
-              fs.appendFileSync(logFilePath, chunk, 'utf8');
-            } catch {}
-          },
-        });
-      } catch (err: any) {
-        result = {
-          exitCode: -1,
-          stdout: '',
-          stderr: String(err),
-          extractedOutput: '',
-          durationMs: 0,
-          error: `Execution error: ${err?.message || err}`,
-        };
-      } finally {
-        if (streamTimer) {
-          clearInterval(streamTimer);
-          streamTimer = null;
-        }
-      }
-
-      // Attribute the files this round changed while the tree state is still
-      // fresh (a pause between here and the finalize below must not lose it).
-      const touchedFiles = diffWorkspaceSnapshots(
-        workspaceBefore,
-        captureWorkspaceSnapshot(getTaskExecutionPath(thread)),
-      );
-
-      this.taskStore.loadFromDisk();
-      const latest = this.taskStore.getTask(thread.threadId);
-      if (!latest) {
-        console.warn(
-          `[AsyncDispatcher] Task ${thread.threadId} was deleted while round ${roundNumber} was executing.`,
-        );
-        return;
-      }
-
-      const liveRound = latest.rounds.filter(r => r.round === roundNumber).slice(-1)[0];
-      if (latest.archivedAt || (latest.failureRevision || 0) !== startedFailureRevision ||
-          latest.currentRound !== roundNumber || !liveRound || liveRound.timestamp !== startedRoundTimestamp ||
-          roleLock.getOwner(thread.threadId)?.token !== roleLease.token) return;
-
-      // A pause may have landed after the child exited but before this handler
-      // ran; the control plane's state wins over a "successful" result.
-      const pausedByControl = latest.status === 'paused';
-      const interruption = result.interruption || (pausedByControl ? latest.interruption : undefined);
-      const isPaused = pausedByControl || interruption?.kind === 'paused';
-      const responseOk = result.assessment
-        ? result.assessment.success
-        : result.exitCode === 0;
-      let isSuccess = !interruption && !pausedByControl && responseOk;
-      if (isSuccess && isIsolatedTaskWorktree(latest.worktree)) {
-        try {
-          latest.worktree.headCommit = currentHead(latest.worktree.path);
-          latest.worktree.integration = { phase: 'ready', sourceCommit: latest.worktree.headCommit, updatedAt: new Date().toISOString() };
-        } catch (error: any) {
-          result.error = `Could not inspect the task worktree: ${error?.message || error}`;
-          result.exitCode = 1;
-          isSuccess = false;
-        }
-      }
-      if (!isSuccess && isIsolatedTaskWorktree(latest.worktree)) {
-        try {
-          const head = currentHead(latest.worktree.path);
-          if (head !== latest.worktree.baseCommit || changedFiles(latest.worktree.path).length) {
-            latest.worktree.headCommit = head;
-            latest.worktree.integration = { phase: 'ready', sourceCommit: head, updatedAt: new Date().toISOString() };
-          }
-        } catch {}
-      }
-      const finalRoundStatus = isPaused ? 'paused' : isSuccess ? 'completed' : 'failed';
-      const finalThreadStatus = isPaused ? 'paused' : isSuccess ? 'reviewing' : 'failed';
-
-      const nativeSessionId = result.actualSessionId || latest.receiverSessionId;
-      if (result.actualSessionId && result.actualSessionId !== latest.receiverSessionId) {
-        console.log(
-          `[AsyncDispatcher] Syncing receiverSessionId from ${latest.receiverSessionId} to actual native ID: ${result.actualSessionId}`,
-        );
-        latest.receiverSessionId = result.actualSessionId;
-      }
-      if (result.actualSessionId) {
-        latest.receiverSessionCaptured = true;
-      }
-
-      const updatedThread = this.taskStore.updateRound(
-        thread.threadId,
-        roundNumber,
-        {
-          output: result.extractedOutput || result.stdout,
-          error: result.error,
-          durationMs: result.durationMs,
-          status: finalRoundStatus,
-          assessment: result.assessment,
-          touchedFiles: touchedFiles.length > 0 ? touchedFiles : undefined,
-          // Execution metadata: who ran this round, on which model, and what
-          // it cost. It must survive the lagged compaction.
-          executorAgent: thread.targetAgent,
-          executorModel: result.model || thread.targetModel,
-          tokenUsage: result.tokenUsage,
-        },
-        finalThreadStatus,
-        nativeSessionId,
-        undefined,
-        interruption,
-        {
-          failureRevision: startedFailureRevision,
-          roundTimestamp: startedRoundTimestamp,
-          receiverSessionCaptured: Boolean(result.actualSessionId || latest.receiverSessionCaptured),
-        },
-      );
-
-      if (updatedThread && this.taskStore.getTask(updatedThread.threadId)) {
-        const completedRound = updatedThread.rounds.find((r) => r.round === roundNumber);
-        if (completedRound) {
-          // Lagged compaction: only after this round actually succeeded, and
-          // before the role handoff. Best-effort — the compactor never throws,
-          // because a failure here must not strand the reviewer wake-up.
-          if (isSuccess) {
-            compactRoundBestEffort(this.taskStore, {
-              threadId: updatedThread.threadId,
-              currentRoundNumber: roundNumber,
-              currentOutput: result.extractedOutput || result.stdout,
-            });
-          }
-          // Hand the task from developer to reviewer.
-          roleLock.release(roleLease);
-          if (!interruption && isSuccess) {
-            await this.callbackManager.notifyCaller(updatedThread, completedRound);
-          } else if (!isUserInterruption(interruption)) {
-            const notified = await this.callbackManager.notifyCallerOfFailure(
-              updatedThread,
-              roundNumber,
-              result,
-            );
-            if (notified) this.taskStore.upsertTask(updatedThread);
-          }
-        }
-      }
-    } finally {
-      if (registration) this.executionRegistry.end(registration);
-      roleLock.release(roleLease);
-      // Strict turn-taking: only after this round has released the gate may the
-      // next queued task start.
-      this.queueDrainer.schedule(50);
-    }
-  }
-
-  /** Pump one queued round; used when no persistent supervisor is alive. */
-  private async executeQueuedRound(target: QueuedExecution): Promise<void> {
-    await this.executeBackgroundRound(
-      target.thread,
-      target.round.round,
-      target.round.prompt,
-      shouldResumeNativeSession(target.thread, target.round),
-    );
-  }
-
-  /** Describe an enabled best-effort execution cap. */
-  private describeConcurrencyBlocked(targetAgent: string): string {
-    const policy = concurrencyPolicy();
-    const owners = this.executionRegistry.listAgentOwners();
-    if (owners.length >= policy.maxConcurrentTasks) {
-      return (
-        `Queued: active execution limit reached (${owners.length}/${policy.maxConcurrentTasks}); ` +
-        `waiting for a free execution record.`
-      );
-    }
-    const sameAgent = owners.filter((owner) => owner.agent === targetAgent).length;
-    if (sameAgent >= policy.maxConcurrentPerAgent) {
-      return (
-        `Queued: agent ${targetAgent} already occupies ${sameAgent}/${policy.maxConcurrentPerAgent} ` +
-        `of its concurrent slots; waiting for one of its running tasks to finish.`
-      );
-    }
-    return 'Queued: waiting for a free execution slot.';
-  }
-
-  private markThreadQueued(
-    thread: DelegationThread,
-    owner?: TaskExecutionOwner,
-    detail?: string,
-  ): void {
-    this.taskStore.loadFromDisk();
-    const fresh = this.taskStore.getTask(thread.threadId);
-    const candidateRound = findInFlightRound(thread);
-    const freshRound = fresh ? findInFlightRound(fresh) : undefined;
-    if (
-      !fresh ||
-      fresh.queuePhase === 'merge' ||
-      (fresh.status !== 'queued' && fresh.status !== 'running') ||
-      fresh.targetAgent !== thread.targetAgent ||
-      fresh.reviewBlocked ||
-      isReviewerBootstrapPending(fresh) ||
-      !candidateRound || freshRound?.round !== candidateRound.round || freshRound.prompt !== candidateRound.prompt
-    ) return;
-    const liveRole = new TaskRoleLock(this.storageDir).getOwner(thread.threadId);
-    if (this.executionRegistry.getOwner(thread.threadId) || liveRole) return;
-    const message =
-      detail ||
-      (owner
-        ? `Queued: Waiting for task ${owner.threadId} (round ${owner.round}) to finish.`
-        : 'Queued: Waiting for a free execution slot.');
-    if (fresh.status === 'queued' && fresh.summary.lastOutputSnippet === message) {
-      return;
-    }
-
-    fresh.status = 'queued';
-    fresh.summary.lastOutputSnippet = message;
-    this.taskStore.upsertTask(fresh);
   }
 
   private generateThreadId(d: Date): string {

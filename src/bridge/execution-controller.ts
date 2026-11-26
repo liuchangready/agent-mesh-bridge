@@ -72,7 +72,7 @@ interface StartExecutionOptions {
 }
 
 type PhaseResult =
-  | { ok: true; verdict?: string }
+  | { ok: true; verdict?: string; recoveryPending?: 'stash_metadata' }
   | { ok: false; code: string; reason: string; stage?: FailureStage; quotaResetsAt?: string; transient?: boolean; mergeReview?: MergeFailureReview };
 
 function v2SlotAgent(task: DelegationThread): AgentId | undefined {
@@ -84,6 +84,11 @@ function v2SlotAgent(task: DelegationThread): AgentId | undefined {
   if (execution.phase === 'develop') return task.targetAgent;
   if (execution.phase === 'review') return task.initiatorAgent;
   return undefined;
+}
+
+function isCompletedLandedStashRecovery(task: DelegationThread | undefined, phase: ExecutionPhase): boolean {
+  return phase === 'merge' && task?.status === 'completed' && task.execution?.version === 2 &&
+    Boolean(task.worktree?.integration?.stashRecoveryPending && task.worktree.integration.mergedCommit);
 }
 
 function mergeQueueTime(task: DelegationThread): number {
@@ -431,7 +436,8 @@ export class ExecutionController {
       const version = thread.execution ? 'VERSION_' + thread.execution.version : 'NO_EXECUTION';
       return { started: false, reason: 'HISTORICAL_TASK_READ_ONLY:' + version };
     }
-    const eligibility = validateV2ExecutionEligibility(thread);
+    const landedStashRecovery = isCompletedLandedStashRecovery(thread, targetPhase || thread.execution.phase);
+    const eligibility = validateV2ExecutionEligibility(landedStashRecovery ? { ...thread, status: 'reviewing' } : thread);
     if (!eligibility.eligible) {
       return { started: false, reason: eligibility.code };
     }
@@ -439,7 +445,7 @@ export class ExecutionController {
     const allowStates = options?.allowStates;
     const isAllowed = (s: ThreadStatus) => allowStates?.includes(s);
 
-    if (thread.status === 'completed' || (thread.status === 'failed' && !isAllowed('failed'))) {
+    if ((thread.status === 'completed' && !landedStashRecovery) || (thread.status === 'failed' && !isAllowed('failed'))) {
       return { started: false, reason: 'terminal' };
     }
     if (thread.status === 'paused' && !isAllowed('paused')) {
@@ -633,9 +639,12 @@ export class ExecutionController {
 
       try {
         thread = await this.taskStore.transitionExecution(threadId, rev, (t) => {
-          const el = validateV2ExecutionEligibility(t);
+          const recoverCompletedLandedStash = isCompletedLandedStashRecovery(t, phase);
+          const el = validateV2ExecutionEligibility(recoverCompletedLandedStash ? { ...t, status: 'reviewing' } : t);
           if (!el.eligible) throw new Error(`INELIGIBLE:${el.code}`);
-          if (t.status === 'completed' || (t.status === 'failed' && !isAllowed('failed'))) {
+          const recoverLandedStash = phase === 'merge' && t.execution?.version === 2 &&
+            Boolean(t.worktree?.integration?.stashRecoveryPending && t.worktree.integration.mergedCommit);
+          if ((t.status === 'completed' && !recoverLandedStash) || (t.status === 'failed' && !isAllowed('failed'))) {
             throw new Error('TERMINAL');
           }
           if (t.status === 'paused' && !isAllowed('paused')) {
@@ -1990,6 +1999,16 @@ export class ExecutionController {
     } : undefined;
     const wakeResult = await this.callbackManager.launchCaller(thread, reviewRound, onChildPid, reviewerIdentity);
 
+    if (thread.reviewerSessionId) {
+      this.callbackManager.finalizeWake(thread, reviewRound, thread.reviewerSessionId, {
+        output: wakeResult.output,
+        error: wakeResult.error,
+        exitCode: wakeResult.exitCode,
+        assessment: wakeResult.assessment,
+        attemptId: reviewerIdentity?.runId,
+      });
+    }
+
     // Re-read task to observe durable verdict
     const freshThread = this.taskStore.getTask(threadId);
     if (!freshThread) return { ok: false, code: 'NOT_FOUND', reason: 'Task disappeared' };
@@ -2076,6 +2095,9 @@ export class ExecutionController {
     try {
       const mergeResult = await this.mergeCoordinator.mergeApprovedAttempt(threadId, onChildPid, mergeRelease);
       if (mergeResult.status === 'merged' || mergeResult.status === 'no_changes') {
+        if (this.taskStore.getTask(threadId)?.worktree?.integration?.stashRecoveryPending) {
+          return { ok: true, recoveryPending: 'stash_metadata' };
+        }
         return { ok: true };
       }
 
@@ -2100,6 +2122,73 @@ export class ExecutionController {
         transient: false,
       };
     } catch (err: any) {
+      const hasPendingStashJournal = this.mergeCoordinator.hasPendingStashCleanupJournal(threadId);
+      const stashRecovery = hasPendingStashJournal
+        ? this.mergeCoordinator.getLandedPendingStashRecovery(threadId)
+        : undefined;
+      if (hasPendingStashJournal && !stashRecovery) {
+        return {
+          ok: false, code: 'STASH_RECOVERY_JOURNAL_UNVERIFIED',
+          reason: 'A durable stash cleanup journal remains pending, but its landed commit and pinned target could not be verified.',
+          stage: 'merge', transient: false,
+        };
+      }
+      if (stashRecovery) {
+        const expectedOperationId = identity?.operationId || thread.execution?.operationId;
+        const expectedGeneration = identity?.generation ?? thread.execution?.generation;
+        const expectedRound = identity?.round ?? thread.execution?.round;
+        const pinnedTarget = thread.worktree?.deliveryTarget;
+        if (thread.execution?.version === 2 && expectedOperationId && expectedGeneration !== undefined &&
+            expectedRound !== undefined && pinnedTarget?.ref === stashRecovery.targetRef) {
+          try {
+            await this.transitionTask(threadId, (current) => {
+              const control = current.execution;
+              if (control?.version !== 2 || control.phase !== 'merge' || control.operationId !== expectedOperationId ||
+                  control.generation !== expectedGeneration || control.round !== expectedRound || control.run?.id !== runId ||
+                  control.run.state === 'stopping' || control.run.unconfirmed || current.status !== 'merging' || current.cleanup ||
+                  current.worktree?.approvedCommit !== stashRecovery.sourceCommit ||
+                  current.worktree.deliveryTarget?.ref !== pinnedTarget.ref ||
+                  current.worktree.deliveryTarget.branch !== pinnedTarget.branch ||
+                  current.worktree.deliveryTarget.repositoryPath !== pinnedTarget.repositoryPath ||
+                  current.worktree.deliveryTarget.ref !== stashRecovery.targetRef) {
+                throw new Error('The V2 merge identity or pinned delivery target changed before stash recovery was recorded.');
+              }
+              const pendingMessage = `Stash metadata cleanup remains pending (${stashRecovery.phase}): ${stashRecovery.error}`;
+              current.worktree.integration = {
+                ...current.worktree.integration, phase: 'blocked', sourceCommit: stashRecovery.sourceCommit,
+                candidateCommit: stashRecovery.candidateCommit, targetOldCommit: stashRecovery.targetOldCommit,
+                targetCommit: stashRecovery.targetCommit, targetPath: stashRecovery.checkoutPath,
+                mergedCommit: stashRecovery.candidateCommit, stashRecoveryPending: true,
+                stashRecoveryLockHeld: stashRecovery.stashRecoveryLockHeld,
+                stashRestore: { status: 'stash_cleanup_uncertain', sha: stashRecovery.stashSha, error: pendingMessage },
+                error: pendingMessage, updatedAt: new Date().toISOString(),
+              };
+              const hasPendingEntry = (current.mergeHistory || []).some((entry) =>
+                entry.phase === 'stash_cleanup' && entry.result === 'pending' && entry.candidateCommit === stashRecovery.candidateCommit);
+              if (!hasPendingEntry) {
+                current.mergeHistory = [...(current.mergeHistory || []), {
+                  id: crypto.randomUUID(), number: (current.mergeHistory?.length || 0) + 1,
+                  at: new Date().toISOString(), phase: 'stash_cleanup', result: 'pending',
+                  error: pendingMessage, errorCode: 'STASH_CLEANUP_PENDING',
+                }];
+              }
+              current.summary.lastOutputSnippet = pendingMessage;
+            });
+            return { ok: true, recoveryPending: 'stash_metadata' };
+          } catch (recordError: any) {
+            return {
+              ok: false, code: 'STASH_RECOVERY_LEDGER_PENDING',
+              reason: `The landed commit is preserved, but stash recovery evidence could not be committed: ${(recordError as Error)?.message || recordError}`,
+              stage: 'merge', transient: false,
+            };
+          }
+        }
+        return {
+          ok: false, code: 'STASH_RECOVERY_IDENTITY_MISMATCH',
+          reason: 'The durable stash cleanup journal is pending, but its V2 run or pinned delivery target could not be verified.',
+          stage: 'merge', transient: false,
+        };
+      }
       if (await this.mergeCoordinator.hasLandedCandidate(threadId)) {
         for (let retry = 0; retry < 3; retry++) {
           try {
@@ -2219,6 +2308,24 @@ export class ExecutionController {
     };
 
     if (result.ok) {
+      if (phase === 'merge' && result.recoveryPending === 'stash_metadata') {
+        await this.transitionTask(threadId, (t) => {
+          validateRunMatch(t);
+          if (!t.worktree?.integration?.stashRecoveryPending || !t.worktree.integration.mergedCommit) {
+            throw new Error('Landed stash recovery evidence changed before the V2 run settled.');
+          }
+          t.status = 'reviewing';
+          t.execution!.run = undefined;
+          t.execution!.queue = undefined;
+          t.execution!.next = undefined;
+          t.execution!.lastOutcome = {
+            code: 'STASH_CLEANUP_PENDING',
+            reason: t.worktree.integration.error || 'The landed commit is preserved; stash metadata recovery is still pending.',
+            at: new Date().toISOString(),
+          };
+        });
+        return;
+      }
       // SUCCESS in this phase: Advance immediately to next phase!
       if (phase === 'develop') {
         // Develop succeeded -> advance directly to review!

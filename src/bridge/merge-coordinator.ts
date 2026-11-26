@@ -437,7 +437,7 @@ export class MergeCoordinator {
           prior.phase = 'checkout_synced'; this.writeTransaction(txPath, prior);
         }
         await this.restoreLandingStash(threadId, prior, txPath);
-        if (prior.stashCleanupPending) return this.finishStashRecoveryPending(threadId, prior);
+        if (prior.stashCleanupPending) return await this.finishStashRecoveryPending(threadId, prior);
         const validationStatus = prior.validationPath ? await this.cleanupValidationWorktree(repoPath, threadId, prior.validationPath) : undefined;
         await this.finishMerged(threadId, sync.commit || prior.candidateCommit!, prior.targetOldCommit, sync.path,
           prior.validationPath ? this.validationRecord(prior.validationPath, prior.validationCommit, prior.validationResult, validationStatus) : undefined, prior.candidateCommit);
@@ -451,7 +451,7 @@ export class MergeCoordinator {
       }
       if (prior?.stashToken && !['stash_restored', 'stash_restore_conflict', 'ledger_written'].includes(prior.phase)) {
         const restored = await this.restoreLandingStash(threadId, prior, txPath);
-        if (prior.stashCleanupPending) return this.finishStashRecoveryPending(threadId, prior);
+        if (prior.stashCleanupPending) return await this.finishStashRecoveryPending(threadId, prior);
         if (!restored) {
           const reason = 'The previous landing stash could not be safely restored; its checkout and stash were preserved.';
           this.finishBlocked(threadId, reason, prior.targetOldCommit, sourceCommit, prior.checkoutPath);
@@ -663,17 +663,17 @@ export class MergeCoordinator {
             await this.loggedGit(threadId, beforeLanding.path, ['read-tree', '-n', '-u', '-m', targetOldCommit, candidateCommit]);
           } catch (error) {
             await this.restoreLandingStash(threadId, tx, txPath);
-            if (tx.stashCleanupPending) return this.finishStashRecoveryPending(threadId, tx);
+            if (tx.stashCleanupPending) return await this.finishStashRecoveryPending(threadId, tx);
             throw error;
           }
         }
-        if (!this.isMergeStillAllowed(threadId, sourceCommit)) { await this.restoreLandingStash(threadId, tx, txPath); if (tx.stashCleanupPending) return this.finishStashRecoveryPending(threadId, tx); validationResult = 'cancelled'; return { status: 'stale', message: 'Task was paused or deleted before the target ref update.' }; }
+        if (!this.isMergeStillAllowed(threadId, sourceCommit)) { await this.restoreLandingStash(threadId, tx, txPath); if (tx.stashCleanupPending) return await this.finishStashRecoveryPending(threadId, tx); validationResult = 'cancelled'; return { status: 'stale', message: 'Task was paused or deleted before the target ref update.' }; }
         // update-ref's old-value argument prevents overwriting a ref changed outside this lock.
         try {
           await this.loggedGit(threadId, repoPath, ['update-ref', targetRef, candidateCommit, targetOldCommit]);
         } catch (error) {
           const restored = await this.restoreLandingStash(threadId, tx, txPath);
-          if (tx.stashCleanupPending) return this.finishStashRecoveryPending(threadId, tx);
+          if (tx.stashCleanupPending) return await this.finishStashRecoveryPending(threadId, tx);
           if (!restored) throw new Error(`Could not restore local changes after target update failed: ${String(error)}`);
           const latestTarget = await this.loggedGit(threadId, repoPath, ['rev-parse', '--verify', `${targetRef}^{commit}`]);
           if (latestTarget === targetOldCommit) throw error;
@@ -693,7 +693,7 @@ export class MergeCoordinator {
         if (!synced.ok) { this.finishBlocked(threadId, synced.error, targetOldCommit, sourceCommit, synced.path, retainForResolution ? scratch : undefined); return { status: 'blocked', message: synced.error }; }
         tx.phase = 'checkout_synced'; this.writeTransaction(txPath, tx);
         await this.restoreLandingStash(threadId, tx, txPath);
-        if (tx.stashCleanupPending) return this.finishStashRecoveryPending(threadId, tx);
+        if (tx.stashCleanupPending) return await this.finishStashRecoveryPending(threadId, tx);
         const validationStatus = await this.removeValidationWorktree(repoPath, scratch, threadId) ? 'cleaned' : 'present'; added = validationStatus === 'present';
         await this.finishMerged(threadId, synced.commit || candidateCommit, targetOldCommit, synced.path, this.validationRecord(scratch, validationCommit, validationResult, validationStatus), candidateCommit);
         tx.phase = 'ledger_written'; this.writeTransaction(txPath, tx);
@@ -720,7 +720,7 @@ export class MergeCoordinator {
           if (!sync.ok) { this.finishBlocked(threadId, sync.error, tx.targetOldCommit, sourceCommit, sync.path); return { status: 'blocked', message: sync.error }; }
           if (!['stash_restoring', 'stash_applied', 'stash_cleanup_started', 'stash_cleanup_prepared', 'stash_reflog_published', 'stash_ref_published', 'stash_cleanup_rolled_back', 'stash_cleanup_needs_recovery', 'stash_restored', 'stash_restore_conflict', 'ledger_written'].includes(tx.phase)) { tx.phase = 'checkout_synced'; this.writeTransaction(this.transactionPath(threadId), tx); }
           await this.restoreLandingStash(threadId, tx, this.transactionPath(threadId));
-          if (tx.stashCleanupPending) return this.finishStashRecoveryPending(threadId, tx);
+          if (tx.stashCleanupPending) return await this.finishStashRecoveryPending(threadId, tx);
           const validationStatus = tx.validationPath ? await this.cleanupValidationWorktree(repoPath, threadId, tx.validationPath) : undefined;
           await this.finishMerged(threadId, sync.commit || tx.candidateCommit, tx.targetOldCommit, sync.path,
             tx.validationPath ? this.validationRecord(tx.validationPath, tx.validationCommit, tx.validationResult, validationStatus) : undefined, tx.candidateCommit);
@@ -1169,7 +1169,7 @@ export class MergeCoordinator {
     return { path: validationPath, commit, status, result, updatedAt: new Date().toISOString() };
   }
 
-  private finishStashRecoveryPending(threadId: string, tx: any): MergeResult {
+  private async finishStashRecoveryPending(threadId: string, tx: any): Promise<MergeResult> {
     const current = this.store.getTask(threadId);
     const message = `Stash metadata cleanup requires recovery (${tx.phase}): ${tx.stashRestoreError || 'publication was interrupted'}`;
     if (!current?.worktree) return { status: 'blocked', message };
@@ -1182,14 +1182,49 @@ export class MergeCoordinator {
       if (target !== tx.candidateCommit) gitOutput(repo, ['merge-base', '--is-ancestor', tx.candidateCommit, target]);
       landedTarget = target;
     } catch {}
-    if (thread.status !== 'paused') thread.status = 'reviewing';
-    worktree.integration = { ...worktree.integration, phase: 'blocked', sourceCommit: tx.sourceCommit, candidateCommit: tx.candidateCommit,
+    if (thread.execution?.version !== 2 && thread.status !== 'paused') thread.status = 'reviewing';
+    const pendingIntegration = { ...worktree.integration, phase: 'blocked' as const, sourceCommit: tx.sourceCommit, candidateCommit: tx.candidateCommit,
       targetOldCommit: tx.targetOldCommit, targetPath: tx.checkoutPath, stashRecoveryPending: true, stashRecoveryLockHeld: tx.phase === 'stash_cleanup_needs_recovery',
       ...(landedTarget ? { targetCommit: landedTarget, mergedCommit: tx.candidateCommit } : {}),
       stashRestore: { status: 'stash_cleanup_uncertain', sha: tx.stashSha, error: tx.stashRestoreError }, error: message, updatedAt: at };
-    thread.mergeHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number: (thread.mergeHistory?.length || 0) + 1,
+    const pendingHistory = [...(thread.mergeHistory || []), { id: crypto.randomUUID(), number: (thread.mergeHistory?.length || 0) + 1,
       at, phase: 'stash_cleanup', result: 'pending', error: message, errorCode: 'STASH_CLEANUP_PENDING', attemptId: this.attemptLogs.get(threadId)?.id }];
-    thread.summary.lastOutputSnippet = message; thread.updatedAt = at; this.store.upsertTask(thread);
+    worktree.integration = pendingIntegration;
+    thread.mergeHistory = pendingHistory;
+    thread.summary.lastOutputSnippet = message; thread.updatedAt = at;
+    if (thread.execution?.version === 2) {
+      // Ordinary upsertTask intentionally ignores persisted V2 records. Keep
+      // the active merge run intact and publish only recovery evidence through
+      // the task's revision-checked execution transition.
+      const expected = thread.execution;
+      const runId = expected.run?.id;
+      if (!runId || expected.phase !== 'merge' || thread.status !== 'merging' || thread.cleanup) {
+        throw new Error(`Cannot record landed stash recovery for ${threadId} without its active v2 merge run.`);
+      }
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const fresh = this.store.reloadTask(threadId);
+        if (fresh?.execution?.version !== 2 || fresh.execution.run?.id !== runId ||
+            fresh.execution.operationId !== expected.operationId || fresh.execution.generation !== expected.generation ||
+            fresh.execution.phase !== 'merge' || fresh.status !== 'merging' || fresh.cleanup) {
+          throw new Error(`Cannot record landed stash recovery for ${threadId}: v2 merge identity changed.`);
+        }
+        try {
+          await this.store.transitionExecution(threadId, fresh.execution.revision, (latest) => {
+            if (latest.execution?.version !== 2 || latest.execution.run?.id !== runId ||
+                latest.execution.operationId !== expected.operationId || latest.execution.generation !== expected.generation ||
+                latest.execution.phase !== 'merge' || latest.status !== 'merging' || latest.cleanup) {
+              throw new Error(`Cannot record landed stash recovery for ${threadId}: v2 merge identity changed.`);
+            }
+            latest.worktree!.integration = pendingIntegration;
+            latest.mergeHistory = pendingHistory;
+            latest.summary.lastOutputSnippet = message;
+          });
+          break;
+        } catch (error: any) {
+          if (attempt === 2 || !String(error?.message || error).includes('revision mismatch')) throw error;
+        }
+      }
+    } else this.store.upsertTask(thread);
     return landedTarget ? { status: 'merged', message: `The merge is landed, but ${message}`, commit: tx.candidateCommit } : { status: 'blocked', message };
   }
 
@@ -1463,6 +1498,43 @@ export class MergeCoordinator {
       if (head === tx.candidateCommit) return true;
       try { await run(['merge-base', '--is-ancestor', tx.candidateCommit, head]); return true; } catch { return false; }
     } catch { return false; }
+  }
+
+  /** Durable stash journal proof used when the task-ledger pending CAS is exhausted. */
+  public hasPendingStashCleanupJournal(threadId: string): boolean {
+    const tx = this.readTransaction(this.transactionPath(threadId));
+    return tx?.threadId === threadId && tx.stashCleanupPending === true;
+  }
+
+  public getLandedPendingStashRecovery(threadId: string): {
+    phase: string;
+    sourceCommit: string;
+    candidateCommit: string;
+    targetOldCommit: string;
+    targetRef: string;
+    targetCommit: string;
+    checkoutPath?: string;
+    stashSha: string;
+    error: string;
+    stashRecoveryLockHeld: boolean;
+  } | undefined {
+    const tx = this.readTransaction(this.transactionPath(threadId));
+    const thread = this.store.reloadTask(threadId);
+    const worktree = thread?.worktree;
+    if (!tx || tx.threadId !== threadId || tx.stashCleanupPending !== true || !tx.stashSha ||
+        !tx.candidateCommit || !tx.sourceCommit || !tx.targetOldCommit || !worktree?.approvedCommit ||
+        tx.sourceCommit !== worktree.approvedCommit || !worktree.deliveryTarget) return undefined;
+    try {
+      const { repositoryPath, ref } = requireDeliveryTarget(worktree);
+      const targetCommit = gitOutput(repositoryPath, ['rev-parse', '--verify', `${ref}^{commit}`]);
+      if (targetCommit !== tx.candidateCommit) gitOutput(repositoryPath, ['merge-base', '--is-ancestor', tx.candidateCommit, targetCommit]);
+      return {
+        phase: String(tx.phase), sourceCommit: tx.sourceCommit, candidateCommit: tx.candidateCommit,
+        targetOldCommit: tx.targetOldCommit, targetRef: ref, targetCommit, checkoutPath: tx.checkoutPath,
+        stashSha: tx.stashSha, error: tx.stashRestoreError || 'Stash metadata cleanup remains pending.',
+        stashRecoveryLockHeld: tx.phase === 'stash_cleanup_needs_recovery',
+      };
+    } catch { return undefined; }
   }
 
   private transactionPath(threadId: string): string { return path.join(this.storageDir, 'merge-transactions', `${threadId}.json`); }

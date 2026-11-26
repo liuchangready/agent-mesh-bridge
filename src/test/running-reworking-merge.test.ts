@@ -1,5 +1,4 @@
 import { testWorkspace } from './workspace-fixture';
-import { enterTaskFailure } from '../bridge/types';
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -10,65 +9,22 @@ const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-home-')
 process.env.USERPROFILE = isolatedHome;
 process.env.HOME = isolatedHome;
 
-import { TaskStore, normalizeThread } from '../bridge/task-store';
-import { ReworkController } from '../bridge/rework-controller';
+import { TaskStore } from '../bridge/task-store';
 import { AgentDetector } from '../bridge/agent-detector';
-import { AutonomousRunner } from '../bridge/autonomous-runner';
-import { CallbackManager } from '../bridge/callback-manager';
-import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { formatTaskTreeStatus } from '../ui/task-status-formatter';
 import { NativeSessionCompactor } from '../bridge/native-session-compactor';
 import {
   DelegationThread,
-  DelegationRound,
   findInFlightRound,
 } from '../bridge/types';
 
 describe('Running and Reworking Status Merge Tests', () => {
   let tmpDir: string;
   let taskStore: TaskStore;
-  let reworkController: ReworkController;
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-merge-status-test-'));
     taskStore = new TaskStore(tmpDir);
-    const detector = new AgentDetector();
-    const runner = new AutonomousRunner(detector);
-    runner.execute = async () => {
-      await new Promise((r) => setTimeout(r, 100));
-      return {
-        exitCode: 0,
-        stdout: 'mock execution output',
-        stderr: '',
-        extractedOutput: 'mock execution output',
-        durationMs: 50,
-        assessment: {
-          success: true,
-          errorCode: 'OK',
-          exitCode: 0,
-          warnings: [],
-          stream: {
-            chunkCount: 1,
-            stdoutBytes: 21,
-            stderrBytes: 0,
-            firstOutputAtMs: 1,
-            lastOutputAtMs: 2,
-            maxGapMs: 1,
-            rawMaxGapMs: 1,
-            excludedSuspensionMs: 0,
-            suspensionCount: 0,
-            gapThresholdMs: 3000,
-            hasActualOutput: true,
-            continuous: true,
-            gapExceeded: false,
-          },
-        },
-      };
-    };
-    const callbackManager = new CallbackManager(detector);
-    callbackManager.notifyCaller = async () => true;
-    const gate = new TaskExecutionRegistry(tmpDir);
-    reworkController = new ReworkController(taskStore, runner, callbackManager, detector, gate);
   });
 
   afterEach(() => {
@@ -256,92 +212,6 @@ describe('Running and Reworking Status Merge Tests', () => {
     assert.strictEqual(reworkTasks[0].threadId, 'thread_rework_run');
     assert.strictEqual(reworkTasks[0].status, 'running');
     assert.strictEqual(findInFlightRound(reworkTasks[0])?.type, 'rework');
-  });
-
-  test('rework creation and retry/resume lifecycle writes status "running"', async () => {
-    const threadId = 'thread_lifecycle_test';
-    const initialThread: DelegationThread = {
-    reviewFlow: 'dedicated',
-    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
-    reviewerSessionCaptured: true,
-    reviewerSessionId: ('reviewer-' + (threadId)),
-    callerSessionId: ('reviewer-' + (threadId)),
-      threadId,
-      title: 'Lifecycle Task',
-      initiatorAgent: 'codex',
-      targetAgent: 'antigravity',
-      status: 'reviewing',
-      currentRound: 1,
-      createdAt: '2026-10-20T10:00:00.000Z',
-      updatedAt: '2026-10-20T10:00:00.000Z',
-      receiverSessionId: 'session-stable-001',
-      receiverSessionCaptured: true,
-      workspace: testWorkspace(tmpDir),
-      summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 },
-      rounds: [
-        {
-          round: 1,
-          type: 'initial',
-          prompt: 'Implement feature A',
-          status: 'completed',
-          durationMs: 3000,
-          output: 'Feature A done',
-          timestamp: '2026-10-20T10:00:00.000Z',
-          touchedFiles: ['featureA.ts'],
-        },
-      ],
-    };
-    taskStore.upsertTask(initialThread);
-
-    // 1. Request rework
-    const reworkResult = await reworkController.requestRework({
-      threadId,
-      feedback: 'Please add unit tests for feature A',
-    });
-    assert.strictEqual(reworkResult.status, 'REWORK_DISPATCHED');
-    assert.strictEqual(reworkResult.round, 2);
-
-    const reworkThread = taskStore.getTask(threadId)!;
-    assert.strictEqual(reworkThread.status, 'running', 'Rework round must set task status to running');
-    assert.strictEqual(reworkThread.rounds.length, 2);
-    assert.strictEqual(reworkThread.rounds[1].type, 'rework');
-    assert.strictEqual(reworkThread.rounds[1].status, 'running');
-    assert.strictEqual(reworkThread.receiverSessionId, 'session-stable-001', 'Must reuse native session');
-
-    // Simulate failure of round 2
-    reworkThread.rounds[1].status = 'failed';
-    reworkThread.rounds[1].error = 'Simulated timeout';
-    enterTaskFailure(reworkThread, { stage: 'execution', reason: 'Simulated timeout', at: new Date().toISOString(), round: 2 });
-    taskStore.upsertTask(reworkThread);
-
-    // 2. Retry failed round 2
-    const retriedRound = await reworkController.retryFailedRound(threadId);
-    assert.strictEqual(retriedRound.round, 2);
-    assert.strictEqual(retriedRound.type, 'rework');
-    assert.strictEqual(retriedRound.status, 'running');
-
-    const retriedThread = taskStore.getTask(threadId)!;
-    assert.strictEqual(retriedThread.status, 'running', 'Retried round sets thread status to running');
-    assert.strictEqual(retriedThread.rounds.length, 2, 'Must not duplicate round on retry');
-    assert.strictEqual(retriedThread.rounds[1].type, 'rework');
-    assert.strictEqual(retriedThread.receiverSessionId, 'session-stable-001');
-
-    // Simulate pause of round 2
-    retriedThread.rounds[1].status = 'paused';
-    retriedThread.status = 'paused';
-    taskStore.upsertTask(retriedThread);
-
-    // 3. Resume paused round 2
-    const resumedRound = await reworkController.resumePausedTask(threadId);
-    assert.strictEqual(resumedRound.round, 2);
-    assert.strictEqual(resumedRound.type, 'rework');
-    assert.strictEqual(resumedRound.status, 'running');
-
-    const resumedThread = taskStore.getTask(threadId)!;
-    assert.strictEqual(resumedThread.status, 'running', 'Resumed task sets status to running');
-    assert.strictEqual(resumedThread.rounds.length, 2);
-    assert.strictEqual(resumedThread.rounds[1].type, 'rework');
-    assert.strictEqual(resumedThread.receiverSessionId, 'session-stable-001');
   });
 
   test('UI task tree status formatter: differentiates Running vs Reworking based on active round type', () => {

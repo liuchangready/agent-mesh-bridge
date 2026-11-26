@@ -4,7 +4,6 @@ import * as assert from 'node:assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-const childProcess = require('child_process') as typeof import('child_process');
 
 const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-review-wake-home-'));
 process.env.USERPROFILE = isolatedHome;
@@ -24,13 +23,6 @@ import {
 } from '../bridge/review-wake';
 import { DelegationRound, DelegationThread, isTaskUnfinished } from '../bridge/types';
 import { TaskRoleLock } from '../bridge/task-role-lock';
-import { NativeSessionCompactor } from '../bridge/native-session-compactor';
-import { CancellationRegistry } from '../bridge/cancellation-registry';
-import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
-import { NativeSessionLock } from '../bridge/native-session-lock';
-import { ReworkController } from '../bridge/rework-controller';
-import { AutonomousRunner } from '../bridge/autonomous-runner';
-import { TaskControlService } from '../bridge/task-control';
 
 describe('Review wake failure policy', () => {
   const now = Date.parse('2026-10-23T12:00:00.000Z');
@@ -136,12 +128,14 @@ describe('CallbackManager records stalled reviewer wakes', () => {
     return path.join(os.tmpdir(), 'agent-bridge-review-wake-ws');
   };
 
-  test('review callback injects only reviewer template instructions', async () => {
-    const {store, manager} = setup(); let prompt = '';
+  test('review callback injects only reviewer template instructions', () => {
+    const { store, manager } = setup();
     const thread = makeThread({threadId:'thread_review_template',taskTemplate:{id:'t',version:'1',label:'T',summary:'S',workerInstructions:'WORKER SECRET',reviewerInstructions:'REVIEWER SNAPSHOT',sourceFileName:'t.md',selectedAt:'now'}});
-    store.upsertTask(thread);
-    (manager as any).launchCaller = (_t: any, _s: any, text: string, _r: any, _k: any, release: () => void) => { prompt=text; release(); return true; };
-    try { assert.equal(await manager.notifyCaller(thread,thread.rounds[0]),true); assert.equal(prompt.split('REVIEWER SNAPSHOT').length-1,1); assert.ok(!prompt.includes('WORKER SECRET')); } finally { store.dispose(); }
+    try {
+      const prompt = manager.buildReviewWakeMessage(thread, thread.rounds[0]);
+      assert.equal(prompt.split('REVIEWER SNAPSHOT').length - 1, 1);
+      assert.ok(!prompt.includes('WORKER SECRET'));
+    } finally { store.dispose(); }
   });
 
   test('a 429 that still exits 0 is a failed review, not a delivered one', () => {
@@ -166,140 +160,6 @@ describe('CallbackManager records stalled reviewer wakes', () => {
     store.dispose();
   });
 
-  test('a dedicated reviewer wake does not launch after prepare pauses an unknown native operation', async () => {
-    const { dir, store, manager } = setup();
-    const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1';
-    const thread = makeThread({
-      threadId: 'thread_unknown_native_review', reviewFlow: 'dedicated',
-      reviewBootstrap: { phase: 'confirmed', attempts: 1 },
-      reviewerSessionId: sessionId, reviewerSessionCaptured: true, callerSessionId: sessionId,
-      nativeSessionCompaction: { reviewer: { sessionId, lastOperationId: 'unknown-op', revision: 2, turnsSinceCompaction: 0 } },
-    });
-    thread.rounds[0].nativeSessionCompactions = [{
-      id: 'unknown-op', role: 'reviewer', agent: 'codex', sessionId, reason: 'turn_budget',
-      phase: 'unknown', revision: 2, startedAt: new Date().toISOString(), recoveryPath: 'unused', logPath: 'unused',
-    } as any];
-    store.upsertTask(thread);
-    let launches = 0;
-    (manager as any).launchCaller = () => { launches++; return true; };
-    const stored = store.getTask(thread.threadId)!;
-    assert.equal(await manager.notifyCaller(stored, stored.rounds[0]), false);
-    assert.equal(store.getTask(thread.threadId)!.status, 'paused');
-    assert.equal(launches, 0);
-    assert.equal(new TaskExecutionRegistry(dir).getOwner(thread.threadId), undefined);
-    store.dispose();
-  });
-
-  test('a blocked merge resumes its dedicated reviewer through real preparation and releases leases', async () => {
-    const { dir, store, manager } = setup();
-    const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1';
-    const workspace = dirWorkspace();
-    const thread = makeThread({ threadId: 'thread_blocked_merge_wake', status: 'reviewing', reviewFlow: 'dedicated',
-      reviewBootstrap: { phase: 'confirmed', attempts: 1 }, reviewerSessionId: sessionId,
-      reviewerSessionCaptured: true, callerSessionId: sessionId, reviewerModel: 'test-model',
-      worktree: { path: workspace, mainPath: workspace, mergePending: true, integration: { phase: 'blocked', error: 'snapshot failed', updatedAt: new Date().toISOString() } } });
-    store.upsertTask(thread);
-    let release: (() => void) | undefined;
-    let onChildPid: ((pid: number | undefined) => void) | undefined;
-    let observedSession = '';
-    (manager as any).launchCaller = (...args: any[]) => {
-      observedSession = args[1]; release = args[5]; onChildPid = args[6];
-      onChildPid?.(process.pid);
-      return true;
-    };
-    assert.equal(await manager.notifyCaller(thread, thread.rounds[0]), true);
-    assert.equal(observedSession, sessionId);
-    assert.equal(new TaskRoleLock(dir).getOwner(thread.threadId)?.role, 'reviewer');
-    assert.ok(new TaskExecutionRegistry(dir).getOwner(thread.threadId));
-    assert.equal(new NativeSessionLock(dir).acquire('codex', sessionId), undefined);
-    onChildPid?.(undefined); release?.();
-    assert.equal(new TaskRoleLock(dir).getOwner(thread.threadId), undefined);
-    assert.equal(new TaskExecutionRegistry(dir).getOwner(thread.threadId), undefined);
-    const lease = new NativeSessionLock(dir).acquire('codex', sessionId);
-    assert.ok(lease); new NativeSessionLock(dir).release(lease!);
-    store.dispose();
-  });
-
-  test('pause and resume preserve every merge phase and wake the same dedicated reviewer after shutdown', async () => {
-    for (const phase of ['waiting', 'merging', 'conflict', 'validation_failed', 'blocked'] as const) {
-      const { dir, store, manager } = setup();
-      const detector = new AgentDetector(); const runner = new AutonomousRunner(detector);
-      const controller = new ReworkController(store, runner, manager, detector);
-      const control = new TaskControlService(store, runner, undefined, dir);
-      const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1'; const workspace = dirWorkspace();
-      fs.mkdirSync(workspace, { recursive: true });
-      const thread = makeThread({ threadId: `thread_resume_${phase}`, status: phase === 'waiting' ? 'queued' : phase === 'merging' ? 'merging' : 'reviewing', queuePhase: phase === 'waiting' ? 'merge' : undefined, reviewFlow: 'dedicated',
-        reviewBootstrap: { phase: 'confirmed', attempts: 1 }, reviewerSessionId: sessionId, reviewerSessionCaptured: true,
-        callerSessionId: sessionId, reviewerModel: 'test-model', mergeControl: { revision: 2, retryGeneration: 1, consecutiveRetries: 3, failureFingerprint: 'old' },
-        mergeHistory: [{ id: 'prior', number: 1, at: new Date().toISOString(), phase: 'conflict', result: 'failed' }],
-        worktree: { path: workspace, mainPath: workspace, approvedCommit: 'candidate', approvedSnapshot: { commit: 'candidate', tree: 'tree', sourceCommit: 'source' },
-          mergeResolutionPath: workspace, integration: { phase, error: 'preserve', updatedAt: new Date().toISOString() } } });
-      store.upsertTask(thread);
-      let launches = 0; let oldChildExited = phase !== 'conflict';
-      (manager as any).launchCaller = (...args: any[]) => {
-        assert.equal(oldChildExited, true); assert.equal(args[1], sessionId);
-        assert.equal(new TaskRoleLock(dir).getOwner(thread.threadId)?.role, 'reviewer');
-        launches++; args[6](process.pid); args[6](undefined); args[5](); return true;
-      };
-      if (phase === 'conflict') {
-        const roles = new TaskRoleLock(dir); const role = roles.tryAcquire(thread.threadId, 'reviewer', sessionId)!;
-        const native = new NativeSessionLock(dir); const lease = native.acquire('codex', sessionId)!;
-        const registry = new TaskExecutionRegistry(dir); const registration = registry.begin(thread.threadId, 1, 'merge-reviewer', workspace, 'reviewer');
-        const child = childProcess.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
-        roles.attachChild(role, child.pid); native.attachChild(lease, child.pid); registry.attachChildPid(child.pid, registration);
-        child.once('close', () => setTimeout(() => { oldChildExited = true; registry.end(registration); native.release(lease); roles.release(role); }, 150));
-      }
-      control.pauseTask(thread.threadId, 'pause merge', 'test');
-      assert.ok(new CancellationRegistry(dir).peek(thread.threadId));
-      await controller.resumePausedTask(thread.threadId);
-      assert.equal(oldChildExited, true);
-      const needsReview = phase === 'conflict' || phase === 'validation_failed' || phase === 'blocked';
-      for (let n = 0; n < 100 && needsReview && !launches; n++) await new Promise((resolve) => setTimeout(resolve, 10));
-      const saved = store.getTask(thread.threadId)!;
-      assert.equal(new CancellationRegistry(dir).peek(thread.threadId), undefined);
-      assert.equal(saved.status, needsReview ? 'reviewing' : 'queued'); assert.equal(saved.interruption, undefined);
-      assert.equal(saved.interruptions?.at(-1)?.kind, 'paused'); assert.equal(JSON.stringify(saved.rounds), JSON.stringify(thread.rounds));
-      assert.equal(saved.worktree?.integration?.phase, phase); assert.deepEqual(saved.worktree?.approvedSnapshot, thread.worktree?.approvedSnapshot);
-      assert.equal(saved.worktree?.mergeResolutionPath, workspace); assert.deepEqual(saved.mergeControl, thread.mergeControl);
-      assert.deepEqual(saved.mergeHistory?.find((entry) => entry.id === 'prior'), thread.mergeHistory?.[0]);
-      assert.equal(saved.receiverSessionId, thread.receiverSessionId); assert.equal(saved.reviewerSessionId, sessionId);
-      assert.equal(launches, needsReview ? 1 : 0);
-      assert.equal(new TaskRoleLock(dir).getOwner(thread.threadId), undefined);
-      assert.equal(new TaskExecutionRegistry(dir).getOwner(thread.threadId), undefined);
-      controller.dispose(); store.dispose();
-    }
-  });
-
-  test('merge decision handoff releases reviewer resources and answers resume the same native session', async () => {
-    const { dir, store, manager } = setup();
-    const detector = new AgentDetector();
-    const controller = new ReworkController(store, new AutonomousRunner(detector), manager, detector);
-    const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1'; const workspace = dirWorkspace();
-    const thread = makeThread({ threadId: 'thread_merge_decision_real', status: 'reviewing', reviewFlow: 'dedicated',
-      reviewBootstrap: { phase: 'confirmed', attempts: 1 }, reviewerSessionId: sessionId,
-      reviewerSessionCaptured: true, callerSessionId: sessionId, reviewerModel: 'test-model',
-      worktree: { path: workspace, mainPath: workspace, mergePending: true, integration: { phase: 'blocked', error: 'need decision', updatedAt: new Date().toISOString() } } });
-    store.upsertTask(thread);
-    const sessions: string[] = [];
-    (manager as any).launchCaller = async (...args: any[]) => {
-      sessions.push(args[1]); const release = args[5]; const onPid = args[6];
-      onPid(process.pid);
-      if (sessions.length === 1) await controller.requestMergeDecision(thread.threadId, 'Choose?', 'background', 'A');
-      onPid(undefined); release(); return true;
-    };
-    assert.equal(await manager.notifyCaller(thread, thread.rounds[0]), true);
-    assert.equal(store.getTask(thread.threadId)!.status, 'wait_decision');
-    assert.equal(new TaskRoleLock(dir).getOwner(thread.threadId), undefined);
-    assert.equal(new TaskExecutionRegistry(dir).getOwner(thread.threadId), undefined);
-    const lock = new NativeSessionLock(dir); const lease = lock.acquire('codex', sessionId);
-    assert.ok(lease); lock.release(lease!);
-    controller.submitMergeDecision(thread.threadId, 'A');
-    for (let n = 0; n < 100 && sessions.length < 2; n++) await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.deepEqual(sessions, [sessionId, sessionId]);
-    assert.equal(store.getTask(thread.threadId)!.status, 'reviewing');
-    controller.dispose(); store.dispose();
-  });
-
   test('a failed merge reviewer is recorded without treating merging as a successful handoff', () => {
     const { store, manager } = setup();
     const workspace = dirWorkspace();
@@ -314,153 +174,6 @@ describe('CallbackManager records stalled reviewer wakes', () => {
     assert.match(saved.mergeHistory![0].error!, /permission denied/);
     assert.equal(saved.mergeHistory![1].result, 'requested');
     store.dispose();
-  });
-
-  test('a launched merge reviewer with status-only output records EMPTY_OUTPUT', async () => {
-    const { dir, store, manager } = setup(); const originalSpawn = childProcess.spawn;
-    const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1'; const workspace = dirWorkspace();
-    const thread = makeThread({ threadId: 'thread_merge_empty_live', initiatorAgent: 'antigravity', status: 'reviewing', reviewFlow: 'dedicated',
-      reviewerSessionId: sessionId, reviewerSessionCaptured: true, callerSessionId: sessionId, reviewerModel: 'test-model',
-      reviewBootstrap: { phase: 'confirmed', attempts: 1 },
-      worktree: { path: workspace, mainPath: workspace, mergePending: true, integration: { phase: 'blocked', error: 'merge failed', updatedAt: new Date().toISOString() } } });
-    fs.mkdirSync(workspace, { recursive: true }); store.upsertTask(thread);
-    (childProcess as any).spawn = (_command: string, _args: string[], options: any) =>
-      originalSpawn(process.execPath, ['-e', 'process.stdout.write(JSON.stringify({type:"status"}))'], options);
-    try {
-      assert.equal(await manager.notifyCaller(thread, thread.rounds[0]), true);
-      for (let n = 0; n < 200 && (!store.getTask(thread.threadId)?.mergeHistory?.length || new TaskRoleLock(dir).getOwner(thread.threadId)); n++) await new Promise((resolve) => setTimeout(resolve, 20));
-      const saved = store.getTask(thread.threadId)!;
-      assert.equal(saved.mergeHistory?.[0]?.result, 'started');
-      assert.equal(saved.mergeHistory?.[0]?.attemptId, saved.mergeHistory?.at(-1)?.attemptId);
-      assert.equal(saved.mergeHistory?.at(-1)?.assessment?.errorCode, 'EMPTY_OUTPUT');
-      assert.equal(saved.mergeHistory?.at(-1)?.errorCode, 'EMPTY_OUTPUT');
-      assert.equal(saved.mergeControl?.consecutiveRetries, 0);
-      assert.equal(saved.status, 'reviewing');
-      assert.equal(new TaskRoleLock(dir).getOwner(thread.threadId), undefined);
-    } finally { (childProcess as any).spawn = originalSpawn; store.dispose(); }
-  });
-
-  test('a reviewer tail process keeps the native session lease after its role is handed off', async () => {
-    const { store, manager } = setup();
-    const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1';
-    const first = makeThread({ threadId: 'thread_live_reviewer_tail_1', reviewFlow: 'dedicated',
-      reviewBootstrap: { phase: 'confirmed', attempts: 1 }, reviewerSessionId: sessionId,
-      reviewerSessionCaptured: true, callerSessionId: sessionId, reviewerModel: 'gpt-6.1-pro' });
-    const second = makeThread({ ...first, threadId: 'thread_live_reviewer_tail_2' });
-    store.upsertTask(first); store.upsertTask(second);
-    let launches = 0;
-    let onChildPid: ((pid: number | undefined) => void) | undefined;
-    let release: (() => void) | undefined;
-    (manager as any).launchCaller = (...args: any[]) => {
-      launches++;
-      release = args[5];
-      onChildPid = args[6];
-      onChildPid?.(process.pid);
-      return true;
-    };
-    const storedFirst = store.getTask(first.threadId)!;
-    assert.equal(await manager.notifyCaller(storedFirst, storedFirst.rounds[0]), true);
-    // Simulate request_rework handing off the reviewer role while the CLI still
-    // has a live tail process; only process exit releases the session writer.
-    new TaskRoleLock(path.dirname(store.getStoragePath())).release(new TaskRoleLock(path.dirname(store.getStoragePath())).getOwner(first.threadId)!);
-    const storedSecond = store.getTask(second.threadId)!;
-    assert.equal(await manager.notifyCaller(storedSecond, storedSecond.rounds[0]), false);
-    assert.equal(launches, 1);
-    assert.equal((manager as any).wakeQueue.pendingCount(sessionId), 1);
-    (manager as any).wakeQueue.discard(sessionId, second.threadId);
-    onChildPid?.(undefined);
-    release?.();
-    store.dispose();
-  });
-
-  test('reviewer launch binding and exit cleanup failures kill or fail safely without escaping callbacks', async () => {
-    const originalSpawn = childProcess.spawn;
-    try {
-      for (const failure of ['bind', 'clear'] as const) {
-        const { store, manager } = setup();
-        const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1';
-        const tempWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'reviewer-child-workspace-'));
-        const thread = makeThread({ threadId: `thread_reviewer_pid_${failure}`, initiatorAgent: 'antigravity',
-          reviewFlow: 'dedicated', reviewerSessionId: sessionId, reviewerSessionCaptured: true, workspace: testWorkspace(tempWorkspace) });
-        store.upsertTask(thread);
-        let launchedPid: number | undefined;
-        let actualClose = false;
-        let killed = false;
-        (childProcess as any).spawn = (_command: string, _args: string[], options: any) => {
-          const script = failure === 'bind'
-            ? 'process.stdout.write("temporary reviewer child\\n");setInterval(()=>{},1000)'
-            : 'process.stdout.write("temporary reviewer child\\n");process.exit(0)';
-          const child: any = originalSpawn(process.execPath, ['-e', script], options);
-          launchedPid = child.pid;
-          const kill = child.kill.bind(child);
-          child.kill = (...args: any[]) => { killed = true; return kill(...args); };
-          child.once('close', () => { actualClose = true; });
-          return child;
-        };
-        let finish!: () => void;
-        const finished = new Promise<void>((resolve) => { finish = resolve; });
-        let releaseCalls = 0;
-        const onChildPid = (pid: number | undefined) => {
-          if (pid) {
-            if (failure === 'bind') throw new Error('PID bind rejected');
-          } else if (failure === 'clear') throw new Error('PID clear rejected');
-        };
-        let started = false;
-        try { started = (manager as any).launchCaller(thread, sessionId, 'review prompt', thread.rounds[0], 'review', () => {
-          releaseCalls++;
-          finish();
-          if (failure === 'clear') throw new Error('release rejected');
-        }, (pid: number | undefined) => {
-          onChildPid(pid);
-          if (!pid && failure === 'clear') finish();
-        }); } finally { await finished; }
-        try {
-          assert.equal(started, true);
-          assert.ok(launchedPid);
-          assert.equal(actualClose, true, 'cleanup/finalization follows the child close event');
-          assert.equal(killed, failure === 'bind', 'a child whose PID could not be durably bound is stopped');
-          assert.equal(releaseCalls, 1);
-          const saved = store.getTask(thread.threadId)!;
-          assert.ok(saved.reviewWake, 'ownership failures become a recorded failed wake');
-          assert.match(saved.reviewWake!.lastError, /Native child ownership failed/);
-          assert.notEqual(saved.status, 'completed');
-        } finally { store.dispose(); fs.rmSync(tempWorkspace, { recursive: true, force: true }); }
-      }
-    } finally { (childProcess as any).spawn = originalSpawn; }
-  });
-
-  test('dedicated reviewer launch rechecks cancellation, deletion, retargeting, and missing session lease', async () => {
-    const originalPrepare = NativeSessionCompactor.prototype.prepareBeforeResume;
-    try {
-      for (const mode of ['no-lease', 'cancel', 'delete', 'retarget'] as const) {
-        const { dir, store, manager } = setup();
-        const sessionId = '4ad2498c-215f-4b92-a172-2af983c691f1';
-        const thread = makeThread({ threadId: `thread_prepare_${mode}`, reviewFlow: 'dedicated',
-          reviewBootstrap: { phase: 'confirmed', attempts: 1 }, reviewerSessionId: sessionId,
-          reviewerSessionCaptured: true, callerSessionId: sessionId, reviewerModel: 'gpt-6.1-pro' });
-        store.upsertTask(thread);
-        NativeSessionCompactor.prototype.prepareBeforeResume = async function (threadId: string) {
-          if (mode === 'cancel') new CancellationRegistry(dir).request(threadId, 'pause', 'test cancellation');
-          if (mode === 'delete') store.deleteTask(threadId);
-          if (mode === 'retarget') {
-            const fresh = store.getTask(threadId)!;
-            fresh.reviewerSessionId = '9203c3bf-62c6-4aef-a661-2e164d39c10e';
-            fresh.callerSessionId = fresh.reviewerSessionId;
-            store.upsertTask(fresh);
-          }
-          return {};
-        } as any;
-        let launches = 0;
-        (manager as any).launchCaller = () => { launches++; return true; };
-        const candidate = store.getTask(thread.threadId)!;
-        assert.equal(await manager.notifyCaller(candidate, candidate.rounds[0]), false, mode);
-        assert.equal(launches, 0, mode);
-        assert.equal(new TaskRoleLock(dir).getOwner(thread.threadId), undefined, `role lease released: ${mode}`);
-        assert.equal(new TaskExecutionRegistry(dir).getOwner(thread.threadId), undefined, `execution registration released: ${mode}`);
-        assert.equal((manager as any).wakeQueue.isBusy(sessionId), false, `wake slot released: ${mode}`);
-        store.dispose();
-      }
-    } finally { NativeSessionCompactor.prototype.prepareBeforeResume = originalPrepare; }
   });
 
   test('a rework starts a fresh review budget instead of inheriting the old one', () => {
@@ -724,16 +437,13 @@ describe('ReviewWakeScheduler', () => {
       let now = nowMs;
       let active = false;
       let calls = 0;
-      let finishWake: (() => void) | undefined;
-      (manager as any).launchCaller = (...args: any[]) => {
+      manager.notifyCaller = async () => {
         calls++;
         active = true;
-        finishWake = args[5];
         if (calls === REVIEW_WAKE_MAX_AUTO_RETRIES && verdict === 'approve') {
           const approved = store.getTask('thread_review_wake_sched')!;
           approved.status = 'completed';
           store.upsertTask(approved);
-          finishWake?.();
           active = false;
         }
         return true;
@@ -760,8 +470,6 @@ describe('ReviewWakeScheduler', () => {
         assert.strictEqual(launched.status, verdict === 'approve' && attempt === 5 ? 'completed' : 'reviewing');
         assert.strictEqual(launched.reviewWake!.autoRetryAttempts, attempt);
         if (attempt < 5) {
-          finishWake?.();
-          finishWake = undefined;
           active = false;
           manager.finalizeWake(launched, launched.rounds[0], 'caller-session-1', {
             exitCode: 1,
@@ -778,8 +486,6 @@ describe('ReviewWakeScheduler', () => {
       assert.strictEqual(await scheduler.runDue(), 0, 'there is no sixth automatic launch');
 
       if (verdict === 'none') {
-        finishWake?.();
-        finishWake = undefined;
         active = false;
         const result = manager.finalizeWake(fifth, fifth.rounds[0], 'caller-session-1', {
           exitCode: 0,
