@@ -1186,9 +1186,16 @@ export class MCPServer {
     if (thread?.execution?.version === 2) {
       const run = thread.execution.run;
       const ownSession = (process.env.MESH_REVIEW_SESSION_ID || '').trim();
+      const sessionMatches = ownSession === thread.reviewerSessionId;
       if (!run || run.role !== 'reviewer' || !['starting', 'active'].includes(run.state) ||
-          !thread.reviewerSessionCaptured || ownSession !== thread.reviewerSessionId) {
-        throw new Error(`[Agent Mesh Bridge] Refusing review action for thread ${threadId}: current v2 reviewer run and fixed reviewer session do not match.`);
+          !thread.reviewerSessionCaptured || !sessionMatches) {
+        const sessionEnv = !ownSession ? 'missing' : sessionMatches ? 'matches' : 'mismatch';
+        throw new Error(
+          `[Agent Mesh Bridge] Refusing review action for thread ${threadId}: current v2 reviewer run and fixed reviewer session do not match. ` +
+          `runId=${run?.id ?? 'none'} runRole=${run?.role ?? 'none'} runState=${run?.state ?? 'none'} ` +
+          `reviewerSessionRecorded=${Boolean(thread.reviewerSessionId)} reviewerSessionCaptured=${Boolean(thread.reviewerSessionCaptured)} ` +
+          `MESH_REVIEW_SESSION_ID=${sessionEnv}`,
+        );
       }
       return;
     }

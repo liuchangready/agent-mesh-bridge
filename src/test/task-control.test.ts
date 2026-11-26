@@ -731,7 +731,7 @@ describe('TaskControlService - pause/delete reasons', () => {
     }
   });
 
-  test('v2 delete resumes a durable pending tombstone once under the original cleaner identity', async () => {
+  test('v2 delete resumes a durable tombstone after the prior cleaner exits', async () => {
     const threadId = 'thread_control_v2_tombstone_retry';
     const artifactDir = path.join(tempDir, 'task-data', threadId);
     const asset = path.join(artifactDir, 'worker_log', `${threadId}_round.log`);
@@ -757,6 +757,8 @@ describe('TaskControlService - pause/delete reasons', () => {
       tombstone: { reason: 'crash window', by: 'user' }, cleanupManifest: manifest,
     });
     assert.equal(fs.existsSync(asset), true, 'tombstone precedes physical cleanup');
+    const exitedCleaner = { pid: 99_999_999, birthId: 'exited-cleaner' };
+    assert.equal(await taskStore.claimTombstoneCleanup(threadId, reservation.token, exitedCleaner), 'claimed');
     const control = new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir);
     const retried = await control.deleteTask(threadId, 'retry', 'user');
     assert.equal(retried.status, 'DELETED');

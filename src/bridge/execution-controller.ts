@@ -3112,6 +3112,7 @@ export class ExecutionController {
           mergeAdmissionPending = true;
         }
         if (ownerStatus === 'exited') {
+          if (await this.settleExitedDevelopment(thread)) continue;
           if (phase === 'merge') scheduleQueuedV2(thread, phase);
           else await this.startExecution(thread.threadId, phase);
         }
@@ -3163,6 +3164,50 @@ export class ExecutionController {
         if (current?.phase === 'merge' && run?.state === 'starting' && !run.unconfirmed &&
             run.purpose !== 'native_maintenance' && await this.probeRunOwner(run.owner) === 'alive') break;
       }
+    }
+  }
+
+  private async settleExitedDevelopment(thread: DelegationThread): Promise<boolean> {
+    const execution = thread.execution;
+    const run = execution?.run;
+    const child = run?.child;
+    if (thread.status !== 'running' || thread.cleanup || execution?.version !== 2 || execution.phase !== 'develop' ||
+        execution.next || run?.state !== 'active' || run.unconfirmed || run.purpose || run.mergeLockHelper ||
+        !run.registeredAt || !child?.pid || !child.birthId ||
+        !run.subtrees?.some(tree => tree.root.pid === child.pid && tree.root.birthId === child.birthId)) return false;
+
+    const { ownerStatus, childStatus, subtreeStatus } = this.inspectRunProcesses(run);
+    if (ownerStatus !== 'exited' || childStatus !== 'exited' || subtreeStatus !== 'exited') return false;
+
+    const expectedRun = JSON.stringify(run);
+    const code = 'EXECUTION_OWNER_EXITED';
+    const reason = 'The execution host exited before the development round was settled. The task worktree and session are preserved.';
+    const at = new Date(this.wallClockNow()).toISOString();
+    const interruption = { kind: 'error' as const, reason, at, by: 'system' };
+    try {
+      await this.taskStore.transitionExecution(thread.threadId, execution.revision, (current) => {
+        const control = current.execution;
+        // The exited identities cannot become live again. Apply that evidence only to the exact ledger snapshot.
+        if (current.status !== 'running' || current.cleanup || control?.version !== 2 || control.phase !== execution.phase ||
+            control.next || control.operationId !== execution.operationId || control.generation !== execution.generation ||
+            control.round !== execution.round || JSON.stringify(control.run) !== expectedRun) {
+          throw new Error('Development run changed before exit settlement.');
+        }
+        control.run = undefined;
+        control.queue = undefined;
+        control.lastOutcome = { code, reason, at };
+        enterTaskFailure(current, { stage: 'execution', code, reason, at, round: control.round, by: 'system' });
+        appendInterruption(current, interruption);
+        const round = current.rounds.find(entry => entry.round === control.round && entry.type !== 'approval');
+        if (round?.status === 'running') {
+          round.status = 'failed';
+          round.error = reason;
+          round.interruption = interruption;
+        }
+      });
+      return true;
+    } catch {
+      return false;
     }
   }
 

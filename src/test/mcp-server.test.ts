@@ -306,6 +306,20 @@ describe('MCPServer Protocol Tests', () => {
         process.env.MESH_REVIEW_SESSION_ID = reviewer;
         const doReview = async (pid: number) => {
           if (reviewCalls === 1) {
+            const requestRework = () => rpc('request_rework', {
+              threadId: thread.threadId, feedback: 'add a second change', callerSessionId: reviewer,
+            });
+            delete process.env.MESH_REVIEW_SESSION_ID;
+            await assert.rejects(requestRework, /runRole=reviewer runState=active .*reviewerSessionCaptured=true MESH_REVIEW_SESSION_ID=missing/);
+            const wrongSession = 'unrelated-reviewer-session';
+            process.env.MESH_REVIEW_SESSION_ID = wrongSession;
+            await assert.rejects(requestRework, (error: Error) => {
+              assert.match(error.message, /MESH_REVIEW_SESSION_ID=mismatch/);
+              assert.ok(!error.message.includes(wrongSession) && !error.message.includes(reviewer));
+              return true;
+            });
+            assert.equal(taskStore.getTask(thread.threadId)?.execution?.next, undefined);
+            process.env.MESH_REVIEW_SESSION_ID = reviewer;
             await rpc('request_rework', { threadId: thread.threadId, feedback: 'add a second change' });
             recordProcessEvent('rework_decision_persisted', pid);
           const handed = taskStore.getTask(thread.threadId)!;
