@@ -109,29 +109,11 @@ describe('review block and terminal state', () => {
     } catch {}
   });
 
-  test('blockReview parks the review without creating a round', async () => {
-    store.upsertTask(makeThread());
-    const before = store.getTask('thread_loop_1')!.rounds.length;
-
-    const result = await controller.blockReview({
-      threadId: 'thread_loop_1',
-      reason: 'waiting for the sibling PostgreSQL task',
-      waitingForThreadId: 'thread_pg_1',
-    });
-
-    const parked = store.getTask('thread_loop_1')!;
-    assert.strictEqual(parked.status, 'reviewing');
-    assert.strictEqual(parked.rounds.length, before, 'a blocked review must not add a round');
-    assert.strictEqual(parked.reviewWake, undefined, 'no retry timer for a parked review');
-    assert.strictEqual(parked.reviewBlocked?.waitingForThreadId, 'thread_pg_1');
-    assert.match(result.message, /no rework round was created/);
-  });
-
-  test('blockReview refuses a task that is not waiting for review', async () => {
+  test('historical tasks cannot be blocked from review through the retired control path', async () => {
     store.upsertTask(makeThread({ status: 'running' }));
     await assert.rejects(
       () => controller.blockReview({ threadId: 'thread_loop_1', reason: 'x' }),
-      /not "reviewing"/,
+      /HISTORICAL_TASK_READ_ONLY/,
     );
   });
 
@@ -139,7 +121,7 @@ describe('review block and terminal state', () => {
     store.upsertTask(makeThread({ status: 'completed' }));
     await assert.rejects(
       () => controller.requestRework({ threadId: 'thread_loop_1', feedback: 'again' }),
-      /already approved and archived/,
+      /HISTORICAL_TASK_READ_ONLY/,
     );
   });
 });

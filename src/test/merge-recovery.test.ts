@@ -57,7 +57,7 @@ test('merge decisions append immutable question and answer records and wake the 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-merge-decision-'));
   const store = new TaskStore(root); const detector = new AgentDetector(); const callback = new CallbackManager(detector, root);
   const sessions: string[] = []; callback.notifyCaller = async (thread) => { sessions.push(thread.callerSessionId!); return true; };
-  const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector);
+  const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector, undefined, undefined, false);
   t.after(() => { controller.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
   store.upsertTask(task(root));
   const stale = structuredClone(store.getTask('thread_merge_decision')!);
@@ -82,7 +82,7 @@ test('a review decision resumes the same reviewer without creating a development
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-review-decision-'));
   const store = new TaskStore(root); const detector = new AgentDetector(); const callback = new CallbackManager(detector, root);
   const sessions: string[] = []; callback.notifyCaller = async (thread) => { sessions.push(thread.callerSessionId!); return true; };
-  const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector);
+  const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector, undefined, undefined, false);
   t.after(() => { controller.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
   const item = task(root); item.worktree = undefined; store.upsertTask(item);
   controller.requestMergeDecision(item.threadId, 'Which approach?', 'review context', 'A');
@@ -98,7 +98,7 @@ test('retry_merge preserves the task identities and history while starting a new
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-merge-retry-'));
   const store = new TaskStore(root); const detector = new AgentDetector(); const callback = new CallbackManager(detector, root);
   callback.notifyCaller = async () => true;
-  const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector);
+  const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector, undefined, undefined, false);
   const thread = task(root); thread.status = 'failed'; thread.failure = { stage: 'merge', reason: 'conflict', at: thread.updatedAt }; thread.failureRevision = 1;
   thread.mergeControl = { revision: 7, retryGeneration: 2, consecutiveRetries: 6, failureFingerprint: 'old' };
   thread.mergeHistory = [{ id: 'old', number: 1, at: thread.updatedAt, phase: 'conflict', result: 'failed' }];
@@ -115,8 +115,12 @@ test('pending stash metadata recovery survives stale writes and pause/resume wit
   const store = new TaskStore(root); const detector = new AgentDetector(); const callback = new CallbackManager(detector, root);
   let wakes = 0; callback.notifyCaller = async () => { wakes++; return true; };
   const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector);
-  const thread = task(root); store.upsertTask(thread); const stale = structuredClone(thread);
-  thread.worktree!.integration!.stashRecoveryPending = true; thread.worktree!.integration!.stashRecoveryLockHeld = true; store.upsertTask(thread);
+  const thread = task(root);
+  thread.execution = { version: 2, revision: 1, operationId: 'stash-recovery-op', phase: 'review', round: 1,
+    generation: 1, attempt: 0, autoRetriesUsed: 0,
+    budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 } };
+  thread.worktree!.integration!.stashRecoveryPending = true; thread.worktree!.integration!.stashRecoveryLockHeld = true;
+  store.upsertTask(thread); const stale = structuredClone(thread);
   stale.updatedAt = new Date(Date.now() + 60_000).toISOString(); stale.worktree!.integration!.updatedAt = stale.updatedAt;
   stale.worktree!.approvedCommit = 'stale-candidate'; store.upsertTask(stale);
   assert.equal(store.getTask(thread.threadId)!.worktree!.integration!.stashRecoveryLockHeld, true);
@@ -126,8 +130,8 @@ test('pending stash metadata recovery survives stale writes and pause/resume wit
   await assert.rejects(() => controller.requestMergeDecision(thread.threadId, 'Choose?', '', ''), /stash metadata recovery/i);
   const control = new TaskControlService(store, undefined, undefined, root);
   assert.equal((await control.pauseTask(thread.threadId, 'pause', 'test')).status, 'PAUSED');
-  await controller.resumePausedTask(thread.threadId);
-  assert.equal(store.getTask(thread.threadId)!.status, 'reviewing');
+  await assert.rejects(controller.resumePausedTask(thread.threadId), /V2 execution controller is unavailable/);
+  assert.equal(store.getTask(thread.threadId)!.status, 'paused');
   assert.equal(store.getTask(thread.threadId)!.worktree!.integration!.stashRecoveryLockHeld, true);
   const saved = store.getTask(thread.threadId)!;
   assert.equal(wakes, 0);
@@ -251,30 +255,20 @@ test('restart schedules unlaunched merge reviews without consuming the merge ret
   }
 });
 
-test('an answered merge decision is recovered after a crash before the reviewer starts', async () => {
+test('a historical answered merge decision cannot restart a legacy reviewer', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-decision-restart-'));
   const store = new TaskStore(root); const detector = new AgentDetector(); const callback = new CallbackManager(detector, root);
-  callback.notifyCaller = async () => false;
   const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector);
   const thread = task(root); thread.reviewFlow = 'dedicated'; thread.reviewerSessionId = 'reviewer-session'; thread.reviewerSessionCaptured = true;
-  thread.reviewWake = { round: 1, attempts: 2, autoRetryAttempts: 1, lastAttemptAt: new Date(1).toISOString(), lastError: 'old' };
+  thread.execution = undefined;
+  thread.status = 'wait_decision';
+  thread.mergeControl = { revision: 1, retryGeneration: 0, consecutiveRetries: 0, pendingDecisionId: 'old-decision' };
   store.upsertTask(thread);
-  controller.requestMergeDecision(thread.threadId, 'Which fix?', 'context', 'A');
-  controller.submitMergeDecision(thread.threadId, 'Choose A');
-  assert.equal(store.getTask(thread.threadId)?.reviewWake, undefined);
-  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.throws(() => controller.submitMergeDecision(thread.threadId, 'Choose A'), /HISTORICAL_TASK_READ_ONLY/i);
+  assert.equal(store.getTask(thread.threadId)?.status, 'wait_decision');
+  assert.equal(store.getTask(thread.threadId)?.mergeControl?.pendingDecisionId, 'old-decision');
   controller.dispose(); store.dispose();
-  const reopened = new TaskStore(root); const newCallback = new CallbackManager(detector, root); const sessions: string[] = [];
-  newCallback.notifyCaller = async (item) => { sessions.push(item.reviewerSessionId!); return true; };
-  const scheduler = new ReviewWakeScheduler(reopened, newCallback, { now: () => Date.now() + 3_600_000, stallTimeoutMs: 10_000, isReviewerActive: () => false });
-  try {
-    assert.equal(await scheduler.runWatchdog(), 1); assert.equal(await scheduler.runDue(), 1);
-    assert.deepEqual(sessions, ['reviewer-session']);
-    const saved = reopened.getTask(thread.threadId)!;
-    assert.equal(saved.status, 'reviewing'); assert.equal(saved.worktree?.approvedCommit, 'candidate');
-    assert.equal(saved.mergeHistory?.find(e => e.result === 'answered')?.answer, 'Choose A');
-    assert.equal(saved.mergeControl?.consecutiveRetries, 0); assert.equal(saved.rounds.length, 1);
-  } finally { scheduler.dispose(); reopened.dispose(); fs.rmSync(root, { recursive: true, force: true }); }
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 test('a wake accepted before a second crash is recovered without charging an unstarted attempt', async () => {

@@ -17,12 +17,12 @@ test('a saved resolution survives a coordinator failure before switching to the 
   const target = resolveGitRepository(repository, storage);
   const worktree = createTaskWorktree(target, 'thread_resolution_recovery', storage);
   const store = new TaskStore(storage); const detector = new AgentDetector();
-  const controller = new ReworkController(store, new AutonomousRunner(detector), new CallbackManager(detector, storage), detector);
+  const controller = new ReworkController(store, new AutonomousRunner(detector), new CallbackManager(detector, storage), detector, undefined, undefined, false);
   t.after(() => { controller.dispose(); store.dispose(); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
   const item = thread('thread_resolution_recovery', worktree); item.status = 'reviewing'; item.worktree!.approvedCommit = undefined;
   store.upsertTask(item); fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'worker\nmiddle\nbeta\n'); controller.approveTask({ threadId: item.threadId });
   fs.writeFileSync(path.join(repository, 'shared.txt'), 'target\nmiddle\nbeta\n'); git(repository, 'add', 'shared.txt'); git(repository, 'commit', '-m', 'target');
-  assert.equal((await controller.mergeApproved(item.threadId)).status, 'conflict');
+  assert.equal((await controller.getMergeCoordinator().mergeApproved(item.threadId)).status, 'conflict');
   const resolution = store.getTask(item.threadId)!.worktree!.mergeResolutionPath!;
   fs.writeFileSync(path.join(resolution, 'shared.txt'), 'A saved fix\nmiddle\nbeta\n'); git(resolution, 'add', 'shared.txt');
   await controller.submitMergeResolution(item.threadId);
@@ -30,12 +30,12 @@ test('a saved resolution survives a coordinator failure before switching to the 
   const coordinator = (controller as any).mergeCoordinator;
   const original = coordinator.writeTransaction.bind(coordinator);
   coordinator.writeTransaction = (file: string, tx: any) => { original(file, tx); if (tx.phase === 'resolution_rebase_prepared') throw new Error('injected interruption'); };
-  assert.equal((await controller.mergeApproved(item.threadId)).status, 'blocked');
+  assert.equal((await controller.getMergeCoordinator().mergeApproved(item.threadId)).status, 'blocked');
   coordinator.writeTransaction = original;
   assert.equal(git(resolution, 'show', ':shared.txt'), 'A saved fix\nmiddle\nbeta');
   fs.writeFileSync(path.join(repository, 'again.txt'), 'again'); git(repository, 'add', 'again.txt'); git(repository, 'commit', '-m', 'advance again');
   await controller.submitMergeResolution(item.threadId);
-  const merged = await controller.mergeApproved(item.threadId);
+  const merged = await controller.getMergeCoordinator().mergeApproved(item.threadId);
   assert.equal(merged.status, 'merged', merged.message);
   assert.equal(git(repository, 'show', `${target.targetRef}:shared.txt`), 'A saved fix\nmiddle\nbeta');
   assert.equal(git(repository, 'show', `${target.targetRef}:next.txt`), 'next');
@@ -48,12 +48,12 @@ test('a saved resolution can recover when switching the merge workspace is inter
   const target = resolveGitRepository(repository, storage);
   const worktree = createTaskWorktree(target, 'thread_resolution_reset', storage);
   const store = new TaskStore(storage); const detector = new AgentDetector();
-  const controller = new ReworkController(store, new AutonomousRunner(detector), new CallbackManager(detector, storage), detector);
+  const controller = new ReworkController(store, new AutonomousRunner(detector), new CallbackManager(detector, storage), detector, undefined, undefined, false);
   t.after(() => { controller.dispose(); store.dispose(); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
   const item = thread('thread_resolution_reset', worktree); item.status = 'reviewing'; item.worktree!.approvedCommit = undefined;
   store.upsertTask(item); fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'worker\nmiddle\nbeta\n'); controller.approveTask({ threadId: item.threadId });
   fs.writeFileSync(path.join(repository, 'shared.txt'), 'target\nmiddle\nbeta\n'); git(repository, 'add', 'shared.txt'); git(repository, 'commit', '-m', 'target');
-  assert.equal((await controller.mergeApproved(item.threadId)).status, 'conflict');
+  assert.equal((await controller.getMergeCoordinator().mergeApproved(item.threadId)).status, 'conflict');
   const resolution = store.getTask(item.threadId)!.worktree!.mergeResolutionPath!;
   fs.writeFileSync(path.join(resolution, 'shared.txt'), 'A saved fix\nmiddle\nbeta\n'); git(resolution, 'add', 'shared.txt');
   await controller.submitMergeResolution(item.threadId);
@@ -65,11 +65,11 @@ test('a saved resolution can recover when switching the merge workspace is inter
     if (cwd === resolution && args[0] === 'reset') throw new Error('injected after reset');
     return value;
   };
-  try { assert.equal((await controller.mergeApproved(item.threadId)).status, 'blocked'); }
+  try { assert.equal((await controller.getMergeCoordinator().mergeApproved(item.threadId)).status, 'blocked'); }
   finally { coordinator.loggedGit = original; }
   assert.equal(store.getTask(item.threadId)!.worktree!.mergeResolutionSubmitted, true);
   fs.writeFileSync(path.join(repository, 'again.txt'), 'again'); git(repository, 'add', 'again.txt'); git(repository, 'commit', '-m', 'advance again');
-  const merged = await controller.mergeApproved(item.threadId);
+  const merged = await controller.getMergeCoordinator().mergeApproved(item.threadId);
   assert.equal(merged.status, 'merged', merged.message);
   assert.equal(git(repository, 'show', `${target.targetRef}:shared.txt`), 'A saved fix\nmiddle\nbeta');
   assert.equal(git(repository, 'show', `${target.targetRef}:next.txt`), 'next');
@@ -81,12 +81,12 @@ test('an interrupted resolution merge is replayed in a fresh workspace when the 
   const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
   const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, 'thread_resolution_replay', storage);
   const store = new TaskStore(storage); const detector = new AgentDetector();
-  const controller = new ReworkController(store, new AutonomousRunner(detector), new CallbackManager(detector, storage), detector);
+  const controller = new ReworkController(store, new AutonomousRunner(detector), new CallbackManager(detector, storage), detector, undefined, undefined, false);
   t.after(() => { controller.dispose(); store.dispose(); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
   const item = thread('thread_resolution_replay', worktree); item.status = 'reviewing'; item.worktree!.approvedCommit = undefined;
   store.upsertTask(item); fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'worker\nmiddle\nbeta\n'); controller.approveTask({ threadId: item.threadId });
   fs.writeFileSync(path.join(repository, 'shared.txt'), 'target\nmiddle\nbeta\n'); git(repository, 'add', 'shared.txt'); git(repository, 'commit', '-m', 'target');
-  assert.equal((await controller.mergeApproved(item.threadId)).status, 'conflict');
+  assert.equal((await controller.getMergeCoordinator().mergeApproved(item.threadId)).status, 'conflict');
   const resolution = store.getTask(item.threadId)!.worktree!.mergeResolutionPath!;
   fs.writeFileSync(path.join(resolution, 'shared.txt'), 'A saved fix\nmiddle\nbeta\n'); git(resolution, 'add', 'shared.txt');
   await controller.submitMergeResolution(item.threadId);
@@ -97,16 +97,16 @@ test('an interrupted resolution merge is replayed in a fresh workspace when the 
     if (cwd === resolution && args[0] === 'merge') throw new Error('injected after resolution merge');
     return value;
   };
-  try { assert.equal((await controller.mergeApproved(item.threadId)).status, 'blocked'); } finally { coordinator.loggedGit = original; }
+  try { assert.equal((await controller.getMergeCoordinator().mergeApproved(item.threadId)).status, 'blocked'); } finally { coordinator.loggedGit = original; }
   fs.writeFileSync(path.join(repository, 'again.txt'), 'again'); git(repository, 'add', 'again.txt'); git(repository, 'commit', '-m', 'advance again');
   const write = coordinator.writeTransaction.bind(coordinator); let interrupted = false;
   coordinator.writeTransaction = (file: string, tx: any) => {
     write(file, tx);
     if (!interrupted && tx.phase === 'resolution_rebase_prepared' && tx.validationPath !== resolution) { interrupted = true; throw new Error('injected after replacement workspace transaction'); }
   };
-  try { assert.equal((await controller.mergeApproved(item.threadId)).status, 'blocked'); } finally { coordinator.writeTransaction = write; }
+  try { assert.equal((await controller.getMergeCoordinator().mergeApproved(item.threadId)).status, 'blocked'); } finally { coordinator.writeTransaction = write; }
   assert.equal(interrupted, true);
-  const merged = await controller.mergeApproved(item.threadId);
+  const merged = await controller.getMergeCoordinator().mergeApproved(item.threadId);
   assert.equal(merged.status, 'merged', merged.message);
   assert.equal(git(repository, 'show', `${target.targetRef}:shared.txt`), 'A saved fix\nmiddle\nbeta');
   assert.equal(git(repository, 'show', `${target.targetRef}:again.txt`), 'again');

@@ -32,22 +32,14 @@ import { TaskStore } from './task-store';
 import { AgentDetector } from './agent-detector';
 import { AutonomousRunner } from './autonomous-runner';
 import { CallbackManager } from './callback-manager';
-import { TaskSupervisor } from './task-supervisor';
-import { captureWorkspaceSnapshot, diffWorkspaceSnapshots } from './git-probe';
-import { TaskExecutionOwner, TaskExecutionRegistration, TaskExecutionRegistry } from './task-execution-registry';
-import { QueueDrainer, QueuedExecution } from './queue-drainer';
-import { concurrencyPolicy } from './bridge-policy';
-import { TaskRoleLock } from './task-role-lock';
+import { TaskExecutionRegistry } from './task-execution-registry';
 import { readReviewerBootstrapToken } from './reviewer-bootstrap';
 import { ModelApprovalHandler } from './model-approval';
 import { TaskRetargetService, latestRetarget } from './task-retarget';
-import { appendCompactionProtocol, compactRoundBestEffort } from './context-compactor';
-import { readStoredRoundUsage } from './token-usage-collector';
 import { currentHead, changedFiles, snapshotTaskWorktree, gitOutput } from './git-worktree';
 import { MergeCoordinator, MergeResult } from './merge-coordinator';
 import { assertCanExecute } from './agent-capabilities';
 import { createMergeLog, noteMergeFailure, resetMergeBudget } from './merge-recovery';
-import { NativeSessionLock } from './native-session-lock';
 import { CancellationRegistry } from './cancellation-registry';
 import { ExecutionController } from './execution-controller';
 import { requireV2ExecutionEligibility } from './execution-gate';
@@ -58,27 +50,21 @@ export class ReworkController {
   private runner: AutonomousRunner;
   private callbackManager: CallbackManager;
   private detector?: AgentDetector;
-  private executionRegistry: TaskExecutionRegistry;
   private readonly storageDir: string;
-  private queueDrainer: QueueDrainer;
   /** Moves a task to another agent/model when rework/retry/resume asks for it. */
   private readonly retargetService: TaskRetargetService;
   private readonly mergeCoordinator: MergeCoordinator;
   private readonly requireV2Execution: boolean;
   private readonly executionAdmission: boolean;
-  private readonly mergeWorkers = new Set<string>();
-  private readonly blockedMergeRetries = new Map<string, string>();
-  private readonly mergePersistenceRetries = new Map<string, { attempts: number; timer: NodeJS.Timeout }>();
-  private mergeWatch?: NodeJS.Timeout;
 
   constructor(
     taskStore: TaskStore,
     runner: AutonomousRunner,
     callbackManager: CallbackManager,
     detector?: AgentDetector,
-    executionRegistry?: TaskExecutionRegistry,
-    residentMergeOwner = false,
-    requireV2Execution = false,
+    _executionRegistry?: TaskExecutionRegistry,
+    _residentMergeOwner = false,
+    requireV2Execution = true,
     executionAdmission = true,
   ) {
     this.taskStore = taskStore;
@@ -92,23 +78,7 @@ export class ReworkController {
       const reviewRound = [...(thread.rounds || [])].reverse().find((round) => round.type !== 'approval');
       if (reviewRound) void this.callbackManager.notifyCaller(thread, reviewRound);
     });
-    if (residentMergeOwner && this.executionAdmission) {
-      this.taskStore.on('changed', () => this.resumePendingMerges());
-      this.mergeWatch = setInterval(() => this.resumePendingMerges(), 1_000);
-      this.mergeWatch.unref();
-    }
-    this.executionRegistry = executionRegistry || new TaskExecutionRegistry(this.storageDir);
     this.retargetService = new TaskRetargetService(taskStore, requireV2Execution, executionAdmission);
-    this.queueDrainer = new QueueDrainer(
-      this.taskStore,
-      this.executionRegistry,
-      () => TaskSupervisor.isSupervisorActive(),
-      (target: QueuedExecution) => this.executeQueuedRound(target),
-    );
-    if (residentMergeOwner && this.executionAdmission) {
-      // Recover transactions already on disk once all controller services exist.
-      this.resumePendingMerges();
-    }
   }
 
   public getMergeCoordinator(): MergeCoordinator {
@@ -165,7 +135,7 @@ export class ReworkController {
     if (!thread) {
       throw new Error(`Task thread not found: ${params.threadId}`);
     }
-    if (this.requireV2Execution) requireV2ExecutionEligibility(thread, 'request rework for this task');
+    requireV2ExecutionEligibility(thread, 'request rework for this task');
     // `completed` is terminal: a stale reviewer must not resurrect an archived
     // task by submitting a late rework.
     if (thread.status === 'completed' || thread.archivedAt) {
@@ -266,8 +236,6 @@ export class ReworkController {
 
     // A resumed session keeps its continuity; a task that was just moved to
     // another agent has no resumable session and starts a fresh one.
-    const resumesNativeSession = shouldResumeNativeSession(thread, reworkRound);
-
     const originalReviewRound = thread.currentRound;
     const expectedOperationId = thread.execution?.operationId;
     const expectedGeneration = thread.execution?.generation;
@@ -292,14 +260,14 @@ export class ReworkController {
 
     // Persist immediately
     let finalHasActiveRun = false;
-    if (thread.execution) {
+    {
       for (let attempt = 0; attempt < 3; attempt++) {
         this.taskStore.loadFromDisk();
         const freshTask = this.taskStore.getTask(thread.threadId);
         if (!freshTask) {
           throw new Error(`Task thread not found: ${thread.threadId}`);
         }
-        const currentRev = thread.execution?.version === 1 ? 'current-legacy-review' : freshTask.execution?.revision ?? 0;
+        const currentRev = freshTask.execution?.revision ?? 0;
         try {
           await this.taskStore.transitionExecution(thread.threadId, currentRev, (t) => {
             if (t.execution) {
@@ -318,7 +286,8 @@ export class ReworkController {
                   `Cannot request rework: execution run changed concurrently (expected ${expectedRunId}, found ${t.execution.run?.id})`,
                 );
               }
-              if (t.execution.version === 2 && t.execution.next) {
+              if (t.execution.version !== 2) throw new Error('Historical tasks cannot accept rework.');
+              if (t.execution.next) {
                 throw new Error(`Cannot request rework: run ${t.execution.next.sourceRunId || 'unknown'} already has a durable handoff.`);
               }
               if (!expectedRunId && t.execution.run) {
@@ -375,18 +344,7 @@ export class ReworkController {
                 : `Reworking in same session (Round ${nextRound})...`,
             };
 
-            if (t.execution) {
-              if (t.execution.version === 2) {
-                t.execution.next = { phase: 'develop', round: nextRound, sourceRunId: expectedRunId };
-              } else {
-                t.execution.round = nextRound;
-              }
-              if (!currentHasActiveRun && t.execution.version !== 2) {
-                t.execution.phase = 'develop';
-                t.execution.run = undefined;
-                t.execution.queue = undefined;
-              }
-            }
+            t.execution!.next = { phase: 'develop', round: nextRound, sourceRunId: expectedRunId };
           });
           break;
         } catch (err: any) {
@@ -397,33 +355,12 @@ export class ReworkController {
         }
       }
 
-    } else {
-      this.taskStore.upsertTask(thread);
     }
 
-    if (thread.execution && ExecutionController.getInstance()) {
-      if (!finalHasActiveRun) {
-        void ExecutionController.getInstance()!.startExecution(thread.threadId, 'develop');
-      }
-    } else if (TaskSupervisor.isSupervisorActive()) {
-      console.log(
-        `[ReworkController] Active TaskSupervisor detected. Delegating Round ${nextRound} execution to supervisor.`,
-      );
-    } else if (this.isGloballyBusy(thread.threadId, getTaskExecutionPath(thread))) {
-      this.markQueued(thread, this.workspaceOwner(thread));
-      this.queueDrainer.schedule(1_500);
-    } else {
-      this.executeReworkBackground(
-        thread,
-        nextRound,
-        params.feedback,
-        resumesNativeSession,
-      ).catch((err) => {
-        console.error(
-          `[ReworkController] Error executing rework round ${nextRound} for ${thread.threadId}:`,
-          err,
-        );
-      });
+    if (!finalHasActiveRun) {
+      const controller = ExecutionController.getInstance();
+      if (!controller) throw new Error('V2 execution controller is unavailable; rework was recorded but not started.');
+      void controller.startExecution(thread.threadId, 'develop');
     }
 
     const switched = !!retarget && retarget.toAgent !== retarget.fromAgent;
@@ -443,161 +380,21 @@ export class ReworkController {
     };
   }
 
-  private async reconcileFailedPreparationRound(thread: DelegationThread): Promise<DelegationThread> {
-    if (thread.status !== 'failed' || thread.failure?.stage !== 'execution' || !findInFlightRound(thread)) return thread;
-    const failure = thread.failure;
-    const validate = (fresh: DelegationThread) => {
-      const round = latestWorkRound(fresh);
-      // Only the known pre-spawn v1 failure is recoverable without a surviving run.
-      if (fresh.status !== 'failed' || fresh.archivedAt || fresh.cleanup || fresh.execution?.version !== 1 ||
-          fresh.execution.phase !== 'develop' || fresh.execution.run || fresh.failure?.stage !== 'execution' ||
-          fresh.failure.code !== 'EXECUTION_ERROR' || fresh.failure.reason !== 'The task role lease is not held during native-session preparation.' ||
-          fresh.failure.at !== failure.at || !round || round.status !== 'running' || round.output || round.durationMs ||
-          round.round !== fresh.currentRound || round.round !== fresh.execution.round || round.round !== fresh.failure.round ||
-          fresh.rounds.filter(item => item.status === 'running').length !== 1 || !fresh.receiverSessionCaptured || !fresh.receiverSessionId) {
-        throw new Error('Cannot reconcile failed round: execution ownership or pre-spawn failure evidence is unverified.');
-      }
-      const record = path.join(this.storageDir, 'executions', `${fresh.threadId.replace(/[^A-Za-z0-9_.-]/g, '_')}.json`);
-      if (fs.existsSync(record)) throw new Error('Cannot reconcile failed round: an execution registration still exists.');
-      return round;
-    };
-    validate(thread);
-    const roleLock = new TaskRoleLock(this.storageDir);
-    const roleLease = roleLock.tryAcquire(thread.threadId, 'developer');
-    if (!roleLease) throw new Error('Cannot reconcile failed round: task role is still occupied.');
-    const sessionLock = new NativeSessionLock(this.storageDir);
-    let sessionLease: ReturnType<NativeSessionLock['acquire']>;
-    try {
-      sessionLease = sessionLock.acquire(thread.targetAgent, thread.receiverSessionId!);
-      if (!sessionLease) throw new Error('Cannot reconcile failed round: native session ownership is unverified or occupied.');
-      return await this.taskStore.transitionExecution(thread.threadId, thread.execution!.revision, fresh => {
-        const round = validate(fresh);
-        if (fresh.targetAgent !== thread.targetAgent || fresh.receiverSessionId !== thread.receiverSessionId ||
-            fresh.targetModel !== thread.targetModel || roleLock.getOwner(thread.threadId)?.token !== roleLease.token) {
-          throw new Error('Cannot reconcile failed round: task binding changed.');
-        }
-        round.status = 'failed';
-        round.error = fresh.failure!.reason;
-      });
-    } finally {
-      if (sessionLease) sessionLock.release(sessionLease);
-      roleLock.release(roleLease);
-    }
-  }
-
-  /** Retry the current failed round in its original session, unless explicitly retargeted. */
-  public async retryFailedRound(
-    threadId: string,
-    overrides: ExecutorOverride = {},
-  ): Promise<DelegationRound> {
+  public async retryFailedRound(threadId: string, overrides: ExecutorOverride = {}): Promise<DelegationRound> {
     this.assertExecutionAdmission('retry this task');
-    this.taskStore.loadFromDisk();
-    let thread = this.taskStore.getTask(threadId);
-    if (thread) assertDedicatedTask(thread);
-    if (!thread) {
-      throw new Error(`Task thread not found: ${threadId}`);
+    const thread = this.taskStore.getTask(threadId);
+    requireV2ExecutionEligibility(thread, 'retry this task');
+    if (this.retargetService.hasOverride(overrides)) {
+      await this.applyExecutorOverride(threadId, overrides, 'retry_task: executor switch');
     }
-    if (this.requireV2Execution) requireV2ExecutionEligibility(thread, 'retry this task');
-    assertCanExecute(overrides.targetAgent || thread.targetAgent, 'receive retried work');
-
-    if (thread.archivedAt || thread.status === 'completed') {
-      throw new Error(`Cannot retry task ${threadId}: completed or archived tasks are immutable.`);
-    }
-    thread = await this.reconcileFailedPreparationRound(thread);
-    const inFlightBeforeRetarget = findInFlightRound(thread);
-    if (inFlightBeforeRetarget) {
-      throw new Error(`Cannot retry round: ${describeRoundInFlight(thread, inFlightBeforeRetarget)}`);
-    }
-    this.assertDedicatedReviewerReady(thread, 'retry failed round');
-
-    if (thread.status !== 'failed' || thread.failure?.stage !== 'execution') {
-      throw new Error(
-        thread.failure?.stage === 'review' ? 'Review failed; use re-review.' :
-          thread.failure?.stage === 'merge' ? 'Merge failed; use retry_merge.' :
-          thread.failure?.stage === 'bootstrap' ? 'Reviewer bootstrap failed; the original handoff must be safely restored.' :
-          `Cannot retry task ${threadId} while it is ${thread.status}; retry is only for a failed task's current failed round.`,
-      );
-    }
-
-    const candidateRound = latestWorkRound(thread);
-    if (!candidateRound || candidateRound.status !== 'failed') {
-      throw new Error(
-        `No current failed execution round found for task ${threadId}. Only the latest failed execution round can be retried.`,
-      );
-    }
-
-    await this.applyExecutorOverride(threadId, overrides, 'retry_task: executor switch');
-    this.taskStore.loadFromDisk();
-    thread = this.taskStore.getTask(threadId);
-    if (!thread) throw new Error(`Task thread not found after retarget: ${threadId}`);
-    const inFlightAfterRetarget = findInFlightRound(thread);
-    if (inFlightAfterRetarget) {
-      throw new Error(`Cannot retry round: ${describeRoundInFlight(thread, inFlightAfterRetarget)}`);
-    }
-    if (thread.archivedAt || thread.status === 'completed') {
-      throw new Error(`Cannot retry task ${threadId}: it became completed or archived during retarget.`);
-    }
-    this.assertDedicatedReviewerReady(thread, 'retry failed round');
-    if (thread.status !== 'failed' || thread.failure?.stage !== 'execution') {
-      throw new Error(`Cannot retry task ${threadId}: it became ${thread.status} during retarget.`);
-    }
-    const refreshedRound = latestWorkRound(thread);
-    if (
-      !refreshedRound || refreshedRound.round !== candidateRound.round ||
-      refreshedRound.status !== 'failed'
-    ) {
-      throw new Error(`Cannot retry task ${threadId}: latest failed round changed during retarget.`);
-    }
-    if (!thread.receiverSessionId) {
-      throw new Error(`Cannot retry: thread ${threadId} is missing receiverSessionId.`);
-    }
-    const failedRound = refreshedRound;
-
-    // Same invariant: retrying must not overlap another in-flight round.
-    const isRework = shouldResumeNativeSession(thread, failedRound);
-    const nowIso = new Date().toISOString();
-    failedRound.status = 'running';
-    failedRound.error = undefined;
-    failedRound.output = undefined;
-    failedRound.interruption = undefined;
-    failedRound.timestamp = nowIso;
-
-    // Never rewind the thread's notion of "latest round"; retrying an older
-    // round must not make a newer one look current again.
-    thread.currentRound = Math.max(thread.currentRound || 1, failedRound.round);
-    clearTaskFailure(thread);
-    thread.status = 'running';
-    thread.interruption = undefined;
-    thread.updatedAt = nowIso;
-    thread.summary.lastPromptSnippet = (failedRound.prompt || '').slice(0, 100);
-    thread.summary.lastOutputSnippet = `Retrying Round ${failedRound.round}...`;
-
-    this.taskStore.upsertTask(thread);
-
-    if (TaskSupervisor.isSupervisorActive()) {
-      console.log(
-        `[ReworkController] Active TaskSupervisor detected. Delegating Round ${failedRound.round} retry to supervisor.`,
-      );
-    } else if (this.isGloballyBusy(thread.threadId, getTaskExecutionPath(thread))) {
-      this.markQueued(thread, this.workspaceOwner(thread));
-      this.queueDrainer.schedule(1_500);
-    } else {
-      this.executeReworkBackground(
-        thread,
-        failedRound.round,
-        failedRound.prompt,
-        isRework,
-      ).catch((err) => {
-        console.error(
-          `[ReworkController] Error executing retry round ${failedRound.round} for ${thread.threadId}:`,
-          err,
-        );
-      });
-    }
-
-    return failedRound;
+    const controller = ExecutionController.getInstance();
+    if (!controller) throw new Error('V2 execution controller is unavailable; retry was not started.');
+    await controller.retryOperation(threadId);
+    const updated = this.taskStore.getTask(threadId);
+    const round = updated?.rounds.find((entry) => entry.round === updated.execution?.round && entry.type !== 'approval');
+    if (!round) throw new Error(`Retry was accepted but round ${updated?.execution?.round ?? 'unknown'} is missing.`);
+    return round;
   }
-
   /**
    * Resume a paused round in place. The original prompt and native session are
    * preserved; the interruption reason stays in history, and the current
@@ -606,296 +403,22 @@ export class ReworkController {
    * `overrides` may resume the task on another agent/model (fresh session) — e.g.
    * pause a task whose model is rate-limited, switch, then resume.
    */
-  public async resumePausedTask(
-    threadId: string,
-    overrides: ExecutorOverride = {},
-  ): Promise<DelegationRound> {
+  public async resumePausedTask(threadId: string, overrides: ExecutorOverride = {}): Promise<DelegationRound> {
     this.assertExecutionAdmission('resume this task');
-    this.taskStore.loadFromDisk();
-    let thread = this.taskStore.getTask(threadId);
-    if (thread) assertDedicatedTask(thread);
-    if (!thread) {
-      throw new Error(`Task thread not found: ${threadId}`);
+    const thread = this.taskStore.getTask(threadId);
+    requireV2ExecutionEligibility(thread, 'resume this task');
+    if (this.retargetService.hasOverride(overrides)) {
+      await this.applyExecutorOverride(threadId, overrides, 'resume_task: executor switch');
     }
-    if (this.requireV2Execution) requireV2ExecutionEligibility(thread, 'resume this task');
-    assertCanExecute(overrides.targetAgent || thread.targetAgent, 'resume work');
-
-    if (thread.archivedAt) {
-      throw new Error(`Cannot resume archived task ${threadId}; its rounds and sessions were archived.`);
-    }
-
-    // A failed reviewer bootstrap has no safe resumable handoff: its token or
-    // native session may have been lost, so resuming would leave a
-    // task that can never run (and, before the pump guard, one that oscillated
-    // `running` ↔ `queued` on every poll).
-    if (thread.reviewBootstrap?.phase === 'failed') {
-      throw new Error(
-        `Cannot resume ${threadId}: its dedicated reviewer bootstrap failed. The original ` +
-          `reviewer session/token cannot be safely inferred; restore that handoff through an ` +
-          `explicit same-thread recovery before resuming. The task was left unchanged.`,
-      );
-    }
-
-    const resumingBootstrap =
-      thread.reviewFlow === 'dedicated' &&
-      isReviewerBootstrapPending(thread) &&
-      !(thread.reviewBootstrap?.phase === 'confirmed' && thread.reviewerSessionCaptured === true);
-    if (!resumingBootstrap) this.assertDedicatedReviewerReady(thread, 'resume task');
-    if (resumingBootstrap && this.retargetService.hasOverride(overrides)) {
-      throw new Error(
-        `Cannot retarget ${threadId} while its reviewer bootstrap is pending; resume the same reviewer session and token first.`,
-      );
-    }
-
-    if (thread.status !== 'paused') {
-      throw new Error(`Cannot resume ${threadId}: task is ${thread.status}, not paused.`);
-    }
-    if ((thread.worktree?.approvedCommit || thread.worktree?.mergePending) &&
-        ['waiting', 'merging', 'conflict', 'validation_failed', 'blocked'].includes(thread.worktree?.integration?.phase || '') &&
-        [...thread.rounds].reverse().find((round) => round.type !== 'approval')?.status !== 'paused') {
-      if (this.retargetService.hasOverride(overrides)) {
-        throw new Error(`Cannot change the executor while resuming approved integration for ${threadId}.`);
-      }
-      if (thread.execution?.version === 2) {
-        const currentRound = [...thread.rounds].reverse().find((entry) => entry.type !== 'approval') || thread.rounds[thread.rounds.length - 1];
-        const integrationPhase = thread.worktree?.integration?.phase || '';
-        const resumedStatus = ['conflict', 'validation_failed', 'blocked'].includes(integrationPhase) ? 'reviewing' : 'queued';
-        const revision = thread.execution.revision;
-        const operationId = thread.execution.operationId;
-        const generation = thread.execution.generation;
-        thread = await this.taskStore.transitionExecution(threadId, revision, (current) => {
-          if (current.execution?.version !== 2 || current.execution.run || current.execution.next || current.cleanup ||
-              current.archivedAt || current.status !== 'paused' ||
-              current.execution.operationId !== operationId || current.execution.generation !== generation ||
-              current.worktree?.integration?.phase !== integrationPhase) {
-            throw new Error(`Cannot resume ${threadId}: v2 run, handoff, cleanup, or integration state changed.`);
-          }
-          current.interruption = undefined;
-          current.status = resumedStatus;
-          current.queuePhase = resumedStatus === 'queued' ? 'merge' : undefined;
-          current.execution.phase = resumedStatus === 'queued' ? 'merge' : 'review';
-          current.execution.queue = undefined;
-          current.updatedAt = new Date().toISOString();
-        });
-        this.runner.clearPendingCancellation(threadId);
-        const cancellations = new CancellationRegistry(this.storageDir);
-        cancellations.clear(threadId);
-        if (cancellations.peek(threadId)) throw new Error(`Cannot resume ${threadId}: cancellation request could not be cleared.`);
-        const round = currentRound;
-        if (round && resumedStatus === 'reviewing') {
-          void ExecutionController.getInstance()?.startExecution(threadId, 'review');
-        }
-        return round;
-      }
-      const roles = new TaskRoleLock(this.storageDir);
-      const nativeLock = new NativeSessionLock(this.storageDir);
-      const sessionId = thread.reviewerSessionId;
-      const deadline = Date.now() + 30_000;
-      while (Date.now() < deadline) {
-        if (this.executionRegistry.getOwner(threadId) || this.mergeWorkers.has(threadId)) {
-          await new Promise((resolve) => setTimeout(resolve, 100));
-          continue;
-        }
-        const role = roles.tryAcquire(threadId, 'reviewer', sessionId);
-        if (!role) { await new Promise((resolve) => setTimeout(resolve, 100)); continue; }
-        let lease: ReturnType<NativeSessionLock['acquire']>;
-        try { lease = isValidSessionId(sessionId) ? nativeLock.acquire(thread.initiatorAgent, sessionId!) : undefined; }
-        catch (error) { roles.release(role); throw error; }
-        if (isValidSessionId(sessionId) && !lease) {
-          roles.release(role);
-          await new Promise((resolve) => setTimeout(resolve, 100));
-          continue;
-        }
-        try {
-          this.taskStore.loadFromDisk();
-          const latest = this.taskStore.getTask(threadId);
-          if (!latest || latest.status !== 'paused') throw new Error(`Cannot resume ${threadId}: task changed while stopping.`);
-          this.runner.clearPendingCancellation(threadId);
-          const cancellations = new CancellationRegistry(this.storageDir);
-          cancellations.clear(threadId);
-          if (cancellations.peek(threadId)) throw new Error(`Cannot resume ${threadId}: the cancellation request could not be cleared.`);
-          latest.interruption = undefined;
-          latest.status = ['conflict', 'validation_failed', 'blocked'].includes(latest.worktree?.integration?.phase || '') ? 'reviewing' : 'queued';
-          latest.queuePhase = latest.status === 'queued' ? 'merge' : undefined;
-          latest.updatedAt = new Date().toISOString();
-          this.taskStore.upsertTask(latest);
-          thread = latest;
-        } finally {
-          try { if (lease) nativeLock.release(lease); }
-          finally { roles.release(role); }
-        }
-        const round = [...thread.rounds].reverse().find((entry) => entry.type !== 'approval') || thread.rounds[thread.rounds.length - 1];
-        if (round && !thread.worktree?.integration?.stashRecoveryPending && ['conflict', 'validation_failed', 'blocked'].includes(thread.worktree?.integration?.phase || '')) {
-          setTimeout(() => { void this.callbackManager.notifyCaller(thread!, round); }, 0).unref();
-        }
-        return round;
-      }
-      throw new Error(`Task ${threadId} is still stopping; its cancellation and paused state were retained.`);
-    }
-    let pausedRound =
-      [...thread.rounds].reverse().find((round) => round.status === 'paused') ||
-      thread.rounds[thread.rounds.length - 1];
-    if (!pausedRound || pausedRound.status !== 'paused') {
-      throw new Error(`No paused round found for thread ${threadId}.`);
-    }
-    const resumeRoundNumber = pausedRound.round;
-    const inFlightBeforeRetarget = findInFlightRound(thread);
-    if (inFlightBeforeRetarget) {
-      throw new Error(`Cannot resume paused task: ${describeRoundInFlight(thread, inFlightBeforeRetarget)}`);
-    }
-
-    await this.applyExecutorOverride(threadId, overrides, 'resume_task: executor switch');
-    this.taskStore.loadFromDisk();
-    const afterRetarget = this.taskStore.getTask(threadId);
-    if (!afterRetarget) throw new Error(`Task thread not found after retarget: ${threadId}`);
-    if (afterRetarget.archivedAt || afterRetarget.status !== 'paused') {
-      throw new Error(`Cannot resume ${threadId}: task changed state during retarget.`);
-    }
-    if (afterRetarget.reviewBootstrap?.phase === 'failed') {
-      throw new Error(`Cannot resume ${threadId}: its dedicated reviewer bootstrap failed during retarget.`);
-    }
-    if (afterRetarget.reviewFlow === 'dedicated' && !resumingBootstrap) {
-      this.assertDedicatedReviewerReady(afterRetarget, 'resume task');
-    }
-    const afterRetargetRound =
-      [...afterRetarget.rounds].reverse().find((round) => round.round === resumeRoundNumber);
-    if (!afterRetargetRound || afterRetargetRound.status !== 'paused') {
-      throw new Error(`Cannot resume ${threadId}: paused round changed during retarget.`);
-    }
-    thread = afterRetarget;
-    pausedRound = afterRetargetRound;
-
-    const inFlight = findInFlightRound(thread);
-    if (inFlight) {
-      throw new Error(`Cannot resume paused task: ${describeRoundInFlight(thread, inFlight)}`);
-    }
-
-    // A pause kills the child asynchronously. Resuming before the old round has
-    // actually released its execution slot would clear its cancellation request
-    // and let the old process keep running. Wait for the slot first.
-    const owner = this.workspaceOwner(thread);
-    if (owner && owner.threadId === threadId) {
-      for (let i = 0; i < 50; i++) {
-        const current = this.workspaceOwner(thread);
-        if (!current || current.threadId !== threadId) break;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-      const stillOwned = this.workspaceOwner(thread);
-      if (stillOwned && stillOwned.threadId === threadId) {
-        throw new Error(
-          `Task ${threadId} is still stopping; wait for the pause to finish before resuming.`,
-        );
-      }
-    }
-
-    // The bootstrap runner may have completed while resume was waiting for its
-    // execution record to clear. Always continue from its persisted session and
-    // phase instead of the pre-wait task snapshot.
-    this.taskStore.loadFromDisk();
-    const latest = this.taskStore.getTask(threadId);
-    if (!latest) throw new Error(`Task thread not found: ${threadId}`);
-    if (latest.status !== 'paused') {
-      throw new Error(`Cannot resume ${threadId}: task is now ${latest.status}, not paused.`);
-    }
-    thread = latest;
-    pausedRound = thread.rounds.find((round) => round.round === resumeRoundNumber)!;
-    if (!pausedRound || pausedRound.status !== 'paused') {
-      throw new Error(`Cannot resume ${threadId}: paused round changed while waiting for shutdown.`);
-    }
-
-    // A stale pause/delete request must not immediately kill the resumed run.
-    // The runner owns both channels — the cancellation file it polls and the
-    // pause it remembers in memory — so clearing through it is the only way to
-    // cover a pause that landed before any child existed and was therefore never
-    // consumed by a settling round.
-    this.runner.clearPendingCancellation(threadId);
-
-    // A dedicated reviewer bootstrap is the first role in the task. Resume its
-    // paused placeholder round and return it to the bootstrap scheduler; never
-    // start the developer before a reviewer session has been confirmed/persisted.
-    if (thread.reviewFlow === 'dedicated' && isReviewerBootstrapPending(thread)) {
-      const nowIso = new Date().toISOString();
-      pausedRound.status = 'running';
-      pausedRound.error = undefined;
-      pausedRound.interruption = undefined;
-      pausedRound.timestamp = nowIso;
-      thread.currentRound = Math.max(thread.currentRound || 1, pausedRound.round);
-      thread.status = 'queued';
-      thread.interruption = undefined;
-      thread.updatedAt = nowIso;
-      thread.summary.lastPromptSnippet = (pausedRound.prompt || '').slice(0, 100);
-      thread.summary.lastOutputSnippet = 'Resuming the dedicated reviewer bootstrap...';
-      const previousBootstrap = thread.reviewBootstrap || { phase: 'pending' as const, attempts: 0 };
-      const existingToken = readReviewerBootstrapToken(threadId, this.storageDir, thread.artifactDir);
-      if (!existingToken) {
-        const reason = previousBootstrap.phase === 'confirmed' && !thread.reviewerSessionCaptured
-          ? 'The one-time reviewer token is unavailable and its native session was never captured; the original reviewer session cannot be resumed safely.'
-          : 'The original reviewer bootstrap token is missing, so a replacement token or session cannot be created safely.';
-        thread.status = 'failed';
-        thread.failureRevision = (thread.failureRevision || 0) + 1;
-        thread.failure = { stage: 'bootstrap', reason, at: nowIso, round: pausedRound.round };
-        pausedRound.status = 'failed';
-        pausedRound.error = reason;
-        thread.reviewBootstrap = { ...previousBootstrap, phase: 'failed', lastError: reason };
-        thread.updatedAt = nowIso;
-        thread.summary.lastOutputSnippet = `[Reviewer bootstrap failed] ${reason}`;
-        this.taskStore.upsertTask(thread);
-        return pausedRound;
-      }
-      thread.reviewBootstrap = {
-        ...previousBootstrap,
-        phase: 'pending',
-        lastError: undefined,
-        retryAfter: undefined,
-      };
-      this.taskStore.upsertTask(thread);
-      if (thread.status === 'queued') this.queueDrainer.schedule(100);
-      return pausedRound;
-    }
-
-    const isRework = shouldResumeNativeSession(thread, pausedRound);
-    const nowIso = new Date().toISOString();
-    pausedRound.status = 'running';
-    pausedRound.error = undefined;
-    // The round carries its own interruption marker as well as the thread-level
-    // one. Leaving it behind made a resumed round look paused at a stale time,
-    // so the supervisor's "task is paused" probe cancelled the fresh run on the
-    // very next pass.
-    pausedRound.interruption = undefined;
-    pausedRound.timestamp = nowIso;
-    thread.currentRound = Math.max(thread.currentRound || 1, pausedRound.round);
-    thread.status = 'running';
-    thread.interruption = undefined;
-    thread.updatedAt = nowIso;
-    thread.summary.lastPromptSnippet = (pausedRound.prompt || '').slice(0, 100);
-    thread.summary.lastOutputSnippet = `Resuming paused Round ${pausedRound.round}...`;
-
-    this.taskStore.upsertTask(thread);
-
-    if (TaskSupervisor.isSupervisorActive()) {
-      console.log(
-        `[ReworkController] Active TaskSupervisor detected. Delegating resumed Round ${pausedRound.round} to supervisor.`,
-      );
-    } else if (this.isGloballyBusy(thread.threadId, getTaskExecutionPath(thread))) {
-      this.markQueued(thread, this.workspaceOwner(thread));
-      this.queueDrainer.schedule(1_500);
-    } else {
-      this.executeReworkBackground(
-        thread,
-        pausedRound.round,
-        pausedRound.prompt,
-        isRework,
-      ).catch((err) => {
-        console.error(
-          `[ReworkController] Error resuming paused round ${pausedRound.round} for ${threadId}:`,
-          err,
-        );
-      });
-    }
-
-    return pausedRound;
+    const controller = ExecutionController.getInstance();
+    if (!controller) throw new Error('V2 execution controller is unavailable; resume was not started.');
+    await controller.resumeOperation(threadId);
+    const updated = this.taskStore.getTask(threadId);
+    const roundNumber = updated?.execution?.round;
+    const round = updated?.rounds.find((entry) => entry.round === roundNumber && entry.type !== 'approval');
+    if (!round) throw new Error(`Resume was accepted but round ${roundNumber ?? 'unknown'} is missing.`);
+    return round;
   }
-
   private assertDedicatedReviewerReady(thread: DelegationThread, operation: string): void {
     assertDedicatedTask(thread);
     if (thread.reviewFlow === 'dedicated' && isReviewerBootstrapPending(thread)) {
@@ -1264,8 +787,21 @@ export class ReworkController {
 
   public mergeApproved(threadId: string): Promise<MergeResult> {
     this.assertExecutionAdmission('merge this task');
-    if (this.requireV2Execution) requireV2ExecutionEligibility(this.taskStore.getTask(threadId), 'merge this task');
-    return this.mergeCoordinator.mergeApproved(threadId);
+    const thread = this.taskStore.getTask(threadId);
+    const landedStashRecovery = thread?.status === 'completed' && thread.execution?.version === 2 &&
+      Boolean(thread.worktree?.integration?.stashRecoveryPending && thread.worktree.integration.mergedCommit);
+    requireV2ExecutionEligibility(landedStashRecovery ? { ...thread!, status: 'reviewing' } : thread, 'merge this task');
+    const controller = ExecutionController.getInstance();
+    if (!controller) throw new Error('V2 execution controller is unavailable; merge was not started.');
+    return controller.startExecution(threadId, 'merge').then((result) => {
+      if (result.started) {
+        return { status: 'blocked', message: 'Merge was started under the V2 execution run; refresh the task for its result.' };
+      }
+      if (result.run) {
+        return { status: 'blocked', message: `Merge is already owned by V2 run ${result.run.id} (${result.run.state}).` };
+      }
+      throw new Error(`V2 merge was not started: ${result.reason || 'unknown admission failure'}.`);
+    });
   }
 
   public async requestMergeDecision(threadId: string, question: string, background: string, suggestion: string, conflictFiles: string[] = [], logPath?: string): Promise<{ threadId: string; status: 'wait_decision'; decisionId: string; nextAction: string; message: string }> {
@@ -1273,9 +809,12 @@ export class ReworkController {
     const current = this.taskStore.getTask(threadId);
     if (current) assertDedicatedTask(current);
     if (!current || current.status !== 'reviewing' || !question?.trim()) throw new Error('An active review and a non-empty question are required.');
+    if (current.worktree?.integration?.stashRecoveryPending) throw new Error('Cannot request a merge decision while stash metadata recovery is pending.');
     if (this.requireV2Execution) requireV2ExecutionEligibility(current, 'request a merge decision for this task');
-    if (current.execution && ExecutionController.getInstance()) {
-      const decision = await ExecutionController.getInstance()!.requestTaskDecision(threadId, {
+    const controller = ExecutionController.getInstance();
+    if (this.requireV2Execution && !controller) throw new Error('V2 execution controller is unavailable; merge decision was not recorded.');
+    if (current.execution && controller) {
+      const decision = await controller.requestTaskDecision(threadId, {
         question: question.trim(),
         background: (background || '').trim(),
         suggestion: (suggestion || '').trim(),
@@ -1291,7 +830,6 @@ export class ReworkController {
         message: 'End this reviewer turn; the user decision will wake the same session.',
       };
     }
-    if (current.worktree?.integration?.stashRecoveryPending) throw new Error('Cannot request a merge decision while stash metadata recovery is pending.');
     const thread = structuredClone(current);
     const decisionId = crypto.randomUUID(); const at = new Date().toISOString();
     const files = Array.isArray(conflictFiles) && conflictFiles.length ? conflictFiles : thread.worktree?.integration?.conflictFiles || [];
@@ -1316,9 +854,11 @@ export class ReworkController {
     if (current) assertDedicatedTask(current);
     if (!current || current.status !== 'wait_decision' || !answer?.trim()) throw new Error('A pending merge decision and a non-empty answer are required.');
     if (this.requireV2Execution) requireV2ExecutionEligibility(current, 'submit a merge decision for this task');
-    if (current.execution && ExecutionController.getInstance()) {
+    const controller = ExecutionController.getInstance();
+    if (this.requireV2Execution && !controller) throw new Error('V2 execution controller is unavailable; merge decision was not submitted.');
+    if (current.execution && controller) {
       const decisionId = current.decision?.id || current.mergeControl?.pendingDecisionId || '';
-      void ExecutionController.getInstance()!.submitTaskDecision(threadId, decisionId, answer);
+      void controller.submitTaskDecision(threadId, decisionId, answer);
       return { threadId, status: 'reviewing', decisionId };
     }
     if (!current.mergeControl?.pendingDecisionId) throw new Error('A pending merge decision and a non-empty answer are required.');
@@ -1342,8 +882,10 @@ export class ReworkController {
     if (current) assertDedicatedTask(current);
     if (!current || current.archivedAt || current.status !== 'failed' || current.failure?.stage !== 'merge') throw new Error('Only a merge failure can restart its merge budget.');
     if (this.requireV2Execution) requireV2ExecutionEligibility(current, 'retry merge for this task');
-    if (current.execution && ExecutionController.getInstance()) {
-      void ExecutionController.getInstance()!.retryOperation(threadId);
+    const controller = ExecutionController.getInstance();
+    if (this.requireV2Execution && !controller) throw new Error('V2 execution controller is unavailable; merge retry was not started.');
+    if (current.execution && controller) {
+      void controller.retryOperation(threadId);
       return { threadId, status: 'queued', retryGeneration: (current.execution.generation || 1) + 1 };
     }
     const thread = structuredClone(current); resetMergeBudget(thread); clearTaskFailure(thread); thread.status = thread.worktree?.mergeResolutionSubmitted ? 'queued' : 'reviewing';
@@ -1402,6 +944,7 @@ export class ReworkController {
     };
     const execution = thread.execution;
     if (execution?.version === 2) {
+      if (this.requireV2Execution && !ExecutionController.getInstance()) throw new Error('V2 execution controller is unavailable; merge resolution was not submitted.');
       await this.taskStore.transitionExecution(threadId, execution.revision, fresh => {
         const run = fresh.execution?.run;
         if (fresh.execution?.version !== 2 || fresh.execution.phase !== 'review' || fresh.execution.next ||
@@ -1419,423 +962,9 @@ export class ReworkController {
     return { threadId, status: 'QUEUED', message: 'Resolution submitted; end the reviewer turn so the bridge can validate and integrate it.' };
   }
 
-  public resumePendingMerges(): void {
-    if (!this.executionAdmission) return;
-    this.taskStore.loadFromDisk();
-    for (const thread of this.taskStore.getAllTasks()) {
-      if (thread.reviewFlow !== 'dedicated') continue;
-      if (this.requireV2Execution && thread.execution?.version !== 2) continue;
-      if (thread.execution || !(thread.status === 'queued' && thread.queuePhase === 'merge') && thread.status !== 'merging') continue;
-      if (['blocked', 'conflict', 'validation_failed'].includes(thread.worktree?.integration?.phase || '')) continue;
-      const blockedAt = this.blockedMergeRetries.get(thread.threadId);
-      if (blockedAt && blockedAt === thread.updatedAt) continue;
-      if (blockedAt) this.blockedMergeRetries.delete(thread.threadId);
-      if (this.mergeWorkers.has(thread.threadId)) continue;
-      if (thread.status === 'merging') {
-        const roles = new TaskRoleLock(this.storageDir);
-        const lease = roles.tryAcquire(thread.threadId, 'reviewer', thread.reviewerSessionId);
-        if (!lease) continue;
-        this.mergeWorkers.add(thread.threadId);
-        let recovered = false;
-        try {
-          this.taskStore.loadFromDisk();
-          const latest = this.taskStore.getTask(thread.threadId);
-          if (latest?.status === 'merging' && !new CancellationRegistry(this.storageDir).peek(thread.threadId)) {
-            const queued = structuredClone(latest);
-            queued.status = 'queued'; queued.queuePhase = 'merge'; queued.updatedAt = new Date().toISOString();
-            this.taskStore.upsertTask(queued);
-            recovered = true;
-          }
-        } catch (error) {
-          console.error(`[ReworkController] Could not queue interrupted merge ${thread.threadId}: ${String(error)}`);
-          this.blockedMergeRetries.set(thread.threadId, thread.updatedAt);
-          const timer = setTimeout(() => { this.blockedMergeRetries.delete(thread.threadId); this.resumePendingMerges(); }, 3_000);
-          timer.unref();
-          this.mergePersistenceRetries.set(thread.threadId, { attempts: 1, timer });
-        } finally {
-          this.mergeWorkers.delete(thread.threadId);
-          roles.release(lease);
-        }
-        if (recovered) this.resumePendingMerges();
-        continue;
-      }
-      this.mergeWorkers.add(thread.threadId);
-      void this.mergeApproved(thread.threadId).then(() => {
-        const previous = this.mergePersistenceRetries.get(thread.threadId);
-        if (previous) { clearTimeout(previous.timer); this.mergePersistenceRetries.delete(thread.threadId); }
-      }).catch(async (error: any) => {
-        if (await this.mergeCoordinator.hasLandedCandidate(thread.threadId)) {
-          const latest = this.taskStore.getTask(thread.threadId);
-          if (latest) this.blockedMergeRetries.set(thread.threadId, latest.updatedAt);
-          console.error(`[ReworkController] Target ref is updated for ${thread.threadId}, but its durable ledger record still needs recovery: ${error?.message || error}`);
-          return;
-        }
-        const current = this.taskStore.getTask(thread.threadId);
-        if (!current || (current.status !== 'merging' && !(current.status === 'queued' && current.queuePhase === 'merge')) || !current.worktree) return;
-        const latest = structuredClone(current);
-        latest.status = 'reviewing';
-        const failure = `Merge coordinator failed: ${error?.message || error}`;
-        latest.worktree!.integration = { ...latest.worktree!.integration, phase: 'blocked', error: failure, updatedAt: new Date().toISOString() };
-        const budget = noteMergeFailure(latest, 'coordinator', 'COORDINATOR_ERROR', failure);
-        latest.mergeHistory = [...(latest.mergeHistory || []), { id: crypto.randomUUID(), number: (latest.mergeHistory?.length || 0) + 1,
-          at: new Date().toISOString(), phase: 'coordinator', result: 'failed', error: failure.slice(-5000), ...budget }];
-        latest.summary.lastOutputSnippet = failure;
-        try { this.taskStore.upsertTask(latest); }
-        catch (persistError: any) {
-          console.error(`[ReworkController] Could not persist merge failure for ${thread.threadId}; retrying with backoff: ${persistError?.message || persistError}`);
-          const previous = this.mergePersistenceRetries.get(thread.threadId);
-          if (previous) clearTimeout(previous.timer);
-          const attempts = (previous?.attempts || 0) + 1;
-          this.blockedMergeRetries.set(thread.threadId, current.updatedAt);
-          const timer = setTimeout(() => {
-            this.blockedMergeRetries.delete(thread.threadId);
-            this.resumePendingMerges();
-          }, Math.min(60_000, 3_000 * 2 ** Math.min(attempts - 1, 5)));
-          timer.unref();
-          this.mergePersistenceRetries.set(thread.threadId, { attempts, timer });
-          return;
-        }
-        const previous = this.mergePersistenceRetries.get(thread.threadId);
-        if (previous) { clearTimeout(previous.timer); this.mergePersistenceRetries.delete(thread.threadId); }
-        const reviewRound = [...(latest.rounds || [])].reverse().find((round) => round.type !== 'approval');
-        if (reviewRound && latest.status === 'reviewing') void this.callbackManager.notifyCaller(latest, reviewRound);
-      }).finally(() => this.mergeWorkers.delete(thread.threadId));
-    }
-  }
-
   public dispose(): void {
-    if (this.mergeWatch) clearInterval(this.mergeWatch);
-    this.mergeWatch = undefined;
-    for (const retry of this.mergePersistenceRetries.values()) clearTimeout(retry.timer);
-    this.mergePersistenceRetries.clear();
   }
 
-  private async executeReworkBackground(
-    thread: DelegationThread,
-    roundNumber: number,
-    feedback: string,
-    isRework: boolean = true,
-  ): Promise<void> {
-    if (this.executionRegistry.getOwner(thread.threadId)) {
-      this.queueDrainer.schedule(1_500);
-      return;
-    }
-    this.taskStore.loadFromDisk();
-
-    const roleLock = new TaskRoleLock(this.storageDir);
-    const roleLease = roleLock.tryAcquire(thread.threadId, 'developer');
-    if (!roleLease) {
-      this.queueDrainer.schedule(1_500);
-      return;
-    }
-
-    let registration: TaskExecutionRegistration | undefined;
-    this.taskStore.loadFromDisk();
-    const latest = this.taskStore.getTask(thread.threadId);
-    const latestRound = latest?.rounds.filter((entry) => entry.round === roundNumber).slice(-1)[0];
-    if (
-      !latest || latest.queuePhase === 'merge' || latest.status === 'merging' || latest.status === 'wait_decision' || latest.status === 'paused' || latest.status === 'reviewing' ||
-      latest.status === 'completed' || latest.status === 'failed' ||
-      latest.targetAgent !== thread.targetAgent || !latestRound || latestRound.status !== 'running' ||
-      latestRound.prompt !== feedback || findInFlightRound(latest)?.round !== roundNumber ||
-      isReviewerBootstrapPending(latest)
-    ) {
-      roleLock.release(roleLease);
-      return;
-    }
-    thread = latest;
-
-
-    const gatePolicy = concurrencyPolicy();
-    if (gatePolicy.enabled) {
-      const owners = this.executionRegistry.listAgentOwners();
-      const agentSlots = owners.filter((owner) => owner.agent === thread.targetAgent).length;
-      if (owners.length >= gatePolicy.maxConcurrentTasks || agentSlots >= gatePolicy.maxConcurrentPerAgent) {
-        roleLock.release(roleLease);
-        this.markQueued(thread, undefined, this.describeConcurrencyBlocked(thread.targetAgent, gatePolicy));
-        this.queueDrainer.schedule(1_500);
-        return;
-      }
-    }
-    try {
-      registration = this.executionRegistry.begin(
-        thread.threadId,
-        roundNumber,
-        thread.targetAgent,
-        getTaskExecutionPath(thread),
-        'developer',
-      );
-    } catch (error: any) {
-      roleLock.release(roleLease);
-      latestRound.status = 'failed';
-      latestRound.error = `Could not register task execution: ${error?.message || error}`;
-      latest.updatedAt = new Date().toISOString();
-      enterTaskFailure(latest, { stage: 'execution', reason: latestRound.error, at: latest.updatedAt, round: latestRound.round });
-      this.taskStore.upsertTask(latest);
-      return;
-    }
-
-    try {
-      const current = thread;
-      current.status = 'running';
-      current.summary.lastOutputSnippet = 'Executing in background...';
-      this.taskStore.upsertTask(current);
-      thread = current;
-      console.log(
-        `[ReworkController] ${isRework ? 'Resuming' : 'Starting'} session ${thread.receiverSessionId} for ` +
-          `${thread.targetAgent} (Round ${roundNumber})`,
-      );
-
-      let result;
-      const startedFailureRevision = thread.failureRevision || 0;
-      const startedRoundTimestamp = thread.rounds.filter(r => r.round === roundNumber).slice(-1)[0]?.timestamp;
-      const workspaceBefore = captureWorkspaceSnapshot(getTaskExecutionPath(thread));
-      // Rework rounds used to run without a per-round stdio log, so the "raw
-      // execution log" existed only for dispatch/supervisor rounds. Capture it
-      // here too: `get_round_raw_log` must not silently return "not captured".
-      const roundLogPath = roundExecutionLogPath(
-        thread.threadId,
-        roundNumber,
-        path.dirname(this.taskStore.getStoragePath()),
-        thread.targetAgent,
-        thread.artifactDir,
-      );
-      try {
-        fs.mkdirSync(path.dirname(roundLogPath), { recursive: true });
-        fs.writeFileSync(roundLogPath, '', 'utf8');
-      } catch {}
-      try {
-        result = await this.runner.execute({
-          agent: thread.targetAgent,
-          prompt: appendTemplateInstructions(isRework ? appendCompactionProtocol(feedback, roundNumber) : feedback, thread.taskTemplate, 'worker'),
-          isRework,
-          receiverSessionId: thread.receiverSessionId,
-          title: thread.title,
-          cwd: getTaskExecutionPath(thread),
-          taskThreadId: thread.threadId,
-          artifactDir: thread.artifactDir,
-          taskRound: roundNumber,
-          model: thread.targetModel,
-          role: 'developer',
-          previousTokenUsage: readStoredRoundUsage(this.taskStore, thread.threadId, roundNumber),
-          onChildPid: (pid) => {
-            if (registration) this.executionRegistry.attachChildPid(pid, registration);
-            roleLock.attachChild(roleLease, pid);
-          },
-          onStdoutChunk: (chunk: string) => {
-            try {
-              fs.appendFileSync(roundLogPath, chunk, 'utf8');
-            } catch {}
-          },
-          onStderrChunk: (chunk: string) => {
-            try {
-              fs.appendFileSync(roundLogPath, chunk, 'utf8');
-            } catch {}
-          },
-        });
-      } catch (err: any) {
-        result = {
-          exitCode: -1,
-          stdout: '',
-          stderr: String(err),
-          extractedOutput: '',
-          durationMs: 0,
-          error: `Execution error: ${err?.message || err}`,
-        };
-      }
-
-      const touchedFiles = diffWorkspaceSnapshots(
-        workspaceBefore,
-        captureWorkspaceSnapshot(getTaskExecutionPath(thread)),
-      );
-
-      this.taskStore.loadFromDisk();
-      const latest = this.taskStore.getTask(thread.threadId);
-      if (!latest) {
-        console.warn(
-          `[ReworkController] Task ${thread.threadId} was deleted while round ${roundNumber} was executing.`,
-        );
-        return;
-      }
-
-      const liveRound = latest.rounds.filter(r => r.round === roundNumber).slice(-1)[0];
-      if (latest.archivedAt || (latest.failureRevision || 0) !== startedFailureRevision ||
-          latest.currentRound !== roundNumber || !liveRound || liveRound.timestamp !== startedRoundTimestamp ||
-          roleLock.getOwner(thread.threadId)?.token !== roleLease.token) return;
-
-      // A pause may have landed after the child exited but before this handler
-      // ran; the control plane's state wins over a "successful" result.
-      const pausedByControl = latest.status === 'paused';
-      const interruption = result.interruption || (pausedByControl ? latest.interruption : undefined);
-      const isPaused = pausedByControl || interruption?.kind === 'paused';
-      const responseOk = result.assessment
-        ? result.assessment.success
-        : result.exitCode === 0;
-      let isSuccess = !interruption && !pausedByControl && responseOk;
-      if (isSuccess && isIsolatedTaskWorktree(latest.worktree)) {
-        try {
-          latest.worktree.headCommit = currentHead(latest.worktree.path);
-          latest.worktree.integration = { phase: 'ready', sourceCommit: latest.worktree.headCommit, updatedAt: new Date().toISOString() };
-        } catch (error: any) {
-          result.error = `Could not inspect the task worktree: ${error?.message || error}`;
-          result.exitCode = 1;
-          isSuccess = false;
-        }
-      }
-      if (!isSuccess && isIsolatedTaskWorktree(latest.worktree)) {
-        try {
-          const head = currentHead(latest.worktree.path);
-          if (head !== latest.worktree.baseCommit || changedFiles(latest.worktree.path).length) {
-            latest.worktree.headCommit = head;
-            latest.worktree.integration = { phase: 'ready', sourceCommit: head, updatedAt: new Date().toISOString() };
-          }
-        } catch {}
-      }
-      const finalRoundStatus = isPaused ? 'paused' : isSuccess ? 'completed' : 'failed';
-      const finalThreadStatus = isPaused ? 'paused' : isSuccess ? 'reviewing' : 'failed';
-
-      const nativeSessionId = result.actualSessionId || latest.receiverSessionId;
-      if (result.actualSessionId && result.actualSessionId !== latest.receiverSessionId) {
-        console.log(
-          `[ReworkController] Syncing receiverSessionId from ${latest.receiverSessionId} to actual native ID: ${result.actualSessionId}`,
-        );
-        latest.receiverSessionId = result.actualSessionId;
-      }
-      if (result.actualSessionId) {
-        latest.receiverSessionCaptured = true;
-      }
-
-      const updatedThread = this.taskStore.updateRound(
-        thread.threadId,
-        roundNumber,
-        {
-          output: result.extractedOutput || result.stdout,
-          error: result.error,
-          durationMs: result.durationMs,
-          status: finalRoundStatus,
-          assessment: result.assessment,
-          touchedFiles: touchedFiles.length > 0 ? touchedFiles : undefined,
-          // Execution metadata: who ran this round, on which model, and what
-          // it cost. It must survive the lagged compaction.
-          executorAgent: thread.targetAgent,
-          executorModel: result.model || thread.targetModel,
-          tokenUsage: result.tokenUsage,
-        },
-        finalThreadStatus,
-        nativeSessionId,
-        undefined,
-        interruption,
-        {
-          failureRevision: startedFailureRevision,
-          roundTimestamp: startedRoundTimestamp,
-          receiverSessionCaptured: Boolean(result.actualSessionId || latest.receiverSessionCaptured),
-        },
-      );
-
-      if (updatedThread && this.taskStore.getTask(updatedThread.threadId)) {
-        const completedRound = updatedThread.rounds.find((r) => r.round === roundNumber);
-        if (completedRound) {
-          // Lagged compaction of the superseded round, before the handoff and
-          // never allowed to block it.
-          if (isSuccess) {
-            compactRoundBestEffort(this.taskStore, {
-              threadId: updatedThread.threadId,
-              currentRoundNumber: roundNumber,
-              currentOutput: result.extractedOutput || result.stdout,
-            });
-          }
-          // Hand the task from developer to reviewer.
-          roleLock.release(roleLease);
-          if (!interruption && isSuccess) {
-            await this.callbackManager.notifyCaller(updatedThread, completedRound);
-          } else if (!isUserInterruption(interruption)) {
-            // The receiver died; the caller must learn about it, otherwise the
-            // task silently rots in `failed` until somebody polls the ledger.
-            const notified = await this.callbackManager.notifyCallerOfFailure(
-              updatedThread,
-              roundNumber,
-              result,
-            );
-            if (notified) this.taskStore.upsertTask(updatedThread);
-          }
-        }
-      }
-    } finally {
-      if (registration) this.executionRegistry.end(registration);
-      roleLock.release(roleLease);
-      this.queueDrainer.schedule(50);
-    }
-  }
-
-  private async executeQueuedRound(target: QueuedExecution): Promise<void> {
-    await this.executeReworkBackground(
-      target.thread,
-      target.round.round,
-      target.round.prompt,
-      shouldResumeNativeSession(target.thread, target.round),
-    );
-  }
-
-  /** A user-enabled count cap is advisory; disabled means unlimited execution. */
-  private isGloballyBusy(excludeThreadId: string, _workspacePath?: string): boolean {
-    const policy = concurrencyPolicy();
-    if (!policy.enabled) return false;
-    const owners = this.executionRegistry.listAgentOwners().filter((owner) => owner.threadId !== excludeThreadId);
-    if (owners.length >= policy.maxConcurrentTasks) return true;
-    const thread = this.taskStore.getTask(excludeThreadId);
-    return owners.filter((owner) => owner.agent === thread?.targetAgent).length >= policy.maxConcurrentPerAgent;
-  }
-
-  /** Current execution record for the given task, if any. */
-  private workspaceOwner(thread: DelegationThread): TaskExecutionOwner | undefined {
-    return this.executionRegistry.getOwner(thread.threadId);
-  }
-
-  private describeConcurrencyBlocked(targetAgent: string, policy: ReturnType<typeof concurrencyPolicy>): string {
-    const owners = this.executionRegistry.listAgentOwners();
-    const sameAgent = owners.filter((owner) => owner.agent === targetAgent).length;
-    if (owners.length >= policy.maxConcurrentTasks) {
-      return `Queued: active execution limit reached (${owners.length}/${policy.maxConcurrentTasks}); waiting for a free execution record.`;
-    }
-    return `Queued: agent ${targetAgent} has ${sameAgent}/${policy.maxConcurrentPerAgent} active executions; waiting for one to finish.`;
-  }
-
-  private markQueued(
-    thread: DelegationThread,
-    owner?: TaskExecutionOwner,
-    detail?: string,
-  ): void {
-    // Never rewrite another process's live execution or role state as queued.
-    if (this.executionRegistry.getOwner(thread.threadId)) return;
-    if (new TaskRoleLock(this.storageDir).getOwner(thread.threadId)) return;
-
-    this.taskStore.loadFromDisk();
-    const fresh = this.taskStore.getTask(thread.threadId);
-    const candidateRound = findInFlightRound(thread);
-    const freshRound = fresh ? findInFlightRound(fresh) : undefined;
-    if (
-      !fresh ||
-      fresh.queuePhase === 'merge' ||
-      (fresh.status !== 'queued' && fresh.status !== 'running') ||
-      fresh.targetAgent !== thread.targetAgent ||
-      fresh.reviewBlocked ||
-      isReviewerBootstrapPending(fresh) ||
-      !candidateRound || freshRound?.round !== candidateRound.round || freshRound.prompt !== candidateRound.prompt
-    ) return;
-
-    const message =
-      detail ||
-      (owner
-        ? `Queued: waiting for task ${owner.threadId} round ${owner.round}.`
-        : 'Queued: waiting for an execution slot.');
-    if (fresh.status === 'queued' && fresh.summary.lastOutputSnippet === message) {
-      return;
-    }
-
-    fresh.status = 'queued';
-    fresh.summary.lastOutputSnippet = message;
-    this.taskStore.upsertTask(fresh);
-  }
 }
 
 function latestWorkRound(thread: DelegationThread): DelegationRound | undefined {
