@@ -1,4 +1,4 @@
-﻿import { test, describe } from 'node:test';
+import { test, describe } from 'node:test';
 import * as assert from 'node:assert';
 import * as child_process from 'child_process';
 import * as fs from 'fs';

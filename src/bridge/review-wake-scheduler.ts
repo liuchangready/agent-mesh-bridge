@@ -26,7 +26,7 @@ import {
 } from './types';
 import { noteMergeFailure } from './merge-recovery';
 import { TaskRoleLock } from './task-role-lock';
-import { callerSessionKey } from './caller-wake-queue';
+import { callerSessionKey } from './caller-session-key';
 
 export interface ReviewWakeSchedulerOptions {
   now?: () => number;

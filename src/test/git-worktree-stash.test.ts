@@ -272,6 +272,12 @@ for (const [failRollback, deleteBeforeRecovery] of [[false, false], [true, false
   const store = new TaskStore(storage); store.upsertTask(thread(id, worktree));
   t.after(() => { store.dispose(); removeTaskWorktree(worktree); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
   const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));
+  let targetRefUpdates = 0;
+  const loggedGit = (coordinator as any).loggedGit.bind(coordinator);
+  (coordinator as any).loggedGit = async (threadId: string, cwd: string, args: string[]) => {
+    if (args[0] === 'update-ref' && args[1] === target.targetRef) targetRefUpdates++;
+    return loggedGit(threadId, cwd, args);
+  };
   const publish = (coordinator as any).writeLockedGitFile.bind(coordinator); let logWrites = 0; let originalLog: Buffer | undefined;
   (coordinator as any).writeLockedGitFile = (file: string, data: Buffer) => {
     if (file.includes(`${path.sep}logs${path.sep}`)) {
@@ -283,6 +289,7 @@ for (const [failRollback, deleteBeforeRecovery] of [[false, false], [true, false
   };
   const first = await coordinator.mergeApproved(id);
   assert.equal(first.status, 'merged');
+  assert.equal(targetRefUpdates, 1, 'the approved commit is published once before stash metadata recovery');
   const landed = git(repository, 'rev-parse', target.targetRef);
   assert.notEqual(landed, target.baseCommit);
   assert.equal(store.getTask(id)!.worktree!.integration!.mergedCommit, landed);
@@ -338,6 +345,7 @@ for (const [failRollback, deleteBeforeRecovery] of [[false, false], [true, false
   } else {
     const recovered = await coordinator.mergeApproved(id);
     assert.equal(recovered.status, 'merged', recovered.message);
+    assert.equal(targetRefUpdates, 1, 'stash recovery reuses the landed commit without a second target ref update');
   }
   assert.equal(git(repository, 'rev-parse', target.targetRef), landed);
   assert.deepEqual(git(repository, 'stash', 'list', '--format=%H').split(/\r?\n/), failRollback ? [old] : [later, old]);

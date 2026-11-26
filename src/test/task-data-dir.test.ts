@@ -25,13 +25,6 @@ import { reviewerLogPath } from '../bridge/reviewer-log';
 import { archiveCompletedTaskLogs, removeTaskArtifacts } from '../bridge/task-summary';
 import { TaskStore } from '../bridge/task-store';
 import { DelegationThread } from '../bridge/types';
-import { AsyncDispatcher } from '../bridge/async-dispatcher';
-import { ActiveAgentResolver } from '../bridge/active-agent-resolver';
-import { AgentDetector } from '../bridge/agent-detector';
-import { AutonomousRunner } from '../bridge/autonomous-runner';
-import { CallbackManager } from '../bridge/callback-manager';
-import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
-import { TaskSupervisor } from '../bridge/task-supervisor';
 import { TaskControlService } from '../bridge/task-control';
 import { MeshFileLock } from '../bridge/merge-coordinator';
 
@@ -392,70 +385,3 @@ test('TaskStore.archiveTask keeps overlays, rounds and sessions when an overlay 
   assert.strictEqual(fs.existsSync(overlayFile), false, 'a successful archive may prune the active overlay');
   assert.strictEqual(archived!.rounds.length, 0);
 });
-
-test('dispatch pins the absolute task directory and writes its round log there', async (t) => {
-  const storage = isolatedDir('mesh-taskdata-dispatch-');
-  const repo = path.join(storage, 'repo');
-  initRepo(repo);
-  const originalCwd = process.cwd();
-  process.chdir(repo);
-  const store = new TaskStore(storage);
-  const detector = new AgentDetector();
-  const runner = new AutonomousRunner(detector);
-  runner.execute = async () => ({
-    exitCode: 0,
-    stdout: 'mock output',
-    stderr: '',
-    extractedOutput: 'mock output',
-    durationMs: 1,
-  });
-  const callbackManager = new CallbackManager(detector, storage);
-  callbackManager.notifyCaller = async () => true;
-  callbackManager.notifyCallerOfFailure = async () => false;
-  const dispatcher = new AsyncDispatcher(
-    store,
-    new ActiveAgentResolver(detector),
-    runner,
-    callbackManager,
-    detector,
-    new TaskExecutionRegistry(storage),
-  );
-  const originalSupervisorProbe = TaskSupervisor.isSupervisorActive;
-  (TaskSupervisor as any).isSupervisorActive = () => false;
-  t.after(() => {
-    (TaskSupervisor as any).isSupervisorActive = originalSupervisorProbe;
-    process.chdir(originalCwd);
-    store.dispose();
-    removeTree(storage);
-  });
-
-  const result = await dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
-    targetAgent: 'codex',
-    initiatorAgent: 'antigravity',
-    title: 'Unified dispatch layout',
-    prompt: 'do the work',
-    reviewFlow: 'dedicated',
-  });
-  const prepared = store.getTask(result.threadId)!;
-  prepared.reviewBootstrap = { phase: 'confirmed', attempts: 1 };
-  prepared.reviewerSessionCaptured = true;
-  prepared.reviewerSessionId = prepared.callerSessionId = 'reviewer-layout-test';
-  prepared.status = 'running';
-  if (prepared.execution) { prepared.execution.phase = 'develop'; prepared.execution.purpose = undefined; }
-  store.upsertTask(prepared);
-  await (dispatcher as any).executeBackgroundRound(prepared, 1, prepared.rounds[0].prompt, false);
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline && store.getTask(result.threadId)?.status !== 'reviewing') {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  const thread = store.getTask(result.threadId)!;
-  assert.strictEqual(thread.status, 'reviewing');
-  assert.strictEqual(thread.artifactDir, path.join(storage, 'tasks', result.threadId));
-  assert.strictEqual(thread.taskDataDir, thread.artifactDir);
-  assert.strictEqual(path.resolve(thread.worktree!.path), path.join(thread.artifactDir!, 'worktree'));
-  assert.strictEqual(fs.existsSync(path.join(thread.artifactDir!, 'worktree', 'readme.txt')), true);
-  assert.strictEqual(fs.existsSync(path.join(thread.artifactDir!, 'worker_log', `${result.threadId}_round_1.log`)), true);
-  // No bridge log may be written inside the Git worktree content.
-  assert.strictEqual(fs.existsSync(path.join(thread.worktree!.path, 'worker_log')), false);
-});
-

@@ -2,7 +2,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { callerSessionKey } from './caller-wake-queue';
+import { callerSessionKey } from './caller-session-key';
 import { AgentId } from './types';
 
 interface NativeSessionOwner {

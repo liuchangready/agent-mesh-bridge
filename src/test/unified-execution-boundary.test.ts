@@ -37,6 +37,30 @@ async function waitForText(read: () => string | undefined, timeoutMs: number): P
 }
 
 describe('Unified Execution Boundary Tests', () => {
+  test('UI merge retry routes through a V2 run and never falls through to the legacy Git coordinator', async () => {
+    const fixture = await setupFixture();
+    try {
+      const thread = createThread('thread_v2_ui_merge_retry', 'review');
+      thread.status = 'reviewing';
+      thread.execution = { ...thread.execution!, version: 2, revision: 1, operationId: 'ui-merge-op', run: undefined };
+      fixture.store.upsertTask(thread);
+
+      const rework = new ReworkController(fixture.store, fixture.runner as any, fixture.callbackManager,
+        fixture.detector, fixture.registry, false, true, true);
+      let legacyGitCalls = 0;
+      (rework.getMergeCoordinator() as any).mergeApproved = async () => {
+        legacyGitCalls++;
+        throw new Error('legacy Git path reached');
+      };
+      (fixture.controller as any).startExecution = async () => ({ started: false, reason: 'run_busy' });
+
+      await assert.rejects(rework.mergeApproved(thread.threadId), /V2 merge was not started: run_busy/);
+      assert.equal(legacyGitCalls, 0, 'a queued V2 task without a run must not enter the old merge path');
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   test('v2 pause retains an unbound spawn-intent run and reports pending stop', async () => {
     const fixture = await setupFixture();
     let lateChild: ReturnType<typeof spawn> | undefined;

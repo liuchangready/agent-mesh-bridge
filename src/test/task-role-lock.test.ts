@@ -10,49 +10,6 @@ process.env.USERPROFILE = isolatedHome;
 process.env.HOME = isolatedHome;
 
 import { TaskRoleLock } from '../bridge/task-role-lock';
-import { TaskStore } from '../bridge/task-store';
-import { AgentDetector } from '../bridge/agent-detector';
-import { AutonomousRunner } from '../bridge/autonomous-runner';
-import { CallbackManager } from '../bridge/callback-manager';
-import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
-import { TaskSupervisor } from '../bridge/task-supervisor';
-import { DelegationThread } from '../bridge/types';
-
-function makeThread(overrides: Partial<DelegationThread> = {}): DelegationThread {
-  return {
-    reviewFlow: 'dedicated',
-    reviewBootstrap: { phase: 'confirmed', attempts: 1 },
-    reviewerSessionCaptured: true,
-    reviewerSessionId: 'rollout-role-0001',
-    threadId: 'thread_role_1',
-    title: 'Role lock probe',
-    initiatorAgent: 'codex',
-    targetAgent: 'deepseek_harness',
-    status: 'running',
-    currentRound: 1,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    receiverSessionId: 'session-role-0001',
-    callerSessionId: 'rollout-role-0001',
-    workspace: testWorkspace(os.tmpdir()),
-    summary: {
-      lastPromptSnippet: 'do the work',
-      lastOutputSnippet: 'Executing...',
-      totalDurationMs: 0,
-    },
-    rounds: [
-      {
-        round: 1,
-        type: 'initial',
-        prompt: 'do the work',
-        status: 'running',
-        durationMs: 0,
-        timestamp: new Date().toISOString(),
-      },
-    ],
-    ...overrides,
-  };
-}
 
 describe('TaskRoleLock - one role per task', () => {
   let tempDir: string;
@@ -163,102 +120,6 @@ describe('TaskRoleLock - one role per task', () => {
   });
 });
 
-describe('Task role enforcement in execution', () => {
-  test('developer waits while reviewer owns the task, then starts after handoff', async () => {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-role-exec-'));
-    const store = new TaskStore(tempDir);
-    const detector = new AgentDetector();
-    const runner = new AutonomousRunner(detector);
-    let executions = 0;
-    runner.execute = async () => {
-      executions++;
-      return {
-        exitCode: 0,
-        stdout: 'done',
-        stderr: '',
-        extractedOutput: 'done',
-        durationMs: 5,
-      };
-    };
-    const callbackManager = new CallbackManager(detector);
-    callbackManager.notifyCaller = async () => true;
-    callbackManager.notifyCallerOfFailure = async () => false;
-    const supervisor = new TaskSupervisor(
-      store,
-      runner,
-      callbackManager,
-      detector,
-      new TaskExecutionRegistry(tempDir),
-    );
-
-    const roleLock = new TaskRoleLock(tempDir);
-    const reviewer = roleLock.tryAcquire('thread_role_1', 'reviewer');
-    assert.ok(reviewer);
-
-    try {
-      const thread = makeThread();
-      store.upsertTask(thread);
-      await supervisor.executeThreadRound(thread, thread.rounds[0]);
-
-      assert.strictEqual(executions, 0, 'developer must not start during reviewer role');
-      assert.strictEqual(store.getTask('thread_role_1')?.status, 'running', 'a live same-task role owner must not rewrite lifecycle state');
-
-      roleLock.release(reviewer!);
-      supervisor.checkPendingTasks();
-
-      const deadline = Date.now() + 2_000;
-      while (Date.now() < deadline) {
-        if (store.getTask('thread_role_1')?.status === 'reviewing') break;
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      }
-
-      assert.strictEqual(executions, 1, 'developer starts after reviewer handoff');
-      assert.strictEqual(store.getTask('thread_role_1')?.status, 'reviewing');
-    } finally {
-      if (reviewer) roleLock.release(reviewer);
-      supervisor.dispose();
-      store.dispose();
-      try {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-      } catch {}
-    }
-  });
-
-  test('a second reviewer wake-up is refused while one is active', async () => {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-role-cb-'));
-    const store = new TaskStore(tempDir);
-    const thread = makeThread({
-      status: 'reviewing',
-      rounds: [
-        {
-          round: 1,
-          type: 'initial',
-          prompt: 'do the work',
-          status: 'completed',
-          durationMs: 10,
-          timestamp: new Date().toISOString(),
-          output: 'report',
-        },
-      ],
-    });
-    store.upsertTask(thread);
-
-    const reviewer = new TaskRoleLock().tryAcquire(thread.threadId, 'reviewer');
-    assert.ok(reviewer);
-
-    try {
-      const callbackManager = new CallbackManager(new AgentDetector());
-      const accepted = await callbackManager.notifyCaller(thread, thread.rounds[0]);
-      assert.strictEqual(accepted, false, 'duplicate reviewer must be rejected');
-    } finally {
-      new TaskRoleLock().release(reviewer!);
-      store.dispose();
-      try {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-      } catch {}
-    }
-  });
-
   test('re-acquiring the role this process already holds returns the live lease', () => {
     // A phase handoff re-enters startExecution while this turn still owns the
     // role. Treating that as "busy" parked the task in queued(role) while the
@@ -278,4 +139,3 @@ describe('Task role enforcement in execution', () => {
       lock.release(first!);
     }
   });
-});

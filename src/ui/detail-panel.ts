@@ -25,6 +25,7 @@ import {
 import { aggregateThreadTokenUsage, formatTokenCount } from '../bridge/token-usage-collector';
 import { nativeCompactionCapability } from '../bridge/native-session-compactor';
 import { renderWorktreeDetails } from './worktree-details';
+import { renderStashRecoveryAction } from './detail-actions';
 
 export class TaskDetailPanel {
   public static currentPanel: TaskDetailPanel | undefined;
@@ -203,6 +204,7 @@ export class TaskDetailPanel {
       const result = await this.reworkController.mergeApproved(this.currentThreadId);
       if (result.status === 'merged' && this.taskStore.getTask(this.currentThreadId)?.worktree?.integration?.stashRecoveryPending) vscode.window.showWarningMessage(result.message);
       else if (result.status === 'merged') vscode.window.showInformationMessage(`Task ${this.currentThreadId} merged into its pinned local target.`);
+      else if (result.status === 'blocked' && result.message.startsWith('Merge was started under the V2 execution run')) vscode.window.showInformationMessage(result.message);
       else vscode.window.showWarningMessage(result.message);
     } catch (err: any) { vscode.window.showErrorMessage(`Merge retry failed: ${err.message}`); }
     this.update();
@@ -1190,7 +1192,7 @@ ${r.assessment.reason ? `reason: ${escapeHtml(r.assessment.reason)}` : ''}${
   }
 
   ${(!historical && thread.status === 'failed' && thread.failure?.stage === 'merge') ? `<div class="action-bar"><button onclick="retryMerge()">重试合并</button><button onclick="deleteTask()">删除任务</button></div>` : ''}
-  ${thread.status === 'reviewing' && thread.worktree?.integration?.stashRecoveryPending ? `<div class="action-bar"><button onclick="retryMerge()">重试恢复 stash 元数据</button></div>` : ''}
+  ${renderStashRecoveryAction(thread, historical)}
   <div class="action-bar" ${(historical || thread.status === 'failed' && thread.failure?.stage === 'merge') ? 'style="display:none"' : ''}>
     ${thread.status === 'failed' && thread.failure?.stage === 'execution' ? `<button class="retry-btn" style="background: #dc2626; color: white;" onclick="retryFailedRound()">🔄 重试失败轮次 (Retry Failed)</button>` : ''}
     ${thread.status === 'reviewing' && thread.reviewWake && thread.reviewWake.round === (thread.currentRound || 1) ? `<button class="notify-btn" onclick="wakeUpCaller()">🔁 重新检视下发者（唤醒失败）</button>` : ''}

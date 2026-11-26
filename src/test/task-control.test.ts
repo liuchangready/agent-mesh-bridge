@@ -860,99 +860,13 @@ describe('TaskControlService - pause/delete reasons', () => {
     registry.dispose();
   });
 
-  test('resuming a paused task keeps history and clears the current interruption', async () => {
-    taskStore.upsertTask(makeThread());
-    const control = new TaskControlService(
-      taskStore,
-      runner,
-      new CancellationRegistry(tempDir),
-      tempDir,
-    );
-    control.pauseTask('thread_control_1', 'pause for inspection', 'user');
-
+  test('historical paused tasks cannot resume through the retired controller path', async () => {
+    const thread = makeThread({ status: 'paused' });
+    taskStore.upsertTask(thread);
     const callbackManager = new CallbackManager(new AgentDetector());
-    callbackManager.notifyCaller = async () => true;
-    callbackManager.notifyCallerOfFailure = async () => false;
-    const reworkController = new ReworkController(
-      taskStore,
-      runner,
-      callbackManager,
-      new AgentDetector(),
-      new TaskExecutionRegistry(tempDir),
-    );
-
-    let executedPrompt = '';
-    runner.execute = async (options: RunOptions): Promise<RunResult> => {
-      executedPrompt = options.prompt;
-      return {
-        exitCode: 0,
-        stdout: 'resumed',
-        stderr: '',
-        extractedOutput: 'resumed',
-        durationMs: 5,
-      };
-    };
-
-    const round = await reworkController.resumePausedTask('thread_control_1');
-    assert.strictEqual(round.status, 'running');
-    assert.strictEqual(round.interruption, undefined, 'resumed round clears its pause marker');
-
-    const deadline = Date.now() + 2_000;
-    while (Date.now() < deadline) {
-      if (taskStore.getTask('thread_control_1')?.status === 'reviewing') break;
-      await new Promise((r) => setTimeout(r, 20));
-    }
-
-    const thread = taskStore.getTask('thread_control_1')!;
-    assert.strictEqual(executedPrompt, 'do the work');
-    assert.strictEqual(thread.status, 'reviewing');
-    assert.strictEqual(thread.interruption, undefined, 'current interruption cleared');
-    assert.strictEqual(thread.rounds[0].interruption, undefined, 'persisted round clears its pause marker');
-    assert.strictEqual(thread.interruptions?.[0]?.reason, 'pause for inspection', 'history kept');
-  });
-
-  test('resuming clears the pause the runner remembered while nothing was running', async () => {
-    taskStore.upsertTask(makeThread({ status: 'queued' }));
-    // Use the real runner: pausing a task that never spawned a child leaves the
-    // pause remembered in memory, where no settling round will consume it.
-    runner.cancelThread = AutonomousRunner.prototype.cancelThread;
-
-    const control = new TaskControlService(
-      taskStore,
-      runner,
-      new CancellationRegistry(tempDir),
-      tempDir,
-    );
-    control.pauseTask('thread_control_1', 'pause before start', 'user');
-    assert.ok(
-      runner.checkPendingCancellation('thread_control_1'),
-      'the pause stays pending for a task that never spawned a child',
-    );
-
-    const callbackManager = new CallbackManager(new AgentDetector());
-    callbackManager.notifyCaller = async () => true;
-    callbackManager.notifyCallerOfFailure = async () => false;
-    const reworkController = new ReworkController(
-      taskStore,
-      runner,
-      callbackManager,
-      new AgentDetector(),
-      new TaskExecutionRegistry(tempDir),
-    );
-    runner.execute = async (): Promise<RunResult> => ({
-      exitCode: 0,
-      stdout: 'resumed',
-      stderr: '',
-      extractedOutput: 'resumed',
-      durationMs: 5,
-    });
-
-    await reworkController.resumePausedTask('thread_control_1');
-
-    assert.strictEqual(
-      runner.checkPendingCancellation('thread_control_1'),
-      undefined,
-      'a resumed task must not be cancelled on sight by the pause it was resumed from',
-    );
+    const reworkController = new ReworkController(taskStore, runner, callbackManager, new AgentDetector());
+    await assert.rejects(reworkController.resumePausedTask(thread.threadId), /HISTORICAL_TASK_READ_ONLY/);
+    assert.deepEqual(taskStore.getTask(thread.threadId), thread);
+    reworkController.dispose();
   });
 });
