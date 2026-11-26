@@ -184,11 +184,15 @@ async function runBatch(batchFiles, batchConcurrency) {
     await runBatch(files, concurrency);
     return;
   }
-  // unique-run-launch starts multiple real Node and PowerShell processes and
-  // exercises cross-process CAS. Keep those two-process barriers intact while
-  // avoiding unrelated full-suite workers competing for Windows helper startup.
-  const ownershipFiles = files.filter((file) => basename(file) === 'unique-run-launch.test.js');
-  const concurrentFiles = files.filter((file) => basename(file) !== 'unique-run-launch.test.js');
+  // Keep the real process and lock contention within these suites. On Windows
+  // they also need predictable helper startup when Git and MCP spawn children.
+  const ownershipSuites = new Set(['unique-run-launch.test.js']);
+  if (process.platform === 'win32') {
+    ownershipSuites.add('mock-agents-e2e.test.js');
+    ownershipSuites.add('unified-execution-integration.test.js');
+  }
+  const ownershipFiles = files.filter((file) => ownershipSuites.has(basename(file)));
+  const concurrentFiles = files.filter((file) => !ownershipSuites.has(basename(file)));
   await runBatch(concurrentFiles, concurrency);
   await runBatch(ownershipFiles, 1);
 })().catch((error) => {

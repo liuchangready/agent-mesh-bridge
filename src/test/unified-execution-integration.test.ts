@@ -152,9 +152,8 @@ describe('Unified Execution Integration Tests', () => {
       assert.notEqual(renderStashRecoveryAction(staleCompleted, false), '', 'the recovery action stays visible on the stale completed row');
       const retry = await rework.mergeApproved(threadId);
       assert.equal(retry.status, 'blocked', 'the visible retry starts the protected V2 recovery path');
-      const recovered = await waitForTask(fixture, threadId, task => task.status === 'completed' && task.worktree?.integration?.stashRecoveryPending === false);
-      await fixture.controller.waitForActiveExecutions(60_000);
-      const settledRecovery = fixture.store.reloadTask(threadId)!;
+      const settledRecovery = await waitForTask(fixture, threadId, task =>
+        task.status === 'completed' && task.worktree?.integration?.stashRecoveryPending === false && !task.execution?.run);
       assert.equal(settledRecovery.status, 'completed', 'the task completes after recovery is confirmed');
       assert.equal(settledRecovery.worktree?.integration?.stashRecoveryPending, false);
       assert.equal(settledRecovery.worktree?.deliveryTarget?.ref, targetRef);
