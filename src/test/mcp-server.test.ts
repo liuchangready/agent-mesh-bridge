@@ -36,6 +36,7 @@ import { ReworkController } from '../bridge/rework-controller';
 import { MCPServer } from '../bridge/mcp-server';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import { ExecutionController } from '../bridge/execution-controller';
+import * as platform from '../bridge/platform';
 import { getProcessBirthId, probeProcessIdentity } from '../bridge/platform';
 import { registerRunChildV2 } from '../bridge/process-binding';
 import { meshMergeLockPath } from '../bridge/mesh-file-lock';
@@ -1130,7 +1131,7 @@ describe('MCPServer Protocol Tests', () => {
       process.env.MESH_TASK_THREAD_ID = 'thread_receiver_1';
 
       // The model should not even see new-work tools.
-      const toolNames = mcpServer.getToolDefinitions().map((tool: any) => tool.name);
+      const toolNames = (await mcpServer.getToolDefinitions()).map(tool => tool.name);
       assert.ok(!toolNames.includes('dispatch_task'));
       assert.ok(!toolNames.includes('list_task_templates'));
       await assert.rejects(mcpServer.handleToolCall('list_task_templates', {}), /receiver/i);
@@ -1254,7 +1255,7 @@ describe('MCPServer Protocol Tests', () => {
       registry.attachChildPid(4321, registration);
       Object.defineProperty(process, 'ppid', { value: 4321, configurable: true });
 
-      const toolNames = mcpServer.getToolDefinitions().map((tool: any) => tool.name);
+      const toolNames = (await mcpServer.getToolDefinitions()).map(tool => tool.name);
       assert.ok(!toolNames.includes('dispatch_task'), 'forwarding tools must stay hidden');
       assert.ok(toolNames.includes('approve_task'));
 
@@ -1301,13 +1302,31 @@ describe('MCPServer Protocol Tests', () => {
       delete process.env.MESH_TASK_RECEIVER;
       Object.defineProperty(process, 'ppid', { value: 987654, configurable: true });
 
-      const toolNames = mcpServer.getToolDefinitions().map((tool: any) => tool.name);
+      const toolNames = (await mcpServer.getToolDefinitions()).map(tool => tool.name);
       assert.ok(toolNames.includes('dispatch_task'), 'a normal caller keeps the forwarding tools');
     } finally {
       if (originalPpid) Object.defineProperty(process, 'ppid', originalPpid);
       if (savedReceiver === undefined) delete process.env.MESH_TASK_RECEIVER;
       else process.env.MESH_TASK_RECEIVER = savedReceiver;
     }
+  });
+
+  test('Windows receiver ancestry rejects a reused PID and blocks forwarding if ancestry is unavailable', {
+    skip: process.platform !== 'win32',
+  }, async t => {
+    const candidate = { threadId: 'thread_windows_developer', round: 1, process: { pid: 4321, birthId: '123' } };
+    t.mock.method(taskStore, 'listDeveloperRunProcesses', () => [candidate]);
+    const ancestors = t.mock.method(platform, 'getWindowsProcessAncestorPids', async () => new Set([4321]));
+    t.mock.method(platform, 'getProcessBirthIds', async () => new Map([[4321, '456']]));
+
+    const visible = await mcpServer.getToolDefinitions();
+    assert.ok(visible.some(tool => tool.name === 'dispatch_task'), 'a reused PID must not mark an ordinary caller as receiver');
+
+    ancestors.mock.mockImplementation(async () => { throw new Error('CIM offline'); });
+    const hidden = await mcpServer.getToolDefinitions();
+    assert.ok(!hidden.some(tool => tool.name === 'dispatch_task'));
+    await assert.rejects(mcpServer.handleToolCall('dispatch_task', {}), /RECEIVER_IDENTITY_UNVERIFIED/);
+    assert.deepEqual(await mcpServer.handleToolCall('list_recent_tasks', { limit: 1 }), []);
   });
 
   test('should never treat a reviewer or bootstrap round as a task receiver', async () => {
@@ -1332,7 +1351,7 @@ describe('MCPServer Protocol Tests', () => {
         assert.strictEqual(registry.findByChildPid(pid), undefined, `${role} must not resolve as a receiver`);
       }
       Object.defineProperty(process, 'ppid', { value: 5101, configurable: true });
-      const toolNames = mcpServer.getToolDefinitions().map((tool: any) => tool.name);
+      const toolNames = (await mcpServer.getToolDefinitions()).map(tool => tool.name);
       assert.ok(toolNames.includes('dispatch_task'), 'a reviewer keeps its forwarding tools');
     } finally {
       if (originalPpid) Object.defineProperty(process, 'ppid', originalPpid);

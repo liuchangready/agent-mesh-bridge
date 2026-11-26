@@ -89,7 +89,14 @@ async function main(): Promise<void> {
     return;
   }
 
-  const mcp = new MockMcpClient(process.env, process.cwd());
+  const mcpEnv = { ...process.env };
+  if (worker && scenario.scrubReceiverMcpEnv) {
+    assert.ok(jobId, 'the worker must be launched under a Windows Job helper');
+    delete mcpEnv.MESH_TASK_RECEIVER;
+    delete mcpEnv.MESH_TASK_THREAD_ID;
+    delete mcpEnv.MESH_TASK_ROUND;
+  }
+  const mcp = new MockMcpClient(mcpEnv, process.cwd());
   try {
     await mcp.initialize();
     if (bootstrap) {
@@ -100,9 +107,14 @@ async function main(): Promise<void> {
       event(root, 'bootstrap.confirmed', { threadId, sessionId });
       answer('Mock reviewer confirmed bootstrap');
     } else if (worker) {
+      const refusal = new RegExp(`receiver of delegated task ${threadId}`, 'i');
+      await assert.rejects(mcp.tool('dispatch_task', {
+        targetAgent: 'codex', workspaceRoot: process.cwd(), title: 'Forbidden forwarding', prompt: 'must not dispatch',
+      }), refusal);
+      await assert.rejects(mcp.tool('invoke_agent', { targetAgent: 'codex', prompt: 'must not invoke' }), refusal);
       const tools = await mcp.rpc('tools/list');
-      assert.ok(!tools.tools.some((tool: any) => tool.name === 'dispatch_task'));
-      await assert.rejects(mcp.tool('dispatch_task', { title: 'Forbidden forwarding', prompt: 'must not dispatch' }), /receiver|forward/i);
+      assert.ok(!tools.tools.some((tool: any) => ['dispatch_task', 'invoke_agent'].includes(tool.name)),
+        'forwarding tools must be hidden from the worker');
       await assert.rejects(mcp.tool('request_rework', { threadId, feedback: 'must not review itself' }), /receiver/i);
       event(root, 'receiver.guards', { threadId, round });
       const task = await mcp.tool('get_thread_details', { threadId });

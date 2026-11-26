@@ -2750,6 +2750,21 @@ export class TaskStore extends EventEmitter {
     return Array.from(this.tasks.values()).map((t) => structuredClone(t));
   }
 
+  /** Project only the process identities needed to recognize v2 developer callers. */
+  public listDeveloperRunProcesses(): { threadId: string; round: number; process: ProcessIdentity }[] {
+    this.ensureUpToDate();
+    const developers: { threadId: string; round: number; process: ProcessIdentity }[] = [];
+    for (const { threadId, execution } of this.tasks.values()) {
+      const run = execution?.run;
+      if (execution?.version !== 2 || run?.role !== 'developer') continue;
+      const processes = [run.child, ...(run.subtrees ?? []).flatMap(tree => [tree.root, ...tree.descendants])];
+      for (const identity of processes) {
+        if (identity?.birthId) developers.push({ threadId, round: execution.round, process: { ...identity } });
+      }
+    }
+    return developers;
+  }
+
   /**
    * Count of stored tasks.
    */

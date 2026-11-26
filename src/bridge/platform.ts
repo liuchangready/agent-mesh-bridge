@@ -346,6 +346,27 @@ export async function collectDescendantsAsync(rootPid: number): Promise<number[]
   return windowsDescendants(rootPid, await requestWindowsProcessHelper({ operation: 'processTable' }));
 }
 
+/** Follow Windows parent links from one snapshot, stopping at recycled PIDs. */
+export async function getWindowsProcessAncestorPids(pid: number): Promise<Set<number>> {
+  const rows = await requestWindowsProcessHelper({ operation: 'processTable' });
+  if (!Array.isArray(rows)) throw new Error('Windows process table is unavailable.');
+  const byPid = new Map(rows.map(row => [row.ProcessId, row]));
+  let current = byPid.get(pid);
+  if (!current) throw new Error('Caller is missing from the Windows process table.');
+  const ancestors = new Set<number>();
+  while (current.ParentProcessId > 0 && current.ParentProcessId !== pid && !ancestors.has(current.ParentProcessId)) {
+    const parent = byPid.get(current.ParentProcessId);
+    if (!parent) break;
+    if (!/^\d{19}$/.test(current.Created) || !/^\d{19}$/.test(parent.Created)) {
+      throw new Error('Windows process ancestry creation times are unavailable.');
+    }
+    if (parent.Created > current.Created) break;
+    ancestors.add(current.ParentProcessId);
+    current = parent;
+  }
+  return ancestors;
+}
+
 function descendantsFromTable(
   rootPid: number,
   childrenByParent: Map<number, number[]>,

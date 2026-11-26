@@ -9,6 +9,7 @@ export interface MockScenario {
   fault?: 'empty-worker' | 'nonzero-worker' | 'no-verdict' | 'bad-bootstrap-token';
   reviewerTailMs?: number;
   bootstrapProcessChurn?: boolean;
+  scrubReceiverMcpEnv?: boolean;
   pauseAt?: 'bootstrap' | 'develop' | 'review' | 'merge';
   pauseRound?: number;
 }

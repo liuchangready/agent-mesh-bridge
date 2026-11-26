@@ -57,6 +57,7 @@ import { assertCanExecute } from './agent-capabilities';
 import { WorkspaceRegistry, WorkspaceResolver, readWindow, matchingWindows, physicalDirectory } from './workspace';
 import { listTaskTemplates } from './task-templates';
 import { resolveTemplateWorkspaceRoot } from './git-worktree';
+import { getProcessBirthIds, getWindowsProcessAncestorPids, IS_WINDOWS } from './platform';
 
 /** Older non-compacted rounds are excerpted to this many characters. */
 const DETAIL_HISTORY_OUTPUT_MAX_CHARS = 4_000;
@@ -119,6 +120,7 @@ export class MCPServer {
   private resolveClientRoots?: (roots: string[]) => void;
   /** Observes bridge-launched task processes so receiver detection works without env. */
   private receiverProbe?: TaskExecutionRegistry;
+  private verifiedReceiver?: { threadId: string; round: number };
 
   constructor(
     dispatcher: AsyncDispatcher,
@@ -419,7 +421,7 @@ export class MCPServer {
   /**
    * Returns list of tools for MCP tools/list.
    */
-  public getToolDefinitions() {
+  public async getToolDefinitions() {
     const tools = [
       { name: 'list_task_templates', description: 'Before each ordinary dispatch, list workspace template summaries and select a suitable templateId, or omit it if none fits. Reviewer bootstrap must only confirm dispatch and must not call this tool.', inputSchema: { type: 'object', properties: { workspaceId: { type: 'string' }, workspaceRoot: { type: 'string' } } } },
       {
@@ -1040,7 +1042,8 @@ export class MCPServer {
     // A receiver is executing one delegated task; hide new-work tools so the
     // model cannot even attempt recursive delegation. The runtime guard in
     // handleToolCall stays as the authoritative enforcement.
-    if (this.resolveReceiverTask()) {
+    // Hide forwarding while the OS cannot confirm the caller's ancestry.
+    if (await this.resolveReceiverTask().catch(() => true)) {
       return tools.filter((tool) => !FORWARDING_TOOLS.has(tool.name));
     }
     return this.submitOnly ? tools.filter(tool => tool.name !== 'invoke_agent') : tools;
@@ -1224,19 +1227,11 @@ export class MCPServer {
    * process environment. That is the deterministic path, but it only works for a
    * host that inherits the environment.
    *
-   * Fallback channel: the pid of the CLI process that launched this MCP server,
-   * matched against the bridge's own execution records. Codex passes ONLY the
-   * `env` table from `config.toml` to the MCP servers it spawns, and DeepSeek
-   * Harness scrubs inherited variables, so the markers never arrive there. This
-   * used to disable the forwarding guard entirely: receivers could call
-   * `dispatch_task` again, and a single blocked baseline silently turned into a
-   * nested chain of tasks that each delegated the same problem one level down.
-   *
-   * A bootstrap reviewer's pid is never a receiver record: reviewer rounds are
-   * registered under the thread's role lock as `reviewer`, and the execution
-   * record for the developer round is what carries the developer pid.
+   * When the CLI scrubs the markers, Windows v2 matches verified ancestry to
+   * a developer run. The direct parent can be the CLI below its recorded Job
+   * helper. Other launches can still identify a directly registered parent.
    */
-  private resolveReceiverTask(): { threadId?: string; round?: number } | null {
+  private async resolveReceiverTask(): Promise<{ threadId?: string; round?: number } | null> {
     if (isTaskReceiverProcess()) {
       const threadId = process.env[MESH_TASK_THREAD_ENV];
       const rawRound = process.env[MESH_TASK_ROUND_ENV];
@@ -1245,6 +1240,28 @@ export class MCPServer {
         threadId,
         ...(Number.isFinite(round) ? { round } : {}),
       };
+    }
+
+    if (this.verifiedReceiver) return this.verifiedReceiver;
+    if (IS_WINDOWS) {
+      const candidates = this.taskStore.listDeveloperRunProcesses();
+      if (candidates.length) {
+        try {
+          const ancestors = await getWindowsProcessAncestorPids(process.pid);
+          const matches = candidates.filter(entry => ancestors.has(entry.process.pid));
+          const births = await getProcessBirthIds(matches.map(entry => entry.process.pid));
+          for (const { threadId, round, process: identity } of matches) {
+            const birthId = births.get(identity.pid);
+            if (!birthId) throw new Error(`Missing birth identity for ancestor ${identity.pid}.`);
+            if (birthId === identity.birthId) {
+              // A stdio connection keeps its verified role for its lifetime.
+              return this.verifiedReceiver = { threadId, round };
+            }
+          }
+        } catch (cause) {
+          throw new Error('RECEIVER_IDENTITY_UNVERIFIED: Could not verify the caller process ancestry.', { cause });
+        }
+      }
     }
 
     const owner = this.executionRegistry().findByChildPid(process.ppid);
@@ -1263,8 +1280,9 @@ export class MCPServer {
    * cached the tool list from before the marker was applied, or call a tool
    * directly over JSON-RPC).
    */
-  private assertReceiverMayCall(name: string, args: any): void {
-    const receiver = this.resolveReceiverTask();
+  private async assertReceiverMayCall(name: string, args: any): Promise<void> {
+    if (!FORWARDING_TOOLS.has(name) && !CONTROL_TOOLS.has(name) && name !== 'request_rework' && name !== 'approve_task') return;
+    const receiver = await this.resolveReceiverTask();
     if (!receiver) return;
 
     const currentThreadId = receiver.threadId;
@@ -1324,7 +1342,7 @@ export class MCPServer {
 
   /** Execute a tool call and return result object. */
   public async handleToolCall(name: string, args: any): Promise<any> {
-    this.assertReceiverMayCall(name, args);
+    await this.assertReceiverMayCall(name, args);
     const controlledTask = typeof args?.threadId === 'string' ? this.taskStore.getTask(args.threadId) : undefined;
     if (this.requireV2Execution && controlledTask && V2_EXECUTION_TOOLS.has(name)) {
       requireV2ExecutionEligibility(controlledTask, `perform ${name}`);
@@ -2080,7 +2098,7 @@ export class MCPServer {
           jsonrpc: '2.0',
           id,
           result: {
-            tools: this.getToolDefinitions(),
+            tools: await this.getToolDefinitions(),
           },
         };
       }

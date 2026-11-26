@@ -3,7 +3,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { killPidTree } from './platform';
+import { killPidTree, probeProcessIdentity } from './platform';
 
 /**
  * Observation record for a task execution. These files describe work that was
@@ -178,10 +178,8 @@ export class TaskExecutionRegistry {
    * Why this exists: `MESH_TASK_RECEIVER` is only visible to an MCP server that
    * inherits its environment. Codex passes ONLY the `env` table from
    * `config.toml` to the servers it spawns and DeepSeek Harness scrubs inherited
-   * variables, so the receiver marker never arrives and the forwarding guard
-   * silently disables itself. The bridge server is still a direct child of the
-   * CLI it launched, though, so matching that pid identifies the same process
-   * without any cooperation from the host.
+   * variables. This fallback handles a directly launched CLI; Windows v2 also
+   * checks the durable run's subtree because a Job helper wraps the CLI.
    *
    * The record is only trusted while it is live: a stale execution file left by a
    * crashed round must never mark an unrelated new process as a receiver.
@@ -207,6 +205,7 @@ export class TaskExecutionRegistry {
     for (const owner of candidates) {
       if (owner.childPid !== hostPid) continue;
       if (owner.role !== 'developer') continue;
+      if (owner.childBirthId && probeProcessIdentity(hostPid, owner.childBirthId) !== 'alive') continue;
       if (!this.isOwnerLive(owner)) continue;
       // A pid can be recycled; the newest live record wins, exactly like the
       // reviewer bootstrap host-pid channel.

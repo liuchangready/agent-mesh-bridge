@@ -273,6 +273,21 @@ test('mock agents: real MCP bootstrap, three worker/reviewer rounds and validate
   f.finish();
 });
 
+test('Windows v2 receiver cannot forward over stdio after the CLI scrubs receiver markers', {
+  skip: process.platform !== 'win32', timeout: 180_000,
+}, async t => {
+  const f = await fixture(t, { rounds: 1, scrubReceiverMcpEnv: true });
+  const task = await waitForTask(f.root, f.threadId, task => task.status === 'completed' && !task.execution?.run, 120_000);
+  const events = trace(f.root);
+  assert.ok(events.some(entry => entry.kind === 'receiver.guards' && entry.threadId === f.threadId));
+  assert.ok(events.some(entry => entry.kind === 'bootstrap.confirmed' && entry.threadId === f.threadId));
+  assert.ok(events.some(entry => entry.kind === 'reviewer.verdict' && entry.tool === 'approve_task'));
+  assert.equal(task.worktree?.integration?.phase, 'merged');
+  const ledger = path.join(f.root, 'home', '.agent-mesh-bridge', 'threads');
+  assert.deepEqual(fs.readdirSync(ledger).filter(name => name.endsWith('.json')), [`${f.threadId}.json`]);
+  f.finish();
+});
+
 for (const phase of ['bootstrap', 'develop', 'review', 'merge'] as const) {
   test(`mock v2 pause/resume: same task, sessions and delivery through ${phase}`, { timeout: 360_000 }, async t => {
     const rounds = phase === 'develop' ? 2 : 1;
