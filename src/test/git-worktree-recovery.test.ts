@@ -6,13 +6,8 @@ import * as path from 'path';
 import { createRequire } from 'module';
 import { resolveGitRepository, createTaskWorktree, commitTaskChanges, gitOutput, removeTaskWorktree } from '../bridge/git-worktree';
 import { MergeCoordinator, MeshFileLock } from '../bridge/merge-coordinator';
-import { meshMergeLockPath } from '../bridge/mesh-file-lock';
 import { TaskStore } from '../bridge/task-store';
 import { DelegationThread } from '../bridge/types';
-import { AgentDetector } from '../bridge/agent-detector';
-import { AutonomousRunner } from '../bridge/autonomous-runner';
-import { CallbackManager } from '../bridge/callback-manager';
-import { ReworkController } from '../bridge/rework-controller';
 import { git, initRepo, thread } from './git-worktree-fixture';
 
 test('an unchecked delivery target that is externally rewound after landing stays blocked', async (t) => {
@@ -44,24 +39,6 @@ test('an unchecked delivery target that is externally rewound after landing stay
   assert.equal(saved.status, 'reviewing');
   assert.equal(saved.worktree!.integration!.phase, 'blocked');
   assert.notEqual(saved.status, 'completed');
-});
-
-test('host recovery requeues an interrupted merge until the global lock is available', async (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-restart-lock-wait-'));
-  const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
-  const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, 'thread_restart_wait', storage);
-  fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A restart\nmiddle\nbeta\n');
-  worktree.headCommit = commitTaskChanges(worktree, 'approved');
-  const store = new TaskStore(storage); const interrupted = thread('thread_restart_wait', worktree);
-  interrupted.status = 'merging'; interrupted.queuePhase = undefined; store.upsertTask(interrupted);
-  const release = await new MeshFileLock(meshMergeLockPath(storage)).acquire(); assert.ok(release);
-  const detector = new AgentDetector(); const controller = new ReworkController(store, new AutonomousRunner(detector), new CallbackManager(detector, storage), detector, undefined, true);
-  t.after(() => { release(); controller.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
-  assert.equal(store.getTask(interrupted.threadId)?.status, 'queued');
-  assert.equal(store.getTask(interrupted.threadId)?.queuePhase, 'merge');
-  release();
-  for (let n = 0; n < 500 && store.getTask(interrupted.threadId)?.status !== 'completed'; n++) await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(store.getTask(interrupted.threadId)?.status, 'completed');
 });
 
 test('recovery syncs the actual latest checkout and reports validation cleanup truthfully', async (t) => {

@@ -144,6 +144,11 @@
         "title": "Sync MCP Configuration to Agents"
       },
       {
+        "command": "agent-mesh-bridge.showStandaloneMcpStatus",
+        "title": "Agent Bridge: 独立 MCP 状态与重启",
+        "icon": "$(plug)"
+      },
+      {
         "command": "agent-mesh-bridge.configureDeepSeekHarness",
         "title": "Agent Bridge: Configure DeepSeek Harness (URL & Key) / 配置 DeepSeek Harness 接口与密钥",
         "icon": "$(gear)"
@@ -156,6 +161,11 @@
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "agent-mesh-bridge.showStandaloneMcpStatus",
+          "when": "view == agent-mesh-bridge.agent-nodes",
+          "group": "navigation"
+        },
         {
           "command": "agent-mesh-bridge.refreshAgentStatus",
           "when": "view == agent-mesh-bridge.agent-nodes",

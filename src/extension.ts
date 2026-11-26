@@ -17,6 +17,7 @@ import { ReworkController } from './bridge/rework-controller';
 import { ExecutionController } from './bridge/execution-controller';
 import { ConfigSyncService } from './config/config-sync';
 import { StatusBarController } from './ui/status-bar';
+import { registerStandaloneMcpStatus } from './ui/standalone-mcp-status';
 import { TaskTreeProvider, TaskTreeItem } from './ui/task-tree-provider';
 import { AgentNodesProvider, AgentNodeItem } from './ui/agent-nodes-provider';
 import { TaskDetailPanel } from './ui/detail-panel';
@@ -535,6 +536,7 @@ export function activate(context: vscode.ExtensionContext) {
   // 3. Status Bar Controller
   const statusBar = new StatusBarController(resolver, detector);
   context.subscriptions.push(statusBar.getStatusBarItem());
+  registerStandaloneMcpStatus(context, taskStore);
 
   // 4. Tree Views
   const agentNodesProvider = new AgentNodesProvider(detector, resolver, () => {

@@ -7,9 +7,9 @@ import { DelegationThread, enterTaskFailure, clearTaskFailure, isMergePending } 
 import { TaskStore, normalizeThread } from '../bridge/task-store';
 import { archiveThreadData, selectTasksToArchive, ensureFinalSummary } from '../bridge/task-summary';
 import { progressSignature } from '../bridge/caller-poll-guard';
-import { testWorkspace } from './workspace-fixture';
 import { CallbackManager } from '../bridge/callback-manager';
 import { AgentDetector } from '../bridge/agent-detector';
+import { testWorkspace } from './workspace-fixture';
 
 function task(root: string): DelegationThread {
   const at = '2026-01-01T00:00:00.000Z';
@@ -134,27 +134,6 @@ test('an old writer cannot restore rounds after archival', () => {
     store.upsertTask(stale);
     const saved = store.getTask(item.threadId)!;
     assert.ok(saved.archivedAt); assert.deepEqual(saved.rounds, []);
-  } finally { store.dispose(); fs.rmSync(root, { recursive: true, force: true }); }
-});
-
-test('ordinary execution-failure notifications reject other failure stages', async () => {
-  const callback = new CallbackManager(new AgentDetector(), os.tmpdir());
-  for (const stage of ['bootstrap', 'review', 'merge'] as const) {
-    const item = task(os.tmpdir()); enterTaskFailure(item, { stage, reason: 'failure', at: item.updatedAt, round: 1 });
-    assert.equal(await callback.notifyCallerOfFailure(item, 1), false);
-    assert.equal(item.failureNotifications, undefined);
-  }
-});
-
-test('queued failure wake from an old revision cannot wake a new failure', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stale-wake-')); const store = new TaskStore(root);
-  try {
-    const item = task(root); enterTaskFailure(item, { stage: 'execution', reason: 'first', at: item.updatedAt, round: 1 });
-    clearTaskFailure(item); item.status = 'running'; enterTaskFailure(item, { stage: 'execution', reason: 'second', at: item.updatedAt, round: 1 });
-    store.upsertTask(item); const callback = new CallbackManager(new AgentDetector(), root); callback.setTaskStore(store);
-    let calls = 0; callback.notifyCallerOfFailure = async () => { calls++; return true; };
-    (callback as any).wakeQueue.enqueue('reviewer', { threadId: item.threadId, round: 1, kind: 'failure', failureRevision: 1, enqueuedAt: Date.now() });
-    callback.drainNextWake('reviewer'); assert.equal(calls, 0); assert.equal(store.getTask(item.threadId)?.failure?.reason, 'second');
   } finally { store.dispose(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 

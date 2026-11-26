@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { randomUUID } from 'crypto';
 import {
   DshProviderConfig,
   resolveNodeCommand,
@@ -267,30 +268,7 @@ export class ConfigSyncService {
   }
 
   private syncAntigravityConfig(): boolean {
-    const home = this.homeDir;
-    const mcpConfigPath = path.join(home, '.gemini', 'antigravity', 'mcp_config.json');
-    const dir = path.dirname(mcpConfigPath);
-
-    if (!fs.existsSync(dir)) {
-      try {
-        fs.mkdirSync(dir, { recursive: true });
-      } catch {}
-    }
-
-    let config: any = {};
-    if (fs.existsSync(mcpConfigPath)) {
-      try {
-        config = JSON.parse(fs.readFileSync(mcpConfigPath, 'utf8'));
-      } catch {
-        config = {};
-      }
-    }
-
-    if (!config.mcpServers) {
-      config.mcpServers = {};
-    }
-
-    config.mcpServers['agent-mesh-bridge'] = {
+    const registration = {
       command: resolveNodeCommand(),
       args: [this.mcpScriptPath, '--caller', 'antigravity'],
       env: {
@@ -298,8 +276,46 @@ export class ConfigSyncService {
         ...this.agentMcpEnv,
       },
     };
+    const errors: string[] = [];
+    // agy reads the shared Gemini config; older desktop versions use the Antigravity directory.
+    for (const scope of ['config', 'antigravity']) {
+      const configPath = path.join(this.homeDir, '.gemini', scope, 'mcp_config.json');
+      try {
+        const exists = fs.existsSync(configPath);
+        const target = exists ? fs.realpathSync(configPath) : configPath;
+        const source = exists ? fs.readFileSync(target, 'utf8').trim() : '';
+        let config;
+        try {
+          config = source ? JSON.parse(source) : {};
+        } catch {
+          throw new Error('Invalid MCP configuration JSON');
+        }
+        if (!config || typeof config !== 'object' || Array.isArray(config) ||
+            (config.mcpServers != null && (typeof config.mcpServers !== 'object' || Array.isArray(config.mcpServers)))) {
+          throw new Error('Invalid MCP configuration structure');
+        }
 
-    fs.writeFileSync(mcpConfigPath, JSON.stringify(config, null, 2), 'utf8');
+        const servers = config.mcpServers ??= {};
+        const previous = servers['agent-mesh-bridge'];
+        const updated = typeof previous?.disabled === 'boolean'
+          ? { ...registration, disabled: previous.disabled }
+          : registration;
+        if (JSON.stringify(previous) === JSON.stringify(updated)) continue;
+        servers['agent-mesh-bridge'] = updated;
+
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        const temporary = `${target}.${randomUUID()}.tmp`;
+        try {
+          fs.writeFileSync(temporary, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+          fs.renameSync(temporary, target);
+        } finally {
+          try { fs.rmSync(temporary, { force: true }); } catch {}
+        }
+      } catch (error) {
+        errors.push(`${configPath}: ${(error as Error).message}`);
+      }
+    }
+    if (errors.length) throw new Error(errors.join('\n'));
     return true;
   }
 }

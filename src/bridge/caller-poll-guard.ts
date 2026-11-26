@@ -58,10 +58,14 @@ export const STOP_POLLING_INSTRUCTION =
   'not changed since your last check, so you already have all the information there is.';
 
 export class CallerPollGuard {
-  private readonly dispatched = new Map<
+  constructor(private readonly dispatched = new Map<
     string,
     { signature: string; views: Map<string, number>; at: number }
-  >();
+  >()) {}
+
+  public snapshot() {
+    return this.dispatched;
+  }
 
   /** Record that this process dispatched the task (starts guarding it). */
   public noteDispatch(threadId: string, signature: string, now: number = Date.now()): void {

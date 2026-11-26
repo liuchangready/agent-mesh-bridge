@@ -37,6 +37,30 @@ async function waitForText(read: () => string | undefined, timeoutMs: number): P
 }
 
 describe('Unified Execution Boundary Tests', () => {
+  test('UI merge retry routes through a V2 run and never falls through to the legacy Git coordinator', async () => {
+    const fixture = await setupFixture();
+    try {
+      const thread = createThread('thread_v2_ui_merge_retry', 'review');
+      thread.status = 'reviewing';
+      thread.execution = { ...thread.execution!, version: 2, revision: 1, operationId: 'ui-merge-op', run: undefined };
+      fixture.store.upsertTask(thread);
+
+      const rework = new ReworkController(fixture.store, fixture.runner as any, fixture.callbackManager,
+        fixture.detector, fixture.registry, false, true, true);
+      let legacyGitCalls = 0;
+      (rework.getMergeCoordinator() as any).mergeApproved = async () => {
+        legacyGitCalls++;
+        throw new Error('legacy Git path reached');
+      };
+      (fixture.controller as any).startExecution = async () => ({ started: false, reason: 'run_busy' });
+
+      await assert.rejects(rework.mergeApproved(thread.threadId), /V2 merge was not started: run_busy/);
+      assert.equal(legacyGitCalls, 0, 'a queued V2 task without a run must not enter the old merge path');
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   test('v2 pause retains an unbound spawn-intent run and reports pending stop', async () => {
     const fixture = await setupFixture();
     let lateChild: ReturnType<typeof spawn> | undefined;
@@ -308,6 +332,65 @@ describe('Unified Execution Boundary Tests', () => {
         try { child.kill('SIGKILL'); } catch {}
         await closed;
       }
+      await fixture.cleanup();
+    }
+  });
+
+  test('startup settles an exited V2 development run without replaying its round', async () => {
+    const fixture = await setupFixture();
+    const descendant = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
+    try {
+      const birthId = await getProcessBirthIdAsync(descendant.pid!);
+      assert.ok(birthId);
+      const thread = createThread('thread_v2_exited_development', 'develop');
+      thread.status = 'running';
+      thread.rounds[0].output = 'Persisted partial report';
+      const execution = thread.execution!;
+      execution.budget.spentActiveMs = 2795;
+      const child = { pid: 99_999_998, birthId: 'exited-child' };
+      const jobId = 'e414ad6b-8ea9-49ba-95d1-9220ca82e47e';
+      const prefix = path.join(fixture.dir, `bridge-job-${jobId}`);
+      execution.run = {
+        id: 'exited-development-run', role: 'developer', state: 'active', step: 'executing',
+        owner: { pid: 99_999_999, birthId: 'exited-owner' }, child,
+        startedAt: thread.createdAt, spawnIntentAt: thread.createdAt, registeredAt: thread.createdAt,
+        subtrees: [{ root: child, descendants: [{ pid: descendant.pid!, birthId }],
+          windowsJob: process.platform === 'win32' ? { id: jobId, prefix } : undefined }],
+      };
+      fixture.store.upsertTask(thread);
+
+      await fixture.controller.scanAndDrain();
+      assert.equal(fixture.store.reloadTask(thread.threadId)?.status, 'running', 'a live descendant retains the run');
+
+      descendant.kill();
+      await waitForExit(descendant);
+      if (process.platform === 'win32') {
+        await fixture.controller.scanAndDrain();
+        assert.equal(fixture.store.reloadTask(thread.threadId)?.execution?.run?.id, execution.run.id,
+          'Windows settlement requires a Job exit receipt even after the recorded processes exit');
+        fs.writeFileSync(`${prefix}.done`, '1');
+      }
+
+      await fixture.controller.scanAndDrain();
+      const settled = fixture.store.reloadTask(thread.threadId)!;
+      assert.equal(settled.status, 'failed');
+      assert.equal(settled.failure?.code, 'EXECUTION_OWNER_EXITED');
+      assert.equal(settled.execution?.run, undefined);
+      assert.equal(settled.execution?.next, undefined);
+      assert.equal(settled.execution?.generation, execution.generation);
+      assert.equal(settled.execution?.budget.spentActiveMs, 2795);
+      assert.equal(settled.receiverSessionId, thread.receiverSessionId);
+      assert.equal(settled.rounds[0].status, 'failed');
+      assert.equal(settled.rounds[0].output, 'Persisted partial report');
+      assert.deepEqual(settled.rounds[0].interruption, settled.interruption);
+      assert.equal(settled.interruptions?.length, 1);
+      assert.equal(fixture.runner.executions.length, 0);
+
+      await fixture.controller.scanAndDrain();
+      assert.equal(fixture.store.reloadTask(thread.threadId)?.execution?.revision, settled.execution?.revision);
+    } finally {
+      if (descendant.exitCode === null && descendant.signalCode === null) descendant.kill();
+      await waitForExit(descendant);
       await fixture.cleanup();
     }
   });

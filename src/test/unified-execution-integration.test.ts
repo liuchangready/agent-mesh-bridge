@@ -22,12 +22,157 @@ import { testWorkspace } from './workspace-fixture';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { readRecentTaskLogs, roundExecutionLogPath } from '../bridge/round-log';
 import { SessionOwnershipStore, nativeSessionNamespace } from '../bridge/session-ownership';
+import { commitTaskChanges, createTaskWorktree, resolveGitRepository } from '../bridge/git-worktree';
+import { git, initMultiStashRepo, initRepo, thread as createGitThread } from './git-worktree-fixture';
+import { MergeCoordinator } from '../bridge/merge-coordinator';
+import { renderStashRecoveryAction } from '../ui/detail-actions';
 import {
   createThread,
   setupFixture,
 } from './unified-execution-fixture';
 
+async function waitForTask(
+  fixture: Awaited<ReturnType<typeof setupFixture>>,
+  threadId: string,
+  predicate: (task: ReturnType<typeof fixture.store.reloadTask> & {}) => boolean,
+  timeoutMs = 60_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let task = fixture.store.reloadTask(threadId);
+  while (task && task.status !== 'failed' && !predicate(task) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    task = fixture.store.reloadTask(threadId);
+  }
+  assert.ok(task && predicate(task), `timed out waiting for task state: ${threadId}; latest=${JSON.stringify(task)}`);
+  return task;
+}
+
 describe('Unified Execution Integration Tests', () => {
+  test('landed V2 merge keeps stash recovery visible after evidence CAS exhaustion and reuses its commit on retry', async () => {
+    const fixture = await setupFixture();
+    const threadId = 'thread_v2_landed_stash_recovery';
+    let rework: ReworkController | undefined;
+    try {
+      const repository = path.join(fixture.dir, 'repo');
+      const { old: originalStash } = initMultiStashRepo(repository);
+      const target = resolveGitRepository(repository, fixture.dir);
+      const worktree = createTaskWorktree(target, threadId, fixture.dir);
+      fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'A task change\nmiddle\nbeta\n');
+      worktree.headCommit = commitTaskChanges(worktree, 'approved task change');
+      const thread = createGitThread(threadId, worktree);
+      thread.execution = createThread(threadId, 'merge').execution;
+      thread.status = 'queued';
+      thread.queuePhase = 'merge';
+      thread.artifactDir = path.join(fixture.dir, 'task-artifacts', threadId);
+      fs.writeFileSync(path.join(repository, 'later-stash.txt'), 'temporary stash entry\n');
+      git(repository, 'stash', 'push', '-u', '-m', 'later');
+      const laterStash = git(repository, 'rev-parse', 'refs/stash');
+      git(repository, 'stash', 'drop');
+      fs.writeFileSync(path.join(repository, 'staged.txt'), 'staged\n');
+      git(repository, 'add', 'staged.txt');
+      fs.appendFileSync(path.join(repository, 'staged.txt'), 'unstaged\n');
+      fs.writeFileSync(path.join(repository, 'mine.txt'), 'caller edit preserved across stash recovery\n');
+      fixture.store.upsertTask(thread);
+
+      const coordinator = new MergeCoordinator(fixture.store, fixture.dir, fixture.mergeLock);
+      let failedPendingEvidenceCas = 0;
+      const transitionExecution = fixture.store.transitionExecution.bind(fixture.store);
+      (fixture.store as any).transitionExecution = (id: string, ...args: any[]) => {
+        const stack = new Error().stack || '';
+        if (id === threadId && /finishStashRecoveryPending/.test(stack)) {
+          failedPendingEvidenceCas++;
+          return Promise.reject(new Error(`Execution revision mismatch for task ${threadId}: injected pending-evidence CAS failure`));
+        }
+        return (transitionExecution as any)(id, ...args);
+      };
+      // Keep the real Windows mutex and child identity capture, but avoid the
+      // helper's transient PID lookup race for short-lived Git commands: by the
+      // time PowerShell acknowledges CHILD, the Git process may be exiting while
+      // Node still holds its pipes open. This test covers V2/CAS and real Git;
+      // helper lifetime behavior has dedicated MeshFileLock coverage.
+      const attachChildPid = fixture.mergeLock.attachChildPid.bind(fixture.mergeLock);
+      fixture.mergeLock.attachChildPid = async (pid, cancelled, expectedBirthId) => {
+        const identity = await attachChildPid(pid, cancelled, expectedBirthId);
+        return identity || (pid ? getProcessBirthId(pid) : undefined);
+      };
+      let targetRefUpdates = 0;
+      const loggedGit = (coordinator as any).loggedGit.bind(coordinator);
+      (coordinator as any).loggedGit = async (id: string, cwd: string, args: string[]) => {
+        if (args[0] === 'update-ref' && args[1] === target.targetRef) targetRefUpdates++;
+        return loggedGit(id, cwd, args);
+      };
+      const publish = (coordinator as any).writeLockedGitFile.bind(coordinator);
+      let failStashMetadata = true;
+      let stashMetadataFailureInjected = false;
+      const lockedGitFiles: string[] = [];
+      (coordinator as any).writeLockedGitFile = (file: string, data: Buffer) => {
+        lockedGitFiles.push(file);
+        if (file.includes(`${path.sep}logs${path.sep}`)) return publish(file, data);
+        if (failStashMetadata) {
+          stashMetadataFailureInjected = true;
+          throw new Error('injected stash metadata publication failure');
+        }
+        return publish(file, data);
+      };
+      (fixture.controller as any).mergeCoordinator = coordinator;
+      rework = new ReworkController(fixture.store, fixture.runner as any, fixture.callbackManager,
+        fixture.detector, fixture.registry, false, true, true);
+
+      const first = await rework.mergeApproved(threadId);
+      assert.equal(first.status, 'blocked', 'the initial UI action starts the real V2 merge run');
+      const firstRunId = fixture.store.reloadTask(threadId)?.execution?.run?.id;
+      assert.ok(firstRunId, 'the first Git landing is owned by a durable V2 run');
+      const pending = await waitForTask(fixture, threadId, task =>
+        task.status === 'reviewing' && task.worktree?.integration?.stashRecoveryPending === true && !task.execution?.run);
+      await fixture.controller.waitForActiveExecutions(60_000);
+      assert.equal(failedPendingEvidenceCas, 6, 'three evidence CAS attempts fail in the initial pass and three in coordinator recovery');
+      assert.equal(stashMetadataFailureInjected, true, `stash metadata failure hook was not reached; locked files=${lockedGitFiles.join('|')}`);
+      const landedCommit = pending.worktree!.integration!.mergedCommit!;
+      const targetRef = pending.worktree!.deliveryTarget!.ref;
+      assert.equal(pending.status, 'reviewing', 'CAS exhaustion leaves the landed task visibly recoverable');
+      assert.equal(pending.execution?.version, 2);
+      assert.equal(pending.execution?.phase, 'merge');
+      assert.equal(pending.execution?.run, undefined, 'the real controller settles the first run after the process tree exits');
+      assert.equal(pending.execution?.lastOutcome?.code, 'STASH_CLEANUP_PENDING');
+      assert.equal(pending.execution?.operationId, thread.execution?.operationId, 'the settle CAS preserves the V2 operation identity');
+      assert.equal(pending.worktree?.integration?.stashRecoveryPending, true, `pending evidence missing: ${JSON.stringify(pending.worktree?.integration)}; writes=${lockedGitFiles.join('|')}`);
+      assert.equal(targetRefUpdates, 1, 'the approved commit is published once before recovery');
+      assert.equal(git(repository, 'rev-parse', '--verify', targetRef), landedCommit);
+      assert.equal(pending.worktree?.integration?.mergedCommit, landedCommit);
+      assert.match(renderStashRecoveryAction(pending, false), /onclick="retryMerge\(\)"/);
+      assert.match(renderStashRecoveryAction(pending, false), /stash/);
+      assert.equal(renderStashRecoveryAction({ ...pending, execution: undefined }, false), '', 'historical tasks do not gain a new execution entry point');
+
+      failStashMetadata = false;
+      // Mark the stale terminal state observed by the UI regression. The action
+      // must still reopen only this landed V2 stash-recovery operation.
+      const staleCompleted = await fixture.store.transitionExecution(threadId, pending.execution!.revision, (task) => {
+        task.status = 'completed';
+      });
+      assert.notEqual(renderStashRecoveryAction(staleCompleted, false), '', 'the recovery action stays visible on the stale completed row');
+      const retry = await rework.mergeApproved(threadId);
+      assert.equal(retry.status, 'blocked', 'the visible retry starts the protected V2 recovery path');
+      const settledRecovery = await waitForTask(fixture, threadId, task =>
+        task.status === 'completed' && task.worktree?.integration?.stashRecoveryPending === false && !task.execution?.run);
+      assert.equal(settledRecovery.status, 'completed', 'the task completes after recovery is confirmed');
+      assert.equal(settledRecovery.worktree?.integration?.stashRecoveryPending, false);
+      assert.equal(settledRecovery.worktree?.deliveryTarget?.ref, targetRef);
+      assert.equal(settledRecovery.worktree?.integration?.mergedCommit, landedCommit, 'the retry retains the already landed commit');
+      assert.equal(git(repository, 'rev-parse', '--verify', targetRef), landedCommit, 'recovery does not move the delivery ref a second time');
+      assert.equal(targetRefUpdates, 1, 'V2 recovery reuses the landed commit without a duplicate target ref update');
+      assert.deepEqual(git(repository, 'stash', 'list', '--format=%H').split(/\r?\n/), [originalStash], 'recovery preserves the original caller stash entry');
+      assert.notEqual(laterStash, originalStash);
+      assert.equal(fs.existsSync(worktree.path), true, 'the task worktree remains registered and present after recovery');
+      assert.equal(settledRecovery.worktree?.path, worktree.path);
+      assert.equal(settledRecovery.receiverSessionId, thread.receiverSessionId);
+      assert.equal(settledRecovery.reviewerSessionId, thread.reviewerSessionId);
+      assert.equal(settledRecovery.execution?.run, undefined, 'the V2 run is cleared only after the recovered merge completes');
+    } finally {
+      rework?.dispose();
+      await fixture.cleanup();
+    }
+  });
+
   test('v2 rework runs through AutonomousRunner with its durable run instead of Bridge role/session locks', async () => {
     const fixture = await setupFixture();
     const legacyLock = new NativeSessionLock(fixture.dir);
@@ -411,6 +556,101 @@ describe('Unified Execution Integration Tests', () => {
 
       await fixture.controller.waitForActiveExecutions(3000);
     } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  test('v2 merge retry validates the latest target and hands a failed validation back to the original reviewer', { timeout: 120_000 }, async () => {
+    const fixture = await setupFixture();
+    const rework = new ReworkController(fixture.store, fixture.runner as any, fixture.callbackManager, fixture.detector);
+    try {
+      const repo = path.join(fixture.dir, 'repository');
+      const evidence = path.join(fixture.dir, 'validation.jsonl');
+      initRepo(repo);
+      fs.writeFileSync(path.join(repo, 'validate.js'), [
+        'const fs = require("node:fs");',
+        'const latest = fs.readFileSync("latest.txt", "utf8");',
+        `fs.appendFileSync(${JSON.stringify(evidence)}, JSON.stringify([process.argv[2], latest]) + "\\n");`,
+        'if (process.argv[2] === "test" && fs.readFileSync("shared.txt", "utf8").includes("broken")) process.exitCode = 1;',
+      ].join('\n'));
+      git(repo, 'add', 'validate.js');
+      git(repo, 'commit', '-m', 'Record each validation step');
+      const target = resolveGitRepository(repo, fixture.dir);
+      const thread = createThread('thread_v2_merge_validation_review', 'merge');
+      const worktree = createTaskWorktree(target, thread.threadId, fixture.dir);
+      fs.writeFileSync(path.join(worktree.path, 'shared.txt'), 'broken\n');
+      const approved = commitTaskChanges(worktree, 'Approved candidate');
+      thread.worktree = { ...worktree, headCommit: approved, approvedCommit: approved, mergePending: true };
+      thread.artifactDir = path.dirname(worktree.path);
+      thread.workspace = testWorkspace(worktree.path);
+      thread.rounds[0].status = 'completed';
+      thread.status = 'failed';
+      thread.failure = { stage: 'merge', code: 'VALIDATION_FAILED', reason: 'Previous validation failed',
+        at: new Date().toISOString(), round: 1 };
+      fixture.addRunnableThread(thread);
+
+      fs.writeFileSync(path.join(repo, 'latest.txt'), 'first advance');
+      git(repo, 'add', 'latest.txt');
+      git(repo, 'commit', '-m', 'Advance the target before retry');
+      const retryBase = git(repo, 'rev-parse', 'HEAD');
+      let reviewerError: unknown;
+      let reviewerCalls = 0;
+      let secondBase = '';
+      fixture.callbackManager.launchCaller = (async (reviewed: typeof thread) => {
+        reviewerCalls++;
+        try {
+          const disk = fixture.store.reloadTask(thread.threadId)!;
+          assert.equal(reviewed.reviewerSessionId, thread.reviewerSessionId);
+          assert.equal(disk.execution?.purpose, 'merge_resolution');
+          assert.equal(disk.execution?.run?.role, 'reviewer');
+          assert.equal(disk.worktree?.integration?.phase, 'validation_failed');
+          assert.equal(disk.worktree?.integration?.targetOldCommit, retryBase);
+          assert.equal(disk.worktree?.approvedCommit, approved);
+          const failure = disk.mergeHistory?.at(-1);
+          assert.equal(failure?.result, 'failed');
+          assert.ok(failure?.logPath);
+          assert.match(fs.readFileSync(failure.logPath, 'utf8'), /npm run compile passed/);
+          const resolution = disk.worktree?.mergeResolutionPath;
+          assert.ok(resolution && fs.existsSync(resolution));
+          assert.equal(git(repo, 'rev-parse', 'HEAD'), retryBase);
+          const release = await fixture.mergeLock.acquire(undefined, undefined, 10_000, true);
+          assert.ok(release, 'review starts after the merge run releases the global lock');
+          assert.equal(await fixture.mergeLock.releaseAndConfirm(release, 10_000), true);
+          fs.writeFileSync(path.join(resolution, 'shared.txt'), 'fixed\n');
+          git(resolution, 'add', 'shared.txt');
+          fs.writeFileSync(path.join(repo, 'latest.txt'), 'second advance');
+          git(repo, 'add', 'latest.txt');
+          git(repo, 'commit', '-m', 'Advance the target during review');
+          secondBase = git(repo, 'rev-parse', 'HEAD');
+          assert.equal((await rework.submitMergeResolution(thread.threadId)).status, 'QUEUED');
+          const queued = fixture.store.reloadTask(thread.threadId)!;
+          assert.equal(queued.execution?.next?.phase, 'merge');
+          assert.equal(queued.execution?.next?.sourceRunId, disk.execution?.run?.id);
+          assert.equal(queued.execution?.run?.id, disk.execution?.run?.id, 'reviewer still owns its run at submission');
+        } catch (error) { reviewerError = error; }
+        return { success: true, exitCode: 0 };
+      }) as any;
+
+      await fixture.controller.retryOperation(thread.threadId);
+      const deadline = Date.now() + 100_000;
+      let final = fixture.store.reloadTask(thread.threadId)!;
+      while (!['completed', 'failed'].includes(final.status) && Date.now() < deadline && !reviewerError) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        final = fixture.store.reloadTask(thread.threadId)!;
+      }
+      if (reviewerError) throw reviewerError;
+      assert.equal(final.status, 'completed', JSON.stringify({
+        status: final.status, failure: final.failure, execution: final.execution,
+      }));
+      assert.equal(reviewerCalls, 1);
+      assert.equal(git(repo, 'rev-parse', 'HEAD^1'), secondBase);
+      assert.equal(fs.readFileSync(path.join(repo, 'shared.txt'), 'utf8').trim(), 'fixed');
+      assert.deepEqual(fs.readFileSync(evidence, 'utf8').trim().split('\n').map(line => JSON.parse(line)), [
+        ['compile', 'first advance'], ['test', 'first advance'],
+        ['compile', 'second advance'], ['test', 'second advance'],
+      ]);
+    } finally {
+      rework.dispose();
       await fixture.cleanup();
     }
   });

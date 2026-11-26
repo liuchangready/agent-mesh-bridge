@@ -385,7 +385,9 @@ export class TaskControlService {
 
     const latest = this.taskStore.reloadTask(threadId) || thread;
     const runUnconfirmed = !!latest.execution?.run || legacyStopUnconfirmed;
-    const preserveOutput = (worktreeHasUnmergedOutput && !force) || !!latest.worktree?.integration?.stashRecoveryLockHeld;
+    const stashRecoveryPending = !!(latest.worktree?.integration?.stashRecoveryPending ||
+      latest.worktree?.integration?.stashRecoveryLockHeld);
+    const preserveOutput = (worktreeHasUnmergedOutput && !force) || stashRecoveryPending;
     const cleanupManifest = cleanupReservation
       ? this.cleanupManifest(latest, cleanupReservation.token, normalizedReason, by, force,
           preserveOutput || runUnconfirmed || cleanupWasInProgress)
@@ -397,24 +399,27 @@ export class TaskControlService {
       });
       warnings.push(...this.taskStore.getCleanupCommitWarnings(cleanupReservation.token));
     } else {
-      if (legacyStopUnconfirmed) {
+      if (preserveOutput || runUnconfirmed || cleanupWasInProgress) {
         const token = `legacy-delete-${threadId}-${Date.now()}`;
         legacyStopCleanupToken = token;
-        const registryOwners = this.executionRegistry.listOwners().filter((owner) => owner.threadId === threadId);
-        const roleOwner = new TaskRoleLock(this.storageDir).getOwner(threadId);
-        const identities = registryOwners.flatMap((owner) => [
-          owner.birthId ? { pid: owner.pid, birthId: owner.birthId } : undefined,
-          owner.childPid && owner.childBirthId ? { pid: owner.childPid, birthId: owner.childBirthId } : undefined,
-        ].filter(Boolean));
         const manifest = this.cleanupManifest(latest, token, normalizedReason, by, force, true);
-        manifest.legacyStopPending = true;
-        manifest.legacyStopIdentities = identities;
-        manifest.legacyStopIdentityUnknown = !identities.length || !!roleOwner ||
-          registryOwners.some((owner) => !owner.birthId || (!!owner.childPid && !owner.childBirthId));
+        manifest.previousCleanup = latest.cleanup;
+        if (legacyStopUnconfirmed) {
+          const registryOwners = this.executionRegistry.listOwners().filter((owner) => owner.threadId === threadId);
+          const roleOwner = new TaskRoleLock(this.storageDir).getOwner(threadId);
+          const identities = registryOwners.flatMap((owner) => [
+            owner.birthId ? { pid: owner.pid, birthId: owner.birthId } : undefined,
+            owner.childPid && owner.childBirthId ? { pid: owner.childPid, birthId: owner.childBirthId } : undefined,
+          ].filter(Boolean));
+          manifest.legacyStopPending = true;
+          manifest.legacyStopIdentities = identities;
+          manifest.legacyStopIdentityUnknown = !identities.length || !!roleOwner ||
+            registryOwners.some((owner) => !owner.birthId || (!!owner.childPid && !owner.childBirthId));
+        }
         legacyStopCleanupManifest = manifest;
         this.appendTombstone(latest, normalizedReason, by, undefined, force, token, false, manifest);
       } else this.appendTombstone(latest, normalizedReason, by, undefined, force);
-      this.taskStore.deleteTask(threadId, undefined, { preserveAssets: legacyStopUnconfirmed });
+      this.taskStore.deleteTask(threadId, undefined, { preserveAssets: true });
     }
 
     const cleanupOwner = { pid: process.pid, birthId: getProcessBirthId(process.pid) };
@@ -435,9 +440,9 @@ export class TaskControlService {
     let cleanupIncomplete = false;
     try {
       // Physical cleanup is single-consumer after the durable tombstone claim.
-      if (preserveOutput) warnings.push('Unmerged task output was retained in its worktree and branch.');
+      if (preserveOutput && !stashRecoveryPending) warnings.push('Unmerged task output was retained in its worktree and branch.');
       if (runUnconfirmed) warnings.push(`Run ${latest.execution?.run?.id} has not confirmed process-tree exit; its resources and native sessions were retained.`);
-      if (latest.worktree?.integration?.stashRecoveryLockHeld) warnings.push('Stash recovery metadata remains pending.');
+      if (stashRecoveryPending) warnings.push('Stash recovery metadata remains pending.');
       if (cleanupWasInProgress) warnings.push('A prior archive or cleanup operation may still own task assets; physical cleanup was deferred.');
       const intentionallyRetained = preserveOutput || runUnconfirmed || cleanupWasInProgress;
       let canCleanAssets = !intentionallyRetained;
@@ -462,6 +467,8 @@ export class TaskControlService {
           warnings.push('The global merge lock is busy; Git worktree and branch cleanup was deferred.');
         } else {
           try {
+            this.removeMergeResolutions(latest, [latest.worktree.mergeResolutionPath,
+              ...(latest.worktree.supersededMergeResolutionPaths || [])].filter((entry): entry is string => !!entry));
             if (latest.worktree) removeTaskWorktree(latest.worktree);
             if (latest.worktree && fs.existsSync(latest.worktree.path)) {
               canCleanAssets = false;
@@ -996,7 +1003,8 @@ export class TaskControlService {
       }
       manifest = { ...manifest, runExitProof: proof, retainResources: false };
     }
-    const stashPending = !!(thread.worktree?.integration?.stashRecoveryLockHeld || (thread.worktree?.integration as any)?.stashCleanupPending || (thread.worktree?.integration as any)?.recoveryRequired);
+    const stashPending = !!(thread.worktree?.integration?.stashRecoveryPending || thread.worktree?.integration?.stashRecoveryLockHeld ||
+      (thread.worktree?.integration as any)?.stashCleanupPending || (thread.worktree?.integration as any)?.recoveryRequired);
     if (stashPending) {
       await this.taskStore.updateTombstoneCleanupManifest(threadId, manifest.token, { retainResources: true }).catch(() => false);
       return { threadId, status: 'DELETED', reason: record.reason || 'Deleted by user', message: `Task ${threadId} is deleted. Stash or merge recovery evidence remains pending and task resources were retained.` };

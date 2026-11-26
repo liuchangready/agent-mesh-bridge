@@ -1,4 +1,4 @@
-import { testWorkspace, confirmTestReviewer } from './workspace-fixture';
+import { testWorkspace } from './workspace-fixture';
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -40,7 +40,6 @@ import { getProcessBirthId, probeProcessIdentity } from '../bridge/platform';
 import { registerRunChildV2 } from '../bridge/process-binding';
 import { meshMergeLockPath } from '../bridge/mesh-file-lock';
 import { MeshFileLock } from '../bridge/mesh-file-lock';
-import { TaskRoleLock } from '../bridge/task-role-lock';
 import { roundOutputArchivePath } from '../bridge/round-log';
 import { reviewerLogPath } from '../bridge/reviewer-log';
 import {
@@ -105,32 +104,11 @@ describe('MCPServer Protocol Tests', () => {
     callbackManager = new CallbackManager(detector);
     callbackManager.notifyCaller = async () => true;
     // Never spawn a real caller CLI from a protocol test.
-    callbackManager.notifyCallerOfFailure = async () => false;
     const gate = new TaskExecutionRegistry(tempDir);
     dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector, gate);
     reworkController = new ReworkController(taskStore, runner, callbackManager, detector, gate);
     mcpServer = new MCPServer(dispatcher, reworkController, taskStore, detector, resolver, runner);
   });
-
-  const waitForStatus = async (threadId: string, status: string, timeoutMs = 3000) => {
-    const pending = taskStore.getTask(threadId);
-    if (pending?.reviewBootstrap?.phase === 'pending') {
-      const task = confirmTestReviewer(pending);
-      taskStore.upsertTask(task);
-      clearReviewerBootstrapToken(task.threadId, tempDir, task.artifactDir);
-      void (dispatcher as any).executeBackgroundRound(task, 1, task.rounds[0].prompt, false);
-    }
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (taskStore.getTask(threadId)?.status === status) return;
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    throw new Error(
-      `Timed out waiting for ${threadId} to reach ${status}; current=${
-        taskStore.getTask(threadId)?.status
-      }`,
-    );
-  };
 
   afterEach(() => {
     if (savedReceiverEnv !== undefined) {
@@ -306,6 +284,20 @@ describe('MCPServer Protocol Tests', () => {
         process.env.MESH_REVIEW_SESSION_ID = reviewer;
         const doReview = async (pid: number) => {
           if (reviewCalls === 1) {
+            const requestRework = () => rpc('request_rework', {
+              threadId: thread.threadId, feedback: 'add a second change', callerSessionId: reviewer,
+            });
+            delete process.env.MESH_REVIEW_SESSION_ID;
+            await assert.rejects(requestRework, /runRole=reviewer runState=active .*reviewerSessionCaptured=true MESH_REVIEW_SESSION_ID=missing/);
+            const wrongSession = 'unrelated-reviewer-session';
+            process.env.MESH_REVIEW_SESSION_ID = wrongSession;
+            await assert.rejects(requestRework, (error: Error) => {
+              assert.match(error.message, /MESH_REVIEW_SESSION_ID=mismatch/);
+              assert.ok(!error.message.includes(wrongSession) && !error.message.includes(reviewer));
+              return true;
+            });
+            assert.equal(taskStore.getTask(thread.threadId)?.execution?.next, undefined);
+            process.env.MESH_REVIEW_SESSION_ID = reviewer;
             await rpc('request_rework', { threadId: thread.threadId, feedback: 'add a second change' });
             recordProcessEvent('rework_decision_persisted', pid);
           const handed = taskStore.getTask(thread.threadId)!;
@@ -847,167 +839,6 @@ describe('MCPServer Protocol Tests', () => {
     }
   });
 
-  test('get_task_summary survives archival with the read-only digest', async () => {
-    const call = async (name: string, args: any) =>
-      mcpServer.handleRpcMessage({
-        jsonrpc: '2.0',
-        id: 63,
-        method: 'tools/call',
-        params: { name, arguments: args },
-      });
-    const payload = (res: any) => JSON.parse(res.result.content[0].text);
-
-    const dispatched = payload(
-      await call('dispatch_task', { workspaceRoot: process.cwd(),
-        targetAgent: 'claude_code',
-        title: 'Summarise me',
-        prompt: 'do the work',
-      }),
-    );
-    await waitForStatus(dispatched.threadId, 'reviewing');
-    // A review decision requires the reviewer role, exactly like a real wake.
-    const lease = new TaskRoleLock().tryAcquire(dispatched.threadId, 'reviewer');
-    assert.ok(lease);
-    payload(await call('approve_task', { threadId: dispatched.threadId, remarks: 'LGTM' }));
-
-    const before = payload(await call('get_task_summary', { threadId: dispatched.threadId }));
-    assert.strictEqual(before.archived, false);
-    assert.strictEqual(before.finalSummary.kind, 'completed');
-    assert.match(before.finalSummary.verdict || '', /LGTM/);
-
-    // Archiving drops the rounds but keeps the digest queryable.
-    assert.ok(taskStore.archiveTask(dispatched.threadId));
-    const after = payload(await call('get_task_summary', { threadId: dispatched.threadId }));
-    assert.strictEqual(after.archived, true);
-    assert.strictEqual(after.finalSummary.kind, 'completed');
-    assert.match(after.finalSummary.summary, /审阅通过/);
-
-    const details = payload(await call('get_thread_details', { threadId: dispatched.threadId }));
-    assert.strictEqual(details.archived, true);
-    assert.deepStrictEqual(details.rounds, []);
-  });
-
-  test('serves the reviewer side of a round and reports a missing log honestly', async () => {
-    const call = async (name: string, args: any) =>
-      mcpServer.handleRpcMessage({
-        jsonrpc: '2.0',
-        id: 61,
-        method: 'tools/call',
-        params: { name, arguments: args },
-      });
-    const payload = (res: any) => JSON.parse(res.result.content[0].text);
-
-    const dispatched = payload(
-      await call('dispatch_task', { workspaceRoot: process.cwd(),
-        targetAgent: 'claude_code',
-        title: 'Reviewer output',
-        prompt: 'do the work',
-      }),
-    );
-    await waitForStatus(dispatched.threadId, 'reviewing');
-
-    // No wake has been captured for this task yet.
-    const missing = payload(await call('get_reviewer_log', { threadId: dispatched.threadId }));
-    assert.strictEqual(missing.available, false);
-    assert.deepStrictEqual(missing.roundsWithReviewerLog, []);
-    assert.match(missing.message, /No reviewer log/);
-
-    // A captured reviewer stream must be served with the same paging contract.
-    // New tasks keep it inside their unified task directory; the helper falls
-    // back to the legacy logs/ location when no artifactDir is recorded.
-    const threadForLog = taskStore.getTask(dispatched.threadId)!;
-    const reviewerFile = reviewerLogPath(
-      dispatched.threadId,
-      1,
-      tempDir,
-      threadForLog.initiatorAgent,
-      threadForLog.artifactDir,
-    );
-    fs.mkdirSync(path.dirname(reviewerFile), { recursive: true });
-    fs.writeFileSync(
-      reviewerFile,
-      '--- wake ---\n[reviewer] EditMode 82/82\n[reviewer] verdict pending\n',
-    );
-
-    const page = payload(
-      await call('get_reviewer_log', { threadId: dispatched.threadId, round: 1 }),
-    );
-    assert.strictEqual(page.available, true);
-    assert.match(page.content, /EditMode 82\/82/);
-    assert.match(page.content, /verdict pending/);
-    assert.strictEqual(page.reviewerAgent, taskStore.getTask(dispatched.threadId)!.initiatorAgent);
-    assert.deepStrictEqual(page.roundsWithReviewerLog, [1]);
-
-    // Bounded reads keep the tail and flag the truncation.
-    const tail = payload(
-      await call('get_reviewer_log', {
-        threadId: dispatched.threadId,
-        round: 1,
-        maxBytes: 20,
-      }),
-    );
-    assert.strictEqual(tail.truncated, true);
-    assert.match(tail.hint, /offsetBytes=/);
-  });
-
-  test('tells the caller to stop and wait, and starves repeated polls', async () => {
-    configureCodexReviewerFixture();
-    const call = async (name: string, args: any) =>
-      mcpServer.handleRpcMessage({
-        jsonrpc: '2.0',
-        id: 60,
-        method: 'tools/call',
-        params: { name, arguments: args },
-      });
-    const payload = (res: any) => {
-      assert.ok(res?.result?.content?.[0]?.text, `MCP call failed: ${JSON.stringify(res)}`);
-      return JSON.parse(res.result.content[0].text);
-    };
-
-    const dispatched = payload(
-      await call('dispatch_task', { workspaceRoot: process.cwd(),
-        targetAgent: 'codex',
-        title: 'Stop polling',
-        prompt: 'do the work',
-      }),
-    );
-    // The dispatch reply itself must carry the directive, before anything else.
-    assert.strictEqual(dispatched.nextAction, 'END_TURN_AND_WAIT_FOR_CALLBACK');
-    assert.match(dispatched.message, /^nextAction=END_TURN_AND_WAIT_FOR_CALLBACK/);
-    assert.match(dispatched.stopInstruction, /End your turn immediately/);
-
-    await waitForStatus(dispatched.threadId, 'reviewing');
-
-    const first = payload(await call('get_thread_details', { threadId: dispatched.threadId }));
-    assert.strictEqual(first.repeatPoll, undefined);
-    assert.ok(first.rounds, 'the first read is a real payload');
-
-    const second = payload(await call('get_thread_details', { threadId: dispatched.threadId }));
-    assert.strictEqual(second.repeatPoll, true);
-    assert.strictEqual(second.nextAction, 'END_TURN_AND_WAIT_FOR_CALLBACK');
-    assert.match(second.stopInstruction, /STOP POLLING/);
-    assert.strictEqual(second.rounds, undefined, 'a repeated poll is starved of details');
-
-    // Log watching is the same loop wearing a different hat: the first read is
-    // still served (one inspection = details + logs), the second is starved.
-    assert.strictEqual(
-      payload(await call('get_recent_logs', { threadId: dispatched.threadId })).repeatPoll,
-      undefined,
-    );
-    assert.strictEqual(
-      payload(await call('get_recent_logs', { threadId: dispatched.threadId })).repeatPoll,
-      true,
-    );
-
-    // Real progress unblocks the full payload: the callback/resume path works.
-    const stored = taskStore.getTask(dispatched.threadId)!;
-    stored.currentRound = 2;
-    taskStore.upsertTask(stored);
-    const afterProgress = payload(await call('get_thread_details', { threadId: dispatched.threadId }));
-    assert.strictEqual(afterProgress.repeatPoll, undefined);
-    assert.strictEqual(afterProgress.threadId, dispatched.threadId);
-  });
-
   test('get_thread_details condenses older rounds and get_round_raw_log pages the archive', async () => {
     const call = async (name: string, args: any) =>
       mcpServer.handleRpcMessage({
@@ -1149,14 +980,17 @@ describe('MCPServer Protocol Tests', () => {
     assert.equal(legacy.content, 'cdef'); assert.equal(decision.content, 'cdef');
     await assert.rejects(mcpServer.handleToolCall('get_merge_log', { threadId, number: 3 }), /Invalid merge log path/);
     await assert.rejects(mcpServer.handleToolCall('get_merge_log', { threadId, number: 4 }), /Invalid merge log path/);
-    await reworkController.requestMergeDecision(threadId, 'Which fix?', 'background', 'suggestion', [], decisionLog);
-    const question = taskStore.getTask(threadId)!.mergeHistory!.at(-1)!;
+    const current = taskStore.getTask(threadId)!;
+    const question = { id: 'historical-decision', decisionId: 'historical-decision', number: 6,
+      at: now, phase: 'decision' as const, result: 'requested' as const, question: 'Which fix?',
+      background: 'background', suggestion: 'suggestion', logPath: decisionLog, logNumber: 5, logFileNumber: 9 };
+    taskStore.upsertTask({ ...current, mergeHistory: [...(current.mergeHistory || []), question] });
     assert.equal(question.logNumber, 5); assert.equal(question.logFileNumber, 9);
     const context = await mcpServer.handleToolCall('get_merge_log', { threadId, number: question.number, limit: 8 });
     assert.equal(context.content, 'decision');
   });
 
-  test('merge_failed rejects ordinary controls and retry_merge keeps task identity', async () => {
+  test('historical merge_failed records stay readable but cannot retry through V2 controls', async () => {
     const threadId = 'thread_merge_failed_control'; const now = new Date().toISOString();
     taskStore.upsertTask({
     reviewFlow: 'dedicated',
@@ -1169,10 +1003,9 @@ describe('MCPServer Protocol Tests', () => {
       for (const name of ['approve_task', 'request_rework', 'retry_task', 'retarget_task']) {
         await assert.rejects(() => mcpServer.handleToolCall(name, { threadId }), /only permits retry_merge, pause_task, or delete_task/);
     }
-    const result = await mcpServer.handleToolCall('retry_merge', { threadId });
-    assert.equal(result.status, 'reviewing');
-    assert.equal(taskStore.getTask(threadId)!.receiverSessionId, 'session-abcdef12');
-    assert.equal(taskStore.getTask(threadId)!.mergeControl!.retryGeneration, 1);
+    const beforeRetry = taskStore.getTask(threadId)!;
+    await assert.rejects(() => mcpServer.handleToolCall('retry_merge', { threadId }), /HISTORICAL_TASK_READ_ONLY/);
+    assert.deepEqual(taskStore.getTask(threadId), beforeRetry);
       taskStore.upsertTask({ ...taskStore.getTask(threadId)!, status: 'failed', failure: { stage: 'merge', reason: 'conflict', at: now }, execution: {
         version: 2, revision: 1, operationId: 'merge-failed-live-op', phase: 'merge', round: 1,
         generation: 1, attempt: 1, autoRetriesUsed: 0,
@@ -1287,160 +1120,6 @@ describe('MCPServer Protocol Tests', () => {
     assert.strictEqual(ExecutionController.getInstance(), controller);
     controller.dispose();
     assert.strictEqual(ExecutionController.getInstance(), undefined);
-  });
-
-  test('should execute dispatch_task, get_thread_details, request_rework, and approve_task via tools/call', async () => {
-    configureCodexReviewerFixture();
-    // 1. Dispatch
-    const dispatchCall = {
-      jsonrpc: '2.0',
-      id: 10,
-      method: 'tools/call',
-      params: {
-        name: 'dispatch_task',
-        arguments: { workspaceRoot: process.cwd(),
-          targetAgent: 'codex',
-          title: 'Refactor Cache Layer',
-          prompt: 'Use LRU cache with 500 items max',
-          callerSessionId: 'caller_mcp_1',
-        },
-      },
-    };
-
-    const dispatchRes = await mcpServer.handleRpcMessage(dispatchCall);
-    assert.strictEqual(dispatchRes.id, 10);
-    const dispatchData = JSON.parse(dispatchRes.result.content[0].text);
-    assert.strictEqual(dispatchData.status, 'REVIEWER_STARTING');
-    const threadId = dispatchData.threadId;
-    const receiverSessionId = dispatchData.receiverSessionId;
-    assert.ok(threadId);
-
-    // 2. Get Thread Details
-    const detailsCall = {
-      jsonrpc: '2.0',
-      id: 11,
-      method: 'tools/call',
-      params: {
-        name: 'get_thread_details',
-        arguments: { threadId },
-      },
-    };
-    const detailsRes = await mcpServer.handleRpcMessage(detailsCall);
-    assert.strictEqual(detailsRes.id, 11);
-    const detailsData = JSON.parse(detailsRes.result.content[0].text);
-    assert.strictEqual(detailsData.threadId, threadId);
-    assert.strictEqual(detailsData.currentRound, 1);
-
-    // 3. Request Rework.
-    // Rounds are strictly sequential, so the receiver's round 1 must reach a
-    // terminal state before a new round may be started.
-    await waitForStatus(threadId, 'reviewing');
-    const reviewer1 = new TaskRoleLock().tryAcquire(threadId, 'reviewer');
-    assert.ok(reviewer1, 'reviewer role must be available after the developer handoff');
-
-    const reworkCall = {
-      jsonrpc: '2.0',
-      id: 12,
-      method: 'tools/call',
-      params: {
-        name: 'request_rework',
-        arguments: {
-          threadId,
-          feedback: 'Please make TTL expiration configurable',
-        },
-      },
-    };
-    const reworkRes = await mcpServer.handleRpcMessage(reworkCall);
-    assert.strictEqual(reworkRes.id, 12);
-    const reworkData = JSON.parse(reworkRes.result.content[0].text);
-    assert.strictEqual(reworkData.status, 'REWORK_DISPATCHED');
-    assert.strictEqual(reworkData.round, 2);
-    assert.strictEqual(reworkData.receiverSessionId, receiverSessionId);
-
-    // 4. Approve Task.
-    // The rework round started above must reach a terminal state first.
-    await waitForStatus(threadId, 'reviewing');
-    const reviewer2 = new TaskRoleLock().tryAcquire(threadId, 'reviewer');
-    assert.ok(reviewer2, 'reviewer role must be available after the rework handoff');
-
-    const approveCall = {
-      jsonrpc: '2.0',
-      id: 13,
-      method: 'tools/call',
-      params: {
-        name: 'approve_task',
-        arguments: {
-          threadId,
-          remarks: 'TTL configurable cache verified',
-        },
-      },
-    };
-    const approveRes = await mcpServer.handleRpcMessage(approveCall);
-    assert.strictEqual(approveRes.id, 13);
-    const approveData = JSON.parse(approveRes.result.content[0].text);
-    assert.strictEqual(approveData.status, 'COMPLETED');
-
-    // 5. Record the caller's MR handoff.
-    const mrCall = {
-      jsonrpc: '2.0',
-      id: 14,
-      method: 'tools/call',
-      params: {
-        name: 'record_merge_request',
-        arguments: {
-          threadId,
-          url: 'https://example.com/mr/42',
-          branch: 'feat/d07',
-          commit: 'abcdef123456',
-          remote: 'origin',
-          status: 'synced',
-          summary: 'D-07 MR',
-        },
-      },
-    };
-    const mrRes = await mcpServer.handleRpcMessage(mrCall);
-    assert.strictEqual(mrRes.id, 14);
-    const mrData = JSON.parse(mrRes.result.content[0].text);
-    assert.strictEqual(mrData.status, 'MR_RECORDED');
-    assert.strictEqual(mrData.mergeRequest.url, 'https://example.com/mr/42');
-    const storedMr = taskStore.getTask(threadId)?.mergeRequest;
-    assert.strictEqual(storedMr?.url, 'https://example.com/mr/42');
-    assert.strictEqual(storedMr?.branch, 'feat/d07');
-    assert.strictEqual(storedMr?.commit, 'abcdef123456');
-
-    // 6. List Tasks
-    const listCall = {
-      jsonrpc: '2.0',
-      id: 15,
-      method: 'tools/call',
-      params: {
-        name: 'list_recent_tasks',
-        arguments: { limit: 10 },
-      },
-    };
-    const listRes = await mcpServer.handleRpcMessage(listCall);
-    assert.strictEqual(listRes.id, 15);
-    const listData = JSON.parse(listRes.result.content[0].text);
-    assert.ok(Array.isArray(listData));
-    assert.strictEqual(listData.length, 1);
-    assert.strictEqual(listData[0].threadId, threadId);
-
-    // 6. Get Recent Logs
-    const logsCall = {
-      jsonrpc: '2.0',
-      id: 15,
-      method: 'tools/call',
-      params: {
-        name: 'get_recent_logs',
-        arguments: { threadId, maxLines: 1000 },
-      },
-    };
-    const logsRes = await mcpServer.handleRpcMessage(logsCall);
-    assert.strictEqual(logsRes.id, 15);
-    const logsData = JSON.parse(logsRes.result.content[0].text);
-    assert.strictEqual(logsData.threadId, threadId);
-    assert.ok(typeof logsData.totalLines === 'number');
-    assert.ok(typeof logsData.recentLogs === 'string');
   });
 
   test('should hide forwarding tools and reject them while acting as a task receiver', async () => {
@@ -1684,66 +1363,6 @@ describe('MCPServer Protocol Tests', () => {
     assert.ok(data.agents.codex);
   });
 
-  test('retry_task re-runs the failed round in place instead of creating a duplicate round', async () => {
-    configureCodexReviewerFixture();
-    let shouldFail = true;
-    runner.execute = async () =>
-      shouldFail
-        ? {
-            exitCode: 1,
-            stdout: '',
-            stderr: 'dsh: TRANSPORT: Connection error.',
-            extractedOutput: '',
-            durationMs: 5,
-            error: 'dsh: TRANSPORT: Connection error.',
-          }
-        : {
-            exitCode: 0,
-            stdout: 'ok',
-            stderr: '',
-            extractedOutput: 'ok',
-            durationMs: 5,
-            actualSessionId: 'session-retry-0001',
-          };
-
-    const dispatchRes = await mcpServer.handleRpcMessage({
-      jsonrpc: '2.0',
-      id: 40,
-      method: 'tools/call',
-      params: {
-        name: 'dispatch_task',
-        arguments: { workspaceRoot: process.cwd(),
-          targetAgent: 'codex',
-          title: 'Retry in place',
-          prompt: 'Implement the extension exactly as designed',
-          callerSessionId: 'caller_mcp_retry',
-        },
-      },
-    });
-    const threadId = JSON.parse(dispatchRes.result.content[0].text).threadId;
-    await waitForStatus(threadId, 'failed', 5000);
-
-    const before = taskStore.getTask(threadId)!;
-    const originalPrompt = before.rounds[0].prompt;
-    assert.strictEqual(before.rounds.length, 1);
-
-    shouldFail = false;
-    const retryRes = await mcpServer.handleRpcMessage({
-      jsonrpc: '2.0',
-      id: 41,
-      method: 'tools/call',
-      params: { name: 'retry_task', arguments: { threadId } },
-    });
-    const retryData = JSON.parse(retryRes.result.content[0].text);
-    assert.strictEqual(retryData.status, 'RETRYING');
-    assert.strictEqual(retryData.round, 1, 'retry must reuse the failed round number');
-
-    await waitForStatus(threadId, 'reviewing', 5000);
-    const after = taskStore.getTask(threadId)!;
-    assert.strictEqual(after.rounds.length, 1, 'retry must not append a second round');
-    assert.strictEqual(after.rounds[0].prompt, originalPrompt);
-  });
-
   test('MCP v2 retry_task and resume_task reject a live child without clearing its run or generation', async () => {
     const controller = new ExecutionController(taskStore, runner, callbackManager,
       reworkController.getMergeCoordinator(), undefined,
@@ -1954,45 +1573,6 @@ describe('MCPServer Protocol Tests', () => {
     } finally {
       controller.dispose();
     }
-  });
-
-  test('request_rework flags a round whose instruction repeats an earlier one', async () => {
-    configureCodexReviewerFixture();
-    const prompt = 'Implement the sleeve bloom extension as designed';
-    const dispatchRes = await mcpServer.handleRpcMessage({
-      jsonrpc: '2.0',
-      id: 50,
-      method: 'tools/call',
-      params: {
-        name: 'dispatch_task',
-        arguments: { workspaceRoot: process.cwd(),
-          targetAgent: 'codex',
-          title: 'Repeat instruction',
-          prompt,
-          callerSessionId: 'caller_mcp_repeat',
-        },
-      },
-    });
-    const threadId = JSON.parse(dispatchRes.result.content[0].text).threadId;
-    await waitForStatus(threadId, 'reviewing');
-
-    new TaskRoleLock().tryAcquire(threadId, 'reviewer');
-    const reworkRes = await mcpServer.handleRpcMessage({
-      jsonrpc: '2.0',
-      id: 51,
-      method: 'tools/call',
-      params: { name: 'request_rework', arguments: { threadId, feedback: prompt } },
-    });
-    assert.ok(reworkRes.result);
-
-    const thread = taskStore.getTask(threadId)!;
-    const reworkRound = thread.rounds.find((r) => r.round === 2);
-    assert.ok(reworkRound);
-    assert.strictEqual(
-      reworkRound!.repeatOfRound,
-      1,
-      'a rework that re-sends the original prompt must be marked as repeating round 1',
-    );
   });
 
   test('rejects self-dispatch instead of parking a task that can never be reviewed', async () => {

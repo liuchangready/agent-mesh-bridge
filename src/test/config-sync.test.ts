@@ -77,8 +77,11 @@ describe('ConfigSyncService - single MCP registration per agent', () => {
   });
 
   test('registers one server for Claude Code and Antigravity too', async () => {
+    const cliConfig = path.join(home, '.gemini', 'config', 'mcp_config.json');
+    fs.mkdirSync(path.dirname(cliConfig), { recursive: true });
+    fs.writeFileSync(cliConfig, '');
     const sync = new ConfigSyncService(path.join(os.tmpdir(), 'bridge-tools', 'agent-bridge-mcp.cjs'), null, home);
-    await sync.syncAll();
+    assert.strictEqual((await sync.syncAll()).success, true);
 
     const claude = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8'));
     assert.deepStrictEqual(Object.keys(claude.mcpServers), ['agent-mesh-bridge']);
@@ -87,6 +90,41 @@ describe('ConfigSyncService - single MCP registration per agent', () => {
       fs.readFileSync(path.join(home, '.gemini', 'antigravity', 'mcp_config.json'), 'utf8'),
     );
     assert.deepStrictEqual(Object.keys(antigravity.mcpServers), ['agent-mesh-bridge']);
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(cliConfig, 'utf8')), antigravity);
+  });
+
+  test('preserves other Antigravity servers and the CLI disabled setting', async () => {
+    const cliConfig = path.join(home, '.gemini', 'config', 'mcp_config.json');
+    const desktopConfig = path.join(home, '.gemini', 'antigravity', 'mcp_config.json');
+    const launcher = path.join(home, 'bridge-tools', 'agent-bridge-mcp.cjs');
+    for (const [file, label] of [[cliConfig, 'cli-other'], [desktopConfig, 'desktop-other']]) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify({
+        mcpServers: { [label]: { command: 'other' }, 'agent-mesh-bridge': { command: 'stale', disabled: true } },
+      }));
+    }
+    const sync = new ConfigSyncService(launcher, null, home);
+    assert.strictEqual((await sync.syncAll()).success, true);
+    const cli = JSON.parse(fs.readFileSync(cliConfig, 'utf8')).mcpServers;
+    const desktop = JSON.parse(fs.readFileSync(desktopConfig, 'utf8')).mcpServers;
+    assert.deepStrictEqual(cli['cli-other'], { command: 'other' });
+    assert.deepStrictEqual(desktop['desktop-other'], { command: 'other' });
+    assert.deepStrictEqual(cli['agent-mesh-bridge'], desktop['agent-mesh-bridge']);
+    assert.deepStrictEqual(cli['agent-mesh-bridge'].args, [launcher, '--caller', 'antigravity']);
+    assert.strictEqual(cli['agent-mesh-bridge'].disabled, true);
+  });
+
+  test('preserves malformed Antigravity config and still syncs the other location', async () => {
+    const cliConfig = path.join(home, '.gemini', 'config', 'mcp_config.json');
+    fs.mkdirSync(path.dirname(cliConfig), { recursive: true });
+    fs.writeFileSync(cliConfig, '{invalid');
+    const sync = new ConfigSyncService(undefined, null, home);
+    const result = await sync.syncAll();
+    assert.strictEqual(result.success, false);
+    assert.ok(result.errors.some(error => error.includes(cliConfig) && error.includes('Invalid MCP configuration JSON')));
+    assert.strictEqual(fs.readFileSync(cliConfig, 'utf8'), '{invalid');
+    const desktop = JSON.parse(fs.readFileSync(path.join(home, '.gemini', 'antigravity', 'mcp_config.json'), 'utf8'));
+    assert.ok(desktop.mcpServers['agent-mesh-bridge']);
   });
 
   test('hands the provider key to every bridge MCP process explicitly', async () => {
@@ -126,6 +164,8 @@ describe('ConfigSyncService - single MCP registration per agent', () => {
       antigravity.mcpServers['agent-mesh-bridge'].env.COMMANDCODE_API_KEY,
       'secret-key-value',
     );
+    const cli = JSON.parse(fs.readFileSync(path.join(home, '.gemini', 'config', 'mcp_config.json'), 'utf8'));
+    assert.deepStrictEqual(cli.mcpServers['agent-mesh-bridge'], antigravity.mcpServers['agent-mesh-bridge']);
 
     const dshPatch = fs.readFileSync(path.join(dshPatchDir, 'cordis.patch.yml'), 'utf8');
     assert.ok(dshPatch.includes('COMMANDCODE_API_KEY'), 'dsh MCP registration carries the key');

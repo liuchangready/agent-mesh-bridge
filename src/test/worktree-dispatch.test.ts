@@ -69,7 +69,6 @@ test('dispatch creates a separate task branch from committed target state and ig
   runner.execute = async () => ({ exitCode: 0, stdout: 'done', stderr: '', extractedOutput: 'done', durationMs: 1 });
   const callback = new CallbackManager(detector, storage);
   callback.notifyCaller = async () => true;
-  callback.notifyCallerOfFailure = async () => false;
   const registry = new TaskExecutionRegistry(storage);
   const dispatcher = new AsyncDispatcher(store, new ActiveAgentResolver(detector), runner, callback, detector, registry);
   t.after(() => { (dispatcher as unknown as { queueDrainer?: { dispose(): void } }).queueDrainer?.dispose(); registry.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
@@ -174,8 +173,7 @@ test('new dispatch creates its worktree while final integration validation holds
   const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
   const store = new TaskStore(storage); const detector = new AgentDetector(); const runner = new AutonomousRunner(detector);
   runner.execute = async () => ({ exitCode: 0, stdout: 'done', stderr: '', extractedOutput: 'done', durationMs: 1 });
-  const callback = new CallbackManager(detector, storage); callback.notifyCaller = async () => true; callback.notifyCallerOfFailure = async () => false;
-  const registry = new TaskExecutionRegistry(storage); const dispatcher = new AsyncDispatcher(store, new ActiveAgentResolver(detector), runner, callback, detector, registry);
+  const callback = new CallbackManager(detector, storage); callback.notifyCaller = async () => true; const registry = new TaskExecutionRegistry(storage); const dispatcher = new AsyncDispatcher(store, new ActiveAgentResolver(detector), runner, callback, detector, registry);
   const lock = new MeshFileLock(meshMergeLockPath(storage)); const release = await lock.acquire(); assert.ok(release);
   t.after(() => { release(); (dispatcher as unknown as { queueDrainer?: { dispose(): void } }).queueDrainer?.dispose(); registry.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
   const result = await Promise.race([
@@ -217,6 +215,9 @@ test('local merge state, not MR metadata, controls preservation and deletion', a
       integration: { phase: 'ready', updatedAt: new Date().toISOString() }, mergePending: true,
     } });
     thread.workspace.executionPath = thread.worktree!.path;
+    fs.mkdirSync(thread.worktree!.path);
+    const output = path.join(thread.worktree!.path, 'unmerged.txt');
+    fs.writeFileSync(output, 'retained output');
     store.upsertTask(thread);
     assert.deepStrictEqual(pendingMerges(store.getAllTasks()).map((task) => task.threadId), ['thread_merge_gate']);
     store.recordMergeRequest('thread_merge_gate', {
@@ -224,8 +225,10 @@ test('local merge state, not MR metadata, controls preservation and deletion', a
       status: 'synced', summary: 'remote record only', updatedAt: new Date().toISOString(), by: 'codex',
     });
     assert.strictEqual(pendingMerges(store.getAllTasks()).length, 1, 'an MR URL cannot claim that local integration succeeded');
-  await assert.rejects(() => control.deleteTask('thread_merge_gate', 'cleanup', 'test', false), /not been integrated locally/i);
-  await control.deleteTask('thread_merge_gate', 'discard explicitly', 'test', true);
+    const deleted = await control.deleteTask('thread_merge_gate', 'cleanup', 'test', false);
+    assert.strictEqual(deleted.status, 'DELETED');
+    assert.match(deleted.message, /retained/i);
+    assert.strictEqual(fs.readFileSync(output, 'utf8'), 'retained output');
     assert.strictEqual(store.getTask('thread_merge_gate'), undefined);
   } finally {
     store.dispose();

@@ -57,7 +57,6 @@ describe('dedicated reviewer bootstrap identity', () => {
     });
     const callbackManager = new CallbackManager(detector);
     callbackManager.notifyCaller = async () => true;
-    callbackManager.notifyCallerOfFailure = async () => false;
     const gate = new TaskExecutionRegistry(tempDir);
     const dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector, gate);
     const reworkController = new ReworkController(taskStore, runner, callbackManager, detector, gate);

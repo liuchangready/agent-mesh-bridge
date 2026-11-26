@@ -258,7 +258,8 @@ test('a failed reflog publication preserves all stash entries and reports the cl
   assert.equal(fs.readFileSync(path.join(repository, 'mine.txt'), 'utf8'), 'mine');
 });
 
-for (const failRollback of [false, true]) test(`ref publication failure preserves recoverable stash metadata, rollback failure=${failRollback}`, async (t) => {
+for (const [failRollback, deleteBeforeRecovery] of [[false, false], [true, false], [true, true]]) test(
+  `ref publication failure preserves recoverable stash metadata, rollback failure=${failRollback}, delete=${deleteBeforeRecovery}`, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-ref-fail-'));
   const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); const { old } = initMultiStashRepo(repository);
   const id = `thread_stash_ref_fail_${failRollback ? 'rollback' : 'ref'}`; const target = resolveGitRepository(repository, storage); const worktree = createTaskWorktree(target, id, storage);
@@ -271,6 +272,12 @@ for (const failRollback of [false, true]) test(`ref publication failure preserve
   const store = new TaskStore(storage); store.upsertTask(thread(id, worktree));
   t.after(() => { store.dispose(); removeTaskWorktree(worktree); try { fs.rmSync(root, { recursive: true, force: true }); } catch {} });
   const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));
+  let targetRefUpdates = 0;
+  const loggedGit = (coordinator as any).loggedGit.bind(coordinator);
+  (coordinator as any).loggedGit = async (threadId: string, cwd: string, args: string[]) => {
+    if (args[0] === 'update-ref' && args[1] === target.targetRef) targetRefUpdates++;
+    return loggedGit(threadId, cwd, args);
+  };
   const publish = (coordinator as any).writeLockedGitFile.bind(coordinator); let logWrites = 0; let originalLog: Buffer | undefined;
   (coordinator as any).writeLockedGitFile = (file: string, data: Buffer) => {
     if (file.includes(`${path.sep}logs${path.sep}`)) {
@@ -282,6 +289,7 @@ for (const failRollback of [false, true]) test(`ref publication failure preserve
   };
   const first = await coordinator.mergeApproved(id);
   assert.equal(first.status, 'merged');
+  assert.equal(targetRefUpdates, 1, 'the approved commit is published once before stash metadata recovery');
   const landed = git(repository, 'rev-parse', target.targetRef);
   assert.notEqual(landed, target.baseCommit);
   assert.equal(store.getTask(id)!.worktree!.integration!.mergedCommit, landed);
@@ -300,8 +308,17 @@ for (const failRollback of [false, true]) test(`ref publication failure preserve
     assert.ok(tx.stashCleanupLock);
     const racing = spawnSync(gitExe, ['stash', 'store', '-m', 'racing', later], { cwd: repository, encoding: 'utf8', windowsHide: true });
     assert.notEqual(racing.status, 0);
-    const control = new TaskControlService(store, undefined, undefined, storage, undefined, new MeshFileLock(path.join(root, 'merge.lock')));
-    await assert.rejects(() => control.deleteTask(id, 'delete', 'test', true), /stash metadata recovery/i);
+    if (deleteBeforeRecovery) {
+      const control = new TaskControlService(store, undefined, undefined, storage, undefined, new MeshFileLock(path.join(root, 'merge.lock')));
+      const deleted = await control.deleteTask(id, 'delete', 'test', true);
+      assert.equal(deleted.status, 'DELETED');
+      assert.match(deleted.message, /stash recovery metadata remains pending/i);
+      assert.equal(store.getTask(id), undefined);
+      assert.ok(fs.existsSync(worktree.path));
+      assert.ok(fs.existsSync(path.join(repository, '.git', 'refs', 'stash.lock')));
+      assert.deepEqual(JSON.parse(fs.readFileSync(txFile, 'utf8')), tx);
+      return;
+    }
   } else {
     assert.equal(tx.phase, 'stash_cleanup_rolled_back');
     assert.equal(fs.existsSync(path.join(repository, '.git', 'refs', 'stash.lock')), false);
@@ -328,6 +345,7 @@ for (const failRollback of [false, true]) test(`ref publication failure preserve
   } else {
     const recovered = await coordinator.mergeApproved(id);
     assert.equal(recovered.status, 'merged', recovered.message);
+    assert.equal(targetRefUpdates, 1, 'stash recovery reuses the landed commit without a second target ref update');
   }
   assert.equal(git(repository, 'rev-parse', target.targetRef), landed);
   assert.deepEqual(git(repository, 'stash', 'list', '--format=%H').split(/\r?\n/), failRollback ? [old] : [later, old]);

@@ -648,7 +648,7 @@ test('pause and delete terminate a running Git process tree and record cancelled
   }
 });
 
-test('a merge waiting for a reviewer cannot resume after a rapid pause and resume', async (t) => {
+test('historical merge waiters cannot resume through a retired controller path', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-pause-merge-waiter-'));
   const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
   const target = resolveGitRepository(repository, storage); const source = createTaskWorktree(target, 'thread_waiter_pause', storage);
@@ -662,9 +662,9 @@ test('a merge waiting for a reviewer cannot resume after a rapid pause and resum
   store.upsertTask(thread('thread_waiter_pause', source));
   const oldMerge = coordinator.mergeApproved('thread_waiter_pause');
   control.pauseTask('thread_waiter_pause', 'pause', 'test'); roles.release(role);
-  await controller.resumePausedTask('thread_waiter_pause');
+  await assert.rejects(controller.resumePausedTask('thread_waiter_pause'), /HISTORICAL_TASK_READ_ONLY/);
   assert.equal((await oldMerge).status, 'stale');
   assert.equal(git(repository, 'rev-parse', target.targetRef), target.baseCommit);
-  assert.equal(store.getTask('thread_waiter_pause')!.status, 'queued');
+  assert.equal(store.getTask('thread_waiter_pause')!.status, 'paused');
   assert.equal(store.getTask('thread_waiter_pause')!.mergeHistory, undefined);
 });

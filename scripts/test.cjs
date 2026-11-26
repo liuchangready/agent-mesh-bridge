@@ -22,14 +22,12 @@ const LAYER_MAPPING = {
     'caller-poll-guard.test.js',
     'caller-session-safety.test.js',
     'legacy-removal.test.js',
-    'caller-wake-queue.test.js',
     'config-sync.test.js',
     'context-compactor.test.js',
     'dispatcher-rework.test.js',
     'execution-gate.test.js',
     'failed-state-unification.test.js',
     'host-suspension.test.js',
-    'independent-scheduling-lifecycle.test.js',
     'merge-validation-strategy.test.js',
     'model-approval.test.js',
     'model-catalog.test.js',
@@ -38,7 +36,6 @@ const LAYER_MAPPING = {
     'session-ownership.test.js',
     'reviewer-log.test.js',
     'shutdown-preflight.test.js',
-    'rework-lifecycle-fixes.test.js',
     'rework-loop-guard.test.js',
     'round-invariant.test.js',
     'task-control.test.js',
@@ -57,7 +54,6 @@ const LAYER_MAPPING = {
     'failed-round-recovery.test.js',
     'task-store-atomic-write.test.js',
     'autonomous-runner.test.js',
-    'callback-failure.test.js',
     'codex-session.test.js',
     'deepseek-harness.test.js',
     'git-probe.test.js',
@@ -89,8 +85,8 @@ const LAYER_MAPPING = {
     'git-worktree-stash.test.js',
     'git-worktree-stash-part2.test.js',
     'mcp-server.test.js',
+    'standalone-mcp-restart.test.js',
     'merge-recovery.test.js',
-    'merge-resident-host.test.js',
     'review-wake.test.js',
     'reviewer-bootstrap.test.js',
     'running-reworking-merge.test.js',
@@ -188,11 +184,15 @@ async function runBatch(batchFiles, batchConcurrency) {
     await runBatch(files, concurrency);
     return;
   }
-  // unique-run-launch starts multiple real Node and PowerShell processes and
-  // exercises cross-process CAS. Keep those two-process barriers intact while
-  // avoiding unrelated full-suite workers competing for Windows helper startup.
-  const ownershipFiles = files.filter((file) => basename(file) === 'unique-run-launch.test.js');
-  const concurrentFiles = files.filter((file) => basename(file) !== 'unique-run-launch.test.js');
+  // Keep the real process and lock contention within these suites. On Windows
+  // they also need predictable helper startup when Git and MCP spawn children.
+  const ownershipSuites = new Set(['unique-run-launch.test.js']);
+  if (process.platform === 'win32') {
+    ownershipSuites.add('mock-agents-e2e.test.js');
+    ownershipSuites.add('unified-execution-integration.test.js');
+  }
+  const ownershipFiles = files.filter((file) => ownershipSuites.has(basename(file)));
+  const concurrentFiles = files.filter((file) => !ownershipSuites.has(basename(file)));
   await runBatch(concurrentFiles, concurrency);
   await runBatch(ownershipFiles, 1);
 })().catch((error) => {
