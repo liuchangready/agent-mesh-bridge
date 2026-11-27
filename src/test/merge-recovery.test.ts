@@ -8,6 +8,7 @@ import { DelegationThread } from '../bridge/types';
 import { failureFingerprint, noteMergeFailure, resetMergeBudget } from '../bridge/merge-recovery';
 import { TaskStore } from '../bridge/task-store';
 import { ReworkController } from '../bridge/rework-controller';
+import { ExecutionController } from '../bridge/execution-controller';
 import { AgentDetector } from '../bridge/agent-detector';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
@@ -53,68 +54,80 @@ test('failure fingerprints ignore temporary paths and object ids but retain the 
   assert.notEqual(first, failureFingerprint('conflict', 'CONFLICT', `failed /tmp/two/file at ${'b'.repeat(40)}`, ['other.txt']));
 });
 
-test('merge decisions append immutable question and answer records and wake the same session', async (t) => {
+function setupDecisionFixture(t: import('node:test').TestContext) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-merge-decision-'));
   const store = new TaskStore(root); const detector = new AgentDetector(); const callback = new CallbackManager(detector, root);
-  const sessions: string[] = []; callback.notifyCaller = async (thread) => { sessions.push(thread.callerSessionId!); return true; };
-  const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector, undefined, undefined, false);
+  const runner = new AutonomousRunner(detector);
+  const rework = new ReworkController(store, callback);
+  const controller = new ExecutionController(store, runner, callback, rework.getMergeCoordinator(), undefined, { ownsRuns: false });
   t.after(() => { controller.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
-  store.upsertTask(task(root));
-  const stale = structuredClone(store.getTask('thread_merge_decision')!);
-  const first = await controller.requestMergeDecision('thread_merge_decision', 'Which fix?', 'context', 'choose A', ['a.txt']);
-  assert.equal(store.getTask(first.threadId)!.status, 'wait_decision');
-  stale.updatedAt = new Date(Date.now() + 60_000).toISOString(); store.upsertTask(stale);
-  assert.equal(store.getTask(first.threadId)!.status, 'wait_decision');
-  const savedQuestion = JSON.stringify(store.getTask(first.threadId)!.mergeHistory![0]);
-  controller.submitMergeDecision(first.threadId, 'Use A\nand retain B');
-  const second = await controller.requestMergeDecision(first.threadId, 'Which test?', 'more context', 'run integration');
-  controller.submitMergeDecision(first.threadId, 'Run it');
-  await new Promise((resolve) => setTimeout(resolve, 25));
-  const stored = store.getTask(first.threadId)!;
-  assert.equal(stored.status, 'reviewing'); assert.equal(stored.callerSessionId, 'reviewer-session');
-  assert.equal(JSON.stringify(stored.mergeHistory![0]), savedQuestion);
-  assert.equal(stored.mergeHistory!.length, 4); assert.notEqual(first.decisionId, second.decisionId);
-  assert.deepEqual(sessions, ['reviewer-session', 'reviewer-session']);
-  assert.equal(stored.currentRound, 1); assert.equal(stored.rounds.length, 1);
+  const item = task(root);
+  item.execution = { version: 2, revision: 1, operationId: 'review-decision', phase: 'review', round: 1,
+    generation: 1, attempt: 0, autoRetriesUsed: 0, budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 } };
+  return { store, rework, item };
+}
+
+test('merge decisions retain the question and queue merge for the same task', async (t) => {
+  const { store, rework, item } = setupDecisionFixture(t);
+  store.upsertTask(item);
+  const stale = structuredClone(store.getTask(item.threadId)!);
+  const first = await rework.requestMergeDecision(item.threadId, 'Which fix?', 'context', 'choose A', ['a.txt']);
+  assert.equal(store.getTask(item.threadId)!.status, 'wait_decision');
+  stale.updatedAt = new Date(Date.now() + 60_000).toISOString();
+  store.upsertTask(stale);
+  assert.equal(store.getTask(item.threadId)!.status, 'wait_decision');
+  await rework.submitMergeDecision(item.threadId, 'Use A\nand retain B');
+  const saved = store.reloadTask(item.threadId)!;
+  assert.equal(saved.status, 'queued');
+  assert.equal(saved.execution?.next?.phase, 'merge');
+  assert.equal(saved.reviewerSessionId, item.reviewerSessionId);
+  assert.equal(saved.decisions?.length, 1);
+  assert.equal(saved.decisions[0].id, first.decisionId);
+  assert.equal(saved.decisions[0].question, 'Which fix?');
+  assert.equal(saved.decisions[0].answer, 'Use A\nand retain B');
+  assert.deepEqual(saved.decisions[0].conflictFiles, ['a.txt']);
+  assert.equal(saved.rounds.length, 1);
 });
 
-test('a review decision resumes the same reviewer without creating a development round', async (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-review-decision-'));
-  const store = new TaskStore(root); const detector = new AgentDetector(); const callback = new CallbackManager(detector, root);
-  const sessions: string[] = []; callback.notifyCaller = async (thread) => { sessions.push(thread.callerSessionId!); return true; };
-  const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector, undefined, undefined, false);
-  t.after(() => { controller.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
-  const item = task(root); item.worktree = undefined; store.upsertTask(item);
-  controller.requestMergeDecision(item.threadId, 'Which approach?', 'review context', 'A');
-  assert.equal(store.getTask(item.threadId)?.mergeControl?.decisionStage, 'review');
-  controller.submitMergeDecision(item.threadId, 'A');
-  await new Promise((resolve) => setTimeout(resolve, 25));
-  assert.equal(store.getTask(item.threadId)?.status, 'reviewing');
-  assert.equal(store.getTask(item.threadId)?.rounds.length, 1);
-  assert.deepEqual(sessions, ['reviewer-session']);
+test('a review decision queues the same reviewer without creating a development round', async (t) => {
+  const { store, rework, item } = setupDecisionFixture(t);
+  item.worktree = undefined;
+  store.upsertTask(item);
+  await rework.requestMergeDecision(item.threadId, 'Which approach?', 'review context', 'A');
+  await rework.submitMergeDecision(item.threadId, 'A');
+  const saved = store.reloadTask(item.threadId)!;
+  assert.equal(saved.status, 'queued');
+  assert.equal(saved.execution?.next?.phase, 'review');
+  assert.equal(saved.reviewerSessionId, item.reviewerSessionId);
+  assert.equal(saved.rounds.length, 1);
 });
 
-test('retry_merge preserves the task identities and history while starting a new budget', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-merge-retry-'));
-  const store = new TaskStore(root); const detector = new AgentDetector(); const callback = new CallbackManager(detector, root);
-  callback.notifyCaller = async () => true;
-  const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector, undefined, undefined, false);
-  const thread = task(root); thread.status = 'failed'; thread.failure = { stage: 'merge', reason: 'conflict', at: thread.updatedAt }; thread.failureRevision = 1;
-  thread.mergeControl = { revision: 7, retryGeneration: 2, consecutiveRetries: 6, failureFingerprint: 'old' };
-  thread.mergeHistory = [{ id: 'old', number: 1, at: thread.updatedAt, phase: 'conflict', result: 'failed' }];
-  store.upsertTask(thread);
-  const result = controller.retryMerge(thread.threadId); const saved = store.getTask(thread.threadId)!;
-  assert.equal(result.retryGeneration, 3); assert.equal(saved.status, 'reviewing');
-  assert.equal(saved.receiverSessionId, thread.receiverSessionId); assert.equal(saved.callerSessionId, thread.callerSessionId);
-  assert.equal(saved.worktree!.approvedCommit, 'candidate'); assert.equal(saved.mergeHistory!.length, 2);
-  controller.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true });
+test('retry_merge preserves the task identities and history while starting a new generation', async (t) => {
+  const { store, rework, item } = setupDecisionFixture(t);
+  item.status = 'failed';
+  item.failure = { stage: 'merge', reason: 'conflict', at: item.updatedAt };
+  item.failureRevision = 1;
+  item.execution!.phase = 'merge';
+  item.execution!.generation = 2;
+  item.execution!.budget.spentActiveMs = 150;
+  item.mergeHistory = [{ id: 'old', number: 1, at: item.updatedAt, phase: 'conflict', result: 'failed' }];
+  store.upsertTask(item);
+  const result = await rework.retryMerge(item.threadId);
+  const saved = store.reloadTask(item.threadId)!;
+  assert.equal(result.retryGeneration, 3);
+  assert.equal(saved.status, 'queued');
+  assert.equal(saved.execution?.budget.spentActiveMs, 0);
+  assert.equal(saved.receiverSessionId, item.receiverSessionId);
+  assert.equal(saved.reviewerSessionId, item.reviewerSessionId);
+  assert.equal(saved.worktree!.approvedCommit, 'candidate');
+  assert.deepEqual(saved.mergeHistory, item.mergeHistory);
 });
 
 test('pending stash metadata recovery survives stale writes and pause/resume without waking a reviewer', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-stash-recovery-retry-'));
   const store = new TaskStore(root); const detector = new AgentDetector(); const callback = new CallbackManager(detector, root);
-  let wakes = 0; callback.notifyCaller = async () => { wakes++; return true; };
-  const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector);
+  let wakes = 0; callback.notifyReviewer = async () => { wakes++; return true; };
+  const controller = new ReworkController(store, callback);
   const thread = task(root);
   thread.execution = { version: 2, revision: 1, operationId: 'stash-recovery-op', phase: 'review', round: 1,
     generation: 1, attempt: 0, autoRetriesUsed: 0,
@@ -126,7 +139,7 @@ test('pending stash metadata recovery survives stale writes and pause/resume wit
   assert.equal(store.getTask(thread.threadId)!.worktree!.integration!.stashRecoveryLockHeld, true);
   assert.equal(store.getTask(thread.threadId)!.worktree!.approvedCommit, 'candidate');
   await assert.rejects(() => controller.requestRework({ threadId: thread.threadId, feedback: 'change it' }), /stash metadata recovery/i);
-  assert.throws(() => controller.approveTask({ threadId: thread.threadId }), /stash metadata recovery/i);
+  await assert.rejects(() => controller.approveTask({ threadId: thread.threadId }), /stash metadata recovery/i);
   await assert.rejects(() => controller.requestMergeDecision(thread.threadId, 'Choose?', '', ''), /stash metadata recovery/i);
   const control = new TaskControlService(store, undefined, undefined, root);
   assert.equal((await control.pauseTask(thread.threadId, 'pause', 'test')).status, 'PAUSED');
@@ -153,7 +166,7 @@ test('actual merge reviewer failures consume the budget, but waiting for a wake 
   }
   const pending = store.getTask(initial.threadId)!;
   pending.reviewWake!.autoRetryAt = new Date(1).toISOString(); store.upsertTask(pending);
-  callback.notifyCaller = async () => false;
+  callback.notifyReviewer = async () => false;
   const scheduler = new ReviewWakeScheduler(store, callback, { now: () => 2_000, isReviewerActive: () => false });
   assert.equal(await scheduler.runDue(), 0);
   assert.equal(store.getTask(initial.threadId)!.mergeControl!.consecutiveRetries, 5);
@@ -170,7 +183,7 @@ test('quota deferral does not consume a merge retry', async (t) => {
   const thread = task(root); thread.mergeControl = { revision: 1, retryGeneration: 0, consecutiveRetries: 2, failureFingerprint: 'fingerprint' };
   thread.reviewWake = { round: 1, attempts: 3, lastAttemptAt: new Date(1).toISOString(), lastError: 'quota', autoRetryAt: new Date(2).toISOString() };
   store.upsertTask(thread); let launches = 0;
-  callback.notifyCaller = async () => { launches++; return true; };
+  callback.notifyReviewer = async () => { launches++; return true; };
   (callback as any).getRateLimitTracker = () => ({ getRateLimitInfo: () => ({ isExhausted: true, resetsAt: new Date(600_000).toISOString() }) });
   const scheduler = new ReviewWakeScheduler(store, callback, { now: () => 10_000, isReviewerActive: () => false });
   t.after(() => { scheduler.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
@@ -230,7 +243,7 @@ test('restart schedules unlaunched merge reviews without consuming the merge ret
     }
     const store = new TaskStore(root); const callback = new CallbackManager(new AgentDetector(), root);
     let now = 3_600_000; let active = true; let calls = 0; const sessions: string[] = [];
-    callback.notifyCaller = async (item) => { calls++; sessions.push(item.reviewerSessionId!); if (calls === 1) return false; active = true; return true; };
+    callback.notifyReviewer = async (item) => { calls++; sessions.push(item.reviewerSessionId!); if (calls === 1) return false; active = true; return true; };
     const scheduler = new ReviewWakeScheduler(store, callback, { now: () => now, stallTimeoutMs: 10_000, isReviewerActive: () => active });
     try {
       assert.equal(await scheduler.runWatchdog(), 0, `${scenario}: an active reviewer must not be duplicated`);
@@ -255,16 +268,16 @@ test('restart schedules unlaunched merge reviews without consuming the merge ret
   }
 });
 
-test('a historical answered merge decision cannot restart a legacy reviewer', async () => {
+test('a historical merge decision cannot start a reviewer', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-decision-restart-'));
   const store = new TaskStore(root); const detector = new AgentDetector(); const callback = new CallbackManager(detector, root);
-  const controller = new ReworkController(store, new AutonomousRunner(detector), callback, detector);
+  const controller = new ReworkController(store, callback);
   const thread = task(root); thread.reviewFlow = 'dedicated'; thread.reviewerSessionId = 'reviewer-session'; thread.reviewerSessionCaptured = true;
   thread.execution = undefined;
   thread.status = 'wait_decision';
   thread.mergeControl = { revision: 1, retryGeneration: 0, consecutiveRetries: 0, pendingDecisionId: 'old-decision' };
   store.upsertTask(thread);
-  assert.throws(() => controller.submitMergeDecision(thread.threadId, 'Choose A'), /HISTORICAL_TASK_READ_ONLY/i);
+  await assert.rejects(() => controller.submitMergeDecision(thread.threadId, 'Choose A'), /HISTORICAL_TASK_READ_ONLY/i);
   assert.equal(store.getTask(thread.threadId)?.status, 'wait_decision');
   assert.equal(store.getTask(thread.threadId)?.mergeControl?.pendingDecisionId, 'old-decision');
   controller.dispose(); store.dispose();
@@ -276,7 +289,7 @@ test('a wake accepted before a second crash is recovered without charging an uns
   let store = new TaskStore(root); const thread = task(root); const old = new Date(1).toISOString();
   thread.createdAt = old; thread.updatedAt = old; thread.rounds[0].timestamp = old; thread.worktree!.integration!.updatedAt = old;
   store.upsertTask(thread); const callback = new CallbackManager(new AgentDetector(), root); let wakes = 0;
-  callback.notifyCaller = async () => { wakes++; return true; };
+  callback.notifyReviewer = async () => { wakes++; return true; };
   let now = Date.now();
   let scheduler = new ReviewWakeScheduler(store, callback, { now: () => now, stallTimeoutMs: 10_000, isReviewerActive: () => false });
   try {

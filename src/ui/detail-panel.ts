@@ -92,7 +92,7 @@ export class TaskDetailPanel {
             await this.handleRetryMerge();
             break;
           case 'submitMergeDecision':
-            try { this.reworkController.submitMergeDecision(this.currentThreadId, String(message.answer || '')); this.update(); }
+            try { await this.reworkController.submitMergeDecision(this.currentThreadId, String(message.answer || '')); this.update(); }
             catch (error: any) { vscode.window.showErrorMessage(`Decision failed: ${error.message}`); }
             break;
           case 'pauseTask':
@@ -197,7 +197,7 @@ export class TaskDetailPanel {
   private async handleRetryMerge() {
     try {
       if ((() => { const task = this.taskStore.getTask(this.currentThreadId); return task?.status === 'failed' && task.failure?.stage === 'merge'; })()) {
-        this.reworkController.retryMerge(this.currentThreadId);
+        await this.reworkController.retryMerge(this.currentThreadId);
         this.update();
         return;
       }

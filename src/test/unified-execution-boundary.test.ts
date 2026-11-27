@@ -45,8 +45,7 @@ describe('Unified Execution Boundary Tests', () => {
       thread.execution = { ...thread.execution!, version: 2, revision: 1, operationId: 'ui-merge-op', run: undefined };
       fixture.store.upsertTask(thread);
 
-      const rework = new ReworkController(fixture.store, fixture.runner as any, fixture.callbackManager,
-        fixture.detector, fixture.registry, false, true, true);
+      const rework = new ReworkController(fixture.store, fixture.callbackManager);
       let legacyGitCalls = 0;
       (rework.getMergeCoordinator() as any).mergeApproved = async () => {
         legacyGitCalls++;
@@ -503,13 +502,13 @@ describe('Unified Execution Boundary Tests', () => {
       }).ok);
       fixture.store.upsertTask(task);
       let startedRun: string | undefined;
-      fixture.callbackManager.launchCaller = (async (_task: unknown, _round: unknown, _onChildPid: unknown, identity?: { runId: string }) => {
+      fixture.callbackManager.launchReviewer = (async (_task: unknown, _round: unknown, _onChildPid: unknown, identity?: { runId: string }) => {
         startedRun = identity?.runId;
         assert.equal(startedRun, fixture.store.reloadTask(task.threadId)?.execution?.run?.id);
         assert.ok(startedRun);
         return { success: false, error: 'controlled reviewer returned without verdict' };
-      }) as typeof fixture.callbackManager.launchCaller;
-      assert.equal(await fixture.callbackManager.notifyCaller(task, task.rounds[0]), true);
+      }) as typeof fixture.callbackManager.launchReviewer;
+      assert.equal(await fixture.callbackManager.notifyReviewer(task, task.rounds[0]), true);
       await fixture.controller.waitForActiveExecutions(5_000);
       assert.ok(startedRun);
       assert.equal(fixture.roleLock.getOwner(task.threadId), undefined);
@@ -1057,15 +1056,7 @@ describe('Unified Execution Boundary Tests', () => {
 
   test('V2 rework and approval reject stale decisions and retry after a budget checkpoint', async () => {
     const fixture = await setupFixture();
-    const reworkController = new ReworkController(
-      fixture.store,
-      fixture.runner as any,
-      fixture.callbackManager,
-      fixture.detector,
-      fixture.registry,
-      false,
-      true,
-    );
+    const reworkController = new ReworkController(fixture.store, fixture.callbackManager);
     const transition = fixture.store.transitionExecution.bind(fixture.store);
     const owner = { pid: process.pid, birthId: getProcessBirthId(process.pid) };
     const reviewingTask = (id: string, status: DelegationThread['status'] = 'reviewing') => {
@@ -1146,10 +1137,6 @@ describe('Unified Execution Boundary Tests', () => {
         round: 2,
         sourceRunId: 'checkpoint-reviewer-run',
       });
-      await assert.rejects(
-        transition(task.threadId, 'current-legacy-review', () => assert.fail('must reject v2 before mutation')),
-        /requires eligible legacy execution/,
-      );
     } finally {
       fixture.store.transitionExecution = transition;
       reworkController.dispose();

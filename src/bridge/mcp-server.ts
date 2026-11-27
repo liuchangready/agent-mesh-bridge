@@ -14,7 +14,6 @@ import { TaskControlService } from './task-control';
 import { ExecutionController } from './execution-controller';
 import { requireV2ExecutionEligibility } from './execution-gate';
 import { CallerPollGuard, progressSignature } from './caller-poll-guard';
-import { TaskRoleLock } from './task-role-lock';
 import { TaskExecutionRegistry } from './task-execution-registry';
 import {
   ModelCatalog,
@@ -108,7 +107,6 @@ export class MCPServer {
   private detector: AgentDetector;
   private resolver: ActiveAgentResolver;
   private runner: AutonomousRunner;
-  private readonly requireV2Execution: boolean;
   private readonly v2StartupBlockReason?: string;
   private taskControl: TaskControlService;
   private modelCatalog: ModelCatalog;
@@ -129,7 +127,6 @@ export class MCPServer {
     detector: AgentDetector,
     resolver: ActiveAgentResolver,
     runner: AutonomousRunner,
-    requireV2Execution = false,
     v2StartupBlockReason?: string,
     private readonly submitOnly = false,
   ) {
@@ -139,7 +136,6 @@ export class MCPServer {
     this.detector = detector;
     this.resolver = resolver;
     this.runner = runner;
-    this.requireV2Execution = requireV2Execution;
     this.v2StartupBlockReason = v2StartupBlockReason;
     this.taskControl = new TaskControlService(taskStore, runner);
     this.modelCatalog = new ModelCatalog(detector);
@@ -434,7 +430,7 @@ export class MCPServer {
           'A `QUEUED` result is normal and needs no action: the task starts on its own when the queue frees up. ' +
           'You may also dispatch to your own agent identity: new tasks run through a DEDICATED reviewer ' +
           'conversation, so the task gets its own reviewer instead of resuming this busy session. Same-agent dispatch ' +
-          'requires reviewFlow=dedicated (the bridge default) plus a sender-side reviewer model that differs from the ' +
+          'requires a sender-side reviewer model that differs from the ' +
           'receiver model (`initiatorModels.<agent>` vs `models.<agent>`). ' +
           'This tool is unavailable while this agent is itself executing a delegated task (receivers must not forward work).',
         inputSchema: {
@@ -1185,37 +1181,22 @@ export class MCPServer {
    */
   private assertActiveReviewerRole(threadId: string): void {
     const thread = this.taskStore.getTask(threadId);
-    if (thread) assertCanExecute(thread.initiatorAgent, 'review or approve tasks', 'initiator');
-    if (thread?.execution?.version === 2) {
-      const run = thread.execution.run;
-      const ownSession = (process.env.MESH_REVIEW_SESSION_ID || '').trim();
-      const sessionMatches = ownSession === thread.reviewerSessionId;
-      if (!run || run.role !== 'reviewer' || !['starting', 'active'].includes(run.state) ||
-          !thread.reviewerSessionCaptured || !sessionMatches) {
-        const sessionEnv = !ownSession ? 'missing' : sessionMatches ? 'matches' : 'mismatch';
-        throw new Error(
-          `[Agent Mesh Bridge] Refusing review action for thread ${threadId}: current v2 reviewer run and fixed reviewer session do not match. ` +
-          `runId=${run?.id ?? 'none'} runRole=${run?.role ?? 'none'} runState=${run?.state ?? 'none'} ` +
-          `reviewerSessionRecorded=${Boolean(thread.reviewerSessionId)} reviewerSessionCaptured=${Boolean(thread.reviewerSessionCaptured)} ` +
-          `MESH_REVIEW_SESSION_ID=${sessionEnv}`,
-        );
-      }
-      return;
+    if (thread) {
+      assertDedicatedTask(thread);
+      assertCanExecute(thread.initiatorAgent, 'review or approve tasks', 'initiator');
     }
-    const owner = new TaskRoleLock().getOwner(threadId);
-    if (!owner || owner.role !== 'reviewer') {
-      throw new Error(
-        `[Agent Mesh Bridge] Refusing review action for thread ${threadId}: ` +
-          `no active reviewer role is held. A task accepts review decisions only from its current reviewer turn; ` +
-          `finish or re-wake the same task instead of acting from a stale reviewer process.`,
-      );
-    }
+    requireV2ExecutionEligibility(thread, 'submit a review action');
+    const run = thread.execution.run;
     const ownSession = (process.env.MESH_REVIEW_SESSION_ID || '').trim();
-    if (ownSession && owner.conversationId && ownSession !== owner.conversationId) {
+    const sessionMatches = ownSession === thread.reviewerSessionId;
+    if (!run || run.role !== 'reviewer' || !['starting', 'active'].includes(run.state) ||
+        run.unconfirmed || !ownSession || !thread.reviewerSessionCaptured || !sessionMatches) {
+      const sessionEnv = !ownSession ? 'missing' : sessionMatches ? 'matches' : 'mismatch';
       throw new Error(
-        `[Agent Mesh Bridge] Refusing review action for thread ${threadId}: this process is ` +
-          `conversation ${ownSession}, but the reviewer role belongs to ${owner.conversationId}. ` +
-          `A task accepts decisions only from its dedicated reviewer conversation.`,
+        `[Agent Mesh Bridge] Refusing review action for thread ${threadId}: current v2 reviewer run and fixed reviewer session do not match. ` +
+        `runId=${run?.id ?? 'none'} runRole=${run?.role ?? 'none'} runState=${run?.state ?? 'none'} ` +
+        `reviewerSessionRecorded=${Boolean(thread.reviewerSessionId)} reviewerSessionCaptured=${Boolean(thread.reviewerSessionCaptured)} ` +
+        `MESH_REVIEW_SESSION_ID=${sessionEnv}`,
       );
     }
   }
@@ -1344,7 +1325,8 @@ export class MCPServer {
   public async handleToolCall(name: string, args: any): Promise<any> {
     await this.assertReceiverMayCall(name, args);
     const controlledTask = typeof args?.threadId === 'string' ? this.taskStore.getTask(args.threadId) : undefined;
-    if (this.requireV2Execution && controlledTask && V2_EXECUTION_TOOLS.has(name)) {
+    if (controlledTask && V2_EXECUTION_TOOLS.has(name)) {
+      assertDedicatedTask(controlledTask);
       requireV2ExecutionEligibility(controlledTask, `perform ${name}`);
     }
     if (this.v2StartupBlockReason && (name === 'dispatch_task' || name.startsWith('invoke_') || V2_EXECUTION_TOOLS.has(name))) {
@@ -1437,7 +1419,6 @@ export class MCPServer {
                 : undefined,
             by: 'caller',
           });
-          if (controlledTask?.execution?.version !== 2) new TaskRoleLock().releaseIfRole(args.threadId, 'reviewer');
           this.pollGuard.forget(args.threadId);
           return parked;
         }
@@ -1449,10 +1430,6 @@ export class MCPServer {
           model: args.model,
           modelRequestedByUser: args.modelRequestedByUser === true,
         });
-        // Reviewer decision submitted: hand the task role over to the
-        // developer. The reviewer CLI process may still be printing its final
-        // message; that is not an active review decision anymore.
-        if (controlledTask?.execution?.version !== 2) new TaskRoleLock().releaseIfRole(args.threadId, 'reviewer');
         return result;
       }
 
@@ -1461,15 +1438,8 @@ export class MCPServer {
         return await this.reworkController.requestMergeDecision(args.threadId, args.question, args.background, args.suggestion, args.conflictFiles, args.logPath);
       }
 
-      case 'submit_merge_decision': {
-        const controller = ExecutionController.getInstance();
-        if (controlledTask?.execution?.version === 2 && controller && controlledTask.decision?.id) {
-          const decisionId = controlledTask.decision.id;
-          const task = await controller.submitTaskDecision(args.threadId, decisionId, args.answer, 'agent');
-          return { threadId: args.threadId, status: task.status, decisionId };
-        }
-        return this.reworkController.submitMergeDecision(args.threadId, args.answer);
-      }
+      case 'submit_merge_decision':
+        return this.reworkController.submitMergeDecision(args.threadId, args.answer, 'agent');
 
       case 'request_task_decision': {
         const callerAgent = (process.env.MESH_CALLER_AGENT as AgentId) || undefined;
@@ -1486,51 +1456,40 @@ export class MCPServer {
         if (!isDeveloper) {
           this.assertActiveReviewerRole(args.threadId);
         }
-        if (ExecutionController.getInstance()) {
-          const resumePoint = args.resumePoint || (isDeveloper ? 'continue_develop' : 'continue_review');
-          const decision = await ExecutionController.getInstance()!.requestTaskDecision(args.threadId, {
-            question: args.question,
-            background: args.background,
-            suggestion: args.suggestion,
-            resumePoint,
-            conflictFiles: args.conflictFiles,
-            logPath: args.logPath,
-          });
-          return {
-            threadId: args.threadId,
-            status: 'wait_decision',
-            decisionId: decision.id,
-            nextAction: 'END_TURN_AND_WAIT_FOR_USER',
-            message: 'Decision requested. End this turn; user answer will wake the task.',
-          };
-        }
-        return await this.reworkController.requestMergeDecision(args.threadId, args.question, args.background, args.suggestion, args.conflictFiles, args.logPath);
+        const controller = ExecutionController.getInstance();
+        if (!controller) throw new Error('V2 execution controller is unavailable; decision was not recorded.');
+        const resumePoint = args.resumePoint || (isDeveloper ? 'continue_develop' : 'continue_review');
+        const decision = await controller.requestTaskDecision(args.threadId, {
+          question: args.question,
+          background: args.background,
+          suggestion: args.suggestion,
+          resumePoint,
+          conflictFiles: args.conflictFiles,
+          logPath: args.logPath,
+        });
+        return {
+          threadId: args.threadId,
+          status: 'wait_decision',
+          decisionId: decision.id,
+          nextAction: 'END_TURN_AND_WAIT_FOR_USER',
+          message: 'Decision requested. End this turn; user answer will wake the task.',
+        };
       }
 
       case 'submit_task_decision': {
-        if (ExecutionController.getInstance()) {
-          const updated = await ExecutionController.getInstance()!.submitTaskDecision(args.threadId, args.decisionId, args.answer, 'agent');
-          return {
-            threadId: args.threadId,
-            status: updated.status,
-            decisionId: args.decisionId,
-            message: `Decision answered. Resumed ${updated.status}.`,
-          };
-        }
-        return await this.reworkController.submitMergeDecision(args.threadId, args.answer);
+        const controller = ExecutionController.getInstance();
+        if (!controller) throw new Error('V2 execution controller is unavailable; decision was not submitted.');
+        const updated = await controller.submitTaskDecision(args.threadId, args.decisionId, args.answer, 'agent');
+        return {
+          threadId: args.threadId,
+          status: updated.status,
+          decisionId: args.decisionId,
+          message: `Decision answered. Resumed ${updated.status}.`,
+        };
       }
 
-      case 'retry_merge': {
-        const controller = ExecutionController.getInstance();
-        if (controlledTask?.execution?.version === 2 && controller) {
-          if (controlledTask.status !== 'failed' || controlledTask.failure?.stage !== 'merge') {
-            throw new Error('Only a merge failure can restart its merge budget.');
-          }
-          const task = await controller.retryOperation(args.threadId);
-          return { threadId: args.threadId, status: 'queued', retryGeneration: task.execution!.generation };
-        }
+      case 'retry_merge':
         return this.reworkController.retryMerge(args.threadId);
-      }
 
       case 'get_merge_log': {
         const thread = this.taskStore.getTask(args.threadId);

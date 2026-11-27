@@ -164,7 +164,7 @@ export class ExecutionController {
       mergeCoordinator ||
       new MergeCoordinator(taskStore, this.storageDir, this.mergeLock, (thread) => {
         const reviewRound = [...(thread.rounds || [])].reverse().find((r) => r.type !== 'approval');
-        if (reviewRound) void this.callbackManager.notifyCaller(thread, reviewRound);
+        if (reviewRound) void this.callbackManager.notifyReviewer(thread, reviewRound);
       });
 
     const scanInterval = options?.standingScanIntervalMs !== undefined
@@ -1997,7 +1997,7 @@ export class ExecutionController {
       round: identity?.round ?? thread.execution.round,
       role: 'reviewer' as const,
     } : undefined;
-    const wakeResult = await this.callbackManager.launchCaller(thread, reviewRound, onChildPid, reviewerIdentity);
+    const wakeResult = await this.callbackManager.launchReviewer(thread, reviewRound, onChildPid, reviewerIdentity);
 
     if (thread.reviewerSessionId) {
       this.callbackManager.finalizeWake(thread, reviewRound, thread.reviewerSessionId, {

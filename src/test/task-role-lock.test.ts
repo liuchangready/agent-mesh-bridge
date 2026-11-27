@@ -30,10 +30,7 @@ describe('TaskRoleLock - one role per task', () => {
     assert.ok(reviewer);
     assert.strictEqual(second.tryAcquire('thread_role_1', 'developer'), null);
     assert.strictEqual(second.getOwner('thread_role_1')?.role, 'reviewer');
-    assert.strictEqual(second.releaseIfRole('thread_role_1', 'developer'), false);
-
-    // The reviewer submits its decision: hand off to developer.
-    assert.strictEqual(second.releaseIfRole('thread_role_1', 'reviewer'), true);
+    first.release(reviewer);
     const developer = second.tryAcquire('thread_role_1', 'developer');
     assert.ok(developer);
     assert.strictEqual(second.getOwner('thread_role_1')?.role, 'developer');

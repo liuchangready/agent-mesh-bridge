@@ -112,11 +112,11 @@ describe('MCPServer Protocol Tests', () => {
       durationMs: 1,
     });
     callbackManager = new CallbackManager(detector);
-    callbackManager.notifyCaller = async () => true;
+    callbackManager.notifyReviewer = async () => true;
     // Never spawn a real caller CLI from a protocol test.
     const gate = new TaskExecutionRegistry(tempDir);
     dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector, gate);
-    reworkController = new ReworkController(taskStore, runner, callbackManager, detector, gate);
+    reworkController = new ReworkController(taskStore, callbackManager);
     mcpServer = new MCPServer(dispatcher, reworkController, taskStore, detector, resolver, runner);
   });
 
@@ -284,7 +284,7 @@ describe('MCPServer Protocol Tests', () => {
           assessment: { success: true, exitCode: 0, stream: { hasActualOutput: true, chunkCount: 1, stdoutBytes: 12, stderrBytes: 0, continuous: true, gapExceeded: false, maxGapMs: 0, gapThresholdMs: 60_000 } },
         } as any;
       };
-      callbackManager.launchCaller = (async (thread: any, _round: any, onChildPid: any) => {
+      callbackManager.launchReviewer = (async (thread: any, _round: any, onChildPid: any) => {
         reviewCalls++;
         recordProcessEvent('reviewer_runner_start', undefined, `review=${reviewCalls}`);
         const reviewer = thread.reviewerSessionId;
@@ -751,7 +751,7 @@ describe('MCPServer Protocol Tests', () => {
     } finally { windowA.dispose(); windowB.dispose(); }
   });
 
-  test('should handle tools/list and return all 18 specified tools', async () => {
+  test('lists the MCP tool contract and dispatch schema', async () => {
     const listReq = {
       jsonrpc: '2.0',
       id: 2,
@@ -1012,7 +1012,7 @@ describe('MCPServer Protocol Tests', () => {
       workspace: testWorkspace(tempDir), summary: { lastPromptSnippet: '', lastOutputSnippet: '', totalDurationMs: 0 }, rounds: [],
       mergeControl: { revision: 1, retryGeneration: 0, consecutiveRetries: 6, failureFingerprint: 'failure' } });
       for (const name of ['approve_task', 'request_rework', 'retry_task', 'retarget_task']) {
-        await assert.rejects(() => mcpServer.handleToolCall(name, { threadId }), /only permits retry_merge, pause_task, or delete_task/);
+        await assert.rejects(() => mcpServer.handleToolCall(name, { threadId }), /HISTORICAL_TASK_READ_ONLY/);
     }
     const beforeRetry = taskStore.getTask(threadId)!;
     await assert.rejects(() => mcpServer.handleToolCall('retry_merge', { threadId }), /HISTORICAL_TASK_READ_ONLY/);

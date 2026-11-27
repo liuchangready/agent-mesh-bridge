@@ -1,4 +1,3 @@
-import { testWorkspace } from './workspace-fixture';
 import { test, describe, beforeEach, afterEach, after } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
@@ -31,9 +30,7 @@ import { ActiveAgentResolver } from '../bridge/active-agent-resolver';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
 import { AsyncDispatcher } from '../bridge/async-dispatcher';
-import { ReworkController } from '../bridge/rework-controller';
 import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
-import { NativeSessionLock } from '../bridge/native-session-lock';
 import { getBridgeHome, invalidateConfiguredModelCache, saveModelDefaults } from '../bridge/model-catalog';
 import { clearReviewerBootstrapToken } from '../bridge/reviewer-bootstrap';
 import { describeModelRouting } from '../bridge/types';
@@ -45,7 +42,7 @@ after(() => {
   else process.env.MESH_CALLER_AGENT = inheritedCallerAgent;
 });
 
-describe('AsyncDispatcher and ReworkController Tests', () => {
+describe('Dedicated reviewer dispatch', () => {
   let tempDir: string;
   let taskStore: TaskStore;
   let detector: AgentDetector;
@@ -53,7 +50,6 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
   let runner: AutonomousRunner;
   let callbackManager: CallbackManager;
   let dispatcher: AsyncDispatcher;
-  let reworkController: ReworkController;
 
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-dispatch-'));
@@ -77,10 +73,9 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
       };
     };
     callbackManager = new CallbackManager(detector);
-    callbackManager.notifyCaller = async () => true;
+    callbackManager.notifyReviewer = async () => true;
     const gate = new TaskExecutionRegistry(tempDir);
     dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector, gate);
-    reworkController = new ReworkController(taskStore, runner, callbackManager, detector, gate);
   });
 
   afterEach(() => {
@@ -146,22 +141,7 @@ describe('AsyncDispatcher and ReworkController Tests', () => {
     }
   });
 
-  test('refuses a same-agent dispatch while the legacy review flow is active', async () => {
-    await assert.rejects(
-      () =>
-        dispatcher.dispatchTask({ workspaceRoot: process.cwd(),
-          targetAgent: 'codex',
-          initiatorAgent: 'codex',
-          title: 'Self dispatch',
-          prompt: 'do the work',
-        }),
-      /configure a sender-side reviewer model/i,
-    );
-    // Rejected before the thread exists: it must not occupy the queue.
-    assert.strictEqual(taskStore.getAllTasks().length, 0);
-  });
-
-  test('refuses a same-agent dispatch detected from the caller environment (legacy)', async () => {
+  test('uses the caller environment to enforce the dedicated self-dispatch model rule', async () => {
     const previous = process.env.MESH_CALLER_AGENT;
     process.env.MESH_CALLER_AGENT = 'deepseek_harness';
     try {

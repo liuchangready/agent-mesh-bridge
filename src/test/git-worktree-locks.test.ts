@@ -654,7 +654,7 @@ test('historical merge waiters cannot resume through a retired controller path',
   const target = resolveGitRepository(repository, storage); const source = createTaskWorktree(target, 'thread_waiter_pause', storage);
   fs.writeFileSync(path.join(source.path, 'shared.txt'), 'A waiter\nmiddle\nbeta\n'); source.headCommit = commitTaskChanges(source, 'candidate');
   const store = new TaskStore(storage); const detector = new AgentDetector(); const runner = new AutonomousRunner(detector);
-  const controller = new ReworkController(store, runner, new CallbackManager(detector, storage), detector);
+  const controller = new ReworkController(store, new CallbackManager(detector, storage));
   const roles = new TaskRoleLock(storage); const role = roles.tryAcquire('thread_waiter_pause', 'reviewer')!;
   const coordinator = new MergeCoordinator(store, storage, new MeshFileLock(path.join(root, 'merge.lock')));
   const control = new TaskControlService(store, runner, undefined, storage);

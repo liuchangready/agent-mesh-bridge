@@ -55,8 +55,6 @@ export interface BridgePolicy {
     maxConcurrentTasks?: number;
     maxConcurrentPerAgent?: number;
   };
-  /** Historical snapshots may contain legacy; all new work is dedicated. */
-  reviewFlow?: 'legacy' | 'dedicated';
   /**
    * Root directory for NEW tasks' unified data directories.
    *
@@ -133,7 +131,7 @@ export function saveBridgePolicy(patch: BridgePolicy, root?: string): BridgePoli
     if (perAgent !== undefined) merged.maxConcurrentPerAgent = perAgent;
     if (Object.keys(merged).length > 0) next.concurrency = merged;
   }
-  next.reviewFlow = 'dedicated';
+  delete (next as BridgePolicy & { reviewFlow?: unknown }).reviewFlow;
   delete (next as any).logDirectories;
   if (patch.taskDataRoot !== undefined) {
     if (typeof patch.taskDataRoot === 'string') {

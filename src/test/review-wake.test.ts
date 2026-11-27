@@ -22,7 +22,6 @@ import {
   reopenFailedReview,
 } from '../bridge/review-wake';
 import { DelegationRound, DelegationThread, isTaskUnfinished } from '../bridge/types';
-import { TaskRoleLock } from '../bridge/task-role-lock';
 
 describe('Review wake failure policy', () => {
   const now = Date.parse('2026-10-23T12:00:00.000Z');
@@ -386,7 +385,7 @@ describe('ReviewWakeScheduler', () => {
     const store = new TaskStore(dir);
     const launches: Array<{ threadId: string; round: number }> = [];
     const fakeCallback = {
-      notifyCaller: async (thread: DelegationThread, round: DelegationRound) => {
+      notifyReviewer: async (thread: DelegationThread, round: DelegationRound) => {
         launches.push({ threadId: thread.threadId, round: round.round });
         return true;
       },
@@ -437,7 +436,7 @@ describe('ReviewWakeScheduler', () => {
       let now = nowMs;
       let active = false;
       let calls = 0;
-      manager.notifyCaller = async () => {
+      manager.notifyReviewer = async () => {
         calls++;
         active = true;
         if (calls === REVIEW_WAKE_MAX_AUTO_RETRIES && verdict === 'approve') {
@@ -589,37 +588,21 @@ describe('ReviewWakeScheduler', () => {
     store.dispose();
   });
 
-  test('does not retry while a sibling task is reviewing the same caller session', async () => {
+  test('skips a historical task even when its wake plan is due', async () => {
     const nowMs = Date.parse('2026-10-23T12:00:00.000Z');
-    const { store, scheduler, launches } = setup(nowMs, { isReviewerActive: () => false });
-    const sharedUuid = '11111111-2222-3333-4444-555555555555';
-
-    // A sibling task spells the same codex thread by its rollout file name.
-    const sibling = makeThread();
-    sibling.threadId = 'thread_sibling_same_session';
-    sibling.callerSessionId = `rollout-2026-10-23T10-00-00-${sharedUuid}`;
-    delete sibling.reviewWake;
-    store.upsertTask(sibling);
-
-    // The retried task spells it as the bare thread id.
-    const retried = makeThread({ autoRetryAt: new Date(nowMs - 1_000).toISOString() });
-    retried.threadId = 'thread_review_wake_sched';
-    retried.callerSessionId = sharedUuid;
-    store.upsertTask(retried);
-
-    const lock = new TaskRoleLock();
-    const lease = lock.tryAcquire(sibling.threadId, 'reviewer');
-    assert.ok(lease, 'the sibling holds the reviewer role for that session');
+    const { store, scheduler, launches } = setup(nowMs, { requireV2Execution: true });
     try {
-      const launched = await scheduler.runDue();
-      assert.strictEqual(launched, 0, 'the busy caller session must not be resumed twice');
-      assert.strictEqual(launches.length, 0);
+      const thread = makeThread({ autoRetryAt: new Date(nowMs - 1_000).toISOString() });
+      store.upsertTask(thread);
+      const before = store.reloadTask(thread.threadId);
+      assert.equal(await scheduler.runDue(), 0);
+      assert.equal(await scheduler.runWatchdog(), 0);
+      assert.deepEqual(launches, []);
+      assert.deepEqual(store.reloadTask(thread.threadId), before);
     } finally {
-      lock.release(lease);
+      scheduler.dispose();
+      store.dispose();
     }
-
-    scheduler.dispose();
-    store.dispose();
   });
 
   test('does not retry while the quota is still cooling down', async () => {

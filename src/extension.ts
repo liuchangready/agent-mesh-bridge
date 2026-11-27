@@ -289,7 +289,6 @@ export function activate(context: vscode.ExtensionContext) {
       nativeSessionCompaction: {
         mode: bridgeCfg.get<'off' | 'auto'>('nativeSessionCompaction.mode', 'off'),
       },
-      reviewFlow: 'dedicated',
       taskDataRoot: bridgeCfg.get<string>('taskDataRoot', ''),
       concurrency: {
         enabled: bridgeCfg.get<boolean>('concurrency.enabled', false),
@@ -472,16 +471,7 @@ export function activate(context: vscode.ExtensionContext) {
   });
   const executionRegistry = new TaskExecutionRegistry(path.dirname(taskStore.getStoragePath()));
   context.subscriptions.push({ dispose: () => executionRegistry.dispose() });
-  const reworkController = new ReworkController(
-    taskStore,
-    runner,
-    callbackManager,
-    detector,
-    executionRegistry,
-    false,
-    true,
-    runtimeAdmission.ready,
-  );
+  const reworkController = new ReworkController(taskStore, callbackManager, runtimeAdmission.ready);
   context.subscriptions.push({ dispose: () => reworkController.dispose() });
   const executionController = new ExecutionController(
     taskStore,
@@ -1022,7 +1012,7 @@ export function activate(context: vscode.ExtensionContext) {
           const input = await vscode.window.showInputBox({ prompt: 'Enter Thread ID to approve:' });
           if (!input) return;
           try {
-            reworkController.approveTask({ threadId: input });
+            await reworkController.approveTask({ threadId: input });
             vscode.window.showInformationMessage(`Task ${input} approved.`);
           } catch (e: any) {
             vscode.window.showErrorMessage(e.message);
@@ -1031,7 +1021,7 @@ export function activate(context: vscode.ExtensionContext) {
         }
 
         try {
-          reworkController.approveTask({ threadId });
+          await reworkController.approveTask({ threadId });
           vscode.window.showInformationMessage(`Task ${threadId} approved.`);
         } catch (e: any) {
           vscode.window.showErrorMessage(e.message);

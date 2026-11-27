@@ -1,12 +1,11 @@
 /**
  * Keeps a caller from sitting in a polling loop after it dispatches a task.
  *
- * The bridge is asynchronous by contract (AGENTS.md §4): `dispatch_task` returns
- * immediately, the caller ends its turn, and the bridge resumes the caller's
- * native session when the round finishes. In practice agents (Codex notably)
+ * Dispatch is asynchronous: the requester ends its turn after acceptance.
+ * The dedicated reviewer handles subsequent rounds and the result is available
+ * from the ledger. In practice agents (Codex notably)
  * keep the turn alive and poll `get_thread_details` / `get_recent_logs` every
- * minute to "watch" the task, burning the user's tokens for information they
- * will receive anyway by callback.
+ * minute to "watch" the task, spending tokens on repeated status requests.
  *
  * Telling them to stop is not enough — the tool reply is the strongest lever the
  * bridge has, so this guard makes repeated reads *uninformative* rather than

@@ -169,7 +169,7 @@ async function main() {
   };
 
   const mockCallbackManager: any = {
-    launchCaller: async () => ({ success: true }),
+    launchReviewer: async () => ({ success: true }),
     launchReviewerBootstrap: async () => ({ confirmed: true }),
   };
 

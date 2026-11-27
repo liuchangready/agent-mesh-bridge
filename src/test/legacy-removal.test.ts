@@ -4,10 +4,9 @@ import { assertDedicatedTask, requireDeliveryTarget } from '../bridge/types';
 import { resolveReviewFlow } from '../bridge/reviewer-bootstrap';
 import { createThread, setupFixture } from './unified-execution-fixture';
 
-test('new dispatch never falls back to requester review with absent or stale policy', () => {
+test('new dispatch always uses dedicated review and rejects the retired flow', () => {
   assert.equal(resolveReviewFlow(), 'dedicated');
-  assert.equal(resolveReviewFlow(undefined, 'legacy'), 'dedicated');
-  assert.equal(resolveReviewFlow('dedicated', 'legacy'), 'dedicated');
+  assert.equal(resolveReviewFlow('dedicated'), 'dedicated');
   assert.throws(() => resolveReviewFlow('legacy'), /LEGACY_REVIEW_FLOW_DISABLED/);
 });
 

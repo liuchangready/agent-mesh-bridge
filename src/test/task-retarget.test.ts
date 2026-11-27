@@ -373,7 +373,7 @@ describe('TaskRetargetService - switching a task executor', () => {
     }
   });
 
-  test('refuses to hand a legacy task to its own initiator (self-review deadlock)', async () => {
+  test('rejects retargeting to the dedicated reviewer agent without distinct configured models', async () => {
     taskStore.upsertTask(makeThread());
     service.setModelApprovalHandler(async () => {
       throw new Error('a rejected self-dispatch must not ask the user for a model');

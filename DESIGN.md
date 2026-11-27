@@ -90,9 +90,9 @@ flowchart TD
    - 注入各 Agent 专属的免交互与权限旁路标志（`--dangerously-skip-permissions` 等）；
    - 关闭 `stdin` 并配置 `CI=1` 环境变量；
    - 输出流质量 assessment 评估、stream 间隔测量与扣除挂起；移除独立静默 kill 看门狗，由控制器统一管理活动时间预算。
-5. **`CallbackManager`（回调唤醒引擎）**：
-   - 监听任务各轮次完成状态；
-   - 根据发起方类型调用各 Agent 原生唤醒信道（`codex queue`、`claude --resume`、`agy --conversation`、`dsh headless --session-id`），触发 A 的下一轮推理。
+5. **`CallbackManager`（审阅唤醒）**：
+   - 通过统一控制器请求启动下一轮审阅。
+   - 使用账本固定的 reviewer 会话与当前 run 身份，经对应 Agent 的原生续聊参数启动审阅。
 6. **`TaskStore`（1,000 条任务中心）**：
    - 单文件/轻量存储 `~/.agent-mesh-bridge/delegation_threads.json`；
    - 最多 1,000 条；只淘汰可安全丢弃的收口任务，没有安全候选时拒绝新任务；
@@ -133,10 +133,10 @@ flowchart TD
 
 角色锁写入 `~/.agent-mesh-bridge/roles/<threadId>.json`（5s 心跳、30s 僵尸回收）。规则：
 
-1. `CallbackManager.notifyCaller()` 必须先校验 `reviewing`、无在飞轮次，并取得 `reviewer` 锁；重复唤醒直接拒绝，不再拉起第二个检视进程。
+1. `CallbackManager.notifyReviewer()` 必须先校验 `reviewing`、无在飞轮次，并取得 `reviewer` 锁；重复唤醒直接拒绝，不再拉起第二个检视进程。
 2. developer 轮次必须先取得 `developer` 锁；若 reviewer 仍持有，则任务进入 `queued`，等交接后由 supervisor/queue-drainer 启动。
 3. developer 轮次结束、状态落为 `reviewing` 后，先释放 developer 锁，再唤醒 reviewer，避免双向等待死锁。
-4. reviewer 在 `request_rework` / `approve_task` 成功时视为完成决策并释放 reviewer 锁（`TaskRoleLock.releaseIfRole`）；其 CLI 进程继续打印最终文本不构成新的活跃检视。
+4. reviewer 在 `request_rework` / `approve_task` 成功时持久化决策。v2 等待当前 reviewer run 的进程子树退出，再推进交接。
 5. **中断恢复不是新建任务**：只能沿用原 `threadId`、原 `receiverSessionId` / `callerSessionId`，并以账本中的历轮 `prompt`（设计/返修指令）、`output`（开发/返修报告）、review feedback 作为中间文档链继续；禁止新建任务、另起会话或把同一任务拆成新的 reviewer/developer 任务。
 
 ### 2.3 响应成功判定（错误码 + 流健康）
@@ -220,7 +220,7 @@ New tasks pin the real local delivery branch selected at dispatch (`targetBranch
 
 - **发现（`list_agent_models`）**：Antigravity 解析 `agy models`；Codex 解析 `codex debug models`（失败时回退 `~/.codex/models_cache.json` 与 `config.toml`）；Claude Code 查询其网关的 `GET {ANTHROPIC_BASE_URL}/v1/models`（失败时回退 `sonnet/opus/haiku` 别名与 `settings.json` 的别名映射）；DeepSeek Harness 查询 provider 的 `GET {baseUrl}/models`（失败时回退 profile 路由里的模型）。结果缓存于 `~/.agent-mesh-bridge/models-cache.json`（默认 6 小时）。
 - **配置（两端分开）**：`agentMeshBridge.models.<agent>` 是**接收者默认**（该 Agent 执行被派发任务时用），`agentMeshBridge.initiatorModels.<agent>` 是**下发者默认**（该 Agent 作为下发者/检视者被唤醒时用）。命令 **Agent Bridge: Select Model for Agent** 先选「接收者 / 下发者」，再选型号；两者分别写入 `~/.agent-mesh-bridge/model-config.json` 的 `models` / `initiatorModels`，供无 VS Code API 的独立 MCP server 进程读取，互不覆盖。同一个 Agent 可以自派发，但仅限专用 reviewer 流程，且 reviewer 模型与执行模型必须不同（同模型不得审阅自己的输出）。
-- **注入**：Codex 用全局 `-c model="..."`（对 `exec` 与 `exec resume` 都有效，且不会误判为位置参数）；Claude 用 `--model`；Antigravity 用 `--model`；DSH 无 `--model`，改为生成一次性 overlay patch 并以 `dsh headless --patch <file>` 应用（`--dump-config` 已验证：只覆盖本次运行的 `agent-default-model` 与 `llm-pi-ai`，不改用户 profile）。检视/失败唤醒 caller 时同样按**下发者默认**注入上述参数（`CallbackManager.launchCaller()`），caller 实际模型写入 `callbacks.log` 与 reviewer 日志头。
+- **注入**：Codex 用全局 `-c model="..."`（对 `exec` 与 `exec resume` 都有效，且不会误判为位置参数）；Claude 用 `--model`；Antigravity 用 `--model`；DSH 无 `--model`，改为生成一次性 overlay patch 并以 `dsh headless --patch <file>` 应用（`--dump-config` 已验证：只覆盖本次运行的 `agent-default-model` 与 `llm-pi-ai`，不改用户 profile）。检视/失败唤醒 caller 时同样按**下发者默认**注入上述参数（`CallbackManager.launchReviewer()`），caller 实际模型写入 `callbacks.log` 与 reviewer 日志头。
 - **记录**：`dispatch_task` 把 `initiatorModel`（显式传参 → 环境提示 → 下发者配置默认 → 接收者配置默认（兼容回退））与 `targetModel`（显式 `model` → 接收者配置默认）落到账本；`initiatorModelSource` 用 `sender-configured` / `configured` 区分两端默认来源。返修/重试沿用同一 `targetModel`，避免中途换模型。任务树、详情面板与 MCP 响应统一用 `getModelRouting()` 输出 `sender A: x -> receiver B: y`。
 
 ### 2.8 专用 Reviewer 会话、会话级锁与终态归档
@@ -230,7 +230,7 @@ New tasks pin the real local delivery branch selected at dispatch (`targetBranch
 1. `dispatch_task` 解析两端模型并校验同 Agent 时 `reviewerModel !== targetModel`，创建 `status=queued`、`reviewBootstrap.phase='pending'` 的任务；developer 轮次被 `isReviewerBootstrapPending()` 拦住。
 2. 扩展宿主的 `ReviewerBootstrapService` 可独立启动多个待处理任务的**全新** reviewer 会话（每个 thread 单独登记与加锁，不设全局队头或执行槽）；启动使用 `MESH_REVIEW_BOOTSTRAP=1` + 一次性 token，token 同时写进 bootstrap prompt，该轮只调用一次 `dispatch_task`。MCP 的 `confirmReviewerBootstrap()` 用账本固化的 brief 确认任务，不创建第二个任务。识别按序走四条通道（prompt 里的 `reviewBootstrap` 凭证 → env 三元组 → 启动记录 pid == `process.ppid` → 无 brief 调用且该 Agent 只有唯一待确认任务），因为宿主可能清洗环境变量，也可能让 MCP server 的父进程不是桥接启动的 CLI。
 3. reviewer 进程退出后，宿主捕获原生会话 id 写入 `reviewerSessionId` / `callerSessionId`，结束该 thread 的执行登记并释放 reviewer 角色；开发者轮次由独立候选调度启动。
-4. developer 完成后，审阅唤醒 resume **reviewer 会话**；`TaskRoleLock` 以该会话 id 为 key（`roles/conv_<sha1>.json`），并注入 `MESH_REVIEW_SESSION_ID`，`approve_task` / `request_rework` 校验会话一致。legacy 任务继续 resume 请求方会话、使用 thread 级锁。
+4. developer 完成后，审阅唤醒沿用 **reviewer 会话**。v2 通过账本中的当前 reviewer run 与固定会话校验 `approve_task` / `request_rework`，并等待 reviewer 子树退出后推进交接。缺失 `reviewFlow` 或值为 `legacy` 的记录只开放历史操作和安全清理。
 5. bootstrap 失败（超时、未调用工具、token 不匹配）→ 任务 `failed` + interruption，不会启动 developer。只靠 env 或只靠 pid 的识别会以 `the reviewer turn ended without calling dispatch_task` 误报失败（reviewer 其实已经调过工具）——2026-11-02 的 `thread_20261102_224144_b057` 即此事故。
 
 终态与保留边界（`AGENTS.md` 第 23 条）：
@@ -444,7 +444,7 @@ export interface DelegationRound {
 - **`resume_task(threadId)`**：恢复暂停轮次；已捕获原生会话时续聊，否则以初始轮重新执行。
 - **`retry_task(threadId)`**：原地重跑失败轮——复用同一轮号、同一 prompt、同一原生会话，不追加新轮次。调用者想「把原任务再做一遍」时用它；把原始 prompt 原样传给 `request_rework` 会在账本里留下两条指令完全相同的轮次（`repeatOfRound` 会标记这种重复）。
 - **`delete_task(threadId, reason)`**：先终止进程，再移除账本条目；原因写入 `deleted_tasks.log` 墓碑日志。随后尽力清理接收方原生对话（Claude/Codex/Antigravity/DSH），找不到对话不报错，失败只记录在墓碑的 `nativeSessions` 字段；调用方会话不清理。
-- 失败回调：轮次进入 `failed` 时，`CallbackManager.notifyCallerOfFailure()` 会唤醒调用方并给出上述处置选项；同一轮只通知一次（`thread.failureNotifications`），每个任务最多 3 次，`paused`/`stopped` 等用户主动中断不通知。
+- 失败回调：轮次进入 `failed` 时，`CallbackManager.notifyReviewerOfFailure()` 会唤醒调用方并给出上述处置选项；同一轮只通知一次（`thread.failureNotifications`），每个任务最多 3 次，`paused`/`stopped` 等用户主动中断不通知。
 - 四者均为控制面操作，接收方进程不能对自己正在执行的任务调用。
 - 失败轮若仍持有已捕获的原生会话，`AutonomousRunner` 的进程内重试（网络抖动）会**续聊该会话**，而不是另开一个新会话重做整件事。
 

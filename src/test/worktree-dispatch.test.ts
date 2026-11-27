@@ -68,7 +68,7 @@ test('dispatch creates a separate task branch from committed target state and ig
   const runner = new AutonomousRunner(detector);
   runner.execute = async () => ({ exitCode: 0, stdout: 'done', stderr: '', extractedOutput: 'done', durationMs: 1 });
   const callback = new CallbackManager(detector, storage);
-  callback.notifyCaller = async () => true;
+  callback.notifyReviewer = async () => true;
   const registry = new TaskExecutionRegistry(storage);
   const dispatcher = new AsyncDispatcher(store, new ActiveAgentResolver(detector), runner, callback, detector, registry);
   t.after(() => { (dispatcher as unknown as { queueDrainer?: { dispose(): void } }).queueDrainer?.dispose(); registry.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
@@ -173,7 +173,7 @@ test('new dispatch creates its worktree while final integration validation holds
   const repository = path.join(root, 'repo'); const storage = path.join(root, 'ledger'); initRepo(repository);
   const store = new TaskStore(storage); const detector = new AgentDetector(); const runner = new AutonomousRunner(detector);
   runner.execute = async () => ({ exitCode: 0, stdout: 'done', stderr: '', extractedOutput: 'done', durationMs: 1 });
-  const callback = new CallbackManager(detector, storage); callback.notifyCaller = async () => true; const registry = new TaskExecutionRegistry(storage); const dispatcher = new AsyncDispatcher(store, new ActiveAgentResolver(detector), runner, callback, detector, registry);
+  const callback = new CallbackManager(detector, storage); callback.notifyReviewer = async () => true; const registry = new TaskExecutionRegistry(storage); const dispatcher = new AsyncDispatcher(store, new ActiveAgentResolver(detector), runner, callback, detector, registry);
   const lock = new MeshFileLock(meshMergeLockPath(storage)); const release = await lock.acquire(); assert.ok(release);
   t.after(() => { release(); (dispatcher as unknown as { queueDrainer?: { dispose(): void } }).queueDrainer?.dispose(); registry.dispose(); store.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
   const result = await Promise.race([

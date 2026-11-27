@@ -870,7 +870,7 @@ describe('TaskControlService - pause/delete reasons', () => {
     const thread = makeThread({ status: 'paused' });
     taskStore.upsertTask(thread);
     const callbackManager = new CallbackManager(new AgentDetector());
-    const reworkController = new ReworkController(taskStore, runner, callbackManager, new AgentDetector());
+    const reworkController = new ReworkController(taskStore, callbackManager);
     await assert.rejects(reworkController.resumePausedTask(thread.threadId), /HISTORICAL_TASK_READ_ONLY/);
     assert.deepEqual(taskStore.getTask(thread.threadId), thread);
     reworkController.dispose();

@@ -56,11 +56,11 @@ describe('dedicated reviewer bootstrap identity', () => {
       durationMs: 1,
     });
     const callbackManager = new CallbackManager(detector);
-    callbackManager.notifyCaller = async () => true;
+    callbackManager.notifyReviewer = async () => true;
     const gate = new TaskExecutionRegistry(tempDir);
     const dispatcher = new AsyncDispatcher(taskStore, resolver, runner, callbackManager, detector, gate);
-    const reworkController = new ReworkController(taskStore, runner, callbackManager, detector, gate);
-    mcpServer = new MCPServer(dispatcher, reworkController, taskStore, detector, resolver, runner, true);
+    const reworkController = new ReworkController(taskStore, callbackManager);
+    mcpServer = new MCPServer(dispatcher, reworkController, taskStore, detector, resolver, runner);
 
     // No inherited bootstrap environment: exactly what a closed-env host does.
     for (const name of saved) delete process.env[name];

@@ -7,7 +7,7 @@ import { CallbackManager } from '../bridge/callback-manager';
 import { AgentDetector } from '../bridge/agent-detector';
 import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { DelegationRound } from '../bridge/types';
-import { readReviewerLogTail, reviewerBootstrapLogPath, reviewerLogPath, statReviewerLog } from '../bridge/reviewer-log';
+import { readReviewerLogTail, reviewerBootstrapLogPath, statReviewerLog } from '../bridge/reviewer-log';
 import { writeReviewerBootstrapToken } from '../bridge/reviewer-bootstrap';
 import { createThread } from './unified-execution-fixture';
 
@@ -50,7 +50,7 @@ describe('Reviewer stream capture', () => {
       return { exitCode: 7, stdout: '', stderr: '', extractedOutput: '', durationMs: 0 };
     };
 
-    const outcome = await manager.launchCaller(thread, completedRound, undefined, identity);
+    const outcome = await manager.launchReviewer(thread, completedRound, undefined, identity);
     assert.strictEqual(outcome.exitCode, 7);
     assert.match(readReviewerLogTail(thread.threadId, 1, { artifactDir })?.content || '', /\[exit\] code=7/);
   });
@@ -74,7 +74,16 @@ describe('Reviewer stream capture', () => {
       exitCode: 1, stdout: `tool arguments ${token}`, stderr: `warning ${token}`, extractedOutput: '', durationMs: 0,
     });
 
-    assert.strictEqual((await manager.launchReviewerBootstrap(thread)).confirmed, false);
+    const execution = thread.execution!;
+    const identity = {
+      runId: 'bootstrap-run', operationId: execution.operationId, generation: execution.generation,
+      phase: 'review', round: execution.round, role: 'reviewer',
+    } as const;
+    execution.run = {
+      id: identity.runId, owner: { pid: process.pid }, state: 'active', step: 'executing',
+      startedAt: thread.createdAt, role: 'reviewer',
+    };
+    assert.strictEqual((await manager.launchReviewerBootstrap(thread, undefined, identity)).confirmed, false);
     const log = reviewerBootstrapLogPath(thread.threadId, undefined, undefined, artifactDir);
     const content = fs.readFileSync(log, 'utf8');
     assert.match(content, /tool arguments \[redacted\]/);

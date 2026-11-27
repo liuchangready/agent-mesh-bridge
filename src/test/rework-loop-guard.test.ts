@@ -11,9 +11,7 @@ process.env.HOME = isolatedHome;
 
 import { TaskStore } from '../bridge/task-store';
 import { AgentDetector } from '../bridge/agent-detector';
-import { AutonomousRunner } from '../bridge/autonomous-runner';
 import { CallbackManager } from '../bridge/callback-manager';
-import { TaskExecutionRegistry } from '../bridge/task-execution-registry';
 import {
   ReworkController,
   assertNotNoopRework,
@@ -96,10 +94,9 @@ describe('review block and terminal state', () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-loop-'));
     store = new TaskStore(tempDir);
     const detector = new AgentDetector();
-    const runner = new AutonomousRunner(detector);
     const callbackManager = new CallbackManager(detector);
-    callbackManager.notifyCaller = async () => true;
-    controller = new ReworkController(store, runner, callbackManager, detector, new TaskExecutionRegistry(tempDir));
+    callbackManager.notifyReviewer = async () => true;
+    controller = new ReworkController(store, callbackManager);
   });
 
   afterEach(() => {
@@ -117,11 +114,18 @@ describe('review block and terminal state', () => {
     );
   });
 
-  test('a completed task cannot be resurrected by a late rework', async () => {
-    store.upsertTask(makeThread({ status: 'completed' }));
+  test('a completed v2 task cannot be resurrected by a late rework', async () => {
+    const thread = makeThread({ status: 'completed', execution: {
+      version: 2, revision: 1, operationId: 'completed-review', phase: 'review', round: 1,
+      generation: 1, attempt: 0, autoRetriesUsed: 0,
+      budget: { limitMs: 120_000, spentActiveMs: 0, maxAutoRetries: 2 },
+    } });
+    store.upsertTask(thread);
+    const before = store.reloadTask(thread.threadId);
     await assert.rejects(
       () => controller.requestRework({ threadId: 'thread_loop_1', feedback: 'again' }),
-      /HISTORICAL_TASK_READ_ONLY/,
+      /TERMINAL_STATUS.*completed/,
     );
+    assert.deepEqual(store.reloadTask(thread.threadId), before);
   });
 });

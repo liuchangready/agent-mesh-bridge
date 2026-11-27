@@ -166,7 +166,7 @@ sequenceDiagram
     end
 ```
 
-**失败隔离是硬约束**：三个执行器（`async-dispatcher` / `rework-controller` / `task-supervisor`）都在 `finally` 里释放租约，若压缩抛错且发生在 `notifyCaller` 之前，reviewer 永不唤醒，`reviewing` 队头会阻塞整个网格。因此：
+**失败隔离是硬约束**：三个执行器（`async-dispatcher` / `rework-controller` / `task-supervisor`）都在 `finally` 里释放租约，若压缩抛错且发生在 `notifyReviewer` 之前，reviewer 永不唤醒，`reviewing` 队头会阻塞整个网格。因此：
 
 - `compactPrecedingRound()` 内部捕获所有异常并返回 `CompactionOutcome`；
 - 调用点统一走 `compactRoundBestEffort()`，忽略返回值；

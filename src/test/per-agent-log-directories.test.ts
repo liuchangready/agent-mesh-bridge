@@ -45,7 +45,8 @@ test('old policy and global log directories are never searched', t => {
   assert.equal(findExistingReviewerLog(threadId,1,{root}),undefined);
   assert.deepEqual(listRoundArtifacts(threadId,root),[]);
   const policy = saveBridgePolicy({},root);
-  assert.equal(policy.reviewFlow,'dedicated');
+  assert.equal('reviewFlow' in policy, false);
+  assert.equal('reviewFlow' in JSON.parse(fs.readFileSync(path.join(root, 'bridge-policy.json'), 'utf8')), false);
   assert.equal((policy as any).logDirectories,undefined);
   assert.equal(roundExecutionLogPath(threadId,1,root),path.join(dirs.workerLogDir,threadId+'_round_1.log'));
 });

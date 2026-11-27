@@ -120,7 +120,7 @@ summary: 实现或修改代码、修复缺陷、调整构建或测试逻辑。
 
 专用 reviewer bootstrap 和后续 reviewer 唤醒在其 review prompt 中追加同一任务的 `Reviewer instructions` 快照。现有审查证据、worker 报告、assessment、工作树与 Git 状态仍按当前流程提供。Reviewer 模板不得让模型自行调用额外控制工具或绕过 `approve_task` / `request_rework` 的现有状态校验。
 
-Legacy 任务仍沿用原 caller-resume 流程；无模板快照的任务不追加新要求。若未来允许 legacy 新任务显式选模板，应在完成兼容性评估后再设计，不由首版隐式改变 `reviewFlow`。
+新任务统一使用专用 reviewer。历史记录保留原有模板快照，缺失快照时读取层按原账本展示。
 
 ## UI 与配置边界
 

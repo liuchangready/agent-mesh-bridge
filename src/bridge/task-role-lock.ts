@@ -164,26 +164,6 @@ export class TaskRoleLock {
   }
 
   /**
-   * Hand off a role without knowing the lease token.
-   *
-   * The reviewer's MCP server calls this after `request_rework` / `approve_task`
-   * succeeds: the reviewer's decision is complete, so the developer may start
-   * even if the reviewer CLI process is still printing its final message.
-   */
-  public releaseIfRole(threadId: string, role: TaskRole): boolean {
-    const owner = this.getOwner(threadId);
-    if (!owner || owner.role !== role) return false;
-    try {
-      const file = this.findOwnerPath(threadId, owner.token);
-      if (!file) return false;
-      fs.unlinkSync(file);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
    * Hand a freshly spawned detached caller child to the role lock.
    *
    * Called by the wake path right after the reviewer process starts: from then on

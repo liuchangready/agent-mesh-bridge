@@ -133,7 +133,7 @@ describe('Unified Execution Policy Tests', () => {
 
   test('v2 scheduler wakes a dependency-blocked review after its sibling settles', async (t) => {
     const fixture = await setupFixture({ useFastLock: true, standingScanIntervalMs: 60_000 });
-    const rework = new ReworkController(fixture.store, fixture.runner as any, fixture.callbackManager);
+    const rework = new ReworkController(fixture.store, fixture.callbackManager);
     try {
       const dependency = createThread('thread_review_dependency');
       dependency.execution!.version = 2;
@@ -145,7 +145,7 @@ describe('Unified Execution Policy Tests', () => {
       review.rounds[0].status = 'completed';
       fixture.store.upsertTask(dependency);
       fixture.store.upsertTask(review);
-      const wake = t.mock.method(fixture.callbackManager, 'launchCaller');
+      const wake = t.mock.method(fixture.callbackManager, 'launchReviewer');
 
       await assert.rejects(rework.blockReview({ threadId: review.threadId, waitingForThreadId: 'missing' }), /not found/);
       await assert.rejects(rework.blockReview({ threadId: review.threadId, waitingForThreadId: review.threadId }), /cycle/);
@@ -427,7 +427,7 @@ describe('Unified Execution Policy Tests', () => {
       fixture.addRunnableThread(thread);
 
       // Reviewer exits 0 with some output but NEVER called approve_task or request_rework
-      fixture.callbackManager.launchCaller = (async () => ({
+      fixture.callbackManager.launchReviewer = (async () => ({
         success: true,
         exitCode: 0,
       })) as any;

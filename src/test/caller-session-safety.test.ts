@@ -80,7 +80,7 @@ describe('Codex active session selection', () => {
   });
 });
 
-describe('caller session resolution', () => {
+describe('dedicated reviewer session resolution', () => {
   const reviewerSession = '05e4a9c1-73f3-4d86-b64c-b1cf7fd3a08b';
 
   function thread(overrides: Partial<DelegationThread> = {}): DelegationThread {
@@ -104,7 +104,7 @@ describe('caller session resolution', () => {
   test('dedicated reviewer requires confirmed captured matching handoff', () => {
     const detector = { detectActiveSession: () => 'wrong-fallback-session' } as unknown as AgentDetector;
     const manager = new CallbackManager(detector);
-    const resolve = (item: DelegationThread) => (manager as any).resolveCallerSession(item);
+    const resolve = (item: DelegationThread) => (manager as any).resolveReviewerSession(item);
     const valid = thread({
       reviewFlow: 'dedicated',
       reviewBootstrap: { phase: 'confirmed', attempts: 1 },
@@ -129,7 +129,7 @@ describe('caller session resolution', () => {
       },
     } as unknown as AgentDetector;
     const manager = new CallbackManager(detector);
-    const resolve = (item: DelegationThread) => (manager as any).resolveCallerSession(item);
+    const resolve = (item: DelegationThread) => (manager as any).resolveReviewerSession(item);
 
     assert.strictEqual(resolve(thread({ callerSessionId: 'legacy-session-123' })), undefined);
     const missing = thread({ callerSessionId: undefined });

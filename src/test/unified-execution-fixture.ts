@@ -215,7 +215,7 @@ export async function setupFixture(options?: SetupFixtureOptions) {
   const callbackManager = new CallbackManager(detector, dir);
   callbackManager.setTaskStore(store);
   callbackManager.setAutonomousRunner(runner as any);
-  callbackManager.launchCaller = (async () => ({ success: true, exitCode: 0 })) as any;
+  callbackManager.launchReviewer = (async () => ({ success: true, exitCode: 0 })) as any;
 
   const roleLock = new TaskRoleLock(dir);
   const sessionLock = new NativeSessionLock(dir);

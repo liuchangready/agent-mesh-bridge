@@ -25,8 +25,6 @@ import {
   appendInterruption,
 } from './types';
 import { noteMergeFailure } from './merge-recovery';
-import { TaskRoleLock } from './task-role-lock';
-import { callerSessionKey } from './caller-session-key';
 
 export interface ReviewWakeSchedulerOptions {
   now?: () => number;
@@ -88,19 +86,10 @@ export class ReviewWakeScheduler extends EventEmitter {
     this.stallTimeoutMs = options.stallTimeoutMs ?? REVIEW_STALL_TIMEOUT_MS;
     this.requireV2Execution = options.requireV2Execution === true;
     this.watchdogIntervalMs = options.watchdogIntervalMs ?? 60_000;
-    this.isReviewerActive =
-      options.isReviewerActive ??
-      ((threadId: string) => {
-        const execution = this.taskStore.getTask(threadId)?.execution;
-        if (execution?.version === 2) return Boolean(execution.run);
-        try {
-          // getOwner() only reports a LIVE owner, so a killed extension host or
-          // a crashed caller shows up as "no reviewer" once its heartbeat stops.
-          return !!new TaskRoleLock().getOwner(threadId);
-        } catch {
-          return false;
-        }
-      });
+    this.isReviewerActive = options.isReviewerActive ?? ((threadId) => {
+      const execution = this.taskStore.getTask(threadId)?.execution;
+      return execution?.version === 2 && Boolean(execution.run);
+    });
   }
 
   public start(): void {
@@ -190,7 +179,7 @@ export class ReviewWakeScheduler extends EventEmitter {
           }
           const round = this.reviewRound(thread);
           if (!round) continue;
-          const accepted = await Promise.resolve(this.callbackManager.notifyCaller(thread, round));
+          const accepted = await Promise.resolve(this.callbackManager.notifyReviewer(thread, round));
           const latest = this.taskStore.getTask(thread.threadId);
           if ((latest && isMergeReview(latest)) && latest.reviewWake?.lastAttemptAt === state.lastAttemptAt) {
             latest.reviewWake = { ...state, autoRetryAt: accepted ? undefined : new Date(now + 60_000).toISOString() };
@@ -237,7 +226,7 @@ export class ReviewWakeScheduler extends EventEmitter {
 
         const planned = noteAutoRetryLaunched({ ...state, quotaResetsAt: undefined }, now);
         this.persist(thread, planned);
-        const accepted = await Promise.resolve(this.callbackManager.notifyCaller(thread, round));
+        const accepted = await Promise.resolve(this.callbackManager.notifyReviewer(thread, round));
         if (accepted) {
           launched++;
           this.emit('retryLaunched', { thread, round, state: planned });
@@ -417,7 +406,7 @@ export class ReviewWakeScheduler extends EventEmitter {
               : `检视无进展：已等待超过 ${minutes} 分钟且没有活跃的检视进程（reviewer timeout）`,
           now,
         });
-        // Clear the park is what makes `notifyCaller` accept the manual
+        // Clear the park is what makes `notifyReviewer` accept the manual
         // re-review. Capture the caller's own reason BEFORE clearing: the park
         // reason is the most useful part of the failure record, and it used to
         // be lost when the dead park was removed.
@@ -484,42 +473,11 @@ export class ReviewWakeScheduler extends EventEmitter {
             // A reviewer is already running this review. Firing the planned
             // retry now would spawn a second process on the SAME native
             // session, and codex rejects that with "no rollout found".
-            !this.isReviewerActive(t.threadId) &&
-            // Sibling tasks can share one caller session (the same codex
-            // thread). While any of them has a live reviewer, this session is
-            // busy: resuming it again is rejected by the CLI.
-            !this.isCallerSessionBusy(t),
+            !this.isReviewerActive(t.threadId),
         );
     } catch {
       return [];
     }
-  }
-
-  /**
-   * True when a live reviewer of a SIBLING task owns the same caller session.
-   *
-   * The wake queue is keyed per process; two tasks whose callerSessionId spells
-   * the same codex thread differently (`rollout-…-uuid` vs bare `uuid`) used to
-   * get separate slots and both resumed it, which codex rejects with
-   * "no rollout found for thread id". The role lock is the cross-process truth:
-   * if a sibling thread still holds a live reviewer role for that session, this
-   * task must wait for it to finish.
-   */
-  private isCallerSessionBusy(thread: DelegationThread): boolean {
-    if (thread.execution?.version === 2) return false;
-    const key = callerSessionKey(thread.callerSessionId || '');
-    if (!key) return false;
-    try {
-      const lock = new TaskRoleLock();
-      for (const other of this.taskStore.getAllTasks()) {
-        if (other.threadId === thread.threadId) continue;
-        if (callerSessionKey(other.callerSessionId || '') !== key) continue;
-        if (lock.getOwner(other.threadId)?.role === 'reviewer') return true;
-      }
-    } catch {
-      // Best effort: a lock read failure must not block the retry path.
-    }
-    return false;
   }
 
   private rateLimitOf(thread: DelegationThread): RateLimitInfo | undefined {

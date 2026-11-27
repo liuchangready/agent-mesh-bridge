@@ -1,62 +1,36 @@
 import { assertDedicatedTask } from './types';
 import { getTaskExecutionPath, isReviewerWakeEligible, isMergeReview } from './types';
 import type { ChildProcess } from 'child_process';
-import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import {
   DelegationThread,
   DelegationRound,
-  MESH_TASK_RECEIVER_ENV,
-  MESH_TASK_ROUND_ENV,
-  MESH_TASK_THREAD_ENV,
   ReviewWakeState,
   ResponseAssessment,
   TaskInterruption,
-  findInFlightRound,
   isValidSessionId,
-  latestCompletedWorkRound,
   appendInterruption,
 } from './types';
 import { AgentDetector } from './agent-detector';
-import { defaultBinary, getProcessBirthId, killProcessTree, needsShellWrapper } from './platform';
-import { buildDshHeadlessCommand } from './deepseek-harness';
-import { resolveConfiguredModel, writeDshModelOverlay } from './model-catalog';
-import { TaskRoleLock, TaskRoleLease } from './task-role-lock';
 import type { TaskStore } from './task-store';
 import { aggregateThreadTokenUsage, formatTokenCount } from './token-usage-collector';
-import { applyReviewFailure, buildReviewWakeState, reopenFailedReview } from './review-wake';
+import { applyReviewFailure, buildReviewWakeState } from './review-wake';
 import { detectRateLimitSignal } from './autonomous-runner';
-import { ReviewerLogWriter, createReviewerLogWriter } from './reviewer-log';
-import { cachedCodexResumeSupport, codexResumeArgument, extractCodexThreadId } from './codex-session';
+import { createReviewerLogWriter } from './reviewer-log';
 import { assertCanExecute } from './agent-capabilities';
 import { AutonomousRunner } from './autonomous-runner';
-import { NativeSessionCompactor, NativeRunPreparationContext } from './native-session-compactor';
-import { NativeSessionLock } from './native-session-lock';
+import type { NativeRunPreparationContext } from './native-session-compactor';
 import { nativeSessionNamespace, SessionOwnershipStore } from './session-ownership';
-import { TaskExecutionRegistry, TaskExecutionRegistration } from './task-execution-registry';
-import { CancellationRegistry } from './cancellation-registry';
 import { noteMergeFailure } from './merge-recovery';
 import { ExecutionController } from './execution-controller';
-import { HostSuspensionGuard, monotonicNowMs } from './host-suspension';
 import {
   buildReviewerBootstrapPrompt,
   clearReviewerBootstrapToken,
   readReviewerBootstrapToken,
   recordReviewerBootstrapHostPid,
 } from './reviewer-bootstrap';
-
-/**
- * How many times one task may wake its caller about failures.
- *
- * Without a cap, a task that keeps dying would ping-pong between caller and
- * receiver forever: every failure wakes the caller, the caller retries, the
- * retry fails again. Three is enough to surface the problem and still let the
- * caller make one or two real attempts.
- */
-const MAX_FAILURE_NOTIFICATIONS = 3;
 
 export class CallbackManager extends EventEmitter {
   private detector: AgentDetector;
@@ -85,11 +59,11 @@ export class CallbackManager extends EventEmitter {
     return this.detector.getRateLimitTracker();
   }
 
-  public async notifyCaller(thread: DelegationThread, round: DelegationRound): Promise<boolean> {
+  public async notifyReviewer(thread: DelegationThread, round: DelegationRound): Promise<boolean> {
     if (thread.execution?.version !== 2 || thread.reviewFlow !== 'dedicated') return false;
     return await ExecutionController.getInstance()?.wakeReviewerV2(thread.threadId, round.round) ?? false;
   }
-  private resolveCallerSession(thread: DelegationThread): string | undefined {
+  private resolveReviewerSession(thread: DelegationThread): string | undefined {
     if (thread.reviewFlow !== 'dedicated' ||
         thread.reviewBootstrap?.phase !== 'confirmed' ||
         thread.reviewerSessionCaptured !== true ||
@@ -137,6 +111,13 @@ export class CallbackManager extends EventEmitter {
   ): Promise<{ confirmed: boolean; error?: string; transient?: boolean }> {
     assertDedicatedTask(thread);
     assertCanExecute(thread.initiatorAgent, 'bootstrap as a reviewer', 'initiator');
+    const control = thread.execution;
+    const identity = executionIdentity;
+    if (control?.version !== 2 || !identity || identity.role !== 'reviewer' || identity.phase !== 'review' ||
+        control.run?.id !== identity.runId || control.operationId !== identity.operationId ||
+        control.generation !== identity.generation || control.round !== identity.round) {
+      return { confirmed: false, error: 'V2 reviewer bootstrap has no matching durable run identity.' };
+    }
     const store = this.taskStore;
     const root = this.storageDir || (store ? path.dirname(store.getStoragePath()) : undefined);
     const tokenRecord = root ? readReviewerBootstrapToken(thread.threadId, root, thread.artifactDir) : undefined;
@@ -168,14 +149,7 @@ export class CallbackManager extends EventEmitter {
       nativeSessionRole: 'reviewer',
       model: thread.reviewerModel,
       role: 'bootstrap',
-      executionIdentity: executionIdentity ? {
-        runId: executionIdentity.runId,
-        operationId: executionIdentity.operationId,
-        generation: executionIdentity.generation,
-        phase: executionIdentity.phase,
-        round: executionIdentity.round,
-        role: 'reviewer',
-      } : undefined,
+      executionIdentity: identity,
       markAsReceiver: false,
       maxRetries: 0,
       extraEnv: {
@@ -207,46 +181,37 @@ export class CallbackManager extends EventEmitter {
         (thread.initiatorAgent === 'claude_code' ? preassigned : undefined) ||
         (resumeReviewerSession ? preassigned : undefined);
       if (sessionId && store) {
-        if (fresh.execution?.version === 2) {
-          const assignment = fresh.nativeSessionAssignments?.reviewer;
-          if (!assignment) return { confirmed: false, error: 'SESSION_OWNERSHIP_UNVERIFIED: reviewer namespace was not pinned.' };
-          if (assignment.namespace !== nativeSessionNamespace(fresh.initiatorAgent)) {
-            return { confirmed: false, error: 'SESSION_OWNERSHIP_UNVERIFIED: pinned reviewer namespace does not match the CLI storage root.' };
-          }
-          const ownershipStore = new SessionOwnershipStore(root);
-          const ownershipInput = {
-            agent: fresh.initiatorAgent,
-            namespace: assignment.namespace,
-            sessionId,
-            threadId: fresh.threadId,
-            role: 'reviewer',
-            sessionEpoch: assignment.sessionEpoch,
-          } as const;
-          const ownership = fresh.reviewerSessionCaptured === true
-            ? ownershipStore.verify(ownershipInput)
-            : ownershipStore.claim(ownershipInput);
-          if (!ownership.ok) return { confirmed: false, error: `${ownership.code}: ${ownership.reason}` };
-          await store.transitionExecution(fresh.threadId, fresh.execution.revision, (current) => {
-            if (current.execution?.run?.id !== fresh.execution?.run?.id || current.cleanup) {
-              throw new Error('Reviewer bootstrap run changed before session binding was persisted.');
-            }
-            current.reviewerSessionId = sessionId;
-            current.reviewerSessionCaptured = true;
-            current.callerSessionId = sessionId;
-          });
-          if (root) clearReviewerBootstrapToken(fresh.threadId, root, fresh.artifactDir);
-          return { confirmed: true };
+        if (fresh.execution?.version !== 2 || fresh.execution.run?.id !== identity.runId ||
+            fresh.execution.operationId !== identity.operationId || fresh.execution.generation !== identity.generation) {
+          return { confirmed: false, error: 'Reviewer bootstrap run changed before session binding was persisted.' };
         }
-        fresh.reviewerSessionId = sessionId;
-        fresh.reviewerSessionCaptured = true;
-        fresh.callerSessionId = sessionId;
-        fresh.reviewBootstrap = {
-          ...fresh.reviewBootstrap,
-          phase: 'confirmed',
-          reviewerSessionId: sessionId,
-        };
+        const assignment = fresh.nativeSessionAssignments?.reviewer;
+        if (!assignment) return { confirmed: false, error: 'SESSION_OWNERSHIP_UNVERIFIED: reviewer namespace was not pinned.' };
+        if (assignment.namespace !== nativeSessionNamespace(fresh.initiatorAgent)) {
+          return { confirmed: false, error: 'SESSION_OWNERSHIP_UNVERIFIED: pinned reviewer namespace does not match the CLI storage root.' };
+        }
+        const ownershipStore = new SessionOwnershipStore(root);
+        const ownershipInput = {
+          agent: fresh.initiatorAgent,
+          namespace: assignment.namespace,
+          sessionId,
+          threadId: fresh.threadId,
+          role: 'reviewer',
+          sessionEpoch: assignment.sessionEpoch,
+        } as const;
+        const ownership = fresh.reviewerSessionCaptured === true
+          ? ownershipStore.verify(ownershipInput)
+          : ownershipStore.claim(ownershipInput);
+        if (!ownership.ok) return { confirmed: false, error: `${ownership.code}: ${ownership.reason}` };
+        await store.transitionExecution(fresh.threadId, fresh.execution.revision, (current) => {
+          if (current.execution?.run?.id !== fresh.execution?.run?.id || current.cleanup) {
+            throw new Error('Reviewer bootstrap run changed before session binding was persisted.');
+          }
+          current.reviewerSessionId = sessionId;
+          current.reviewerSessionCaptured = true;
+          current.callerSessionId = sessionId;
+        });
         if (root) clearReviewerBootstrapToken(fresh.threadId, root, fresh.artifactDir);
-        store.upsertTask(fresh);
       }
       return { confirmed: true };
     }
@@ -256,102 +221,88 @@ export class CallbackManager extends EventEmitter {
     return { confirmed: false, error: detail, transient: isTransient };
   }
 
-  public launchCaller(
+  public launchReviewer(
     thread: DelegationThread,
     round: DelegationRound,
     onChildPid?: (pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>,
     executionIdentity?: NativeRunPreparationContext,
   ): Promise<{ success: boolean; error?: string; exitCode?: number; output?: string; assessment?: ResponseAssessment }> {
     assertDedicatedTask(thread);
-    if (thread.execution?.version !== 2 || thread.reviewFlow !== 'dedicated') {
+    if (thread.execution?.version !== 2) {
       return Promise.resolve({ success: false, error: 'Historical tasks cannot start a reviewer.' , exitCode: -1 });
     }
-    return this.launchCallerAsync(thread, round, onChildPid, executionIdentity);
-  }
-  private launchCallerAsync(
-    thread: DelegationThread,
-    round: DelegationRound,
-    onChildPid?: (pid: number | undefined, childProcess?: ChildProcess, childBirthId?: string) => void | Promise<void>,
-    executionIdentity?: NativeRunPreparationContext,
-  ): Promise<{ success: boolean; error?: string; exitCode?: number; output?: string; assessment?: ResponseAssessment }> {
     assertCanExecute(thread.initiatorAgent, 'resume as a reviewer', 'initiator');
-    const callerSessionId = this.resolveCallerSession(thread);
-    if (!callerSessionId) {
-      return Promise.resolve({ success: false, error: `No caller session ID found for task ${thread.threadId}` });
+    const reviewerSessionId = this.resolveReviewerSession(thread);
+    if (!reviewerSessionId) {
+      return Promise.resolve({ success: false, error: `No reviewer session ID found for task ${thread.threadId}` });
     }
 
     const initiator = thread.initiatorAgent;
     const cwd = isMergeReview(thread) && thread.worktree?.mergeResolutionPath || getTaskExecutionPath(thread);
     const senderModel = thread.reviewerModel;
-    const modelFlagArgs = senderModel ? ['--model', senderModel] : [];
-    const codexModelArgs = senderModel ? ['-c', `model="${senderModel}"`] : [];
 
     const wakeMessage = this.buildReviewWakeMessage(thread, round);
 
-    if (thread.execution?.version === 2) {
-      const identity = executionIdentity;
-      if (!identity || identity.role !== 'reviewer' || identity.phase !== 'review' ||
-          identity.runId !== thread.execution.run?.id || identity.operationId !== thread.execution.operationId ||
-          identity.generation !== thread.execution.generation || identity.round !== thread.execution.round) {
-        return Promise.resolve({ success: false, error: 'V2 reviewer wake has no matching durable run identity.', exitCode: -1 });
-      }
-      const runner = this.runner || new AutonomousRunner(this.detector, undefined, undefined, this.taskStore);
-      const reviewerLog = createReviewerLogWriter(thread.threadId, round.round, {
-        agent: initiator,
-        sessionId: callerSessionId,
-        kind: 'review',
-        note: `${thread.title} | receiver=${thread.targetAgent} | roundType=${round.type} | senderModel=${senderModel || 'agent default'}`,
-      }, { root: this.storageDir, artifactDir: thread.artifactDir });
-      return runner.execute({
-        agent: initiator,
-        prompt: wakeMessage,
-        isRework: true,
-        receiverSessionId: callerSessionId,
-        title: `Review: ${thread.title}`,
-        cwd,
-        taskThreadId: thread.threadId,
-        artifactDir: thread.artifactDir,
-        taskRound: round.round,
-        nativeSessionRole: 'reviewer',
-        model: senderModel,
-        role: 'reviewer',
-        executionIdentity: { ...identity },
-        markAsReceiver: false,
-        maxRetries: 0,
-        extraEnv: {
-          MESH_REVIEW_SESSION_ID: callerSessionId,
-          MESH_REVIEW_THREAD_ID: thread.threadId,
-          MESH_CALLER_AGENT: initiator,
-        },
-        preSpawnGuard: () => {
-          this.taskStore?.loadFromDisk();
-          const fresh = this.taskStore?.getTask(thread.threadId);
-          const current = fresh?.execution;
-          if (!fresh || fresh.cleanup || fresh.status !== 'reviewing' || current?.version !== 2 ||
-              current.run?.id !== identity.runId || current.operationId !== identity.operationId ||
-              current.generation !== identity.generation || current.phase !== 'review' || current.round !== identity.round ||
-              current.run.state === 'stopping' || current.run.unconfirmed) {
-            return { ok: false, reason: 'V2 reviewer run or task state changed before spawn.' };
-          }
-          return { ok: true };
-        },
-        onStdoutChunk: (chunk) => reviewerLog.write(chunk),
-        onStderrChunk: (chunk) => reviewerLog.write(chunk),
-        onChildPid,
-      }).then((result) => {
-        reviewerLog.writeOutcome(result);
-        return {
-          success: result.exitCode === 0 && result.assessment?.success === true,
-          exitCode: result.exitCode,
-          error: result.error,
-          output: result.stdout,
-          assessment: result.assessment,
-        };
-      }).finally(() => reviewerLog.close());
+    const identity = executionIdentity;
+    if (!identity || identity.role !== 'reviewer' || identity.phase !== 'review' ||
+        identity.runId !== thread.execution.run?.id || identity.operationId !== thread.execution.operationId ||
+        identity.generation !== thread.execution.generation || identity.round !== thread.execution.round) {
+      return Promise.resolve({ success: false, error: 'V2 reviewer wake has no matching durable run identity.', exitCode: -1 });
     }
-
-    return Promise.resolve({ success: false, error: 'Historical task reviewer execution is disabled.', exitCode: -1 });
-}
+    const runner = this.runner || new AutonomousRunner(this.detector, undefined, undefined, this.taskStore);
+    const reviewerLog = createReviewerLogWriter(thread.threadId, round.round, {
+      agent: initiator,
+      sessionId: reviewerSessionId,
+      kind: 'review',
+      note: `${thread.title} | receiver=${thread.targetAgent} | roundType=${round.type} | senderModel=${senderModel || 'agent default'}`,
+    }, { root: this.storageDir, artifactDir: thread.artifactDir });
+    return runner.execute({
+      agent: initiator,
+      prompt: wakeMessage,
+      isRework: true,
+      receiverSessionId: reviewerSessionId,
+      title: `Review: ${thread.title}`,
+      cwd,
+      taskThreadId: thread.threadId,
+      artifactDir: thread.artifactDir,
+      taskRound: round.round,
+      nativeSessionRole: 'reviewer',
+      model: senderModel,
+      role: 'reviewer',
+      executionIdentity: { ...identity },
+      markAsReceiver: false,
+      maxRetries: 0,
+      extraEnv: {
+        MESH_REVIEW_SESSION_ID: reviewerSessionId,
+        MESH_REVIEW_THREAD_ID: thread.threadId,
+        MESH_CALLER_AGENT: initiator,
+      },
+      preSpawnGuard: () => {
+        this.taskStore?.loadFromDisk();
+        const fresh = this.taskStore?.getTask(thread.threadId);
+        const current = fresh?.execution;
+        if (!fresh || fresh.cleanup || fresh.status !== 'reviewing' || current?.version !== 2 ||
+            current.run?.id !== identity.runId || current.operationId !== identity.operationId ||
+            current.generation !== identity.generation || current.phase !== 'review' || current.round !== identity.round ||
+            current.run.state === 'stopping' || current.run.unconfirmed) {
+          return { ok: false, reason: 'V2 reviewer run or task state changed before spawn.' };
+        }
+        return { ok: true };
+      },
+      onStdoutChunk: (chunk) => reviewerLog.write(chunk),
+      onStderrChunk: (chunk) => reviewerLog.write(chunk),
+      onChildPid,
+    }).then((result) => {
+      reviewerLog.writeOutcome(result);
+      return {
+        success: result.exitCode === 0 && result.assessment?.success === true,
+        exitCode: result.exitCode,
+        error: result.error,
+        output: result.stdout,
+        assessment: result.assessment,
+      };
+    }).finally(() => reviewerLog.close());
+  }
   public finalizeWake(
     thread: DelegationThread,
     round: DelegationRound,
@@ -518,27 +469,3 @@ export class CallbackManager extends EventEmitter {
     return state;
   }
 }
-
-/**
- * Bounded tail of a wake child's output.
- *
- * A reviewer turn can print megabytes; only the last few KB matter for
- * classifying the failure, and holding all of it would blow up the extension
- * host for long sessions.
- */
-class WakeOutputCapture {
-  private static readonly MAX_CHARS = 16_384;
-  private buffer = '';
-
-  public push(chunk: Buffer | string): void {
-    this.buffer += chunk.toString();
-    if (this.buffer.length > WakeOutputCapture.MAX_CHARS) {
-      this.buffer = this.buffer.slice(-WakeOutputCapture.MAX_CHARS);
-    }
-  }
-
-  public text(): string {
-    return this.buffer;
-  }
-}
-

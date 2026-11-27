@@ -5,6 +5,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import { DelegationThread, WorktreeInfo } from '../bridge/types';
+import { snapshotTaskWorktree } from '../bridge/git-worktree';
+import { TaskStore } from '../bridge/task-store';
 
 export const gitExe = process.env.MESH_GIT_PATH || (process.platform === 'win32' ? 'D:\\Git\\cmd\\git.exe' : 'git');
 process.env.MESH_GIT_PATH = gitExe;
@@ -90,6 +92,31 @@ export function thread(threadId: string, worktree: WorktreeInfo): DelegationThre
     rounds: [{ round: 1, type: 'initial', prompt: 'change one line', output: 'done', durationMs: 1, status: 'completed', timestamp: now }],
     worktree: { ...worktree, approvedCommit: worktree.headCommit, integration: { phase: 'waiting', sourceCommit: worktree.headCommit, updatedAt: now } },
   };
+}
+
+// Prepare inputs at the Git boundary. V2 controller suites exercise reviewer admission and handoff.
+export function storeApprovedGitSnapshot(store: TaskStore, item: DelegationThread): void {
+  const worktree = item.worktree!;
+  const snapshot = snapshotTaskWorktree(worktree);
+  git(worktree.path, 'update-ref', 'refs/mesh/candidates/' + item.threadId, snapshot.commit);
+  worktree.approvedSnapshot = snapshot;
+  worktree.approvedCommit = snapshot.commit;
+  worktree.mergePending = true;
+  worktree.integration = { phase: 'waiting', sourceCommit: snapshot.commit, updatedAt: new Date().toISOString() };
+  item.status = 'queued';
+  item.queuePhase = 'merge';
+  store.upsertTask(item);
+}
+
+export function storeQueuedGitResolution(store: TaskStore, threadId: string): void {
+  const item = store.getTask(threadId)!;
+  const worktree = item.worktree!;
+  assert.ok(worktree.mergeResolutionPath);
+  worktree.mergeResolutionSubmitted = true;
+  worktree.integration = { ...worktree.integration!, phase: 'waiting', updatedAt: new Date().toISOString() };
+  item.status = 'queued';
+  item.queuePhase = 'merge';
+  store.upsertTask(item);
 }
 
 export async function waitFor(file: string, attempts = 300): Promise<void> {

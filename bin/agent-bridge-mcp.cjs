@@ -65,7 +65,7 @@ function createBridgeHost(options = {}) {
   callbackManager.setTaskStore(taskStore);
   callbackManager.setAutonomousRunner(runner);
   const registry = options.registry;
-  const reworkController = new ReworkController(taskStore, runner, callbackManager, detector, registry, false, true, startupAdmission.ready);
+  const reworkController = new ReworkController(taskStore, callbackManager, startupAdmission.ready);
   const executionController = new ExecutionController(
     taskStore,
     runner,
@@ -79,7 +79,7 @@ function createBridgeHost(options = {}) {
   const reason = startupAdmission.ready ? undefined :
     (startupAdmission.blockers || []).slice(0, 5).map((item) => `${item.code}: ${item.evidence}`).join(' | ') ||
     'runtime component preflight has not passed.';
-  const server = new MCPServer(dispatcher, reworkController, taskStore, detector, resolver, runner, true, reason, true);
+  const server = new MCPServer(dispatcher, reworkController, taskStore, detector, resolver, runner, reason, true);
   return { taskStore, detector, resolver, runner, callbackManager, registry, dispatcher, reworkController, executionController, server, startupAdmission };
 }
 

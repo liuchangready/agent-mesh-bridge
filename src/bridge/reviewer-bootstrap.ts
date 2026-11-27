@@ -201,7 +201,7 @@ export function findReviewerBootstrapByHostPid(
 }
 
 /** A stale policy snapshot must never resume the requester for new work. */
-export function resolveReviewFlow(override?: ReviewFlow, _policyFlow?: ReviewFlow): 'dedicated' {
+export function resolveReviewFlow(override?: ReviewFlow): 'dedicated' {
   if (override !== undefined && override !== 'dedicated') {
     throw new Error('LEGACY_REVIEW_FLOW_DISABLED: New tasks require a dedicated reviewer.');
   }

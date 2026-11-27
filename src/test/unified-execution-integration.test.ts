@@ -115,8 +115,7 @@ describe('Unified Execution Integration Tests', () => {
         return publish(file, data);
       };
       (fixture.controller as any).mergeCoordinator = coordinator;
-      rework = new ReworkController(fixture.store, fixture.runner as any, fixture.callbackManager,
-        fixture.detector, fixture.registry, false, true, true);
+      rework = new ReworkController(fixture.store, fixture.callbackManager);
 
       const first = await rework.mergeApproved(threadId);
       assert.equal(first.status, 'blocked', 'the initial UI action starts the real V2 merge run');
@@ -403,7 +402,7 @@ describe('Unified Execution Integration Tests', () => {
       // Remove the fixture's legacy direct-spawn mock. V2 review must use the
       // real CallbackManager -> AutonomousRunner path and only replace the
       // lowest-level CLI adapter with a controlled OS child.
-      delete (fixture.callbackManager as any).launchCaller;
+      delete (fixture.callbackManager as any).launchReviewer;
       const actualRunner = new AutonomousRunner(fixture.detector, undefined, undefined, fixture.store);
       fixture.callbackManager.setAutonomousRunner(actualRunner);
       (fixture.controller as any).runner = actualRunner;
@@ -486,7 +485,7 @@ describe('Unified Execution Integration Tests', () => {
 
       let finishReview: () => void;
       const reviewBarrier = new Promise<void>((r) => { finishReview = r; });
-      fixture.callbackManager.launchCaller = (async () => {
+      fixture.callbackManager.launchReviewer = (async () => {
         await reviewBarrier;
         return { success: true, exitCode: 0 };
       }) as any;
@@ -562,7 +561,7 @@ describe('Unified Execution Integration Tests', () => {
 
   test('v2 merge retry validates the latest target and hands a failed validation back to the original reviewer', { timeout: 120_000 }, async () => {
     const fixture = await setupFixture();
-    const rework = new ReworkController(fixture.store, fixture.runner as any, fixture.callbackManager, fixture.detector);
+    const rework = new ReworkController(fixture.store, fixture.callbackManager);
     try {
       const repo = path.join(fixture.dir, 'repository');
       const evidence = path.join(fixture.dir, 'validation.jsonl');
@@ -596,7 +595,7 @@ describe('Unified Execution Integration Tests', () => {
       let reviewerError: unknown;
       let reviewerCalls = 0;
       let secondBase = '';
-      fixture.callbackManager.launchCaller = (async (reviewed: typeof thread) => {
+      fixture.callbackManager.launchReviewer = (async (reviewed: typeof thread) => {
         reviewerCalls++;
         try {
           const disk = fixture.store.reloadTask(thread.threadId)!;
@@ -927,7 +926,7 @@ describe('Unified Execution Integration Tests', () => {
 
       let finishReview: () => void;
       const reviewBarrier = new Promise<void>((r) => { finishReview = r; });
-      fixture.callbackManager.launchCaller = (async () => {
+      fixture.callbackManager.launchReviewer = (async () => {
         await reviewBarrier;
         return { success: true, exitCode: 0 };
       }) as any;
@@ -1087,13 +1086,7 @@ describe('Unified Execution Integration Tests', () => {
   // Scenario 29: Separate logical verdict from physical execution exit: approve/rework retains Reviewer run until CLI exits
   test('Scenario 29: approveTask retains Reviewer run until CLI exits and non-zero tail exit does not revoke verdict', async () => {
     const fixture = await setupFixture();
-    const reworkController = new ReworkController(
-      fixture.store,
-      fixture.runner as any,
-      fixture.callbackManager,
-      fixture.detector,
-      fixture.registry,
-    );
+    const reworkController = new ReworkController(fixture.store, fixture.callbackManager);
     const gitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-s29-test-'));
 
     try {
@@ -1130,8 +1123,8 @@ describe('Unified Execution Integration Tests', () => {
         releaseCliBarrier = resolve;
       });
 
-      // Mock launchCaller representing a live Reviewer CLI
-      fixture.callbackManager.launchCaller = (async () => await cliBarrier) as any;
+      // Mock launchReviewer representing a live Reviewer CLI
+      fixture.callbackManager.launchReviewer = (async () => await cliBarrier) as any;
 
       // Start review phase
       const startRes = await fixture.controller.startExecution('thread_s29', 'review');
