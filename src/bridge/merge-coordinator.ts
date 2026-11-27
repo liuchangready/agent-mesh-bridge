@@ -217,7 +217,7 @@ export class MergeCoordinator {
     const registration = this.executions.begin(threadId, thread?.currentRound || 0, 'merge-git', cwd);
     let child: ReturnType<typeof spawn>;
     let start: (() => void) | undefined;
-    try { ({ child, start } = this.spawnMergeChild(threadId, gitExecutable(), args, cwd)); }
+    try { ({ child, start } = this.spawnMergeChild(threadId, gitExecutable(this.storageDir), args, cwd)); }
     catch (error) { this.executions.end(registration); throw error; }
     const windows = process.platform === 'win32';
     let childBirthId = !windows && child.pid ? getProcessBirthId(child.pid) : undefined;
@@ -979,8 +979,9 @@ export class MergeCoordinator {
     if (!/^[0-9a-f]{40,64}$/i.test(sha)) throw new Error('Invalid landing stash SHA.');
     const registration = this.executions.begin(threadId, this.store.getTask(threadId)?.currentRound || 0, 'merge-git', cwd);
     let child: ReturnType<typeof spawn>;
-    try { child = this.spawnJobIfV2(threadId, gitExecutable(), ['update-ref', '--stdin'], cwd) ??
-      spawn(gitExecutable(), ['update-ref', '--stdin'], { cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }); }
+    const executable = gitExecutable(this.storageDir);
+    try { child = this.spawnJobIfV2(threadId, executable, ['update-ref', '--stdin'], cwd) ??
+      spawn(executable, ['update-ref', '--stdin'], { cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }); }
     catch (failure) { this.executions.end(registration); throw failure; }
     const windows = process.platform === 'win32';
     let childBirthId = !windows && child.pid ? getProcessBirthId(child.pid) : undefined;

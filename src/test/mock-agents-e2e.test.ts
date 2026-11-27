@@ -104,7 +104,7 @@ async function fixture(t: TestContext, scenario: MockScenario, delayResident = f
   fs.writeFileSync(path.join(repo, 'validate.cjs'), [
     "const fs=require('fs'), assert=require('assert/strict');",
     `assert.equal(fs.readFileSync('result.txt','utf8'),${JSON.stringify(`round ${scenario.rounds}\n`)});`,
-    ...(scenario.pauseAt === 'merge' ? [
+    ...(scenario.pauseAt?.merge ? [
       `const gate=${JSON.stringify(path.join(root, 'merge'))}; if(!fs.existsSync(gate+'.pause-marker')){fs.writeFileSync(gate+'.pause-marker','held');fs.writeFileSync(gate+'.ready',JSON.stringify({pid:process.pid,at:process.hrtime.bigint().toString()}));const until=Date.now()+240000;while(!fs.existsSync(gate+'.release')&&Date.now()<until)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);if(!fs.existsSync(gate+'.release'))throw Error('merge gate timed out');}`,
     ] : []),
     `fs.appendFileSync(${JSON.stringify(path.join(root, 'validation.jsonl'))},JSON.stringify({step:process.argv[2],cwd:process.cwd()})+String.fromCharCode(10));`,
@@ -189,13 +189,15 @@ async function fixture(t: TestContext, scenario: MockScenario, delayResident = f
   state.threadId = dispatch.threadId;
   assert.equal(dispatch.nextAction, 'END_TURN_AND_WAIT_FOR_CALLBACK');
   assert.equal(dispatch.status, 'QUEUED');
-  return { root, repo, base, client, residentPid: resident.child.pid, residentGate, threadId: state.threadId!,
+  return { root, repo, base, client, resident, residentPid: resident.child.pid, residentGate, threadId: state.threadId!,
     closeSubmitter: async () => { await client.close(); clientClosed = true; },
     finish: () => { state.passed = true; } };
 }
 
-test('resident Bridge starts the accepted task after its stdio submitter exits', { timeout: 180_000 }, async t => {
-  const f = await fixture(t, { rounds: 1, pauseAt: 'bootstrap' }, true);
+test('resident Bridge takes over after submitter exits and delivers three rounds', { timeout: 420_000 }, async t => {
+  const f = await fixture(t, {
+    rounds: 3, reviewerTailMs: 200, bootstrapProcessChurn: process.platform === 'win32', pauseAt: { bootstrap: true },
+  }, true);
   const queued = await waitForTask(f.root, f.threadId, task => task.workspace?.dispatchAccepted === true);
   assert.equal(queued.status, 'queued');
   assert.equal(queued.execution?.run, undefined);
@@ -208,13 +210,6 @@ test('resident Bridge starts the accepted task after its stdio submitter exits',
   // Let the controlled waiting agent proceed through bootstrap and delivery.
   const gate = await waitForEvent(f.root, 'agent.pause-ready', entry => entry.role === 'bootstrap');
   fs.writeFileSync(path.join(f.root, 'bootstrap-' + gate.round + '.release'), '');
-  await waitForTask(f.root, f.threadId, task => task.status === 'completed' && !task.execution?.run, 80000);
-  assert.equal(trace(f.root).filter(entry => entry.kind === 'bootstrap.confirmed').length, 1);
-  f.finish();
-});
-
-test('mock agents: real MCP bootstrap, three worker/reviewer rounds and validated Git delivery', { timeout: 420_000 }, async t => {
-  const f = await fixture(t, { rounds: 3, reviewerTailMs: 200, bootstrapProcessChurn: process.platform === 'win32' });
   const task = await waitForTask(
     f.root,
     f.threadId,
@@ -253,7 +248,7 @@ test('mock agents: real MCP bootstrap, three worker/reviewer rounds and validate
   assert.deepEqual(task.rounds.filter(round => round.type !== 'approval').map(round => round.round), [1, 2, 3]);
   assert.ok(task.rounds.filter(round => round.type !== 'approval').every(round => round.assessment?.success));
   for (const round of [1, 2, 3]) {
-    const log = await f.client.tool('get_reviewer_log', { threadId: f.threadId, round });
+    const log = await f.resident.tool('get_reviewer_log', { threadId: f.threadId, round });
     assert.equal(log.available, true);
     assert.match(log.content, /"type":"thread.started"/);
   }
@@ -267,7 +262,7 @@ test('mock agents: real MCP bootstrap, three worker/reviewer rounds and validate
   assert.deepEqual(validation.map(entry => entry.step), ['compile', 'test']);
   assert.ok(validation.every(entry => entry.cwd !== f.repo), 'Validation must use the combined validation worktree');
   assert.equal(fs.readdirSync(path.join(f.root, 'home', '.agent-mesh-bridge', 'threads')).filter(name => name.endsWith('.json')).length, 1);
-  const summary = await f.client.tool('get_task_summary', { threadId: f.threadId });
+  const summary = await f.resident.tool('get_task_summary', { threadId: f.threadId });
   assert.equal(summary.status, 'completed');
   assert.ok(summary.finalSummary);
   f.finish();
@@ -288,94 +283,114 @@ test('Windows v2 receiver cannot forward over stdio after the CLI scrubs receive
   f.finish();
 });
 
-for (const phase of ['bootstrap', 'develop', 'review', 'merge'] as const) {
-  test(`mock v2 pause/resume: same task, sessions and delivery through ${phase}`, { timeout: 360_000 }, async t => {
-    const rounds = phase === 'develop' ? 2 : 1;
-    const pauseRound = phase === 'develop' ? 2 : undefined;
-    const f = await fixture(t, { rounds, pauseAt: phase, pauseRound });
-    const mergeReady = path.join(f.root, 'merge.ready');
-    let heldValidation: { pid: number; birthId?: string } | undefined;
-    let mergeGateAt = '';
-    let agentsBeforeMergeResume = 0;
-    let firstRunId: string;
-    let pausedTask: DelegationThread;
+test('mock v2 pause/resume: same task, sessions and delivery through all four phases', { timeout: 360_000 }, async t => {
+  const rounds = 2;
+  const pauseAt = { bootstrap: true, develop: rounds, review: rounds, merge: true } as const;
+  const f = await fixture(t, { rounds, pauseAt });
+  const initialTask = await waitForTask(f.root, f.threadId, task => Boolean(task.worktree?.path));
+  const worktree = initialTask.worktree?.path;
+  assert.ok(worktree);
+  let agentsBeforeMerge = 0;
+
+  for (const phase of ['bootstrap', 'develop', 'review', 'merge'] as const) {
+    const executionPhase = phase === 'bootstrap' ? 'review' : phase;
+    const role = phase === 'develop' ? 'worker' : phase === 'review' ? 'reviewer' : phase;
+    const pauseRound = pauseAt[phase];
+    let heldValidation: { pid: number; birthId: string } | undefined;
     let gateEvent: any;
 
     if (phase === 'merge') {
+      const mergeReady = path.join(f.root, 'merge.ready');
       await waitForFile(mergeReady);
       const gate = JSON.parse(fs.readFileSync(mergeReady, 'utf8'));
-      mergeGateAt = gate.at;
-      agentsBeforeMergeResume = trace(f.root).filter(entry => entry.kind === 'agent.start').length;
-      heldValidation = { pid: gate.pid, birthId: getProcessBirthId(gate.pid) };
-      assert.ok(heldValidation.birthId, 'the held validation child must have captured process identity');
-      pausedTask = await waitForTask(f.root, f.threadId, task => task.status === 'merging' && task.execution?.run?.state === 'active' && task.execution.phase === 'merge');
+      const birthId = getProcessBirthId(gate.pid);
+      assert.ok(birthId, 'the held validation child must have captured process identity');
+      heldValidation = { pid: gate.pid, birthId };
+      const events = trace(f.root);
+      const agents = events.filter(entry => entry.kind === 'agent.start');
+      agentsBeforeMerge = agents.length;
+      const lastReviewer = agents.filter(entry => entry.role === 'reviewer').at(-1);
+      assert.ok(lastReviewer);
+      const closed = events.find(entry => entry.kind === 'process.close' && entry.launchId === lastReviewer.launchId);
+      assert.ok(closed && BigInt(closed.at) < BigInt(gate.at), 'reviewer must exit before merge consumes its handoff');
     } else {
-      const expectedRole = phase === 'develop' ? 'worker' : phase === 'review' ? 'reviewer' : 'bootstrap';
-      gateEvent = await waitForEvent(f.root, 'agent.pause-ready', entry => entry.role === expectedRole &&
-        (pauseRound === undefined || entry.round === pauseRound));
-      pausedTask = await waitForTask(f.root, f.threadId, task => task.execution?.run?.state === 'active' &&
-        (phase === 'develop' ? task.execution.phase === 'develop' && task.execution.round === pauseRound :
-          phase === 'bootstrap' ? task.execution.phase === 'review' : task.execution.phase === 'review'));
+      gateEvent = await waitForEvent(f.root, 'agent.pause-ready', entry => entry.threadId === f.threadId && entry.role === role &&
+        (pauseRound === true || entry.round === pauseRound));
     }
-    assert.equal(pausedTask.execution?.version, 2, 'the task must use admitted production v2 execution');
-    assert.ok(pausedTask.execution.run?.id);
-    firstRunId = pausedTask.execution.run.id;
-    assert.equal(pausedTask.threadId, f.threadId);
-    const sameWorktree = pausedTask.worktree?.path;
-    const receiverSession = pausedTask.receiverSessionCaptured ? pausedTask.receiverSessionId : undefined;
-    const reviewerSession = pausedTask.reviewerSessionCaptured ? pausedTask.reviewerSessionId : undefined;
-    if (phase === 'develop') assert.ok(receiverSession, 'round 2 starts after the developer session was captured');
-    if (phase === 'review') assert.ok(reviewerSession, 'review starts after bootstrap captured the reviewer session');
+
+    const running = await waitForTask(f.root, f.threadId, task => task.execution?.run?.state === 'active' &&
+      task.execution.phase === executionPhase && (gateEvent ? task.execution.run.id === gateEvent.runId : task.status === 'merging'));
+    assert.equal(running.execution?.version, 2, `${phase} must use admitted production v2 execution`);
+    assert.ok(running.execution.run?.id);
+    const oldRunId = running.execution.run.id;
+    const round = running.execution.round;
+    if (typeof pauseRound === 'number') assert.equal(round, pauseRound, `${phase} must pause in the selected round`);
+    assert.equal(running.threadId, f.threadId);
+    assert.equal(running.worktree?.path, worktree);
 
     const pausedByMcp = await f.client.tool('pause_task', { threadId: f.threadId, reason: `E2E pause at ${phase}` });
     assert.ok(['PAUSED', 'STOPPING'].includes(pausedByMcp.status), JSON.stringify(pausedByMcp));
-    pausedTask = await waitForTask(f.root, f.threadId, task => task.status === 'paused' && !task.execution?.run);
+    const paused = await waitForTask(f.root, f.threadId, task => task.status === 'paused' && !task.execution?.run);
+    assert.equal(paused.execution?.phase, executionPhase, `pause must preserve ${phase}`);
+    assert.equal(paused.execution?.round, round, 'pause must preserve the round');
     if (heldValidation) assert.equal(probeProcessIdentity(heldValidation.pid, heldValidation.birthId), 'exited', 'pause must stop the held validation child');
-    if (gateEvent?.launchId) {
+    if (gateEvent) {
+      assert.ok(gateEvent.launchId);
       await waitForEvent(f.root, 'process.close', entry => entry.launchId === gateEvent.launchId);
     }
 
-    const resumedRun = waitForTask(f.root, f.threadId, task => !!task.execution?.run && task.execution.run.id !== firstRunId, 60_000);
-    const resumeResult = await f.client.tool('resume_task', { threadId: f.threadId });
-    assert.ok(resumeResult, 'resume_task must respond through real MCP');
-    const resumedTask = await resumedRun;
-    assert.equal(resumedTask.execution?.version, 2);
-    assert.notEqual(resumedTask.execution?.run?.id, firstRunId, 'resume must use a unique v2 run ID');
-    assert.equal(resumedTask.execution?.phase, pausedTask.execution?.phase);
-    assert.equal(resumedTask.execution?.round, pausedTask.execution?.round);
-    const finalTask = await waitForTask(f.root, f.threadId, task => task.status === 'completed' && task.worktree?.integration?.phase === 'merged' && !task.execution?.run, 300_000);
-    assert.equal(finalTask.threadId, f.threadId);
-    assert.equal(finalTask.worktree?.path, sameWorktree);
-    assert.equal(finalTask.worktree?.deliveryTarget?.ref, 'refs/heads/master');
-    assert.equal(finalTask.execution?.version, 2);
-    if (receiverSession) assert.equal(finalTask.receiverSessionId, receiverSession);
-    if (reviewerSession) assert.equal(finalTask.reviewerSessionId, reviewerSession);
-    const events = trace(f.root);
+    const [resumed, resumeResult] = await Promise.all([
+      waitForTask(f.root, f.threadId, task => Boolean(task.execution?.run && task.execution.run.id !== oldRunId), 60_000),
+      f.client.tool('resume_task', { threadId: f.threadId }),
+    ]);
+    assert.ok(resumeResult, `resume_task must respond through real MCP during ${phase}`);
+    assert.equal(resumed.execution?.version, 2);
+    assert.ok(resumed.execution.run?.id);
+    assert.notEqual(resumed.execution.run.id, oldRunId, 'resume must use a unique v2 run ID');
+    assert.equal(resumed.execution.phase, executionPhase);
+    assert.equal(resumed.execution.round, round);
+    assert.equal(resumed.execution.purpose, running.execution.purpose);
+    assert.equal(resumed.threadId, f.threadId);
+    assert.equal(resumed.worktree?.path, worktree);
+
+    if (phase === 'merge') continue;
+    const agent = await waitForEvent(f.root, 'agent.start', entry => entry.threadId === f.threadId &&
+      entry.runId === resumed.execution?.run?.id && entry.role === role);
     if (phase === 'bootstrap') {
-      if (pausedTask.reviewerSessionCaptured) {
-        assert.ok(events.filter(entry => entry.role === 'bootstrap').every(entry => entry.sessionId === pausedTask.reviewerSessionId));
+      if (paused.reviewerSessionCaptured) {
+        assert.equal(agent.sessionId, paused.reviewerSessionId);
       } else {
-        const tokens = events.filter(entry => entry.kind === 'bootstrap.prompt').map(entry => entry.bootstrapToken);
-        assert.ok(tokens.length >= 2 && tokens.every(token => token === tokens[0]), 'uncaptured bootstrap retries must carry the original credential token');
+        const prompt = await waitForEvent(f.root, 'bootstrap.prompt', entry => entry.launchId === agent.launchId);
+        assert.ok(gateEvent.bootstrapToken);
+        assert.equal(prompt.bootstrapToken, gateEvent.bootstrapToken, 'uncaptured bootstrap retries must carry the original credential token');
       }
+    } else if (phase === 'develop') {
+      assert.ok(paused.receiverSessionCaptured && paused.receiverSessionId, 'round 2 starts with the captured developer session');
+      assert.equal(agent.sessionId, paused.receiverSessionId);
+    } else {
+      assert.ok(paused.reviewerSessionCaptured && paused.reviewerSessionId, 'review starts with the captured reviewer session');
+      assert.equal(agent.sessionId, paused.reviewerSessionId);
+      const verdict = await waitForEvent(f.root, 'reviewer.verdict', entry => entry.launchId === agent.launchId);
+      assert.equal(verdict.tool, 'approve_task');
     }
-    if (phase === 'develop') assert.ok(events.filter(entry => entry.kind === 'agent.start' && entry.role === 'worker').every(entry => entry.sessionId === receiverSession));
-    if (phase === 'review') assert.ok(events.filter(entry => entry.kind === 'agent.start' && entry.role === 'reviewer').every(entry => entry.sessionId === reviewerSession));
-    if (phase === 'merge') {
-      assert.equal(events.filter(entry => entry.kind === 'agent.start').length, agentsBeforeMergeResume, 'merge resume must not launch another agent');
-      assert.ok(reviewerSession && receiverSession && finalTask.reviewerSessionId === reviewerSession && finalTask.receiverSessionId === receiverSession);
-      const lastReviewer = events.filter(entry => entry.kind === 'process.close' && entry.threadId === f.threadId &&
-        events.some(start => start.kind === 'agent.start' && start.role === 'reviewer' && start.launchId === entry.launchId))
-        .sort((a, b) => BigInt(a.at) < BigInt(b.at) ? -1 : 1).at(-1);
-      assert.ok(lastReviewer, 'final reviewer process must close before merge starts');
-      assert.ok(BigInt(lastReviewer.at) < BigInt(mergeGateAt), 'reviewer must exit before merge consumes its handoff');
-    }
-    assert.equal(git(f.repo, 'rev-parse', 'HEAD'), finalTask.worktree?.integration?.targetCommit);
-    assert.equal(fs.readFileSync(path.join(f.repo, 'result.txt'), 'utf8'), `round ${rounds}\n`);
-    assert.equal(git(f.repo, 'status', '--porcelain'), '');
-    f.finish();
-  });
-}
+  }
+
+  const finalTask = await waitForTask(f.root, f.threadId, task => task.status === 'completed' && task.worktree?.integration?.phase === 'merged' && !task.execution?.run, 300_000);
+  assert.equal(finalTask.threadId, f.threadId);
+  assert.equal(finalTask.worktree?.path, worktree);
+  assert.equal(finalTask.worktree?.deliveryTarget?.ref, 'refs/heads/master');
+  assert.equal(finalTask.execution?.version, 2);
+  assert.equal(finalTask.worktree?.validation?.result, 'passed');
+  const agents = trace(f.root).filter(entry => entry.kind === 'agent.start');
+  assert.equal(agents.length, agentsBeforeMerge, 'merge resume must not launch another agent');
+  assert.ok(finalTask.receiverSessionId && finalTask.reviewerSessionId);
+  assert.ok(agents.filter(entry => entry.role === 'worker').every(entry => entry.sessionId === finalTask.receiverSessionId));
+  assert.ok(agents.filter(entry => entry.role === 'reviewer').every(entry => entry.sessionId === finalTask.reviewerSessionId));
+  assert.equal(git(f.repo, 'rev-parse', 'HEAD'), finalTask.worktree?.integration?.targetCommit);
+  assert.equal(fs.readFileSync(path.join(f.repo, 'result.txt'), 'utf8'), `round ${rounds}\n`);
+  assert.equal(git(f.repo, 'status', '--porcelain'), '');
+  f.finish();
+});
 
 for (const fault of ['empty-worker', 'nonzero-worker', 'no-verdict', 'bad-bootstrap-token'] as const) {
   test(`mock agents fail closed: ${fault}`, { timeout: 180_000 }, async t => {

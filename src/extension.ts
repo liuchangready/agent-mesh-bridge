@@ -12,7 +12,7 @@ import { ActiveAgentResolver, applyConfiguredAgentDefault } from './bridge/activ
 import { AutonomousRunner } from './bridge/autonomous-runner';
 import { CallbackManager } from './bridge/callback-manager';
 import { ReviewWakeScheduler } from './bridge/review-wake-scheduler';
-import { inspectV2RuntimeActivation, loadShutdownPreflightSnapshot } from './bridge/shutdown-preflight';
+import { inspectV2RuntimeActivation, prepareRuntimePreflightSnapshot } from './bridge/shutdown-preflight';
 import { ReworkController } from './bridge/rework-controller';
 import { ExecutionController } from './bridge/execution-controller';
 import { ConfigSyncService } from './config/config-sync';
@@ -279,9 +279,29 @@ export function activate(context: vscode.ExtensionContext) {
   // 2. Initialize Core Services
   const taskStore = TaskStore.getInstance();
   const storageDir = path.dirname(taskStore.getStoragePath());
+  // Standalone MCP processes cannot read VS Code settings. Publish the shared
+  // policy before startup admission, which also needs the Git executable.
+  const applyBridgePolicy = (): void => {
+    const bridgeCfg = vscode.workspace.getConfiguration('agentMeshBridge');
+    saveBridgePolicy({
+      gitPath: vscode.workspace.getConfiguration('git').get<string | string[] | null>('path') ?? [],
+      contextCompaction: bridgeCfg.get<boolean>('contextCompaction', true),
+      nativeSessionCompaction: {
+        mode: bridgeCfg.get<'off' | 'auto'>('nativeSessionCompaction.mode', 'off'),
+      },
+      reviewFlow: 'dedicated',
+      taskDataRoot: bridgeCfg.get<string>('taskDataRoot', ''),
+      concurrency: {
+        enabled: bridgeCfg.get<boolean>('concurrency.enabled', false),
+        maxConcurrentTasks: bridgeCfg.get<number>('concurrency.maxConcurrentTasks', 2),
+        maxConcurrentPerAgent: bridgeCfg.get<number>('concurrency.maxConcurrentPerAgent', 1),
+      },
+    }, storageDir);
+  };
+  applyBridgePolicy();
   const packageVersion = String(context.extension.packageJSON.version || '');
   const runtimeAdmission = inspectV2RuntimeActivation({
-    ...loadShutdownPreflightSnapshot(storageDir), storageDir,
+    ...prepareRuntimePreflightSnapshot(storageDir), storageDir,
     components: [
       { component: 'extension-host', version: packageVersion, packageRoot: context.extensionPath,
         path: path.join(context.extensionPath, 'out', 'extension.js') },
@@ -386,33 +406,6 @@ export function activate(context: vscode.ExtensionContext) {
   };
 
   applyModelSettings();
-
-  /**
-   * Mirror the bridge-wide policy switches next to the ledger.
-   *
-   * `dispatch_task` and `request_rework` run inside the agents' MCP processes,
-   * which cannot read VS Code settings, so the switches must travel as a file.
-   */
-  const applyBridgePolicy = (): void => {
-    const bridgeCfg = vscode.workspace.getConfiguration('agentMeshBridge');
-    saveBridgePolicy({
-      contextCompaction: bridgeCfg.get<boolean>('contextCompaction', true),
-      nativeSessionCompaction: {
-        mode: bridgeCfg.get<'off' | 'auto'>('nativeSessionCompaction.mode', 'off'),
-      },
-      // Stale user settings cannot restore requester-session review.
-      reviewFlow: 'dedicated',
-      // Unified task data directories for NEW tasks (worktree + logs + Archive).
-      // Old tasks keep their recorded artifactDir/worktree path.
-      taskDataRoot: bridgeCfg.get<string>('taskDataRoot', ''),
-      concurrency: {
-        enabled: bridgeCfg.get<boolean>('concurrency.enabled', false),
-        maxConcurrentTasks: bridgeCfg.get<number>('concurrency.maxConcurrentTasks', 2),
-        maxConcurrentPerAgent: bridgeCfg.get<number>('concurrency.maxConcurrentPerAgent', 1),
-      },
-    });
-  };
-  applyBridgePolicy();
 
   // Non-default receiver models are confirmed by the user through a modal
   // dialog; this service answers the requests that agent MCP processes publish
@@ -1673,6 +1666,7 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (
+        !e.affectsConfiguration('git.path') &&
         !e.affectsConfiguration('agentMeshBridge.models') &&
         !e.affectsConfiguration('agentMeshBridge.initiatorModels') &&
         !e.affectsConfiguration('agentMeshBridge.defaultAgent') &&

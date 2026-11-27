@@ -1,5 +1,5 @@
 import { testWorkspace } from './workspace-fixture';
-import { test, describe, beforeEach, afterEach } from 'node:test';
+import { test, describe, before, beforeEach, afterEach, after } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -65,6 +65,7 @@ function configureCodexReviewerFixture(): void {
 }
 
 describe('MCPServer Protocol Tests', () => {
+  const repositoryTemplate = path.join(isolatedHome, 'repository-template');
   let tempDir: string;
   let taskStore: TaskStore;
   let detector: AgentDetector;
@@ -77,6 +78,15 @@ describe('MCPServer Protocol Tests', () => {
   let savedReceiverEnv: string | undefined;
   let savedThreadIdEnv: string | undefined;
 
+  before(() => {
+    fs.mkdirSync(repositoryTemplate);
+    initGitRepo(repositoryTemplate);
+  });
+
+  after(() => {
+    fs.rmSync(repositoryTemplate, { recursive: true, force: true });
+  });
+
   beforeEach(() => {
     savedReceiverEnv = process.env.MESH_TASK_RECEIVER;
     savedThreadIdEnv = process.env.MESH_TASK_THREAD_ID;
@@ -86,8 +96,7 @@ describe('MCPServer Protocol Tests', () => {
     invalidateConfiguredModelCache();
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-mcp-test-'));
     const workspace = path.join(tempDir, 'repo');
-    fs.mkdirSync(workspace, { recursive: true });
-    initGitRepo(workspace);
+    fs.cpSync(repositoryTemplate, workspace, { recursive: true });
     originalCwd = process.cwd();
     process.chdir(workspace);
     taskStore = new TaskStore(tempDir);
@@ -689,7 +698,8 @@ describe('MCPServer Protocol Tests', () => {
 
   test('explicit cross-workspace dispatch keeps caller window on first and later calls', async () => {
     const rootA = process.cwd();
-    const rootB = path.join(tempDir, 'repo-b'); fs.mkdirSync(rootB); initGitRepo(rootB);
+    const rootB = path.join(tempDir, 'repo-b');
+    fs.cpSync(repositoryTemplate, rootB, { recursive: true });
     const registry = new WorkspaceRegistry(tempDir);
     const workspaceA = registry.register(rootA, 'user');
     const workspaceB = registry.register(rootB, 'user');

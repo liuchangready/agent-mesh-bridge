@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
-import type { ExecutionSubtreeEvidence } from '../../bridge/types';
+import type { DelegationThread } from '../../bridge/types';
 import { MockMcpClient, MockScenario, event, fixtureRoot } from './mock-agent-protocol';
 
 const root = fixtureRoot();
@@ -19,17 +19,18 @@ const threadId = process.env.MESH_TASK_THREAD_ID || process.env.MESH_REVIEW_THRE
 const model = args.find(arg => arg.startsWith('model='));
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const emit = (value: unknown) => process.stdout.write(JSON.stringify(value) + '\n');
-async function waitForDurableBinding(): Promise<{ runId: string; jobId?: string }> {
+async function waitForDurableBinding(): Promise<{ runId: string; round: number; jobId?: string }> {
   const file = path.join(root, 'home', '.agent-mesh-bridge', 'threads', `${threadId}.json`);
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     try {
-      const task = JSON.parse(fs.readFileSync(file, 'utf8'));
-      const child = task.execution?.run?.child;
-      const job = task.execution?.run?.subtrees?.find((tree: ExecutionSubtreeEvidence) =>
-        tree.root.pid === process.ppid)?.windowsJob;
-      if (task.execution?.run?.state === 'active' && (child?.pid === process.pid || (job && child?.pid === process.ppid)) &&
-          typeof child.birthId === 'string') return { runId: task.execution.run.id, jobId: job?.id };
+      const task: DelegationThread = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const execution = task.execution;
+      const run = execution?.run;
+      const child = run?.child;
+      const job = run?.subtrees?.find(tree => tree.root.pid === process.ppid)?.windowsJob;
+      if (execution && run?.state === 'active' && (child?.pid === process.pid || (job && child?.pid === process.ppid)) &&
+          typeof child.birthId === 'string') return { runId: run.id, round: execution.round, jobId: job?.id };
     } catch { /* the ledger is atomically replaced during launch binding */ }
     await delay(20);
   }
@@ -48,9 +49,9 @@ async function main(): Promise<void> {
   assert.ok(args.indexOf('--ask-for-approval') < exec);
   assert.ok(threadId);
   emit({ type: 'thread.started', thread_id: sessionId });
-  const { runId, jobId } = await waitForDurableBinding();
+  const { runId, round: executionRound, jobId } = await waitForDurableBinding();
   const role = bootstrap ? 'bootstrap' : worker ? 'worker' : 'reviewer';
-  const round = Number(process.env.MESH_TASK_ROUND || 0);
+  const round = worker ? Number(process.env.MESH_TASK_ROUND || 0) : executionRound;
   event(root, 'agent.start', { launchId: process.env.MESH_MOCK_LAUNCH_ID, role, round, threadId, sessionId, resume, runId, jobId, model, cwd: process.cwd() });
   if (bootstrap && scenario.bootstrapProcessChurn) {
     // A short-lived child can disappear between process enumeration and identity reads.
@@ -66,11 +67,11 @@ async function main(): Promise<void> {
   const credential = bootstrap ? /^(\{"reviewBootstrap":\s*\{[^\n]+\}\})$/m.exec(prompt) : undefined;
   const bootstrapToken = credential ? JSON.parse(credential[1]).reviewBootstrap.token : undefined;
   if (bootstrapToken) event(root, 'bootstrap.prompt', { threadId, sessionId, bootstrapToken, resume });
-  const shouldPause = scenario.pauseAt === pauseStage && (scenario.pauseRound === undefined || scenario.pauseRound === round);
+  const pauseAt = scenario.pauseAt?.[pauseStage];
   const pauseMarker = path.join(root, `${pauseStage}-${round}.pause-marker`);
-  if (shouldPause && !fs.existsSync(pauseMarker)) {
+  if ((pauseAt === true || pauseAt === round) && !fs.existsSync(pauseMarker)) {
     fs.writeFileSync(pauseMarker, 'held');
-    event(root, 'agent.pause-ready', { launchId: process.env.MESH_MOCK_LAUNCH_ID, role, round, threadId, sessionId, bootstrapToken });
+    event(root, 'agent.pause-ready', { launchId: process.env.MESH_MOCK_LAUNCH_ID, role, round, threadId, runId, bootstrapToken });
     await new Promise<void>((resolve, reject) => {
       const poll = setInterval(() => {
         if (fs.existsSync(path.join(root, `${pauseStage}-${round}.release`))) {
@@ -134,7 +135,7 @@ async function main(): Promise<void> {
           ? { threadId, feedback: `Implement revision ${thread.currentRound + 1} of result.txt` }
           : { threadId, remarks: 'Mock reviewer verified the final file' };
         await mcp.tool(tool, payload);
-        event(root, 'reviewer.verdict', { threadId, round: thread.currentRound, tool, sessionId });
+        event(root, 'reviewer.verdict', { launchId: process.env.MESH_MOCK_LAUNCH_ID, threadId, round: thread.currentRound, tool, sessionId });
       }
       answer('Mock reviewer finished its turn');
       await delay(scenario.reviewerTailMs || 0);

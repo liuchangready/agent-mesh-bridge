@@ -66,6 +66,7 @@ test('standalone MCP reports and swaps real builds without replacing the stdio c
   try {
     send({ method: 'initialize', id: 1, params: { capabilities: { roots: {} } } });
     assert.equal((await response(1)).result.serverInfo.version, '1.2.37');
+    assert.equal(fs.readFileSync(path.join(storage, 'delegation_threads.json'), 'utf8'), '[]');
     send({ method: 'notifications/initialized' });
     assert.equal((await response('mesh-roots')).method, 'roots/list');
     send({ id: 'mesh-roots', result: { roots: [] } });

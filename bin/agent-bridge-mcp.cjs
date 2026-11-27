@@ -37,10 +37,10 @@ if (callerIdx !== -1 && process.argv[callerIdx + 1]) {
 }
 
 function readRuntimeAdmission(storageDir) {
-  const { inspectV2RuntimeActivation, loadShutdownPreflightSnapshot } = require(path.join(outBridgeDir, 'shutdown-preflight'));
+  const { inspectV2RuntimeActivation, prepareRuntimePreflightSnapshot } = require(path.join(outBridgeDir, 'shutdown-preflight'));
   const packageRoot = path.resolve(__dirname, '..');
   const version = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8')).version;
-  return inspectV2RuntimeActivation({ ...loadShutdownPreflightSnapshot(storageDir), storageDir, components: [
+  return inspectV2RuntimeActivation({ ...prepareRuntimePreflightSnapshot(storageDir), storageDir, components: [
     { component: 'extension-host', version, packageRoot, path: path.join(packageRoot, 'out', 'extension.js') },
     { component: 'standalone-mcp', version, packageRoot, path: path.resolve(__dirname, 'agent-bridge-mcp.cjs') },
   ] });

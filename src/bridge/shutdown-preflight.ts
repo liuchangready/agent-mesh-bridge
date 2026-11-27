@@ -1,9 +1,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { execFileSync } from 'child_process';
+import { randomUUID } from 'crypto';
 import { DelegationThread } from './types';
 import { probeProcessIdentity } from './platform';
-import { gitExecutable } from './git-worktree';
+import { gitOutput } from './git-worktree';
+import { TASK_DATA_ROOT_DIRNAME } from './task-data-dir';
 
 export interface PreflightComponentVersion {
   component: string;
@@ -74,6 +75,7 @@ export function loadShutdownPreflightSnapshot(storageDir: string): {
   tombstones: any[];
   owners: PreflightOwnerRecord[];
   readErrors: string[];
+  emptyLedgerNeedsInitialization: boolean;
   pendingCoordination: string[];
   pendingMergeTransactions: Array<{ threadId?: string; path: string; phase?: string }>;
 } {
@@ -81,6 +83,7 @@ export function loadShutdownPreflightSnapshot(storageDir: string): {
   const tombstones: any[] = [];
   const owners: PreflightOwnerRecord[] = [];
   const readErrors: string[] = [];
+  const missingLedger: string[] = [];
   const pendingCoordination: string[] = [];
   const pendingMergeTransactions: Array<{ threadId?: string; path: string; phase?: string }> = [];
   try {
@@ -92,10 +95,12 @@ export function loadShutdownPreflightSnapshot(storageDir: string): {
   } catch (error: any) { readErrors.push(`deleted_tasks.log: ${error?.message || error}`); }
   const tombstonedIds = new Set(tombstones.map((entry) => entry?.threadId).filter((id): id is string => typeof id === 'string'));
   const threadsDir = path.join(storageDir, 'threads');
-  let taskFiles: string[] = [];
-  try { taskFiles = fs.readdirSync(threadsDir).filter((name) => name.endsWith('.json')); }
-  catch (error: any) { readErrors.push(`threads/: ${error?.message || error}`); }
-  for (const name of taskFiles) {
+  let threadEntries: string[] = [];
+  try { threadEntries = fs.readdirSync(threadsDir); }
+  catch (error: any) {
+    (error?.code === 'ENOENT' ? missingLedger : readErrors).push(`threads/: ${error?.message || error}`);
+  }
+  for (const name of threadEntries.filter((name) => name.endsWith('.json'))) {
     const file = path.join(threadsDir, name);
     try {
       const item = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -106,6 +111,7 @@ export function loadShutdownPreflightSnapshot(storageDir: string): {
   }
   const threadIds = new Set(tasks.map((task) => task.threadId));
   const aggregatePath = path.join(storageDir, 'delegation_threads.json');
+  let aggregateMissing = false;
   try {
     const aggregate = JSON.parse(fs.readFileSync(aggregatePath, 'utf8'));
     if (!Array.isArray(aggregate)) throw new Error('aggregate is not an array');
@@ -115,7 +121,10 @@ export function loadShutdownPreflightSnapshot(storageDir: string): {
         readErrors.push(`delegation_threads.json: aggregate entry ${String(item?.threadId)} has no matching per-thread record.`);
       }
     }
-  } catch (error: any) { readErrors.push(`delegation_threads.json: ${error?.message || error}`); }
+  } catch (error: any) {
+    aggregateMissing = error?.code === 'ENOENT';
+    (aggregateMissing ? missingLedger : readErrors).push(`delegation_threads.json: ${error?.message || error}`);
+  }
   for (const directory of ['executions', 'leases']) {
     const root = path.join(storageDir, directory);
     let names: string[] = [];
@@ -291,10 +300,54 @@ export function loadShutdownPreflightSnapshot(storageDir: string): {
       } catch (error: any) { readErrors.push(`${path.relative(storageDir, file)}: ${error?.message || error}`); }
     }
   }
-  return { tasks, tombstones, owners, readErrors, pendingCoordination, pendingMergeTransactions };
+  let emptyLedgerNeedsInitialization = false;
+  if (missingLedger.length) {
+    const hasTaskRecords = !aggregateMissing || threadEntries.length > 0 || owners.length > 0 ||
+      pendingCoordination.length > 0 || transactionFiles.length > 0 || rootEntries.some((name) =>
+        name === 'deleted_tasks.log' || name.startsWith('delegation_threads.json.tmp.'));
+    // A configured artifact root can be shared by installations. Only this
+    // Bridge home's own task records and private default task directory can
+    // establish that it already had a ledger.
+    let hasLocalArtifacts = false;
+    if (!hasTaskRecords) {
+      const localTasks = path.join(storageDir, TASK_DATA_ROOT_DIRNAME);
+      try { hasLocalArtifacts = fs.readdirSync(localTasks).some((name) => name.startsWith('thread_')); }
+      catch (error: any) {
+        if (error?.code !== 'ENOENT') readErrors.push(`${localTasks}: ${error?.message || error}`);
+      }
+    }
+    emptyLedgerNeedsInitialization = !hasTaskRecords && !hasLocalArtifacts && readErrors.length === 0;
+    if (!emptyLedgerNeedsInitialization) readErrors.push(...missingLedger);
+  }
+  return { tasks, tombstones, owners, readErrors, emptyLedgerNeedsInitialization, pendingCoordination, pendingMergeTransactions };
 }
 
-function historicalDeliveryProblem(task: DelegationThread): string | undefined {
+/** Initialize a fresh ledger on runtime startup. The standalone preflight CLI only reads it. */
+export function prepareRuntimePreflightSnapshot(storageDir: string): ReturnType<typeof loadShutdownPreflightSnapshot> {
+  const snapshot = loadShutdownPreflightSnapshot(storageDir);
+  if (!snapshot.emptyLedgerNeedsInitialization) return snapshot;
+
+  const aggregatePath = path.join(storageDir, 'delegation_threads.json');
+  const temporary = path.join(storageDir, `.initial-ledger-${randomUUID()}.tmp`);
+  try {
+    fs.mkdirSync(path.join(storageDir, 'threads'), { recursive: true });
+    fs.writeFileSync(temporary, '[]', { flag: 'wx' });
+    try { fs.linkSync(temporary, aggregatePath); }
+    catch (error: any) { if (error?.code !== 'EEXIST') throw error; }
+  } catch (error: any) {
+    snapshot.readErrors.push(`Could not initialize delegation_threads.json: ${error?.message || error}`);
+    return snapshot;
+  } finally {
+    try { fs.unlinkSync(temporary); } catch {}
+  }
+  const initialized = loadShutdownPreflightSnapshot(storageDir);
+  if (initialized.emptyLedgerNeedsInitialization) {
+    initialized.readErrors.push('Could not initialize delegation_threads.json: the ledger is still missing.');
+  }
+  return initialized;
+}
+
+function historicalDeliveryProblem(task: DelegationThread, storageDir?: string): string | undefined {
   const worktree = task.worktree as any;
   if (!worktree) return undefined;
   const integration = worktree.integration || {};
@@ -315,8 +368,7 @@ function historicalDeliveryProblem(task: DelegationThread): string | undefined {
     return 'Merged status lacks a pinned local branch, repository path, or approved commit proof.';
   }
   try {
-    const git = gitExecutable();
-    const run = (args: string[]) => execFileSync(git, ['-C', repositoryPath, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }).trim();
+    const run = (args: string[]) => gitOutput(repositoryPath, args, storageDir);
     const targetCommit = run(['rev-parse', '--verify', `${ref}^{commit}`]);
     const ancestors = [approvedCommit, integration.targetCommit, integration.mergedCommit].filter((value): value is string => typeof value === 'string');
     for (const commit of ancestors) run(['merge-base', '--is-ancestor', commit, targetCommit]);
@@ -329,6 +381,7 @@ function historicalDeliveryProblem(task: DelegationThread): string | undefined {
 /** Pure, read-only cutover decision. An omitted/unverifiable identity or
  * component version is a blocker, never an implicit green result. */
 export function inspectShutdownPreflight(input: {
+  storageDir?: string;
   tasks: DelegationThread[];
   tombstones?: any[];
   owners?: Array<PreflightOwnerRecord>;
@@ -395,7 +448,7 @@ export function inspectShutdownPreflight(input: {
       blockers.push({ code: 'UNDELIVERED_APPROVAL', threadId: thread.threadId,
         evidence: `Approved commit ${thread.worktree.approvedCommit} is not recorded as merged or no_changes.` });
     }
-    const deliveryProblem = thread.status === 'completed' ? historicalDeliveryProblem(thread) : undefined;
+    const deliveryProblem = thread.status === 'completed' ? historicalDeliveryProblem(thread, input.storageDir) : undefined;
     if (deliveryProblem) blockers.push({ code: 'UNDELIVERED_TASK', threadId: thread.threadId, evidence: deliveryProblem });
     if (thread.execution?.next) blockers.push({ code: 'PENDING_HANDOFF', threadId: thread.threadId,
       evidence: `Durable ${thread.execution.next.phase} handoff from ${thread.execution.next.sourceRunId || 'unknown source run'} is unconsumed.` });
@@ -485,7 +538,15 @@ export function inspectV2RuntimeActivation(input: {
   const blockers: CutoverBlocker[] = [];
   const probe = input.probe || probeProcessIdentity;
   let inventory: any;
-  try { inventory = JSON.parse(fs.readFileSync(inventoryPath, 'utf8')); }
+  try {
+    const content = readText(inventoryPath);
+    if (content === undefined) {
+      blockers.push({ code: 'RUNTIME_COMPONENT_INVENTORY_UNVERIFIED',
+        evidence: `Verified v2 runtime component inventory is missing at ${inventoryPath}. Complete the cutover preflight and supply the inventory to enable scheduling.` });
+    } else {
+      inventory = JSON.parse(content);
+    }
+  }
   catch (error: any) { blockers.push({ code: 'RUNTIME_COMPONENT_INVENTORY_UNVERIFIED', evidence: `${path.basename(inventoryPath)}: ${error?.message || error}` }); }
   if (!inventory || inventory.schemaVersion !== 1 || inventory.cutoverApproved !== true || !Array.isArray(inventory.components)) {
     if (!blockers.some((item) => item.code === 'RUNTIME_COMPONENT_INVENTORY_UNVERIFIED')) blockers.push({ code: 'RUNTIME_COMPONENT_INVENTORY_UNVERIFIED', evidence: 'Runtime inventory is missing, incomplete, or has no explicit cutover approval.' });
@@ -505,7 +566,9 @@ export function inspectV2RuntimeActivation(input: {
   for (const expected of input.components) {
     const entry = inventoryByName.get(expected.component);
     if (!entry) {
-      blockers.push({ code: 'RUNTIME_COMPONENT_UNVERIFIED', evidence: `${expected.component} inventory entry is missing.` });
+      if (Array.isArray(inventory?.components)) {
+        blockers.push({ code: 'RUNTIME_COMPONENT_UNVERIFIED', evidence: `${expected.component} inventory entry is missing.` });
+      }
       continue;
     }
     const actualEntryPath = canonical(expected.path);
@@ -634,7 +697,7 @@ export function inspectV2RuntimeActivation(input: {
       evidence: `Historical ${task.execution.next.phase} handoff from ${task.execution.next.sourceRunId || 'unknown source run'} remains unconsumed.` });
     if (task.cleanup) blockers.push({ code: 'CLEANUP_IN_PROGRESS', threadId: task.threadId,
       evidence: `Historical ${task.cleanup.action} cleanup token ${task.cleanup.token} remains active.` });
-    const deliveryProblem = historicalDeliveryProblem(task);
+    const deliveryProblem = historicalDeliveryProblem(task, input.storageDir);
     if (task.status !== 'completed' || (task.rounds || []).some((round) => round.status === 'running') ||
         (task.decision && !task.decision.answer) || (task.execution?.queue) ||
         (task.reviewWake && !task.reviewWake.gaveUp) ||
@@ -656,7 +719,19 @@ export function inspectV2RuntimeActivation(input: {
     if (!manifest || manifest.stage === 'complete' || tombstone.cleanupComplete) continue;
     const run = manifest.execution?.run;
     const proof = manifest.runExitProof;
-    if (run && (!proof || proof.runId !== run.id || proof.operationId !== manifest.execution?.operationId || proof.generation !== manifest.execution?.generation)) {
+    const runExitConfirmed = !!run?.id && !!proof && !!manifest.execution.operationId &&
+      Number.isSafeInteger(manifest.execution.generation) && proof.runId === run.id &&
+      proof.operationId === manifest.execution.operationId && proof.generation === manifest.execution.generation;
+    const integration = manifest.thread?.worktree?.integration;
+    // The tombstone keeps task-local assets protected while unrelated v2 runs recover.
+    if (manifest.execution?.version === 2 && manifest.stage === 'pending' &&
+        manifest.thread?.threadId === threadId && typeof manifest.token === 'string' &&
+        !!manifest.token && manifest.token === tombstone.cleanupToken &&
+        !manifest.legacyStopPending && !manifest.previousCleanup && (!run || runExitConfirmed) &&
+        !integration?.stashRecoveryPending && !integration?.stashRecoveryLockHeld &&
+        !integration?.stashCleanupPending && !integration?.recoveryRequired) continue;
+
+    if (run && !runExitConfirmed) {
       blockers.push({ code: 'DELETED_RUN_PROTECTED', threadId,
         evidence: `Deleted task run ${run.id} has no matching process-tree/Job exit acknowledgement.` });
       inspectRuntimeIdentity(run.owner?.pid, run.owner?.birthId, 'Deleted run owner', threadId);

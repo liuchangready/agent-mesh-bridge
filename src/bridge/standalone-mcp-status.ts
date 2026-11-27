@@ -234,11 +234,7 @@ export async function discoverTaskMcpProcesses(tasks: readonly Pick<DelegationTh
 /** A stdio runtime swap leaves the resident execution host and all task records in place. */
 export function mcpRestartBlockers(storageDir: string): string[] {
   const snapshot = loadShutdownPreflightSnapshot(storageDir);
-  // A fresh data root has no ledger yet. Admission still makes its own decision.
-  const empty = snapshot.tasks.length === 0 &&
-    !fs.existsSync(path.join(storageDir, 'delegation_threads.json'));
   const blockers = snapshot.readErrors
-    .filter(error => !(empty && /^(threads\/|delegation_threads\.json): ENOENT/.test(error)))
     .map(error => `无法核验任务账本和进程记录 ${error}`);
   for (const task of snapshot.tasks) {
     const run = task.execution?.run;

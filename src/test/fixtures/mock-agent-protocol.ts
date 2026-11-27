@@ -10,8 +10,7 @@ export interface MockScenario {
   reviewerTailMs?: number;
   bootstrapProcessChurn?: boolean;
   scrubReceiverMcpEnv?: boolean;
-  pauseAt?: 'bootstrap' | 'develop' | 'review' | 'merge';
-  pauseRound?: number;
+  pauseAt?: { bootstrap?: true; develop?: number; review?: number; merge?: true };
 }
 
 export function fixtureRoot(): string {

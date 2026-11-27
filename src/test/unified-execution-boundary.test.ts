@@ -173,21 +173,30 @@ describe('Unified Execution Boundary Tests', () => {
     };
     try {
       root = spawn(process.execPath, ['-e',
-        "const {spawn}=require('child_process');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore',windowsHide:true});console.log(c.pid);setTimeout(()=>process.exit(0),800);",
-      ], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+        [
+          "const { spawn } = require('child_process');",
+          "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore', windowsHide: true });",
+          'console.log(child.pid);',
+          "process.stdin.once('end', () => process.exit(0));",
+          'process.stdin.resume();',
+        ].join('\n'),
+      ], { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
       await new Promise<void>((resolve, reject) => { root!.once('error', reject); root!.once('spawn', resolve); });
       const rootPid = root.pid!;
-      const rootBirthId = getProcessBirthId(rootPid)!;
       let stdout = '';
       root.stdout!.on('data', (chunk) => { stdout += chunk.toString(); });
       await waitForText(() => stdout.trim().split(/\s+/).at(-1), 5000);
       descendant = Number(stdout.trim().split(/\s+/).at(-1));
-      assert.ok(descendant && getProcessBirthId(descendant));
-      const descendantBirthId = getProcessBirthId(descendant!);
+      assert.ok(descendant);
+      const rootBirthId = getProcessBirthId(rootPid);
+      assert.ok(rootBirthId, 'the root remains alive while identities are captured');
+      const descendantBirthId = getProcessBirthId(descendant);
       assert.ok(descendantBirthId, 'the root emitted the spawned descendant identity');
-      const knownDescendants = [{ pid: descendant!, birthId: descendantBirthId }];
-      const rootClosed = new Promise<void>((resolve) => root!.once('close', () => resolve()));
-      await rootClosed;
+      const knownDescendants = [{ pid: descendant, birthId: descendantBirthId }];
+      const rootExited = waitForExit(root);
+      root.stdin!.end();
+      await rootExited;
+      assert.equal(root.exitCode, 0, 'the root exits after the test closes its stdin');
       assert.equal(probeProcessIdentity(descendant!), 'alive', 'the detached descendant remains alive after its captured root exits');
 
       owner = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true });

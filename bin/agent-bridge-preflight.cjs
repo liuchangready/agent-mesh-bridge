@@ -34,6 +34,7 @@ for (let index = 2; index < process.argv.length; index += 1) {
 }
 const report = inspectShutdownPreflight({
   ...snapshot,
+  storageDir,
   expectedVersion,
   components,
   requiredComponents: ['extension-host', 'standalone-mcp'],

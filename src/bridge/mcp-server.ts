@@ -1365,7 +1365,7 @@ export class MCPServer {
         const id = args.workspaceId || (!args.workspaceRoot ? window?.defaultWorkspaceId || context?.id : undefined);
         const registry = new WorkspaceRegistry(storage);
         const requested = new WorkspaceResolver(registry).resolve(id, args.workspaceRoot);
-        const workspace = registry.register(resolveTemplateWorkspaceRoot(requested.rootPath));
+        const workspace = registry.register(resolveTemplateWorkspaceRoot(requested.rootPath, storage));
         const result = listTaskTemplates(workspace.rootPath);
         return { workspaceId: workspace.id, templates: result.templates.map(({id, label, summary, version}) => ({id, label, summary, version})), diagnostics: result.diagnostics };
       }

@@ -110,7 +110,7 @@ export class AsyncDispatcher {
     if (!params.workspaceRoot && !requestedWorkspace) throw new Error('WORKSPACE_REQUIRED');
     const repositoryPath = physicalDirectory(params.workspaceRoot || requestedWorkspace!.rootPath);
     const repository = resolveGitRepository(repositoryPath, this.storageDir, params.targetBranch);
-    const mainRoot = resolveMainWorkspaceRoot(repositoryPath, repository.commonDir);
+    const mainRoot = resolveMainWorkspaceRoot(repositoryPath, repository.commonDir, this.storageDir);
     const selected = registry.register(mainRoot || repositoryPath);
     if (requestedWorkspace && requestedWorkspace.id !== selected.id &&
         physicalDirectory(requestedWorkspace.rootPath) !== repositoryPath) {

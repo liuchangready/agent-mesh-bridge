@@ -38,6 +38,8 @@ export interface ConcurrencyPolicy {
 }
 
 export interface BridgePolicy {
+  /** VS Code's machine-scoped Git executable setting, shared with standalone MCP. */
+  gitPath?: string | string[];
   /** Bridge-controlled native session maintenance; shipped disabled until certification. */
   nativeSessionCompaction?: { mode?: 'off' | 'auto' };
   /**
@@ -99,6 +101,13 @@ export function readBridgePolicy(root?: string): BridgePolicy {
 export function saveBridgePolicy(patch: BridgePolicy, root?: string): BridgePolicy {
   const current = readBridgePolicy(root);
   const next: BridgePolicy = { ...current };
+  if (patch.gitPath !== undefined) {
+    const paths = (Array.isArray(patch.gitPath) ? patch.gitPath : [patch.gitPath])
+      .filter((value) => typeof value === 'string' && path.isAbsolute(value.trim()))
+      .map((value) => value.trim());
+    if (paths.length > 0) next.gitPath = paths;
+    else delete next.gitPath;
+  }
   if (patch.contextCompaction !== undefined) {
     next.contextCompaction = patch.contextCompaction !== false;
   }

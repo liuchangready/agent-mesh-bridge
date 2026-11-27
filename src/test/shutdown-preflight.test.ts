@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { inspectShutdownPreflight, inspectV2RuntimeActivation, loadShutdownPreflightSnapshot } from '../bridge/shutdown-preflight';
+import { inspectShutdownPreflight, inspectV2RuntimeActivation, loadShutdownPreflightSnapshot, prepareRuntimePreflightSnapshot } from '../bridge/shutdown-preflight';
 import { writeReviewerBootstrapToken } from '../bridge/reviewer-bootstrap';
 import { getProcessBirthId, probeProcessIdentity } from '../bridge/platform';
 import { MeshFileLock } from '../bridge/mesh-file-lock';
@@ -164,21 +164,76 @@ test('shutdown preflight reports old pending wake, bootstrap credential, and Bri
   } finally { fs.rmSync(storage, { recursive: true, force: true }); }
 });
 
-test('standalone preflight CLI is read-only and emits blocking evidence for missing ledger and host inventory', () => {
+test('standalone shutdown preflight accepts a fresh ledger and still requires host version evidence', () => {
   const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-preflight-cli-'));
   const entry = path.resolve(__dirname, '../../bin/agent-bridge-preflight.cjs');
   try {
-    const result = spawnSync(process.execPath, [entry, '--component', `extension-host=${cliPackageVersion}`], {
+    const result = spawnSync(process.execPath, [entry], {
       encoding: 'utf8', windowsHide: true,
       env: { ...process.env, USERPROFILE: isolatedHome, HOME: isolatedHome },
     });
     assert.equal(result.status, 2, result.stdout || result.stderr);
     const report = JSON.parse(result.stdout);
-    assert.equal(report.ready, false);
-    assert.ok(report.blockers.some((item: any) => item.code === 'PREFLIGHT_READ_ERROR' && item.evidence.includes('threads/')));
-    assert.ok(report.blockers.some((item: any) => item.code === 'PREFLIGHT_READ_ERROR' && item.evidence.includes('delegation_threads.json')));
+    assert.deepEqual(report.blockers.map((item: any) => item.evidence), ['extension-host version is missing or ambiguous.']);
+    const verified = runPreflightCli(isolatedHome);
+    assert.equal(verified.status, 0, verified.stdout || verified.stderr);
     assert.equal(fs.readdirSync(isolatedHome).length, 0, 'preflight must not create Bridge state under the inspected home');
   } finally { fs.rmSync(isolatedHome, { recursive: true, force: true }); }
+});
+
+test('preflight still reports a missing or damaged ledger when task evidence exists', (t) => {
+  const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-preflight-ledger-evidence-'));
+  t.after(() => fs.rmSync(storage, { recursive: true, force: true }));
+  const threads = path.join(storage, 'threads');
+  const aggregate = path.join(storage, 'delegation_threads.json');
+  fs.writeFileSync(aggregate, JSON.stringify([{ threadId: 'retained' }]));
+  const incompleteLedger = loadShutdownPreflightSnapshot(storage).readErrors;
+  assert.ok(incompleteLedger.some(error => error.startsWith('threads/: ENOENT')));
+  assert.ok(incompleteLedger.some(error => error.includes('retained has no matching per-thread record')));
+
+  fs.unlinkSync(aggregate);
+  fs.mkdirSync(threads);
+  const task = path.join(threads, 'retained.json');
+  fs.writeFileSync(task, JSON.stringify({ threadId: 'retained' }));
+  assert.ok(prepareRuntimePreflightSnapshot(storage).readErrors.some(error => error.startsWith('delegation_threads.json: ENOENT')));
+  assert.equal(fs.existsSync(aggregate), false);
+
+  fs.unlinkSync(task);
+  fs.writeFileSync(aggregate, '{');
+  assert.ok(prepareRuntimePreflightSnapshot(storage).readErrors.some(error => error.startsWith('delegation_threads.json:')));
+  assert.equal(fs.readFileSync(aggregate, 'utf8'), '{');
+
+  fs.unlinkSync(aggregate);
+  fs.mkdirSync(path.join(storage, 'tasks', 'thread_20261127_000000_aaaa'), { recursive: true });
+  assert.ok(prepareRuntimePreflightSnapshot(storage).readErrors.some(error => error.startsWith('delegation_threads.json: ENOENT')));
+  assert.equal(fs.existsSync(aggregate), false);
+});
+
+test('runtime startup initializes an empty ledger when the configured task root contains another installation’s artifacts', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-startup-shared-task-root-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const storage = path.join(root, 'bridge-home');
+  const sharedRoot = path.join(root, 'shared-tasks');
+  const oldTask = path.join(sharedRoot, 'thread_20261126_000000_aaaa');
+  fs.mkdirSync(oldTask, { recursive: true });
+  fs.writeFileSync(path.join(oldTask, 'worker.log'), 'previous installation');
+  const before = snapshotTree(sharedRoot);
+  fs.mkdirSync(storage);
+  fs.writeFileSync(path.join(storage, 'bridge-policy.json'), JSON.stringify({ taskDataRoot: sharedRoot }));
+
+  assert.deepEqual(loadShutdownPreflightSnapshot(storage).readErrors, []);
+  assert.deepEqual(fs.readdirSync(storage), ['bridge-policy.json']);
+  const initialized = prepareRuntimePreflightSnapshot(storage);
+  assert.deepEqual(initialized.readErrors, []);
+  assert.deepEqual(initialized.tasks, []);
+  assert.equal(initialized.emptyLedgerNeedsInitialization, false);
+  assert.equal(fs.readFileSync(path.join(storage, 'delegation_threads.json'), 'utf8'), '[]');
+  assert.deepEqual(fs.readdirSync(path.join(storage, 'threads')), []);
+  assert.deepEqual(snapshotTree(sharedRoot), before);
+
+  const afterInitialization = snapshotTree(storage);
+  assert.deepEqual(prepareRuntimePreflightSnapshot(storage), initialized);
+  assert.deepEqual(snapshotTree(storage), afterInitialization);
 });
 
 test('standalone preflight CLI blocks an exited lock owner while its exact merge helper is alive', async () => {
@@ -480,6 +535,54 @@ test('runtime activation admits valid v2 recovery but requires exact component p
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 
+test('retained v2 deletion artifacts do not block ordinary recovery when run exit is settled', () => {
+  const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-runtime-deleted-artifacts-'));
+  const inventory = runtimeInventory(path.resolve(__dirname, '../..'), cliPackageVersion);
+  const threadId = 'deleted_duplicate';
+  const token = 'delete-duplicate';
+  const manifest = {
+    token, stage: 'pending', retainResources: true,
+    execution: { version: 2, operationId: 'develop_1', generation: 1 },
+    thread: { threadId, worktree: { mergePending: true } },
+  };
+  const tombstone = { threadId, cleanupToken: token, cleanupManifest: manifest };
+  try {
+    fs.mkdirSync(path.join(storage, 'threads'));
+    fs.writeFileSync(path.join(storage, 'delegation_threads.json'), '[]');
+    fs.writeFileSync(path.join(storage, 'v2-runtime-components.json'), JSON.stringify(inventory));
+    fs.writeFileSync(path.join(storage, 'deleted_tasks.log'), JSON.stringify(tombstone) + '\n');
+    const before = snapshotTree(storage);
+    const snapshot = loadShutdownPreflightSnapshot(storage);
+    const input = { ...snapshot, storageDir: storage, components: inventory.components };
+    const activation = inspectV2RuntimeActivation(input);
+    assert.equal(activation.ready, true, JSON.stringify(activation.blockers));
+    const cutover = inspectShutdownPreflight({ ...snapshot, expectedVersion: '1.2.36', components: matchingVersions });
+    assert.ok(cutover.blockers.some(item => item.code === 'DELETED_CLEANUP_PENDING'));
+    assert.ok(cutover.blockers.some(item => item.code === 'DELETED_RESOURCES_RETAINED'));
+
+    const inspect = (cleanupManifest: object) => inspectV2RuntimeActivation({ ...input,
+      tombstones: [{ ...tombstone, cleanupManifest }], probe: () => 'exited',
+    });
+    const execution = { ...manifest.execution, run: { id: 'run-1', owner: { pid: 1234, birthId: 'birth-1' } } };
+    const runExitProof = { runId: 'run-1', operationId: 'develop_1', generation: 1, confirmedAt: new Date().toISOString() };
+    assert.equal(inspect({ ...manifest, execution, runExitProof }).ready, true);
+    assert.ok(inspect({ ...manifest, execution }).blockers.some(item => item.code === 'DELETED_RUN_PROTECTED'));
+    assert.ok(inspect({ ...manifest, execution, runExitProof: { ...runExitProof, generation: 2 } })
+      .blockers.some(item => item.code === 'DELETED_RUN_PROTECTED'));
+    assert.equal(inspect({ ...manifest, stage: 'running' }).ready, false);
+    assert.equal(inspect({ ...manifest, execution: { ...manifest.execution, version: 1 } }).ready, false);
+    assert.equal(inspect({ ...manifest, legacyStopPending: true }).ready, false);
+    assert.equal(inspect({ ...manifest, previousCleanup: { owner: { pid: 1234 } } }).ready, false);
+    assert.equal(inspect({ ...manifest, thread: { threadId, worktree: { integration: { stashRecoveryPending: true } } } }).ready, false);
+    assert.equal(inspect({ ...manifest, token: 'wrong-token' }).ready, false);
+    const withMerge = inspectV2RuntimeActivation({ ...input,
+      pendingMergeTransactions: [{ threadId, path: 'merge-transactions/deleted_duplicate.json', phase: 'stash_created' }],
+    });
+    assert.ok(withMerge.blockers.some(item => item.code === 'GIT_RECOVERY_PENDING'));
+    assert.deepEqual(snapshotTree(storage), before);
+  } finally { fs.rmSync(storage, { recursive: true, force: true }); }
+});
+
 test('runtime admission inspects terminal legacy run identities, next and cleanup even without registry files', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-runtime-legacy-run-'));
   const storage = path.join(home, '.agent-mesh-bridge');
@@ -629,15 +732,23 @@ test('preflight CLI exposes runtime activation mode and requires inventory witho
   const storage = path.join(home, '.agent-mesh-bridge');
   const packageRoot = path.resolve(__dirname, '../..');
   const version = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8')).version;
-  fs.mkdirSync(path.join(storage, 'threads'), { recursive: true });
-  fs.writeFileSync(path.join(storage, 'delegation_threads.json'), '[]');
-  fs.writeFileSync(path.join(storage, 'v2-runtime-components.json'), JSON.stringify(runtimeInventory(packageRoot, version)));
   try {
+    const uninitialized = runStartupPreflightCli(home);
+    assert.equal(uninitialized.status, 2, uninitialized.stdout || uninitialized.stderr);
+    const missingInventory = JSON.parse(uninitialized.stdout).startupAdmission;
+    assert.deepEqual(missingInventory.blockers.map((item: any) => item.code), ['RUNTIME_COMPONENT_INVENTORY_UNVERIFIED']);
+    assert.match(missingInventory.blockers[0].evidence, /v2-runtime-components\.json/);
+    assert.deepEqual(fs.readdirSync(home), []);
+
+    fs.mkdirSync(path.join(storage, 'threads'), { recursive: true });
+    const initialized = runStartupPreflightCli(home);
+    assert.equal(initialized.status, 2, initialized.stdout || initialized.stderr);
+    assert.deepEqual(JSON.parse(initialized.stdout).startupAdmission.blockers, missingInventory.blockers);
+    assert.deepEqual(fs.readdirSync(storage), ['threads']);
+
+    fs.writeFileSync(path.join(storage, 'v2-runtime-components.json'), JSON.stringify(runtimeInventory(packageRoot, version)));
     const before = snapshotTree(storage);
-    const entry = path.resolve(__dirname, '../../bin/agent-bridge-preflight.cjs');
-    const result = spawnSync(process.execPath, [entry, '--startup-admission'], {
-      encoding: 'utf8', windowsHide: true, env: { ...process.env, USERPROFILE: home, HOME: home },
-    });
+    const result = runStartupPreflightCli(home);
     assert.equal(result.status, 0, result.stdout || result.stderr);
     const report = JSON.parse(result.stdout);
     assert.equal(report.startupAdmission.ready, true);

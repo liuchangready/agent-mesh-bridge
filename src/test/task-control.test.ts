@@ -278,13 +278,18 @@ describe('TaskControlService - pause/delete reasons', () => {
       targetOldCommit: baseCommit, candidateCommit: approved, phase: 'ledger_written', at: new Date().toISOString() }));
     const lockPath = path.join(tempDir, 'merge.lock');
     const mergeLock = new MeshFileLock(lockPath);
+    const verifyMergeLockReleased = async (message: string) => {
+      const probeLock = new MeshFileLock(lockPath);
+      const release = await probeLock.acquire(undefined, undefined, 10_000);
+      assert.ok(release, message);
+      assert.ok(await probeLock.releaseAndConfirm(release), 'the probe lock releases before the next operation');
+    };
     const control = new TaskControlService(taskStore, runner, new CancellationRegistry(tempDir), tempDir, undefined, mergeLock);
     const originalSafeWorktree = (control as any).isSafeDeletionWorktree.bind(control);
     (control as any).isSafeDeletionWorktree = () => { throw new Error('injected failure after merge lock acquisition'); };
     const interrupted = await control.deleteTask(threadId, 'retry after cleaner fault', 'user');
     assert.equal(interrupted.status, 'DELETED'); assert.match(interrupted.message, /injected failure after merge lock acquisition/);
-    const afterFaultRelease = await new MeshFileLock(lockPath).acquire(undefined, undefined, 500, true);
-    assert.ok(afterFaultRelease, 'cleaner finally releases the exact merge lock after an exception'); afterFaultRelease();
+    await verifyMergeLockReleased('cleaner finally releases the exact merge lock after an exception');
     (control as any).isSafeDeletionWorktree = originalSafeWorktree;
 
     const transactionPath = path.join(transactionDir, `${threadId}.json`);
@@ -302,8 +307,7 @@ describe('TaskControlService - pause/delete reasons', () => {
     finally { (mutableFs as any).readFileSync = originalReadFileSync; }
     assert.equal(transactionReads, 1, 'all checks reuse the single verified transaction snapshot');
     assert.equal(result.status, 'DELETED');
-    const afterCleanupRelease = await new MeshFileLock(lockPath).acquire(undefined, undefined, 500, true);
-    assert.ok(afterCleanupRelease, 'another lock instance can acquire after cleanup'); afterCleanupRelease();
+    await verifyMergeLockReleased('another lock instance can acquire after cleanup');
     assert.equal(fs.existsSync(worktreePath), false);
     assert.throws(() => git(['show-ref', '--verify', `refs/heads/mesh/task/${threadId}`]));
     const preflight = inspectShutdownPreflight({ ...loadShutdownPreflightSnapshot(tempDir), expectedVersion: 'test', requiredComponents: [] });

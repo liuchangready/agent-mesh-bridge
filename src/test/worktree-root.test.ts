@@ -54,3 +54,44 @@ test('stale worktreeRoot is discarded without changing recorded worktrees', t =>
   assert.equal((policy as any).worktreeRoot,undefined);
   assert.equal(policy.taskDataRoot,'tasks');
 });
+
+test('standalone Git resolution uses the mirrored Git path and explains a missing executable', t => {
+  const storage = isolatedDir('mesh-git-config-');
+  t.after(() => removeTree(storage));
+  const repository = path.join(storage, 'repo');
+  initRepo(repository);
+  const binary = path.isAbsolute(gitExe) ? gitExe : spawnSync(
+    process.platform === 'win32' ? 'where.exe' : 'which', [gitExe], { encoding: 'utf8', windowsHide: true },
+  ).stdout.trim().split(/\r?\n/)[0];
+  assert.ok(path.isAbsolute(binary));
+
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+    !/^(PATH|MESH_GIT_PATH|GIT_EXECUTABLE|GIT_CONFIG_COUNT)$/i.test(key)));
+  const modulePath = path.resolve(__dirname, '../bridge/git-worktree.js');
+  const run = (extraEnv: NodeJS.ProcessEnv = {}) => spawnSync(process.execPath, ['-e', `
+    const { resolveGitRepository, resolveTemplateWorkspaceRoot } = require(process.argv[1]);
+    const [repository, storage] = process.argv.slice(2);
+    const repo = resolveGitRepository(repository, storage);
+    const workspace = resolveTemplateWorkspaceRoot(repository, storage);
+    console.log(JSON.stringify({ ref: repo.targetRef, workspace }));
+  `, modulePath, repository, storage], { env: { ...env, PATH: '', ...extraEnv }, encoding: 'utf8', windowsHide: true });
+
+  const missing = run();
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stderr, /GIT_EXECUTABLE_UNAVAILABLE.*git\.path.*MESH_GIT_PATH/);
+  assert.doesNotMatch(missing.stderr, /not a usable Git checkout/);
+
+  saveBridgePolicy({ gitPath: [path.join(storage, 'missing-git'), binary] }, storage);
+  const configured = run();
+  assert.equal(configured.status, 0, configured.stderr);
+  assert.equal(JSON.parse(configured.stdout).ref, 'refs/heads/main');
+  assert.equal(JSON.parse(configured.stdout).workspace, fs.realpathSync.native(repository));
+
+  const refused = run({ GIT_TEST_ASSUME_DIFFERENT_OWNER: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: path.join(storage, 'empty-gitconfig') });
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /GIT_REPOSITORY_OWNERSHIP/);
+  assert.doesNotMatch(refused.stderr, /GIT_EXECUTABLE_UNAVAILABLE|not a usable Git checkout/);
+
+  saveBridgePolicy({ gitPath: [] }, storage);
+  assert.equal(readBridgePolicy(storage).gitPath, undefined);
+});
